@@ -27,7 +27,11 @@ display, with hot reload and live sliders.
 Requires Visual Studio 2022 (or 18) with the Windows SDK. CMake and Ninja ship
 with VS, so no separate install is needed.
 
+Dear ImGui is a submodule, so clone recursively (or run
+`git submodule update --init` in an existing clone):
+
 ```sh
+git clone --recursive <repo-url>
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Debug
 ```
@@ -137,3 +141,7 @@ vendored under `third_party/`.
   existing algorithm.
 - **Views render to offscreen targets** behind a `View` interface, so a 3D
   viewport (SfM, gaussian splats) can dock alongside 2D panels later.
+
+## Licence
+
+MIT — see [LICENSE](LICENSE). Dear ImGui is MIT; `stb` is public domain / MIT.
