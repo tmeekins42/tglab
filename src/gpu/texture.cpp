@@ -10,7 +10,9 @@ namespace tglab {
 
 void GpuTexture::Release() {
     if (m_res) {
-        if (m_dev) m_dev->Srv().Free(m_cpu, m_gpu);
+        // Srv().Free() tolerates being called after the heap is gone, but the
+        // descriptor is only meaningful while the device lives.
+        if (m_dev && m_dev->Ready()) m_dev->Srv().Free(m_cpu, m_gpu);
         m_res->Release();
         m_res = nullptr;
     }

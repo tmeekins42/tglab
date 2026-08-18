@@ -182,7 +182,14 @@ bool App::Init(HWND hwnd) {
 void App::Shutdown() {
     m_worker.Stop();   // before the device: results reference image memory
     m_dev.WaitForLastSubmittedFrame();
+
+    // Every GpuTexture holds an SRV descriptor from the device's heap, so all
+    // of them must be released BEFORE m_dev.Shutdown() destroys that heap.
+    // Anything left to a member destructor would run afterwards and free a
+    // descriptor against a dangling heap base.
     m_views.clear();
+    m_diffTex.Release();
+
     ImGui_ImplDX12_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();

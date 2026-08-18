@@ -25,6 +25,11 @@ void SrvHeap::Shutdown() {
     if (m_heap) { m_heap->Release(); m_heap = nullptr; }
     m_free.clear();
     m_capacity = 0;
+    // Cleared so a late Free() is detected rather than computing an index from
+    // a stale base pointer.
+    m_cpuStart = {};
+    m_gpuStart = {};
+    m_stride   = 0;
 }
 
 void SrvHeap::Alloc(D3D12_CPU_DESCRIPTOR_HANDLE* outCpu, D3D12_GPU_DESCRIPTOR_HANDLE* outGpu) {
@@ -37,8 +42,23 @@ void SrvHeap::Alloc(D3D12_CPU_DESCRIPTOR_HANDLE* outCpu, D3D12_GPU_DESCRIPTOR_HA
 
 void SrvHeap::Free(D3D12_CPU_DESCRIPTOR_HANDLE cpu, D3D12_GPU_DESCRIPTOR_HANDLE gpu) {
     (void)gpu;
+
+    // Freeing after Shutdown() is a lifetime bug in the caller (a GpuTexture
+    // outliving the device), but it must not corrupt the free list or crash on
+    // the way out. Ignore it here and let the assert flag it in debug builds.
+    if (!m_heap || m_stride == 0) return;
+    if (cpu.ptr < m_cpuStart.ptr) {
+        assert(false && "SRV freed against a different/destroyed heap — "
+                        "release GpuTextures before Device::Shutdown()");
+        return;
+    }
+
     const uint32_t idx = uint32_t((cpu.ptr - m_cpuStart.ptr) / m_stride);
-    assert(idx < m_capacity);
+    if (idx >= m_capacity) {
+        assert(false && "SRV index out of range — descriptor freed twice, or "
+                        "after the heap was destroyed");
+        return;
+    }
     m_free.push_back(idx);
 }
 
