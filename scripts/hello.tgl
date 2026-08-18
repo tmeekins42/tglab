@@ -1,0 +1,14 @@
+# tglab M1 vertical slice.
+# Edit and save — the app reloads automatically (or press F5).
+
+src = image("test")
+
+amount = slider("brightness", -1.0, 1.0, 0.0)
+gain   = slider("gain", 0.0, 4.0, 1.0)
+
+grey     = grayscale(src)
+adjusted = brightness(grey, amount = amount, gain = gain)
+
+display(src,      "original")
+display(grey,     "greyscale")
+display(adjusted, "adjusted")
