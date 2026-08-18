@@ -3,6 +3,7 @@
 #include <cassert>
 
 #include "../gpu/compute.h"
+#include "../gpu/gpu_image.h"
 
 namespace tglab {
 
@@ -177,51 +178,33 @@ bool Pipeline::RunStageGpu(Stage& s, const std::vector<const Data*>& in,
         }
     }
 
-    std::vector<GpuImage>        owned(in.size() + s.outputs.size());
+    // Acquire through Image, which owns its GPU resource and only transfers
+    // when a side is stale. Chained GPU stages therefore upload once at the
+    // head and never read back in the middle: the intermediate images stay
+    // GPU-resident, and nothing asks for their CPU pixels.
     std::vector<const GpuImage*> gin;
     std::vector<GpuImage*>       gout;
-
-    size_t slot = 0;
-    bool ok = true;
+    gin.reserve(in.size());
+    gout.reserve(s.outputs.size());
 
     for (const Data* d : in) {
         Image& img = const_cast<Image&>(std::get<Image>(*d));
-        GpuImage& g = owned[slot++];
-        if (!gpu->CreateImage(img.Desc(), &g)) { ok = false; break; }
-        ImageView v = img.MapCpuRead();
-        if (!gpu->Upload(v, &g)) { ok = false; break; }
-        gin.push_back(&g);
+        GpuResidency* g = img.AcquireGpuRead(*gpu);
+        if (!g) { *err = "could not make an input GPU-resident"; return false; }
+        gin.push_back(&g->image);
     }
-    if (ok) {
-        for (Data& d : s.outputs) {
-            Image& img = std::get<Image>(d);
-            GpuImage& g = owned[slot++];
-            if (!gpu->CreateImage(img.Desc(), &g)) { ok = false; break; }
-            gout.push_back(&g);
-        }
+    for (Data& d : s.outputs) {
+        Image& img = std::get<Image>(d);
+        GpuResidency* g = img.AcquireGpuWrite(*gpu);
+        if (!g) { *err = "could not allocate a GPU output"; return false; }
+        gout.push_back(&g->image);
     }
 
-    if (ok) ok = gpu->Dispatch(*s.kernel, gin, gout, s.algo->GpuConstants(), err);
+    if (!gpu->Dispatch(*s.kernel, gin, gout, s.algo->GpuConstants(), err)) return false;
 
-    // Read results back. M3 keeps results CPU-side because viewers and later
-    // CPU stages both expect that.
-    //
-    // This is where the remaining performance is: the kernel itself is ~550x
-    // faster than the CPU path, but a full stage measures ~5x once upload and
-    // readback are counted. Giving Image real GPU residency (so a chain of GPU
-    // stages uploads once, never reads back mid-chain, and displays straight
-    // from the SRV) is what closes that gap.
-    if (ok) {
-        for (size_t i = 0; i < s.outputs.size(); ++i) {
-            Image& img = std::get<Image>(s.outputs[i]);
-            ImageView v = img.MapCpuWrite();
-            if (!gpu->Readback(*gout[i], &v)) { ok = false; break; }
-        }
-    }
-
-    for (GpuImage& g : owned) g.Release();
-    if (!ok && err->empty()) *err = "GPU execution failed";
-    return ok;
+    // No readback here. Outputs stay GPU-resident; whoever needs CPU pixels
+    // (a later CPU stage, or a viewer) triggers the transfer via MapCpuRead().
+    return true;
 }
 
 } // namespace tglab

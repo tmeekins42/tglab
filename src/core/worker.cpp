@@ -3,6 +3,7 @@
 #include <chrono>
 
 #include "../gpu/compute.h"
+#include "../gpu/gpu_image.h"
 
 namespace tglab {
 
@@ -39,6 +40,25 @@ uint64_t PipelineWorker::Submit(Pipeline pipe, std::vector<Data> sources) {
     return seq;
 }
 
+uint64_t PipelineWorker::SubmitCompare(Pipeline pipe, std::vector<Data> sources,
+                                       int stageIndex) {
+    uint64_t seq;
+    {
+        std::lock_guard<std::mutex> lock(m_mtx);
+        seq = m_nextSeq++;
+        auto job = std::make_unique<PipelineJob>();
+        job->seq          = seq;
+        job->pipe         = std::move(pipe);
+        job->sources      = std::move(sources);
+        job->compare      = true;
+        job->compareStage = stageIndex;
+        m_pending         = std::move(job);
+        m_busy.store(true, std::memory_order_relaxed);
+    }
+    m_cv.notify_one();
+    return seq;
+}
+
 bool PipelineWorker::TryFetch(PipelineOutcome* out) {
     std::lock_guard<std::mutex> lock(m_mtx);
     if (!m_result) return false;
@@ -59,6 +79,8 @@ void PipelineWorker::Run() {
     // are never touched by the UI thread.
     ComputeContext gpu;
     const bool haveGpu = m_device && gpu.Init(m_device);
+    // Lets Image::MapCpuRead() pull pixels back when they live only on the GPU.
+    if (haveGpu) InstallGpuResidencyHooks();
 
     for (;;) {
         std::unique_ptr<PipelineJob> job;
@@ -71,6 +93,33 @@ void PipelineWorker::Run() {
 
         auto outcome = std::make_unique<PipelineOutcome>();
         outcome->seq = job->seq;
+
+        if (job->compare) {
+            // Comparison runs the pipeline twice with explicit modes, so it
+            // must not reuse the cache (which would make the second run free
+            // and the timing meaningless).
+            outcome->isCompare = true;
+            auto cr = std::make_shared<CompareResult>(
+                CompareCpuGpu(job->pipe, &job->sources,
+                              haveGpu ? &gpu : nullptr, job->compareStage));
+            outcome->ok      = cr->ok;
+            outcome->error   = cr->error;
+            outcome->compare = std::move(cr);
+
+            // A comparison leaves the pipeline's cache in an unknown mode, so
+            // drop it rather than let the next normal run inherit it.
+            havePrev = false;
+            prev.Clear();
+
+            const uint64_t seq = outcome->seq;
+            {
+                std::lock_guard<std::mutex> lock(m_mtx);
+                m_result = std::move(outcome);
+                if (!m_pending) m_busy.store(false, std::memory_order_relaxed);
+            }
+            m_lastFinished.store(seq, std::memory_order_relaxed);
+            continue;
+        }
 
         const auto t0 = std::chrono::steady_clock::now();
         std::string err;

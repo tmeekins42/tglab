@@ -14,9 +14,11 @@
 #include <d3d12.h>
 
 #include "../src/core/algorithm.h"
+#include "../src/core/compare.h"
 #include "../src/core/pipeline.h"
 #include "../src/core/worker.h"
 #include "../src/gpu/compute.h"
+#include "../src/gpu/gpu_image.h"
 #include "../src/script/interp.h"
 #include "../src/script/parser.h"
 
@@ -254,6 +256,182 @@ static void TestGpuPipeline(ID3D12Device* dev) {
     gpu.Shutdown();
 }
 
+static void TestResidency(ID3D12Device* dev) {
+    Section("GPU residency");
+
+    ComputeContext gpu;
+    if (!gpu.Init(dev)) { Check(false, "compute context"); return; }
+
+    // A GPU stage must leave its output GPU-resident, not read it back. That
+    // is what lets a chain upload once and transfer nothing in the middle.
+    {
+        UiState ui; Pipeline pipe; std::vector<Data> src; std::string e;
+        BuildPipeline("src = image(\"test\")\nb = gaussian_blur(src, sigma = 2)\ndisplay(b)\n",
+                      256, &ui, &pipe, &src, &e);
+        Check(pipe.Execute(&src, nullptr, &e, &gpu, ExecMode::ForceGPU),
+              "GPU stage runs" + (e.empty() ? "" : ": " + e));
+
+        const Data* d = pipe.Resolve(pipe.Viewers()[0].source, &src);
+        Image& out = const_cast<Image&>(std::get<Image>(*d));
+        Check(out.HasGpu(), "the output is GPU-resident after the dispatch");
+        Check(!out.HasCpu(), "no readback happened (output is GPU-only)");
+
+        // Asking for CPU pixels is what triggers the single transfer.
+        ImageView v = out.MapCpuRead();
+        Check(v.Valid() && out.HasCpu(), "MapCpuRead() pulls the pixels back on demand");
+        Check(out.HasGpu(), "the GPU copy survives readback (now resident on both)");
+
+        // And the pixels must be real, not an uninitialised buffer.
+        int nonZero = 0;
+        for (int i = 0; i < v.desc.width * v.desc.height * 4; ++i)
+            if (v.data[i] != 0) ++nonZero;
+        Check(nonZero > v.desc.width * v.desc.height,
+              "read-back pixels are real data, not a blank buffer");
+    }
+
+    // Chained GPU stages: the intermediate must never touch the CPU.
+    {
+        UiState ui; Pipeline pipe; std::vector<Data> src; std::string e;
+        BuildPipeline("src = image(\"test\")\n"
+                      "a = gaussian_blur(src, sigma = 2)\n"
+                      "b = gaussian_blur(a, sigma = 2)\n"
+                      "display(b)\n",
+                      256, &ui, &pipe, &src, &e);
+        Check(pipe.Execute(&src, nullptr, &e, &gpu, ExecMode::ForceGPU),
+              "chained GPU stages run" + (e.empty() ? "" : ": " + e));
+        Check(pipe.GpuStageCount() == 2, "both stages ran on the GPU");
+
+        // The intermediate (stage 0's output) is the one that would have cost
+        // a readback + upload round trip before residency.
+        Image& mid = std::get<Image>(pipe.Stages()[0].outputs[0]);
+        Check(mid.HasGpu() && !mid.HasCpu(),
+              "the intermediate stayed GPU-only — no round trip through the CPU");
+    }
+
+    // Writing on the CPU must invalidate the GPU copy, or a later GPU stage
+    // would silently consume stale pixels.
+    {
+        Image img;
+        img.Alloc({64, 64, Format::RGBA8});
+        Check(img.HasCpu() && !img.HasGpu(), "a fresh image is CPU-only");
+        Check(img.AcquireGpuRead(gpu) != nullptr, "AcquireGpuRead uploads");
+        Check(img.HasGpu() && img.HasCpu(), "after upload it is resident on both");
+
+        img.MapCpuWrite();
+        Check(img.HasCpu() && !img.HasGpu(),
+              "MapCpuWrite() invalidates the GPU copy");
+    }
+
+    gpu.Shutdown();
+}
+
+static void TestCompare(ID3D12Device* dev) {
+    Section("compare mode");
+
+    ComputeContext gpu;
+    if (!gpu.Init(dev)) { Check(false, "compute context"); return; }
+
+    // Identical images must report zero difference — the baseline that makes
+    // any non-zero result meaningful.
+    {
+        Image a, b;
+        a.Alloc({32, 32, Format::RGBA8});
+        b.Alloc({32, 32, Format::RGBA8});
+        ImageView va = a.MapCpuWrite(), vb = b.MapCpuWrite();
+        for (int i = 0; i < 32 * 32 * 4; ++i) { va.data[i] = uint8_t(i); vb.data[i] = uint8_t(i); }
+        const CompareStats s = CompareImages(a, b, 1.0);
+        Check(s.maxAbsDiff == 0 && s.meanAbsDiff == 0, "identical images differ by zero");
+        Check(s.diffPixels == 0, "no pixels beyond tolerance");
+    }
+
+    // A known offset must be measured exactly.
+    {
+        Image a, b;
+        a.Alloc({16, 16, Format::RGBA8});
+        b.Alloc({16, 16, Format::RGBA8});
+        ImageView va = a.MapCpuWrite(), vb = b.MapCpuWrite();
+        for (int y = 0; y < 16; ++y)
+            for (int x = 0; x < 16; ++x) {
+                uint8_t* pa = va.At<uint8_t>(x, y);
+                uint8_t* pb = vb.At<uint8_t>(x, y);
+                pa[0] = 100; pa[1] = 100; pa[2] = 100; pa[3] = 255;
+                pb[0] = 110; pb[1] = 100; pb[2] = 100; pb[3] = 255;   // +10 on red
+            }
+        const CompareStats s = CompareImages(a, b, 1.0);
+        Check(s.maxAbsDiff == 10.0, "max difference is measured exactly");
+        Check(s.diffPixels == 256, "every pixel counted as differing");
+        // 10 on one of three compared channels.
+        Check(std::fabs(s.meanAbsDiff - 10.0 / 3.0) < 0.01, "mean is over compared channels");
+    }
+
+    // Alpha is excluded: most algorithms pass it through, so counting it would
+    // dilute a real difference in the colour channels.
+    {
+        Image a, b;
+        a.Alloc({8, 8, Format::RGBA8});
+        b.Alloc({8, 8, Format::RGBA8});
+        ImageView va = a.MapCpuWrite(), vb = b.MapCpuWrite();
+        for (int i = 0; i < 8 * 8; ++i) {
+            va.data[i * 4 + 3] = 255;
+            vb.data[i * 4 + 3] = 0;      // alpha differs wildly
+        }
+        const CompareStats s = CompareImages(a, b, 1.0);
+        Check(s.maxAbsDiff == 0, "alpha differences are ignored");
+    }
+
+    // The real thing: run gaussian_blur both ways through the pipeline.
+    {
+        UiState ui; Pipeline pipe; std::vector<Data> src; std::string e;
+        BuildPipeline("src = image(\"test\")\nb = gaussian_blur(src, sigma = 3)\ndisplay(b)\n",
+                      256, &ui, &pipe, &src, &e);
+        const CompareResult r = CompareCpuGpu(pipe, &src, &gpu, -1);
+        Check(r.ok, "CompareCpuGpu runs" + (r.ok ? "" : ": " + r.error));
+        Check(r.algorithm == "gaussian_blur", "reports which algorithm was compared");
+        std::printf("       CPU %.1f ms   GPU %.1f ms   speedup %.1fx   maxdiff %.3f\n",
+                    r.cpuMs, r.gpuMs, r.Speedup(), r.stats.maxAbsDiff);
+        Check(r.stats.maxAbsDiff <= 4.0, "CPU and GPU agree");
+        Check(r.cpuMs > 0 && r.gpuMs > 0, "both paths were timed");
+        Check(r.cpuImage.Valid() && r.gpuImage.Valid(), "both result images captured");
+        Check(r.diffImage.Valid(), "diff image produced");
+    }
+
+    // A pipeline with nothing comparable must say so, rather than silently
+    // comparing something against itself.
+    {
+        UiState ui; Pipeline pipe; std::vector<Data> src; std::string e;
+        BuildPipeline("src = image(\"test\")\ng = grayscale(src)\ndisplay(g)\n",
+                      128, &ui, &pipe, &src, &e);
+        const CompareResult r = CompareCpuGpu(pipe, &src, &gpu, -1);
+        Check(!r.ok && r.error.find("no stage") != std::string::npos,
+              "an all-CPU pipeline reports nothing to compare: " + r.error);
+    }
+    // Naming a specific CPU-only stage reports that stage by name.
+    {
+        UiState ui; Pipeline pipe; std::vector<Data> src; std::string e;
+        BuildPipeline("src = image(\"test\")\ng = grayscale(src)\ndisplay(g)\n",
+                      128, &ui, &pipe, &src, &e);
+        const CompareResult r = CompareCpuGpu(pipe, &src, &gpu, 0);
+        Check(!r.ok && r.error.find("grayscale") != std::string::npos,
+              "an explicitly chosen CPU-only stage names itself: " + r.error);
+    }
+    // Auto-selection skips CPU-only stages to find a comparable one — a
+    // pipeline usually ends in something without a kernel, so defaulting to
+    // the last stage would almost always report "cannot compare".
+    {
+        UiState ui; Pipeline pipe; std::vector<Data> src; std::string e;
+        BuildPipeline("src = image(\"test\")\n"
+                      "b = gaussian_blur(src, sigma = 2)\n"
+                      "gx, gy, mag = sobel(b)\n"
+                      "display(mag)\n",
+                      128, &ui, &pipe, &src, &e);
+        const CompareResult r = CompareCpuGpu(pipe, &src, &gpu, -1);
+        Check(r.ok && r.algorithm == "gaussian_blur",
+              "auto-select picks the comparable stage, not the last one");
+    }
+
+    gpu.Shutdown();
+}
+
 int main() {
     TestWorker();
     TestShaderCompiler();
@@ -261,6 +439,8 @@ int main() {
     ID3D12Device* dev = nullptr;
     if (SUCCEEDED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev)))) {
         TestGpuPipeline(dev);
+        TestResidency(dev);
+        TestCompare(dev);
         dev->Release();
     } else {
         std::printf("\n(no D3D12 device — GPU tests skipped)\n");

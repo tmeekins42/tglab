@@ -34,6 +34,7 @@ add_library(tglab_core STATIC
     src/core/algorithm.cpp
     src/core/pipeline.cpp
     src/core/worker.cpp
+    src/core/compare.cpp
     src/script/lexer.cpp
     src/script/parser.cpp
     src/script/interp.cpp
@@ -41,6 +42,7 @@ add_library(tglab_core STATIC
     src/gpu/device.cpp
     src/gpu/texture.cpp
     src/gpu/shader.cpp
+    src/gpu/gpu_image.cpp
     src/gpu/compute.cpp
 )
 target_include_directories(tglab_core PUBLIC

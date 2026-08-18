@@ -13,6 +13,7 @@
 
 #include "../core/algorithm.h"
 #include "../core/image_io.h"
+#include "../core/compare.h"
 #include "../core/pipeline.h"
 #include "../core/worker.h"
 #include "../script/interp.h"
@@ -63,6 +64,8 @@ private:
     void DrawControlsPanel();
     void DrawPalettePanel();
     void DrawAlgorithmsPanel();
+    void DrawComparePanel();
+    void RequestCompare();
     void SyncViews();
     void DockLooseViewers();
     void ReportError(const std::string& prevError);
@@ -104,7 +107,19 @@ private:
     bool        m_haveSavedLayout = false; // a tglab_layout.ini already existed
     ImGuiID     m_centreNode = 0;          // where new viewers get docked
     ImGuiID     m_dockspaceId = 0;         // fallback when a saved layout exists
+    ImGuiID     m_compareNode = 0;         // right-hand column for compare
     int         m_spinner = 0;             // "working..." animation
+
+    // Compare mode (M4). TGLAB_COMPARE=1 opens the panel at startup, which is
+    // how the panel gets verified without driving the menus.
+    std::shared_ptr<CompareResult> m_compare;
+    GpuTexture m_diffTex;
+    bool       m_compareOpen       = false;
+    int        m_compareStage      = -1;   // -1 = last stage
+    uint64_t   m_compareVersion    = 1;
+    bool       m_compareRequested  = false;
+    std::vector<std::string> m_stageNames;
+    std::vector<bool>        m_stageGpuCapable;
 };
 
 App* g_app = nullptr;
@@ -181,6 +196,8 @@ void App::SetScriptPath(const std::string& path) {
         m_error = "could not read script '" + path + "'";
     m_dirty = true;
     UpdateWindowTitle();
+
+    if (GetEnvironmentVariableA("TGLAB_COMPARE", nullptr, 0) > 0) m_compareOpen = true;
 }
 
 void App::LoadImageIntoPalette(const std::string& path) {
@@ -250,12 +267,46 @@ void App::RunScript() {
             for (const ViewerDecl& d : built.Viewers()) m_viewerNames.push_back(d.name);
             SyncViews();
 
+            // Stage list for the compare panel's picker.
+            m_stageNames.clear();
+            m_stageGpuCapable.clear();
+            for (const Stage& s : built.Stages()) {
+                m_stageNames.push_back(std::to_string(m_stageNames.size()) + ": " + s.algoName);
+                m_stageGpuCapable.push_back(s.algo->HasGPU() && s.algo->GpuSource());
+            }
+
             m_pendingSeq = m_worker.Submit(std::move(built), std::move(sources));
         }
     }
 
     ReportError(prevError);
     UpdateWindowTitle();
+}
+
+// Re-runs the script and asks the worker to compare CPU vs GPU on the final
+// stage. Separate from the normal path because it is an explicit request, not
+// something a slider change triggers.
+void App::RequestCompare() {
+    std::vector<Data> sources;
+    std::vector<SourceImage> names;
+    for (size_t i = 0; i < m_palette.size(); ++i) {
+        if (std::holds_alternative<Image>(m_palette[i].data))
+            sources.push_back(Data{std::get<Image>(m_palette[i].data).Clone()});
+        else
+            sources.push_back(Data{});
+        names.push_back({m_palette[i].name, int(i)});
+    }
+
+    Program prog;
+    std::string err;
+    if (!Parse(m_source, &prog, &err)) { m_error = err; return; }
+
+    Pipeline built;
+    InterpResult r = Interpret(prog, names, &m_ui, &built);
+    if (!r.ok) { m_error = r.error; return; }
+
+    m_worker.SubmitCompare(std::move(built), std::move(sources), m_compareStage);
+    m_compareOpen = true;
 }
 
 // Picks up a finished run. Called once per frame, before anything draws.
@@ -269,6 +320,16 @@ void App::PollWorker() {
     m_shownSeq = out.seq;
 
     const std::string prevError = m_error;
+
+    if (out.isCompare) {
+        m_error = out.ok ? std::string() : out.error;
+        m_compare = std::move(out.compare);
+        ++m_compareVersion;
+        ReportError(prevError);
+        UpdateWindowTitle();
+        return;
+    }
+
     if (!out.ok) {
         m_error = out.error;          // keep the previous images on screen
     } else {
@@ -355,6 +416,17 @@ void App::DockLooseViewers() {
         if (w == nullptr || w->DockId == 0)
             ImGui::DockBuilderDockWindow(v->Name().c_str(), target);
     }
+
+    // The compare panel is created on demand, so it misses the initial layout
+    // pass and would otherwise open as a small floating window over the others.
+    // m_compareNode is only set when the default layout was built, so fall back
+    // to the viewers' node — same reasoning as CentreDockNode() above.
+    if (m_compareOpen) {
+        const ImGuiID node = m_compareNode != 0 ? m_compareNode : target;
+        ImGuiWindow* w = ImGui::FindWindowByName("Compare CPU / GPU");
+        if (node != 0 && (w == nullptr || w->DockId == 0))
+            ImGui::DockBuilderDockWindow("Compare CPU / GPU", node);
+    }
 }
 
 // Where new viewers should go, in order of preference:
@@ -391,6 +463,7 @@ void App::BuildDefaultLayout(ImGuiID dockspace) {
 
     ImGuiID centre = dockspace;
     const ImGuiID left   = ImGui::DockBuilderSplitNode(centre, ImGuiDir_Left, 0.22f, nullptr, &centre);
+    const ImGuiID right  = ImGui::DockBuilderSplitNode(centre, ImGuiDir_Right, 0.28f, nullptr, &centre);
     const ImGuiID bottom = ImGui::DockBuilderSplitNode(centre, ImGuiDir_Down, 0.18f, nullptr, &centre);
     ImGuiID leftBottom   = left;
     const ImGuiID leftTop = ImGui::DockBuilderSplitNode(leftBottom, ImGuiDir_Up, 0.5f, nullptr, &leftBottom);
@@ -399,6 +472,9 @@ void App::BuildDefaultLayout(ImGuiID dockspace) {
     ImGui::DockBuilderDockWindow("Algorithms", leftTop);
     ImGui::DockBuilderDockWindow("Controls",   leftBottom);
     ImGui::DockBuilderDockWindow("Status",     bottom);
+    // Compare gets its own column on the right: it is read side by side with
+    // the viewers, not instead of them.
+    ImGui::DockBuilderDockWindow("Compare CPU / GPU", right);
 
     // Viewers declared by the script share the centre node, so several
     // display() calls tab together rather than piling up as floating windows.
@@ -406,7 +482,8 @@ void App::BuildDefaultLayout(ImGuiID dockspace) {
         ImGui::DockBuilderDockWindow(name.c_str(), centre);
 
     ImGui::DockBuilderFinish(dockspace);
-    m_centreNode = centre;   // remember it for viewers added by later edits
+    m_centreNode  = centre;   // remember it for viewers added by later edits
+    m_compareNode = right;    // ditto for the on-demand compare panel
 }
 
 void App::DrawMenuBar() {
@@ -440,6 +517,11 @@ void App::DrawMenuBar() {
         if (ImGui::MenuItem("Force GPU", nullptr, mode == ExecMode::ForceGPU)) {
             m_worker.SetExecMode(ExecMode::ForceGPU);
             m_dirty = true;
+        }
+        ImGui::Separator();
+        if (ImGui::MenuItem("Compare CPU / GPU...", nullptr, m_compareOpen)) {
+            m_compareOpen = !m_compareOpen;
+            if (m_compareOpen && !m_compare) RequestCompare();
         }
         ImGui::EndMenu();
     }
@@ -549,6 +631,125 @@ std::string App::DefaultText(const UiControl& c) {
     }
 }
 
+// CPU vs GPU for one algorithm: both results, their difference, and the
+// numbers. A kernel that merely *looks* right is not verified.
+void App::DrawComparePanel() {
+    if (!m_compareOpen) return;
+
+    // Big enough to show the numbers and the diff image without resizing.
+    ImGui::SetNextWindowSize(ImVec2(460, 620), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Compare CPU / GPU", &m_compareOpen)) { ImGui::End(); return; }
+
+    // Which stage to compare. Defaulting to the last one often lands on an
+    // algorithm with no GPU kernel (a pipeline usually ends in something CPU
+    // -only), so offer the comparable stages explicitly.
+    const char* preview = m_compareStage < 0
+                              ? "auto (first comparable)"
+                              : (size_t(m_compareStage) < m_stageNames.size()
+                                     ? m_stageNames[size_t(m_compareStage)].c_str()
+                                     : "?");
+    ImGui::SetNextItemWidth(220);
+    if (ImGui::BeginCombo("stage", preview)) {
+        if (ImGui::Selectable("auto (first comparable)", m_compareStage < 0)) {
+            m_compareStage = -1;
+            m_compare.reset();
+            m_compareRequested = false;
+        }
+        for (int i = 0; i < int(m_stageNames.size()); ++i) {
+            const bool gpuCapable = i < int(m_stageGpuCapable.size()) && m_stageGpuCapable[size_t(i)];
+            // Non-comparable stages stay visible but unselectable, so it is
+            // obvious *why* a given algorithm is not on offer.
+            ImGui::BeginDisabled(!gpuCapable);
+            const std::string label =
+                m_stageNames[size_t(i)] + (gpuCapable ? "" : "  (CPU only)");
+            if (ImGui::Selectable(label.c_str(), i == m_compareStage)) {
+                m_compareStage = i;
+                m_compare.reset();
+                m_compareRequested = false;
+            }
+            ImGui::EndDisabled();
+        }
+        ImGui::EndCombo();
+    }
+
+    // Kick off the first comparison automatically when the panel opens, so it
+    // shows numbers rather than an empty box.
+    if (!m_compare && !m_worker.Busy() && !m_compareRequested) {
+        m_compareRequested = true;
+        RequestCompare();
+    }
+
+    if (ImGui::Button("Run comparison")) { m_compareRequested = true; RequestCompare(); }
+    ImGui::SameLine();
+    ImGui::TextDisabled("runs the pipeline twice, forced to each backend");
+
+    if (m_worker.Busy()) {
+        ImGui::Separator();
+        ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "running...");
+        ImGui::End();
+        return;
+    }
+
+    if (!m_compare) {
+        ImGui::Separator();
+        ImGui::TextDisabled("No comparison yet.");
+        ImGui::End();
+        return;
+    }
+
+    const CompareResult& c = *m_compare;
+    ImGui::Separator();
+
+    if (!c.ok) {
+        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f), "%s", c.error.c_str());
+        ImGui::End();
+        return;
+    }
+
+    ImGui::Text("algorithm: %s", c.algorithm.c_str());
+
+    if (ImGui::BeginTable("timing", 2, ImGuiTableFlags_SizingFixedFit)) {
+        ImGui::TableNextRow(); ImGui::TableNextColumn();
+        ImGui::Text("CPU"); ImGui::TableNextColumn(); ImGui::Text("%.1f ms", c.cpuMs);
+        ImGui::TableNextRow(); ImGui::TableNextColumn();
+        ImGui::Text("GPU"); ImGui::TableNextColumn(); ImGui::Text("%.1f ms", c.gpuMs);
+        ImGui::TableNextRow(); ImGui::TableNextColumn();
+        ImGui::Text("speedup"); ImGui::TableNextColumn();
+        ImGui::TextColored(ImVec4(0.6f, 0.9f, 0.6f, 1.0f), "%.1fx", c.Speedup());
+        ImGui::EndTable();
+    }
+
+    ImGui::Separator();
+
+    // Agreement is the part that matters: a fast kernel that disagrees with
+    // the reference is a bug, not an optimisation.
+    const CompareStats& s = c.stats;
+    const bool agrees = s.maxAbsDiff <= 4.0;
+    ImGui::TextColored(agrees ? ImVec4(0.5f, 0.9f, 0.5f, 1.0f) : ImVec4(1.0f, 0.6f, 0.3f, 1.0f),
+                       agrees ? "results agree" : "results DIFFER");
+    ImGui::Text("max abs diff  %.4f", s.maxAbsDiff);
+    ImGui::Text("mean abs diff %.4f", s.meanAbsDiff);
+    ImGui::Text("rmse          %.4f", s.rmse);
+    ImGui::Text("pixels beyond tolerance: %d / %d  (%.2f%%)",
+                s.diffPixels, s.totalPixels, s.DiffFraction() * 100.0);
+
+    ImGui::Separator();
+    ImGui::TextDisabled("difference, amplified 16x");
+
+    // The diff image is the fastest way to see *where* two results disagree,
+    // which is usually more informative than the aggregate numbers.
+    Image& diff = const_cast<Image&>(c.diffImage);
+    if (diff.Valid() && m_diffTex.Update(m_dev, diff, m_compareVersion)) {
+        const float avail = std::max(ImGui::GetContentRegionAvail().x, 64.0f);
+        const float scale = std::min(1.0f, avail / float(m_diffTex.Width()));
+        ImGui::Image(ImTextureRef(static_cast<ImTextureID>(m_diffTex.Handle().ptr)),
+                     ImVec2(float(m_diffTex.Width()) * scale,
+                            float(m_diffTex.Height()) * scale));
+    }
+
+    ImGui::End();
+}
+
 void App::DrawPalettePanel() {
     if (!ImGui::Begin("Images")) { ImGui::End(); return; }
 
@@ -617,6 +818,8 @@ void App::Frame() {
     DrawPalettePanel();
     DrawControlsPanel();
     DrawAlgorithmsPanel();
+    // DrawComparePanel() uploads a texture, so it must run after BeginFrame()
+    // has opened the command list — see below, with the image views.
 
     // Status strip: errors never blank the viewers, they just report.
     if (ImGui::Begin("Status")) {
@@ -661,6 +864,10 @@ void App::Frame() {
         v->SetContentVersion(m_contentVersion);
         v->Draw(m_dev, img);
     }
+
+    // Also uploads a texture (the diff image), so it belongs here rather than
+    // with the other panels above.
+    DrawComparePanel();
 
     ImGui::Render();
     ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), cl);

@@ -6,6 +6,10 @@
 
 namespace tglab {
 
+// Defined in gpu_image.cpp; declared here rather than included because
+// gpu_image.h includes this header.
+void InstallGpuResidencyHooks();
+
 namespace {
 
 // Descriptors a single dispatch can bind. Kept small and fixed so the root
@@ -53,6 +57,11 @@ bool ComputeContext::Init(ID3D12Device* device) {
     hd.Flags          = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&m_srvHeap)))) return false;
     m_srvStride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+    // Install here rather than at the call site: any code path that has a
+    // ComputeContext can produce GPU-resident images, and without the hook
+    // MapCpuRead() would silently hand back stale pixels instead of failing.
+    InstallGpuResidencyHooks();
 
     return m_compiler.Init();
 }

@@ -21,7 +21,7 @@ algorithms.
 | **M1** vertical slice | **done** |
 | **M2** `choose()`, edge/gradient algorithms, drag-drop | **done** |
 | **M3** worker thread, DXC, GPU compute path | **done** |
-| M4 compare mode, benchmarks, pixel inspector | next |
+| **M4** GPU residency, CPU/GPU compare mode | **done** |
 
 Algorithms so far: `brightness`, `grayscale`, `gaussian_blur` (CPU + GPU),
 `sobel`, `non_max_suppression`, `hysteresis`, `canny`.
@@ -34,7 +34,15 @@ while a slow algorithm runs.
 
 **GPU compute** is available per algorithm. `gaussian_blur` has an HLSL kernel;
 under **Compute → Auto** it runs there, and Force CPU / Force GPU let you
-compare. The two implementations agree to within 1/255 on the test image.
+compare. Images carry **GPU residency**, so a chain of GPU stages uploads once
+at the head and never round-trips through the CPU in between — pixels come back
+only when something asks for them.
+
+**Compare mode** (**Compute → Compare CPU / GPU**) runs the pipeline twice,
+forced to each backend, and reports max/mean/RMSE difference, the count of
+pixels beyond tolerance, both timings, and an amplified diff image showing
+*where* the two disagree. A kernel that merely looks right is not verified;
+on the test image `gaussian_blur` agrees to within 1/255 at ~9× the speed.
 
 ## Build
 
@@ -253,13 +261,20 @@ vendored under `third_party/`.
   direct queue ImGui submits on. Sharing one queue across threads is the
   classic source of intermittent corruption.
 
-### Known limitation
+- **`Image` owns its residency.** `AcquireGpuWrite()` clears the CPU bit,
+  `AcquireGpuRead()` uploads only when the GPU copy is stale, and
+  `MapCpuRead()` is the single blocking sync point. That one rule is what keeps
+  a chain of GPU stages free of intermediate transfers.
 
-A GPU stage currently uploads its inputs and reads its outputs back every run.
-The kernel itself is ~550× faster than the CPU path, but a full stage measures
-~5× once transfers are counted. Giving `Image` real GPU residency — upload
-once, no readback mid-chain, display straight from the SRV — is what closes
-that gap, and the acquire/invalidate API is already shaped for it.
+### Known limitations
+
+- **Display still goes through the CPU.** A viewer calls `MapCpuRead()`, which
+  reads the image back and re-uploads it as a display texture. Rendering
+  straight from the compute output's SRV would remove that round trip; the
+  residency API already supports it, the viewer does not yet use it.
+- **One dispatch per stage.** A GPU algorithm gets a single kernel invocation,
+  so genuinely multi-pass algorithms (a separable blur, say) either fuse into
+  one pass or stay on the CPU.
 
 ## Licence
 

@@ -20,6 +20,7 @@
 #include <thread>
 #include <vector>
 
+#include "compare.h"
 #include "pipeline.h"
 
 // Declared at global scope: writing `struct ID3D12Device*` inside namespace
@@ -29,10 +30,14 @@ struct ID3D12Device;
 namespace tglab {
 
 // One unit of work: an already-interpreted pipeline plus its source images.
+// `compare` runs the pipeline twice (CPU then GPU) and diffs, instead of the
+// normal single run.
 struct PipelineJob {
     uint64_t          seq = 0;
     Pipeline          pipe;
     std::vector<Data> sources;
+    bool              compare    = false;
+    int               compareStage = -1;   // -1 = last stage
 };
 
 // What the UI actually needs to draw: one image per declared viewer. The
@@ -48,6 +53,10 @@ struct PipelineOutcome {
     bool                     ok  = false;
     std::string              error;
     std::vector<ViewerImage> viewers;
+
+    // Set when the job was a comparison rather than a normal run.
+    bool                           isCompare = false;
+    std::shared_ptr<CompareResult> compare;
 };
 
 class ComputeContext;
@@ -74,6 +83,11 @@ public:
     // unbounded backlog of results nobody will ever see — only the newest
     // matters. Returns the sequence number assigned to this job.
     uint64_t Submit(Pipeline pipe, std::vector<Data> sources);
+
+    // Runs the pipeline twice (CPU then GPU) and diffs the chosen stage.
+    // Deliberately not coalesced with normal runs in the caller's mind: it is
+    // an explicit, one-off request, not something a slider triggers.
+    uint64_t SubmitCompare(Pipeline pipe, std::vector<Data> sources, int stageIndex = -1);
 
     // Non-blocking. Returns true and fills `out` when a newer result is ready.
     bool TryFetch(PipelineOutcome* out);
