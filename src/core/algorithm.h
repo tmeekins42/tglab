@@ -36,6 +36,10 @@ public:
 
     const ImageDesc& InDesc(size_t i) const;
 
+    // Raw port data, for composite algorithms that forward an input straight
+    // into a sub-algorithm (see canny.cpp).
+    const Data* InData(size_t i) const { return i < m_in.size() ? m_in[i] : nullptr; }
+
     size_t NumIn()  const { return m_in.size(); }
     size_t NumOut() const { return m_out.size(); }
 

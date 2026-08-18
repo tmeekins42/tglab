@@ -5,6 +5,7 @@
 #include <windows.h>
 #include <shellapi.h>   // DragAcceptFiles / DragQueryFile
 
+#include <algorithm>
 #include <cstdio>
 #include <memory>
 #include <string>
@@ -62,11 +63,21 @@ private:
     void DrawPalettePanel();
     void DrawAlgorithmsPanel();
     void SyncViews();
+    void DockLooseViewers();
+    void ReportError(const std::string& prevError);
+    void UpdateWindowTitle();
+    ImGuiID CentreDockNode() const;
 
+    static bool        IsModified(const UiControl& c);
+    static void        ResetControl(UiControl& c);
+    static std::string DefaultText(const UiControl& c);
+
+    HWND        m_hwnd = nullptr;
     Device      m_dev;
     FileWatch   m_watch;
     std::string m_scriptPath;
     std::string m_source;
+    std::string m_shownTitle;   // avoids SetWindowText on every frame
 
     UiState  m_ui;
     Pipeline m_pipe;
@@ -85,11 +96,13 @@ private:
     bool        m_rebuildLayout = false;   // set once viewer names are known
     bool        m_haveSavedLayout = false; // a tglab_layout.ini already existed
     ImGuiID     m_centreNode = 0;          // where new viewers get docked
+    ImGuiID     m_dockspaceId = 0;         // fallback when a saved layout exists
 };
 
 App* g_app = nullptr;
 
 bool App::Init(HWND hwnd) {
+    m_hwnd = hwnd;
     if (!m_dev.Init(hwnd, /*enableDebugLayer=*/
 #ifdef _DEBUG
                     true
@@ -154,6 +167,7 @@ void App::SetScriptPath(const std::string& path) {
     if (!ReadTextFile(path, &m_source))
         m_error = "could not read script '" + path + "'";
     m_dirty = true;
+    UpdateWindowTitle();
 }
 
 void App::LoadImageIntoPalette(const std::string& path) {
@@ -187,6 +201,7 @@ void App::LoadImageIntoPalette(const std::string& path) {
 }
 
 void App::RunScript() {
+    const std::string prevError = m_error;
     m_error.clear();
 
     // Sources are rebuilt each run so PortRef{-1, i} stays in step.
@@ -201,29 +216,63 @@ void App::RunScript() {
         names.push_back({m_palette[i].name, int(i)});
     }
 
+    // Any failure below leaves the last good result on screen and reports the
+    // reason; only a fully successful run replaces the pipeline.
     Program prog;
     std::string err;
     if (!Parse(m_source, &prog, &err)) {
         m_error = err;
-        return;   // keep the last good result on screen
+    } else {
+        Pipeline built;
+        InterpResult r = Interpret(prog, names, &m_ui, &built);
+        if (!r.ok) {
+            m_error = r.error;
+        } else if (!built.Execute(&m_sources, m_everRan ? &m_pipe : nullptr, &err)) {
+            m_error = err;
+        } else {
+            m_pipe = std::move(built);
+            m_everRan = true;
+            ++m_contentVersion;   // tells the views their pixels are new
+            SyncViews();
+        }
     }
 
-    Pipeline built;
-    InterpResult r = Interpret(prog, names, &m_ui, &built);
-    if (!r.ok) {
-        m_error = r.error;
-        return;
-    }
+    ReportError(prevError);
+    UpdateWindowTitle();
+}
 
-    if (!built.Execute(&m_sources, m_everRan ? &m_pipe : nullptr, &err)) {
-        m_error = err;
-        return;
-    }
+// "tglab — edges.tgl", with an [error] marker when the script is failing, so
+// a broken hot reload is visible from the taskbar without focusing the window.
+void App::UpdateWindowTitle() {
+    if (!m_hwnd) return;
 
-    m_pipe = std::move(built);
-    m_everRan = true;
-    ++m_contentVersion;   // tells the views their pixels are new
-    SyncViews();
+    std::string name = m_scriptPath;
+    if (auto slash = name.find_last_of("/\\"); slash != std::string::npos)
+        name = name.substr(slash + 1);
+
+    // ASCII only: the title goes through SetWindowTextA, so a UTF-8 em-dash
+    // would arrive mojibaked ("â€”") under a non-UTF-8 code page.
+    std::string title = "tglab";
+    if (!name.empty()) title += " - " + name;
+    if (!m_error.empty()) title += "  [error]";
+
+    if (title == m_shownTitle) return;   // SetWindowText every frame flickers
+    m_shownTitle = title;
+    SetWindowTextA(m_hwnd, title.c_str());
+}
+
+// Echo script errors to stderr as well as the Status panel. Running from a
+// terminal is the natural way to debug a script, and errors that only appear
+// in the UI are easy to miss.
+void App::ReportError(const std::string& prevError) {
+    if (m_error == prevError) return;   // only on change, not every frame
+    if (!m_error.empty()) {
+        std::fprintf(stderr, "[tglab] %s\n", m_error.c_str());
+        std::fflush(stderr);
+    } else if (!prevError.empty()) {
+        std::fprintf(stderr, "[tglab] script ok\n");
+        std::fflush(stderr);
+    }
 }
 
 void App::SyncViews() {
@@ -246,14 +295,48 @@ void App::SyncViews() {
     // saved layout of their own to preserve.
     if (before == 0 && !m_views.empty() && !m_haveSavedLayout) m_rebuildLayout = true;
 
-    // A viewer added by a script edit has no dock node yet and would open as a
-    // floating window. Park it with its siblings instead.
-    if (m_centreNode != 0) {
-        for (auto& v : m_views) {
-            if (ImGui::FindWindowByName(v->Name().c_str()) == nullptr)
-                ImGui::DockBuilderDockWindow(v->Name().c_str(), m_centreNode);
-        }
+    DockLooseViewers();
+}
+
+// Any viewer without a dock node would open as a small floating window. This
+// happens whenever a script declares viewer names the saved layout has never
+// seen — e.g. switching from a script using "original" to one using "source".
+//
+// Regression to watch for (this shipped broken once): the bug only appears
+// when tglab_layout.ini ALREADY EXISTS and lacks the current viewer names, so
+// testing always from a deleted layout hides it. To reproduce by hand: run
+// hello.tgl, quit, then run compare.tgl — its viewers must dock, not float.
+void App::DockLooseViewers() {
+    const ImGuiID target = CentreDockNode();
+    if (target == 0) return;
+
+    for (auto& v : m_views) {
+        ImGuiWindow* w = ImGui::FindWindowByName(v->Name().c_str());
+        // Never seen before, or known but not docked anywhere.
+        if (w == nullptr || w->DockId == 0)
+            ImGui::DockBuilderDockWindow(v->Name().c_str(), target);
     }
+}
+
+// Where new viewers should go, in order of preference:
+//   1. beside a viewer that is already docked (so they stay together wherever
+//      the user dragged them),
+//   2. the node recorded when the default layout was built,
+//   3. the dockspace's central node — the case that matters when a *saved*
+//      layout exists but has never seen these viewer names.
+ImGuiID App::CentreDockNode() const {
+    for (const auto& v : m_views) {
+        ImGuiWindow* w = ImGui::FindWindowByName(v->Name().c_str());
+        if (w && w->DockId != 0) return w->DockId;
+    }
+    if (m_centreNode != 0) return m_centreNode;
+
+    if (m_dockspaceId != 0) {
+        if (ImGuiDockNode* node = ImGui::DockBuilderGetCentralNode(m_dockspaceId))
+            return node->ID;
+        return m_dockspaceId;
+    }
+    return 0;
 }
 
 // Docks the panels into a sensible arrangement the first time the app runs
@@ -292,6 +375,10 @@ void App::DrawMenuBar() {
 
     if (ImGui::BeginMenu("File")) {
         if (ImGui::MenuItem("Reload script", "F5")) m_dirty = true;
+        if (ImGui::MenuItem("Reset all controls", nullptr, false, !m_ui.Controls().empty())) {
+            for (UiControl& c : m_ui.Controls()) ResetControl(c);
+            m_dirty = true;
+        }
         ImGui::Separator();
         if (ImGui::MenuItem("Exit")) PostQuitMessage(0);
         ImGui::EndMenu();
@@ -310,7 +397,25 @@ void App::DrawControlsPanel() {
     if (m_ui.Controls().empty()) {
         ImGui::TextDisabled("No controls declared.");
         ImGui::TextWrapped("Use slider(\"name\", min, max, default) in the script.");
+        ImGui::End();
+        return;
     }
+
+    // Enabled only when something actually differs from the script's defaults,
+    // so the button doubles as an indicator that values have been changed.
+    bool anyModified = false;
+    for (const UiControl& c : m_ui.Controls())
+        if (IsModified(c)) { anyModified = true; break; }
+
+    ImGui::BeginDisabled(!anyModified);
+    if (ImGui::Button("Reset all")) {
+        for (UiControl& c : m_ui.Controls()) ResetControl(c);
+        m_dirty = true;
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::TextDisabled("(double-click a control to reset it)");
+    ImGui::Separator();
 
     for (UiControl& c : m_ui.Controls()) {
         switch (c.kind) {
@@ -330,12 +435,63 @@ void App::DrawControlsPanel() {
                 }
                 break;
             }
-            case UiControl::Kind::Choose:
-                // M2
+            case UiControl::Kind::Choose: {
+                if (c.options.empty()) break;
+                const int sel = std::clamp(c.selected, 0, int(c.options.size()) - 1);
+                if (ImGui::BeginCombo(c.label.c_str(), c.options[size_t(sel)].c_str())) {
+                    for (int i = 0; i < int(c.options.size()); ++i) {
+                        const bool chosen = (i == sel);
+                        if (ImGui::Selectable(c.options[size_t(i)].c_str(), chosen)) {
+                            if (i != c.selected) {
+                                c.selected = i;
+                                m_dirty = true;   // different algorithm -> re-run
+                            }
+                        }
+                        if (chosen) ImGui::SetItemDefaultFocus();
+                    }
+                    ImGui::EndCombo();
+                }
                 break;
+            }
         }
+
+        // Double-click the control just drawn to restore its scripted default.
+        // Note ImGui reserves ctrl+click on a slider for typing an exact value,
+        // so double-click is the free gesture here.
+        if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+            if (IsModified(c)) {
+                ResetControl(c);
+                m_dirty = true;
+            }
+        }
+        if (ImGui::IsItemHovered() && IsModified(c))
+            ImGui::SetTooltip("default: %s\ndouble-click to reset", DefaultText(c).c_str());
     }
     ImGui::End();
+}
+
+bool App::IsModified(const UiControl& c) {
+    if (c.kind == UiControl::Kind::Choose) return c.selected != 0;
+    return c.value != c.def;
+}
+
+void App::ResetControl(UiControl& c) {
+    if (c.kind == UiControl::Kind::Choose) c.selected = 0;   // first listed option
+    else                                   c.value = c.def;
+}
+
+std::string App::DefaultText(const UiControl& c) {
+    char buf[64];
+    switch (c.kind) {
+        case UiControl::Kind::Check:
+            return c.def != 0 ? "on" : "off";
+        case UiControl::Kind::Choose:
+            return c.options.empty() ? std::string("-") : c.options[0];
+        case UiControl::Kind::Slider:
+        default:
+            std::snprintf(buf, sizeof(buf), "%.3f", c.def);
+            return buf;
+    }
 }
 
 void App::DrawPalettePanel() {
@@ -391,7 +547,13 @@ void App::Frame() {
     ImGui::NewFrame();
 
     const ImGuiID dockspace = ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport());
+    m_dockspaceId = dockspace;
     BuildDefaultLayout(dockspace);
+
+    // SyncViews() may have run before the dockspace existed (first frame, or a
+    // hot reload that introduced new viewer names), so catch any still-floating
+    // viewer here now that a target node is resolvable.
+    DockLooseViewers();
 
     if (ImGui::IsKeyPressed(ImGuiKey_F5, false)) m_dirty = true;
 

@@ -1,0 +1,22 @@
+# Edge detection — the Canny pipeline, one stage per viewer.
+#
+# Every intermediate is visible, which is the point: you can watch what
+# non-max suppression actually removes, and what hysteresis reconnects.
+
+src = image("test")
+
+sigma = slider("blur sigma", 0.1, 6.0, 1.4)
+lo    = slider("hysteresis low", 0.0, 2.0, 0.10)
+hi    = slider("hysteresis high", 0.0, 2.0, 0.30)
+
+blurred     = gaussian_blur(src, sigma = sigma)
+gx, gy, mag = sobel(blurred)
+thin        = non_max_suppression(gx, gy, mag)
+edges       = hysteresis(thin, low = lo, high = hi)
+
+display(src,     "1 source")
+display(blurred, "2 blurred")
+display(mag,     "3 gradient magnitude")
+display(gx,      "3b gradient x")        # signed: auto-normalised for display
+display(thin,    "4 thinned")
+display(edges,   "5 edges")

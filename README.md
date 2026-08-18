@@ -10,17 +10,25 @@ logic.
 
 Adding a new experiment costs one `.cpp` file and a few lines of script.
 
-## Status — M1 (vertical slice) complete
+## Status
 
 Working end to end: script → registry → ports → parameters → algorithm →
-display, with hot reload and live sliders.
+display, with hot reload, live sliders, algorithm dropdowns, and multi-output
+algorithms.
 
 | Milestone | State |
 |---|---|
 | **M1** vertical slice | **done** |
-| M2 drag-drop palette, worker thread, `choose()`, more algorithms | next |
-| M3 GPU path (DXC, compute queue, zero-readback display) | planned |
+| **M2** `choose()`, edge/gradient algorithms, drag-drop | **done** (worker thread still pending) |
+| M3 GPU path (DXC, compute queue, zero-readback display) | next |
 | M4 compare mode, benchmarks, pixel inspector | planned |
+
+Algorithms so far: `brightness`, `grayscale`, `gaussian_blur`, `sobel`,
+`non_max_suppression`, `hysteresis`, `canny`.
+
+Pipeline execution still runs on the UI thread. That is fine at 512×512, but
+a slow algorithm on a large image will block the window until the worker
+thread lands.
 
 ## Build
 
@@ -51,9 +59,14 @@ Headless checks for the script engine (no window required):
 ## Scripting
 
 The script is a plain file on disk; edit it in your own editor and **save to
-re-run** (or press F5). Slider values survive a reload, so tuning is not lost
-when you edit. A parse error leaves the last good result on screen and reports
-the line in the Status panel.
+re-run** (or press F5). The title bar shows which script is loaded, with an
+`[error]` marker when it is failing. Slider values survive a reload, so tuning
+is not lost when you edit. A parse error leaves the last good result on screen
+and reports the line in the Status panel and on stderr.
+
+To get back to the script's declared values, **double-click any control**, or
+use **Reset all** in the Controls panel (also in the File menu). The button is
+greyed out when nothing has been changed, so it doubles as an indicator.
 
 ```
 src = image("test")                  # by palette name
@@ -70,18 +83,63 @@ display(adjusted, "adjusted")
 ```
 
 Builtins: `image(name)`, `slider(label, min, max, default)`,
-`check(label, default)`, `display(data [, name])`. Any registered algorithm is
-callable by name; named arguments set its parameters.
+`check(label, default)`, `choose(label, options)`, `display(data [, name])`.
+Any registered algorithm is callable by name; named arguments set its
+parameters.
 
-Multi-output algorithms bind positionally:
+**Multi-output algorithms** bind positionally, and `_` discards outputs you
+don't need:
 
 ```
+gx, gy, mag = sobel(blurred)         # gx/gy are signed R32F
+_,  _,  mag = sobel(blurred)         # only the magnitude
+out         = sobel(blurred)         # one target takes the first output
+```
+
+`_` is write-only, as in Rust and Go — reading it back is an error, since it
+would just return whichever output was assigned last. Discarded outputs are
+still computed and cached, so adding a viewer for one later costs nothing.
+(`_tmp` and similar are ordinary names; only a bare `_` is special.)
+
+**`choose()`** puts a dropdown in the Controls panel and returns the selected
+algorithm as a callable value — swap implementations without editing the
+script:
+
+```
+prep   = choose("preprocess", [gaussian_blur, grayscale])   # explicit list
+edgeOp = choose("edge operator", "edge")                    # whole category
+
+result = edgeOp(prep(src))
+```
+
+Passing a *category* means a newly written algorithm declaring that
+`Category()` appears in the dropdown automatically, with no script change.
+
+The grammar also accepts matrix literals (`[[-1,0,1],[-2,0,2],[-1,0,1]]`),
+which are in place for kernel parameters.
+
+Example scripts: [scripts/hello.tgl](scripts/hello.tgl) (basics),
+[scripts/edges.tgl](scripts/edges.tgl) (Canny stage by stage),
+[scripts/compare.tgl](scripts/compare.tgl) (`choose()` dropdowns).
+
+### Canny, both ways
+
+The stages are registered individually *and* wrapped by `canny()`. Call the
+stages when you want to see what each one did; call `canny()` when you just
+want edges.
+
+```
+blurred     = gaussian_blur(src, sigma = 1.4)
 gx, gy, mag = sobel(blurred)
+thin        = non_max_suppression(gx, gy, mag)
+edges       = hysteresis(thin, low = 0.1, high = 0.3)
+
+edges2 = canny(src, sigma = 1.4, low = 0.1, high = 0.3)   # same thing
 ```
 
-The grammar also accepts matrix literals (`[[-1,0,1],[-2,0,2],[-1,0,1]]`) and
-calling a *variable* that holds an algorithm — both are in place for M2's
-`choose()` dropdowns and matrix parameters.
+R32F viewers auto-normalise min/max, so signed gradients are visible (mid-grey
+is zero). Note this means brightness is *not* comparable between two viewers,
+since each scales independently.
 
 ## Adding an algorithm
 

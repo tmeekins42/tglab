@@ -38,7 +38,9 @@ void ImageViewPanel::Draw(Device& dev, Data* data) {
     ImGui::SameLine();
     if (ImGui::SmallButton("1:1")) { cam.fit = false; cam.zoom = 1.0f; cam.panX = cam.panY = 0.0f; }
     ImGui::SameLine();
-    ImGui::Text("%.0f%%", cam.zoom * 100.0f);
+    // Sub-1% zooms need a decimal, or the readout just says "0%".
+    const float zoomPct = cam.zoom * 100.0f;
+    ImGui::Text(zoomPct < 10.0f ? "%.1f%%" : "%.0f%%", zoomPct);
 
     // End the toolbar row, then take the whole remaining content rect as the
     // canvas. GetContentRegion* is measured from the window's content edges,
@@ -53,7 +55,9 @@ void ImageViewPanel::Draw(Device& dev, Data* data) {
         std::max(ImGui::GetWindowPos().y + contentMax.y - origin.y, 1.0f));
 
     if (cam.fit && iw > 0 && ih > 0) {
-        cam.zoom = std::min(region.x / iw, region.y / ih);
+        // Clamp: a panel that is briefly tiny (undocked, or mid-resize) would
+        // otherwise fit to ~0% and show nothing at all.
+        cam.zoom = std::clamp(std::min(region.x / iw, region.y / ih), 0.01f, 64.0f);
         cam.panX = cam.panY = 0.0f;
     }
 

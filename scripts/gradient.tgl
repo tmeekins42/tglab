@@ -1,0 +1,17 @@
+# Gradient magnitude only — demonstrates `_` discarding unwanted outputs.
+#
+# sobel returns gx, gy and mag. Here only the magnitude is wanted, so the two
+# gradient components are discarded with `_`. They are still computed (the
+# three come out of one loop) and still cached, so adding a viewer for gx later
+# costs nothing.
+
+src = image("test")
+
+scale = slider("gradient scale", 0.1, 4.0, 1.0)
+sigma = slider("pre-blur sigma", 0.1, 6.0, 1.0)
+
+smoothed  = gaussian_blur(src, sigma = sigma)
+_, _, mag = sobel(smoothed, scale = scale)
+
+display(src, "source")
+display(mag, "gradient magnitude")

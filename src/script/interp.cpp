@@ -1,6 +1,8 @@
 #include "interp.h"
 
+#include <algorithm>
 #include <cmath>
+#include <vector>
 
 #include "../core/algorithm.h"
 
@@ -78,12 +80,24 @@ private:
         return false;
     }
 
+    // `_` is a discard target, not a variable: write-only, like Rust and Go.
+    // Only a bare underscore — `_tmp` is an ordinary name.
+    static bool IsDiscard(const std::string& name) { return name == "_"; }
+
     bool ExecStmt(const Stmt& s) {
         // A call may return several ports (multi-output algorithms).
         std::vector<Value> results;
         if (!EvalMulti(*s.value, &results)) return false;
 
         if (s.targets.empty()) return true;   // expression statement
+
+        // A single target takes the first output, matching what a call already
+        // does in single-value position: hysteresis(sobel(x)) uses port 0, so
+        // `t = sobel(x)` must mean the same thing. Requiring exact arity here
+        // made those two spellings disagree, and made any multi-output
+        // algorithm unusable from a choose() dropdown.
+        if (s.targets.size() == 1 && results.size() > 1)
+            results.resize(1);
 
         if (s.targets.size() != results.size()) {
             return Fail(s.line, "'" + DescribeCallee(*s.value) + "' returns " +
@@ -96,6 +110,7 @@ private:
         // A single-target assignment from a call remembers which stage it
         // named, so `blur.sigma = x` can later find that stage's parameter.
         if (s.targets.size() == 1 && s.targets[0].object.empty() &&
+            !IsDiscard(s.targets[0].field) &&
             s.value->kind == ExprKind::Call && m_lastStage >= 0) {
             m_stageOfVar[s.targets[0].field] = m_lastStage;
         }
@@ -103,10 +118,19 @@ private:
 
         for (size_t i = 0; i < s.targets.size(); ++i) {
             const Target& t = s.targets[i];
+            if (t.object.empty() && IsDiscard(t.field)) {
+                // `_` discards this output. The algorithm still computed it
+                // (outputs are usually fused — sobel's gx/gy/mag come from one
+                // loop), and it stays in the stage cache, so adding a viewer
+                // for it later costs nothing.
+                continue;
+            }
             if (t.object.empty()) {
                 m_vars[t.field] = results[i];
             } else {
                 // `algo.param = value` — assign into a recorded stage's param.
+                if (IsDiscard(t.object))
+                    return Fail(t.line, "'_' discards a value; it has no parameters to set");
                 auto it = m_stageOfVar.find(t.object);
                 if (it == m_stageOfVar.end())
                     return Fail(t.line, "'" + t.object + "' is not an algorithm result");
@@ -143,6 +167,9 @@ private:
             case ExprKind::String: *out = Value(e.text);   return true;
 
             case ExprKind::Ident: {
+                if (IsDiscard(e.text))
+                    return Fail(e.line, "'_' discards a value; it cannot be read back");
+
                 auto it = m_vars.find(e.text);
                 if (it != m_vars.end()) { *out = it->second; return true; }
                 // A bare name that is not a variable resolves to an algorithm
@@ -253,6 +280,7 @@ private:
         if (calleeName == "image")   return CallImage(e, out);
         if (calleeName == "slider")  return CallSlider(e, out);
         if (calleeName == "check")   return CallCheck(e, out);
+        if (calleeName == "choose")  return CallChoose(e, out);
         if (calleeName == "display") return CallDisplay(e, out);
 
         return CallAlgorithm(calleeName, e, out, wantAll);
@@ -324,6 +352,51 @@ private:
 
         UiControl& c = m_ui->FindOrAdd(proto);
         out->push_back(Value(c.value));
+        return true;
+    }
+
+    // choose("label", [algo_a, algo_b, ...])  — explicit candidates
+    // choose("label", "category")             — every algorithm in a category,
+    //                                           so a newly written one appears
+    //                                           with no script edit.
+    //
+    // Returns the *selected* algorithm as a callable value, which is what makes
+    // `f = choose(...)` followed by `f(img)` work.
+    bool CallChoose(const Expr& e, std::vector<Value>* out) {
+        EvaledArgs a;
+        if (!EvalArgs(e, &a)) return false;
+        if (a.pos.size() != 2 || !a.pos[0].IsString())
+            return Fail(e.line,
+                        "choose() takes (\"label\", [algo, ...]) or (\"label\", \"category\")");
+
+        std::vector<std::string> options;
+
+        if (a.pos[1].IsList()) {
+            for (const Value& v : a.pos[1].AsList().items) {
+                if (!v.IsAlgo())
+                    return Fail(e.line, std::string("choose() list must contain algorithms, found ") +
+                                            v.TypeName());
+                options.push_back(v.AsAlgo().name);
+            }
+        } else if (a.pos[1].IsString()) {
+            options = Registry::Get().NamesInCategory(a.pos[1].AsString());
+            if (options.empty())
+                return Fail(e.line, "no algorithms in category '" + a.pos[1].AsString() + "'");
+        } else {
+            return Fail(e.line, std::string("choose() expects a list or a category name, got ") +
+                                    a.pos[1].TypeName());
+        }
+
+        if (options.empty()) return Fail(e.line, "choose() needs at least one algorithm");
+
+        UiControl proto;
+        proto.kind    = UiControl::Kind::Choose;
+        proto.label   = a.pos[0].AsString();
+        proto.options = options;
+
+        UiControl& c = m_ui->FindOrAdd(proto);
+        const int sel = std::clamp(c.selected, 0, int(options.size()) - 1);
+        out->push_back(Value(AlgoHandle{options[size_t(sel)]}));
         return true;
     }
 

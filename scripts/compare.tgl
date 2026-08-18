@@ -1,0 +1,19 @@
+# choose() — swap algorithms from a dropdown without editing the script.
+#
+# "edge" is a category, so every algorithm declaring Category()=="edge" appears
+# in the dropdown automatically. Write a new edge detector in C++ and it shows
+# up here with no change to this file.
+
+src = image("test")
+
+prep   = choose("preprocess", [gaussian_blur, grayscale, brightness])
+edgeOp = choose("edge operator", "edge")
+
+sigma = slider("blur sigma", 0.1, 6.0, 1.4)
+
+prepped = prep(src)
+result  = edgeOp(prepped)
+
+display(src,     "source")
+display(prepped, "preprocessed")
+display(result,  "result")

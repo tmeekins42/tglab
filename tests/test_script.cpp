@@ -96,7 +96,66 @@ int main() {
         UiState ui; Pipeline p; std::string err; std::vector<Data> src;
         RunScript("src = image(\"test\")\na, b = brightness(src)\n", &ui, &p, &err, &src);
         Check(err.find("returns 1") != std::string::npos,
-              "multi-assign arity mismatch is caught: \"" + err + "\"");
+              "asking for more values than an algorithm returns is caught: \"" + err + "\"");
+    }
+    {
+        // Too FEW targets is not an error: one target takes port 0, matching
+        // what a nested call already does. Requiring exact arity made
+        // `t = sobel(x)` fail while `f(sobel(x))` succeeded, and made
+        // multi-output algorithms unusable from a choose() dropdown.
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        const bool ok = RunScript("src = image(\"test\")\nout = sobel(src)\ndisplay(out)\n",
+                                  &ui, &p, &err, &src);
+        Check(ok, "single target from a multi-output algorithm takes port 0" +
+                      (ok ? "" : ": " + err));
+    }
+    {
+        // The two spellings must agree.
+        UiState ui; Pipeline p1, p2; std::string err; std::vector<Data> src;
+        const bool a = RunScript("src = image(\"test\")\nout = sobel(src)\ndisplay(out)\n",
+                                 &ui, &p1, &err, &src);
+        const bool b = RunScript("src = image(\"test\")\nout = hysteresis(sobel(src))\ndisplay(out)\n",
+                                 &ui, &p2, &err, &src);
+        Check(a && b, "assigned and nested multi-output calls both work");
+    }
+    // --- `_` discards an output (Rust/Go style) -----------------------------
+    {
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        const bool ok = RunScript(
+            "src = image(\"test\")\n_, _, mag = sobel(src)\ndisplay(mag)\n", &ui, &p, &err, &src);
+        Check(ok, "`_` discards unwanted outputs, repeatable" + (ok ? "" : ": " + err));
+    }
+    {
+        // Write-only: reading it back would silently return whichever output
+        // was assigned last, which is meaningless.
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        RunScript("src = image(\"test\")\n_, _, mag = sobel(src)\ndisplay(_)\n", &ui, &p, &err, &src);
+        Check(err.find("cannot be read back") != std::string::npos,
+              "reading `_` is an error: \"" + err + "\"");
+    }
+    {
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        RunScript("src = image(\"test\")\n_ = sobel(src)\n_.scale = 2\n", &ui, &p, &err, &src);
+        Check(!err.empty(), "setting a parameter on `_` is an error: \"" + err + "\"");
+    }
+    {
+        // Only a bare underscore is special.
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        const bool ok = RunScript(
+            "src = image(\"test\")\n_tmp, gy, mag = sobel(src)\ndisplay(_tmp)\n",
+            &ui, &p, &err, &src);
+        Check(ok, "`_tmp` is an ordinary variable, not a discard" + (ok ? "" : ": " + err));
+    }
+
+    {
+        // A category is only useful if every member is interchangeable, i.e.
+        // selectable from a choose() dropdown with the same call shape.
+        bool allOneInput = true;
+        for (const std::string& n : Registry::Get().NamesInCategory("edge")) {
+            auto algo = Registry::Get().Create(n);
+            if (!algo || algo->Inputs().size() != 1) allOneInput = false;
+        }
+        Check(allOneInput, "every algorithm in the 'edge' category takes one image");
     }
     {
         UiState ui; Pipeline p; std::string err; std::vector<Data> src;
@@ -217,6 +276,197 @@ int main() {
                   "display(a, \"bright\")\n"
                   "display(b, \"grey\")\n", &ui, &p, &err, &src);
         Check(p.Viewers().size() == 3, "three named viewers declared side by side");
+    }
+
+    // --- multi-output ports (sobel) -----------------------------------------
+    {
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        const bool ok = RunScript(
+            "src = image(\"test\")\n"
+            "gx, gy, mag = sobel(src)\n"
+            "display(gx, \"gx\")\ndisplay(gy, \"gy\")\ndisplay(mag, \"mag\")\n",
+            &ui, &p, &err, &src);
+        Check(ok, "sobel multi-output runs" + (ok ? "" : ": " + err));
+        Check(ok && p.Stages()[0].outputs.size() == 3, "sobel produces three outputs");
+
+        if (ok) {
+            // gx/gy are signed; R32F is what makes that representable.
+            Image& gxi = std::get<Image>(p.Stages()[0].outputs[0]);
+            Check(gxi.Desc().format == Format::R32F, "sobel gx is R32F");
+        }
+    }
+
+    // Signs need a pattern whose gradient actually reverses. The shared 4x4
+    // fixture is a monotonic ramp, so its gx is single-signed by construction —
+    // use a bright bar, which must give + on one edge and - on the other.
+    {
+        ImageDesc d{5, 5, Format::RGBA8};
+        Image img;
+        img.Alloc(d);
+        ImageView v = img.MapCpuWrite();
+        for (int y = 0; y < 5; ++y) {
+            for (int x = 0; x < 5; ++x) {
+                const uint8_t c = (x == 2 && y >= 1 && y <= 3) ? 255 : 0;
+                uint8_t* p = v.At<uint8_t>(x, y);
+                p[0] = p[1] = p[2] = c;
+                p[3] = 255;
+            }
+        }
+
+        auto algo = Registry::Get().Create("sobel");
+        Data in{std::move(img)};
+        const Data* ins[1] = {&in};
+        std::vector<Data> outs(3);
+        for (auto& o : outs) {
+            Image t;
+            t.Alloc({5, 5, Format::R32F});
+            o = Data{std::move(t)};
+        }
+        RunCtx c(ins, outs);
+        algo->RunCPU(c);
+
+        ImageView gx = std::get<Image>(outs[0]).MapCpuRead();
+        bool neg = false, pos = false;
+        for (int i = 0; i < 25; ++i) {
+            const float f = reinterpret_cast<const float*>(gx.data)[i];
+            if (f < -1e-6f) neg = true;
+            if (f >  1e-6f) pos = true;
+        }
+        Check(neg && pos, "sobel gx is signed: + on one edge of a bar, - on the other");
+    }
+
+    // --- choose(): explicit list --------------------------------------------
+    {
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        const char* kScript =
+            "src = image(\"test\")\n"
+            "f = choose(\"op\", [brightness, grayscale])\n"
+            "out = f(src)\n"
+            "display(out)\n";
+
+        const bool ok = RunScript(kScript, &ui, &p, &err, &src);
+        Check(ok, "choose() with a list runs" + (ok ? "" : ": " + err));
+        Check(ok && p.Stages()[0].algoName == "brightness",
+              "choose() defaults to the first option");
+
+        // Switching the dropdown must select the other algorithm.
+        UiControl* c = ui.Find("op");
+        Check(c && c->options.size() == 2, "choose() recorded both options");
+        if (c) c->selected = 1;
+
+        Pipeline p2;
+        RunScript(kScript, &ui, &p2, &err, &src);
+        Check(p2.Stages().size() == 1 && p2.Stages()[0].algoName == "grayscale",
+              "switching the dropdown swaps the algorithm");
+    }
+
+    // --- choose(): by category ----------------------------------------------
+    // A newly written algorithm in the category must appear with no script edit.
+    {
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        const bool ok = RunScript(
+            "src = image(\"test\")\n"
+            "f = choose(\"edge op\", \"edge\")\n"
+            "out = f(src)\n"
+            "display(out)\n", &ui, &p, &err, &src);
+        Check(ok, "choose() by category runs" + (ok ? "" : ": " + err));
+        UiControl* c = ui.Find("edge op");
+        Check(c && c->options.size() >= 2,
+              "category lookup found the edge algorithms (" +
+                  std::to_string(c ? c->options.size() : 0) + " found)");
+    }
+
+    // --- choose() error handling --------------------------------------------
+    {
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        RunScript("f = choose(\"x\", \"no_such_category\")\n", &ui, &p, &err, &src);
+        Check(err.find("no_such_category") != std::string::npos,
+              "unknown category is reported: \"" + err + "\"");
+    }
+    {
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        RunScript("src = image(\"test\")\nf = choose(\"x\", [1, 2])\n", &ui, &p, &err, &src);
+        Check(!err.empty(), "choose() rejects a list of non-algorithms: \"" + err + "\"");
+    }
+
+    // --- composite canny chains its stages ----------------------------------
+    {
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        const bool ok = RunScript(
+            "src = image(\"test\")\n"
+            "e = canny(src, sigma = 1.4)\n"
+            "display(e)\n", &ui, &p, &err, &src);
+        Check(ok, "canny() runs as one stage" + (ok ? "" : ": " + err));
+
+        if (ok) {
+            ImageView v = std::get<Image>(p.Stages()[0].outputs[0]).MapCpuRead();
+            int edgePixels = 0;
+            for (int i = 0; i < v.desc.width * v.desc.height; ++i)
+                if (reinterpret_cast<const float*>(v.data)[i] > 0.5f) ++edgePixels;
+            // The test image has a checker patch, so it must find *some* edges
+            // but must not mark everything.
+            Check(edgePixels > 0 && edgePixels < v.desc.width * v.desc.height,
+                  "canny finds edges without flooding (" + std::to_string(edgePixels) + " px)");
+        }
+    }
+
+    // --- the same pipeline, built by hand from stages -----------------------
+    {
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        const bool ok = RunScript(
+            "src = image(\"test\")\n"
+            "b = gaussian_blur(src, sigma = 1.4)\n"
+            "gx, gy, mag = sobel(b)\n"
+            "thin = non_max_suppression(gx, gy, mag)\n"
+            "edges = hysteresis(thin, low = 0.1, high = 0.3)\n"
+            "display(thin,  \"thinned\")\n"
+            "display(edges, \"edges\")\n", &ui, &p, &err, &src);
+        Check(ok, "canny stages compose in script" + (ok ? "" : ": " + err));
+        Check(ok && p.Stages().size() == 4, "four separate stages recorded");
+        Check(ok && p.Viewers().size() == 2, "intermediates are individually viewable");
+    }
+
+    // --- control reset ------------------------------------------------------
+    // Mirrors App::IsModified/ResetControl. The UI wiring needs the app, but
+    // the rules themselves are worth pinning down here.
+    {
+        auto modified = [](const UiControl& c) {
+            return c.kind == UiControl::Kind::Choose ? c.selected != 0 : c.value != c.def;
+        };
+        auto reset = [](UiControl& c) {
+            if (c.kind == UiControl::Kind::Choose) c.selected = 0;
+            else                                   c.value = c.def;
+        };
+
+        UiControl s;
+        s.kind = UiControl::Kind::Slider;
+        s.lo = 0; s.hi = 10; s.def = 1.4; s.value = 1.4;
+        Check(!modified(s), "a fresh slider is not 'modified'");
+        s.value = 7.0;
+        reset(s);
+        Check(s.value == 1.4, "slider resets to its scripted default");
+
+        UiControl d;
+        d.kind = UiControl::Kind::Choose;
+        d.options = {"canny", "sobel"};
+        d.selected = 1;
+        Check(modified(d), "a changed dropdown is 'modified'");
+        reset(d);
+        Check(d.selected == 0, "dropdown resets to the first listed option");
+    }
+    {
+        // The reset target must be the value the script declared, and that has
+        // to survive a re-run (which is what makes reset meaningful at all).
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        const char* kScript =
+            "src = image(\"test\")\ng = slider(\"gain\", 0, 4, 2.5)\n"
+            "o = brightness(src, gain = g)\ndisplay(o)\n";
+        RunScript(kScript, &ui, &p, &err, &src);
+        ui.Controls()[0].value = 3.9;          // user drags it
+        Pipeline p2;
+        RunScript(kScript, &ui, &p2, &err, &src);
+        Check(ui.Controls()[0].def == 2.5,
+              "the scripted default survives a re-run, so reset stays correct");
     }
 
     std::printf("\n%s\n", g_fail == 0 ? "all checks passed" : "FAILURES PRESENT");

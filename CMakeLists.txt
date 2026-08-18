@@ -55,6 +55,10 @@ target_link_libraries(tglab_core PUBLIC imgui d3d12 dxgi)
 add_library(tglab_algorithms OBJECT
     src/algorithms/brightness.cpp
     src/algorithms/grayscale.cpp
+    src/algorithms/gaussian_blur.cpp
+    src/algorithms/sobel.cpp
+    src/algorithms/canny_stages.cpp
+    src/algorithms/canny.cpp
 )
 target_link_libraries(tglab_algorithms PUBLIC tglab_core)
 
@@ -91,4 +95,9 @@ endif()
 
 enable_testing()
 add_test(NAME script_spine COMMAND tglab_tests)
+
+
+
+
+
 

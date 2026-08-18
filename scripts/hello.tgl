@@ -1,4 +1,4 @@
-# tglab M1 vertical slice.
+# tglab — basics.
 # Edit and save — the app reloads automatically (or press F5).
 
 src = image("test")
