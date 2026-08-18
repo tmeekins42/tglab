@@ -14,6 +14,7 @@
 #include "../core/algorithm.h"
 #include "../core/image_io.h"
 #include "../core/pipeline.h"
+#include "../core/worker.h"
 #include "../script/interp.h"
 #include "../script/parser.h"
 #include "../gpu/device.h"
@@ -65,6 +66,7 @@ private:
     void SyncViews();
     void DockLooseViewers();
     void ReportError(const std::string& prevError);
+    void PollWorker();
     void UpdateWindowTitle();
     ImGuiID CentreDockNode() const;
 
@@ -79,11 +81,17 @@ private:
     std::string m_source;
     std::string m_shownTitle;   // avoids SetWindowText on every frame
 
-    UiState  m_ui;
-    Pipeline m_pipe;
-    Pipeline m_prev;
+    UiState        m_ui;
+    PipelineWorker m_worker;
     std::vector<PaletteEntry> m_palette;
-    std::vector<Data>         m_sources;   // parallel to m_palette
+
+    // Viewer names come from phase 1 (immediately); images arrive later from
+    // the worker. Keeping them separate lets panels appear and dock straight
+    // away rather than popping in when the first result lands.
+    std::vector<std::string> m_viewerNames;
+    std::vector<ViewerImage> m_viewerImages;
+    uint64_t                 m_pendingSeq = 0;
+    uint64_t                 m_shownSeq   = 0;
 
     std::vector<std::unique_ptr<ImageViewPanel>> m_views;
     ViewCamera m_sharedCam;
@@ -91,12 +99,12 @@ private:
 
     std::string m_error;        // last script/run error, empty when fine
     bool        m_dirty = true; // re-run requested
-    bool        m_everRan = false;
     uint64_t    m_contentVersion = 1;
     bool        m_rebuildLayout = false;   // set once viewer names are known
     bool        m_haveSavedLayout = false; // a tglab_layout.ini already existed
     ImGuiID     m_centreNode = 0;          // where new viewers get docked
     ImGuiID     m_dockspaceId = 0;         // fallback when a saved layout exists
+    int         m_spinner = 0;             // "working..." animation
 };
 
 App* g_app = nullptr;
@@ -111,6 +119,10 @@ bool App::Init(HWND hwnd) {
 #endif
                     ))
         return false;
+
+    // After the device exists: the worker builds its own compute context (and
+    // its own compute queue) from it, on the worker thread.
+    m_worker.Start(m_dev.Get());
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -153,6 +165,7 @@ bool App::Init(HWND hwnd) {
 }
 
 void App::Shutdown() {
+    m_worker.Stop();   // before the device: results reference image memory
     m_dev.WaitForLastSubmittedFrame();
     m_views.clear();
     ImGui_ImplDX12_Shutdown();
@@ -200,24 +213,27 @@ void App::LoadImageIntoPalette(const std::string& path) {
     m_dirty = true;
 }
 
+// Phase 1 only: parse and interpret (microseconds), then hand the recorded
+// pipeline to the worker. Interpret() is what declares sliders into m_ui, so
+// keeping it here means UiState is never shared across threads.
 void App::RunScript() {
     const std::string prevError = m_error;
     m_error.clear();
 
-    // Sources are rebuilt each run so PortRef{-1, i} stays in step.
-    m_sources.clear();
+    // Sources are rebuilt each run so PortRef{-1, i} stays in step. The worker
+    // gets its own copies, since it may still be reading them next frame.
+    std::vector<Data> sources;
     std::vector<SourceImage> names;
     for (size_t i = 0; i < m_palette.size(); ++i) {
-        // Data is move-only; hand the pipeline a shallow clone of the pixels.
         if (std::holds_alternative<Image>(m_palette[i].data))
-            m_sources.push_back(Data{std::get<Image>(m_palette[i].data).Clone()});
+            sources.push_back(Data{std::get<Image>(m_palette[i].data).Clone()});
         else
-            m_sources.push_back(Data{});
+            sources.push_back(Data{});
         names.push_back({m_palette[i].name, int(i)});
     }
 
-    // Any failure below leaves the last good result on screen and reports the
-    // reason; only a fully successful run replaces the pipeline.
+    // Any failure here leaves the last good result on screen and reports the
+    // reason; the viewers are only replaced when a run succeeds.
     Program prog;
     std::string err;
     if (!Parse(m_source, &prog, &err)) {
@@ -227,16 +243,39 @@ void App::RunScript() {
         InterpResult r = Interpret(prog, names, &m_ui, &built);
         if (!r.ok) {
             m_error = r.error;
-        } else if (!built.Execute(&m_sources, m_everRan ? &m_pipe : nullptr, &err)) {
-            m_error = err;
         } else {
-            m_pipe = std::move(built);
-            m_everRan = true;
-            ++m_contentVersion;   // tells the views their pixels are new
+            // Viewer panels are created from the declarations now, so the
+            // layout settles immediately rather than waiting for the result.
+            m_viewerNames.clear();
+            for (const ViewerDecl& d : built.Viewers()) m_viewerNames.push_back(d.name);
             SyncViews();
+
+            m_pendingSeq = m_worker.Submit(std::move(built), std::move(sources));
         }
     }
 
+    ReportError(prevError);
+    UpdateWindowTitle();
+}
+
+// Picks up a finished run. Called once per frame, before anything draws.
+void App::PollWorker() {
+    PipelineOutcome out;
+    if (!m_worker.TryFetch(&out)) return;
+
+    // A result older than the newest submitted job is stale: the user has
+    // already moved the slider again, and a newer result is on its way.
+    if (out.seq < m_shownSeq) return;
+    m_shownSeq = out.seq;
+
+    const std::string prevError = m_error;
+    if (!out.ok) {
+        m_error = out.error;          // keep the previous images on screen
+    } else {
+        m_error.clear();
+        m_viewerImages = std::move(out.viewers);
+        ++m_contentVersion;           // tells the views their pixels are new
+    }
     ReportError(prevError);
     UpdateWindowTitle();
 }
@@ -280,12 +319,12 @@ void App::SyncViews() {
 
     // Reuse panels by name so layout and camera survive re-runs.
     std::vector<std::unique_ptr<ImageViewPanel>> next;
-    for (const ViewerDecl& d : m_pipe.Viewers()) {
+    for (const std::string& name : m_viewerNames) {
         std::unique_ptr<ImageViewPanel> panel;
         for (auto& v : m_views) {
-            if (v && v->Name() == d.name) { panel = std::move(v); break; }
+            if (v && v->Name() == name) { panel = std::move(v); break; }
         }
-        if (!panel) panel = std::make_unique<ImageViewPanel>(d.name);
+        if (!panel) panel = std::make_unique<ImageViewPanel>(name);
         next.push_back(std::move(panel));
     }
     m_views = std::move(next);
@@ -363,8 +402,8 @@ void App::BuildDefaultLayout(ImGuiID dockspace) {
 
     // Viewers declared by the script share the centre node, so several
     // display() calls tab together rather than piling up as floating windows.
-    for (const ViewerDecl& d : m_pipe.Viewers())
-        ImGui::DockBuilderDockWindow(d.name.c_str(), centre);
+    for (const std::string& name : m_viewerNames)
+        ImGui::DockBuilderDockWindow(name.c_str(), centre);
 
     ImGui::DockBuilderFinish(dockspace);
     m_centreNode = centre;   // remember it for viewers added by later edits
@@ -386,6 +425,22 @@ void App::DrawMenuBar() {
     if (ImGui::BeginMenu("View")) {
         if (ImGui::MenuItem("Sync pan/zoom", nullptr, &m_syncCameras)) SyncViews();
         if (ImGui::MenuItem("Reset layout")) m_rebuildLayout = true;
+        ImGui::EndMenu();
+    }
+    if (ImGui::BeginMenu("Compute")) {
+        const ExecMode mode = m_worker.GetExecMode();
+        if (ImGui::MenuItem("Auto (GPU when available)", nullptr, mode == ExecMode::Auto)) {
+            m_worker.SetExecMode(ExecMode::Auto);
+            m_dirty = true;
+        }
+        if (ImGui::MenuItem("Force CPU", nullptr, mode == ExecMode::ForceCPU)) {
+            m_worker.SetExecMode(ExecMode::ForceCPU);
+            m_dirty = true;
+        }
+        if (ImGui::MenuItem("Force GPU", nullptr, mode == ExecMode::ForceGPU)) {
+            m_worker.SetExecMode(ExecMode::ForceGPU);
+            m_dirty = true;
+        }
         ImGui::EndMenu();
     }
     ImGui::EndMainMenuBar();
@@ -535,12 +590,13 @@ void App::Frame() {
     }
 
     // Re-run before NewFrame() so that viewers declared by the script exist
-    // when the dock layout is built. This is pure CPU work — no ImGui or D3D12
-    // state is touched, and uploads happen later inside the view Draw calls.
+    // when the dock layout is built. This is only phase 1 (parse + interpret);
+    // execution happens on the worker.
     if (m_dirty) {
         m_dirty = false;
         RunScript();
     }
+    PollWorker();
 
     ImGui_ImplDX12_NewFrame();
     ImGui_ImplWin32_NewFrame();
@@ -564,12 +620,30 @@ void App::Frame() {
 
     // Status strip: errors never blank the viewers, they just report.
     if (ImGui::Begin("Status")) {
-        if (m_error.empty()) {
+        if (m_worker.Busy()) {
+            // Visible feedback that a slow algorithm is still running — the
+            // whole point of the worker is that the UI keeps drawing meanwhile.
+            const char* spin = "|/-\\";
+            m_spinner = (m_spinner + 1) % 4;
+            ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f),
+                               "%c working...", spin[m_spinner]);
+        } else if (m_error.empty()) {
             ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1.0f), "OK");
         } else {
             ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f), "%s", m_error.c_str());
         }
         ImGui::TextDisabled("%s", m_scriptPath.empty() ? "(no script)" : m_scriptPath.c_str());
+
+        // Timing plus where the work ran — the two numbers you want side by
+        // side when deciding whether a GPU port was worth it.
+        const char* modeName = "auto";
+        switch (m_worker.GetExecMode()) {
+            case ExecMode::ForceCPU: modeName = "CPU"; break;
+            case ExecMode::ForceGPU: modeName = "GPU"; break;
+            case ExecMode::Auto:     modeName = "auto"; break;
+        }
+        ImGui::TextDisabled("last run %.1f ms   %d stage(s) on GPU   [%s]",
+                            m_worker.LastRunMs(), m_worker.LastGpuStages(), modeName);
     }
     ImGui::End();
 
@@ -578,14 +652,14 @@ void App::Frame() {
     ID3D12GraphicsCommandList* cl = m_dev.BeginFrame();
 
     for (auto& v : m_views) {
-        const ViewerDecl* decl = nullptr;
-        for (const ViewerDecl& d : m_pipe.Viewers())
-            if (d.name == v->Name()) { decl = &d; break; }
+        // Images lag the declarations by one worker round-trip, so a freshly
+        // declared viewer draws "computing..." until its first result lands.
+        Image* img = nullptr;
+        for (ViewerImage& vi : m_viewerImages)
+            if (vi.name == v->Name()) { img = &vi.image; break; }
 
-        Data* data = nullptr;
-        if (decl) data = const_cast<Data*>(m_pipe.Resolve(decl->source, &m_sources));
         v->SetContentVersion(m_contentVersion);
-        v->Draw(m_dev, data);
+        v->Draw(m_dev, img);
     }
 
     ImGui::Render();

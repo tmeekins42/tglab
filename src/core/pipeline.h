@@ -23,6 +23,8 @@ struct PortRef {
     bool operator==(const PortRef&) const = default;
 };
 
+struct ComputeKernel;   // gpu/compute.h
+
 struct Stage {
     std::unique_ptr<AlgorithmBase> algo;
     std::string          algoName;
@@ -31,6 +33,11 @@ struct Stage {
     uint64_t             paramHash = 0;
     bool                 valid     = false;   // outputs hold a usable result
     int                  line      = 0;       // for error messages
+
+    // Compiled kernel, cached so dragging a slider does not recompile HLSL
+    // every frame. shared_ptr because Stage is moved between pipelines and the
+    // kernel outlives any single run.
+    std::shared_ptr<ComputeKernel> kernel;
 };
 
 // A viewer declared by the script via display().
@@ -38,6 +45,12 @@ struct ViewerDecl {
     std::string name;
     PortRef     source;
 };
+
+// Which implementation to run. Auto prefers the GPU when the algorithm has
+// one; the explicit modes exist for correctness comparison and benchmarking.
+enum class ExecMode : uint8_t { Auto, ForceCPU, ForceGPU };
+
+class ComputeContext;   // fwd; pipeline only needs a pointer
 
 class Pipeline {
 public:
@@ -50,7 +63,12 @@ public:
     // --- execution (phase 2) ---
     // `sources` are the palette images, indexed by PortRef::port when stage==-1.
     // Reuses cached outputs from `prev` where the stage is unchanged.
-    bool Execute(std::vector<Data>* sources, Pipeline* prev, std::string* err);
+    // `gpu` may be null, in which case everything runs on the CPU.
+    bool Execute(std::vector<Data>* sources, Pipeline* prev, std::string* err,
+                 ComputeContext* gpu = nullptr, ExecMode mode = ExecMode::Auto);
+
+    // How many stages actually ran on the GPU last time (for the UI/benchmarks).
+    int GpuStageCount() const { return m_gpuStages; }
 
     const Data* Resolve(PortRef r, const std::vector<Data>* sources) const;
 
@@ -62,8 +80,14 @@ private:
     // True if `a` and `b` are the same algorithm with the same wiring/params.
     static bool SameStage(const Stage& a, const Stage& b);
 
+    // Runs one stage on the GPU. Returns false (with `err` set) if anything
+    // about the stage is unsupported, so the caller can fall back to the CPU.
+    bool RunStageGpu(Stage& s, const std::vector<const Data*>& in,
+                     ComputeContext* gpu, std::string* err);
+
     std::vector<Stage>      m_stages;
     std::vector<ViewerDecl> m_viewers;
+    int                     m_gpuStages = 0;
 };
 
 } // namespace tglab

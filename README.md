@@ -19,16 +19,22 @@ algorithms.
 | Milestone | State |
 |---|---|
 | **M1** vertical slice | **done** |
-| **M2** `choose()`, edge/gradient algorithms, drag-drop | **done** (worker thread still pending) |
-| M3 GPU path (DXC, compute queue, zero-readback display) | next |
-| M4 compare mode, benchmarks, pixel inspector | planned |
+| **M2** `choose()`, edge/gradient algorithms, drag-drop | **done** |
+| **M3** worker thread, DXC, GPU compute path | **done** |
+| M4 compare mode, benchmarks, pixel inspector | next |
 
-Algorithms so far: `brightness`, `grayscale`, `gaussian_blur`, `sobel`,
-`non_max_suppression`, `hysteresis`, `canny`.
+Algorithms so far: `brightness`, `grayscale`, `gaussian_blur` (CPU + GPU),
+`sobel`, `non_max_suppression`, `hysteresis`, `canny`.
 
-Pipeline execution still runs on the UI thread. That is fine at 512×512, but
-a slow algorithm on a large image will block the window until the worker
-thread lands.
+**Execution runs off the UI thread.** Parse and interpret stay on the UI thread
+(microseconds, and they own the control state); the worker runs the pipeline
+and publishes results. A burst of slider events coalesces to the newest
+request, so dragging never builds a backlog, and the window keeps drawing
+while a slow algorithm runs.
+
+**GPU compute** is available per algorithm. `gaussian_blur` has an HLSL kernel;
+under **Compute → Auto** it runs there, and Force CPU / Force GPU let you
+compare. The two implementations agree to within 1/255 on the test image.
 
 ## Build
 
@@ -50,10 +56,12 @@ Run — arguments are a `.tgl` script plus any images to preload:
 ./build/Debug/tglab.exe scripts/hello.tgl assets/test.png
 ```
 
-Headless checks for the script engine (no window required):
+Tests — the first is fast and needs no window; the second needs a D3D12 device
+and takes a few seconds:
 
 ```sh
-./build/Debug/tglab_tests.exe
+./build/Debug/tglab_tests.exe          # language, pipeline semantics
+./build/Debug/tglab_runtime_tests.exe  # worker thread, shader compilation, GPU
 ```
 
 ## Scripting
@@ -170,6 +178,45 @@ REGISTER_ALGORITHM(Threshold);
 `Param<T>` is the single storage location for a parameter — the script writes
 it, the UI writes it, the algorithm reads it. There is nothing to keep in sync.
 
+### Adding a GPU kernel
+
+An algorithm opts into the GPU by returning HLSL. The framework handles
+compilation (cached, so slider drags don't recompile), residency, descriptor
+binding and dispatch:
+
+```cpp
+bool HasGPU() const override { return true; }
+
+const char* GpuSource() const override {
+    return R"(
+Texture2D<float4>   Src : register(t0);
+RWTexture2D<float4> Dst : register(u0);
+cbuffer Params : register(b0) { uint Width; uint Height; uint LevelBits; };
+
+[numthreads(8, 8, 1)]
+void main(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= Width || tid.y >= Height) return;
+    float level = asfloat(LevelBits);
+    Dst[tid.xy] = step(level, Src[tid.xy]);
+}
+)";
+}
+
+std::vector<uint32_t> GpuConstants() const override {
+    const float level = m_level;
+    uint32_t bits; std::memcpy(&bits, &level, sizeof(bits));
+    return {bits};
+}
+```
+
+Bindings are fixed by convention: `t0..t3` inputs, `u0..u3` outputs, and `b0`
+holding `Width`, `Height`, then whatever `GpuConstants()` returns (floats
+bit-cast through `uint`, read back with `asfloat`). Thread groups are 8×8.
+
+A kernel that fails to compile falls back to the CPU rather than failing the
+run, with the DXC diagnostics reported — a shader you're mid-way through
+writing should degrade to slow-and-correct, not to a blank viewer.
+
 > `src/algorithms/` **must** stay a CMake `OBJECT` library. Algorithms
 > self-register through a static initializer that nothing references, so a
 > `STATIC` library would be stripped by the linker and they would silently
@@ -199,6 +246,20 @@ vendored under `third_party/`.
   existing algorithm.
 - **Views render to offscreen targets** behind a `View` interface, so a 3D
   viewport (SfM, gaussian splats) can dock alongside 2D panels later.
+- **The worker owns the stage cache.** `Execute()` moves cached outputs out of
+  the previous run, so that pipeline must not be reachable from the UI thread;
+  the worker keeps it and hands the UI only the images its viewers draw.
+- **The compute queue is created on the worker thread**, separate from the
+  direct queue ImGui submits on. Sharing one queue across threads is the
+  classic source of intermittent corruption.
+
+### Known limitation
+
+A GPU stage currently uploads its inputs and reads its outputs back every run.
+The kernel itself is ~550× faster than the CPU path, but a full stage measures
+~5× once transfers are counted. Giving `Image` real GPU residency — upload
+once, no readback mid-chain, display straight from the SRV — is what closes
+that gap, and the acquire/invalidate API is already shaped for it.
 
 ## Licence
 

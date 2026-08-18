@@ -19,7 +19,7 @@ public:
     explicit ImageViewPanel(std::string name) : m_name(std::move(name)) {}
 
     const std::string& Name() const override { return m_name; }
-    void Draw(Device& dev, Data* data) override;
+    void Draw(Device& dev, Image* image) override;
 
     void SetSharedCamera(ViewCamera* cam) { m_shared = cam; }
 

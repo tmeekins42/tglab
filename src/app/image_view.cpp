@@ -7,16 +7,15 @@
 
 namespace tglab {
 
-void ImageViewPanel::Draw(Device& dev, Data* data) {
+void ImageViewPanel::Draw(Device& dev, Image* img) {
     // Keep the panel identity stable so ImGui remembers docking across runs.
     if (!ImGui::Begin(m_name.c_str())) {
         ImGui::End();
         return;
     }
 
-    Image* img = (data && std::holds_alternative<Image>(*data)) ? &std::get<Image>(*data) : nullptr;
     if (!img || !img->Valid()) {
-        ImGui::TextDisabled("no data");
+        ImGui::TextDisabled("computing...");
         ImGui::End();
         return;
     }

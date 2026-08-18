@@ -5,6 +5,7 @@
 // compute shader in M3.
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <vector>
 
 #include "../core/algorithm.h"
@@ -69,6 +70,56 @@ public:
                 Write(dst, x, y, acc, ch);
             }
         }
+    }
+
+    // --- GPU implementation -------------------------------------------------
+    // Single-pass here rather than separable: the two-pass version needs an
+    // intermediate target, which the current one-dispatch-per-algorithm model
+    // does not express. Still far faster than the CPU path, and it makes the
+    // CPU/GPU comparison in M4 an honest one (same maths, different hardware).
+    bool HasGPU() const override { return true; }
+
+    const char* GpuSource() const override {
+        return R"(
+Texture2D<float4>   Src : register(t0);
+RWTexture2D<float4> Dst : register(u0);
+
+cbuffer Params : register(b0) {
+    uint Width;
+    uint Height;
+    uint SigmaBits;
+};
+
+[numthreads(8, 8, 1)]
+void main(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= Width || tid.y >= Height) return;
+
+    float sigma  = max(asfloat(SigmaBits), 0.01);
+    int   radius = min(int(ceil(sigma * 3.0)), 64);
+    float twoSS  = 2.0 * sigma * sigma;
+
+    float4 sum    = 0.0;
+    float  weight = 0.0;
+
+    for (int dy = -radius; dy <= radius; ++dy) {
+        for (int dx = -radius; dx <= radius; ++dx) {
+            int2 p = int2(tid.xy) + int2(dx, dy);
+            p = clamp(p, int2(0, 0), int2(Width - 1, Height - 1));   // clamp-to-edge
+            float w = exp(-float(dx * dx + dy * dy) / twoSS);
+            sum    += Src[p] * w;
+            weight += w;
+        }
+    }
+    Dst[tid.xy] = sum / max(weight, 1e-6);
+}
+)";
+    }
+
+    std::vector<uint32_t> GpuConstants() const override {
+        const float sigma = m_sigma;
+        uint32_t bits;
+        std::memcpy(&bits, &sigma, sizeof(bits));
+        return {bits};
     }
 
 private:

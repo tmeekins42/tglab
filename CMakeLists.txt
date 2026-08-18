@@ -33,18 +33,21 @@ add_library(tglab_core STATIC
     src/core/param.cpp
     src/core/algorithm.cpp
     src/core/pipeline.cpp
+    src/core/worker.cpp
     src/script/lexer.cpp
     src/script/parser.cpp
     src/script/interp.cpp
     src/gpu/descriptor_heap.cpp
     src/gpu/device.cpp
     src/gpu/texture.cpp
+    src/gpu/shader.cpp
+    src/gpu/compute.cpp
 )
 target_include_directories(tglab_core PUBLIC
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/third_party/stb
 )
-target_link_libraries(tglab_core PUBLIC imgui d3d12 dxgi)
+target_link_libraries(tglab_core PUBLIC imgui d3d12 dxgi dxcompiler)
 
 # ---------------------------------------------------------------------------
 # Algorithms.
@@ -83,6 +86,39 @@ endif()
 set_target_properties(tglab PROPERTIES VS_DEBUGGER_WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 # ---------------------------------------------------------------------------
+# DXC redistributables.
+#
+# dxcompiler.dll needs dxil.dll beside it to sign shaders; without the signing
+# step D3D12 refuses to load the resulting DXIL, with an error that does not
+# mention the missing DLL. Copy both next to every executable that compiles
+# shaders.
+find_file(DXC_COMPILER_DLL dxcompiler.dll
+    PATHS "$ENV{WindowsSdkDir}bin/${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}/x64"
+          "C:/Program Files (x86)/Windows Kits/10/bin/${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}/x64"
+          "C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64"
+    NO_DEFAULT_PATH)
+find_file(DXC_DXIL_DLL dxil.dll
+    PATHS "$ENV{WindowsSdkDir}bin/${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}/x64"
+          "C:/Program Files (x86)/Windows Kits/10/bin/${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}/x64"
+          "C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64"
+    NO_DEFAULT_PATH)
+
+function(tglab_copy_dxc target)
+    if(DXC_COMPILER_DLL AND DXC_DXIL_DLL)
+        add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${DXC_COMPILER_DLL}" "$<TARGET_FILE_DIR:${target}>"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${DXC_DXIL_DLL}" "$<TARGET_FILE_DIR:${target}>"
+            VERBATIM)
+    else()
+        message(WARNING "dxcompiler.dll/dxil.dll not found — GPU shaders will not compile at runtime")
+    endif()
+endfunction()
+
+tglab_copy_dxc(tglab)
+
+# ---------------------------------------------------------------------------
 # Headless checks for the script spine (no window required).
 add_executable(tglab_tests
     tests/test_script.cpp
@@ -93,8 +129,23 @@ if(MSVC)
     target_compile_definitions(tglab_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
 
+# Runtime checks: worker thread + GPU compute. Needs a D3D12 device and takes
+# seconds, so it is a separate binary from the fast script tests.
+add_executable(tglab_runtime_tests
+    tests/test_runtime.cpp
+    $<TARGET_OBJECTS:tglab_algorithms>
+)
+target_link_libraries(tglab_runtime_tests PRIVATE tglab_core imgui d3d12 dxgi)
+if(MSVC)
+    target_compile_definitions(tglab_runtime_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+tglab_copy_dxc(tglab_runtime_tests)
+
 enable_testing()
 add_test(NAME script_spine COMMAND tglab_tests)
+add_test(NAME runtime      COMMAND tglab_runtime_tests)
+
+
 
 
 

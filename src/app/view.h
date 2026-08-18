@@ -19,9 +19,9 @@ public:
 
     virtual const std::string& Name() const = 0;
 
-    // Called once per frame with the data this view was declared on
-    // (null when the pipeline produced nothing for it).
-    virtual void Draw(Device& dev, Data* data) = 0;
+    // Called once per frame with this view's image, or null when the pipeline
+    // has not produced one yet (a newly declared viewer, or a failed run).
+    virtual void Draw(Device& dev, Image* image) = 0;
 };
 
 } // namespace tglab

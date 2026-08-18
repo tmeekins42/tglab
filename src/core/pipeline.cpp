@@ -2,6 +2,8 @@
 
 #include <cassert>
 
+#include "../gpu/compute.h"
+
 namespace tglab {
 
 void Pipeline::Clear() {
@@ -49,7 +51,9 @@ bool Pipeline::SameStage(const Stage& a, const Stage& b) {
            a.paramHash == b.paramHash && a.outputs.size() == b.outputs.size();
 }
 
-bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* err) {
+bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* err,
+                       ComputeContext* gpu, ExecMode mode) {
+    m_gpuStages = 0;
     // Find the first stage that differs from the previous run. Everything
     // before it can reuse its cached output. Comparing by hash means there is
     // no dirty flag to forget to set.
@@ -60,10 +64,23 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
                prev->m_stages[firstDirty].valid &&
                SameStage(m_stages[firstDirty], prev->m_stages[firstDirty])) {
             // Steal the cached outputs — Data is move-only, and the previous
-            // pipeline is discarded right after this call.
+            // pipeline is discarded right after this call. The compiled kernel
+            // comes along too, so an unchanged stage never recompiles.
             m_stages[firstDirty].outputs = std::move(prev->m_stages[firstDirty].outputs);
+            m_stages[firstDirty].kernel  = prev->m_stages[firstDirty].kernel;
             m_stages[firstDirty].valid   = true;
             ++firstDirty;
+        }
+    }
+
+    // Dirty stages still reuse their compiled kernel when they are the same
+    // algorithm as last run — a parameter change does not alter the HLSL, and
+    // recompiling on every slider tick would defeat the point of the GPU path.
+    if (prev) {
+        for (size_t i = firstDirty; i < m_stages.size(); ++i) {
+            if (i >= prev->m_stages.size()) break;
+            if (m_stages[i].algoName == prev->m_stages[i].algoName)
+                m_stages[i].kernel = prev->m_stages[i].kernel;
         }
     }
 
@@ -110,12 +127,101 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
             s.outputs[p] = Data{std::move(img)};
         }
 
-        RunCtx ctx(in, s.outputs);
-        s.algo->RunCPU(ctx);
+        // GPU when asked for and available; otherwise CPU. A GPU failure falls
+        // back rather than failing the run — a broken kernel should degrade to
+        // a slow correct result, not an empty viewer.
+        const bool wantGpu = gpu && mode != ExecMode::ForceCPU &&
+                             s.algo->HasGPU() && s.algo->GpuSource();
+        bool ranOnGpu = false;
+        if (wantGpu) {
+            std::string gpuErr;
+            if (RunStageGpu(s, in, gpu, &gpuErr)) {
+                ranOnGpu = true;
+                ++m_gpuStages;
+            } else if (mode == ExecMode::ForceGPU) {
+                *err = "line " + std::to_string(s.line) + ": '" + s.algoName +
+                       "' GPU path failed: " + gpuErr;
+                return false;
+            }
+        }
+
+        if (!ranOnGpu) {
+            RunCtx ctx(in, s.outputs);
+            s.algo->RunCPU(ctx);
+        }
         s.valid = true;
     }
 
     return true;
+}
+
+bool Pipeline::RunStageGpu(Stage& s, const std::vector<const Data*>& in,
+                           ComputeContext* gpu, std::string* err) {
+    // M3 supports the common shape: image inputs and image outputs, one
+    // dispatch. Anything else stays on the CPU.
+    for (const Data* d : in)
+        if (!d || !std::holds_alternative<Image>(*d)) { *err = "non-image input"; return false; }
+    for (const Data& d : s.outputs)
+        if (!std::holds_alternative<Image>(d)) { *err = "non-image output"; return false; }
+
+    // Kernels are compiled once per stage and cached on the stage, so dragging
+    // a slider does not recompile HLSL every frame.
+    if (!s.kernel) {
+        s.kernel = std::make_shared<ComputeKernel>();
+        std::string compileErr;
+        if (!gpu->CreateKernel(s.algo->GpuSource(), "main", s.algoName,
+                               s.kernel.get(), &compileErr)) {
+            s.kernel.reset();
+            *err = compileErr;
+            return false;
+        }
+    }
+
+    std::vector<GpuImage>        owned(in.size() + s.outputs.size());
+    std::vector<const GpuImage*> gin;
+    std::vector<GpuImage*>       gout;
+
+    size_t slot = 0;
+    bool ok = true;
+
+    for (const Data* d : in) {
+        Image& img = const_cast<Image&>(std::get<Image>(*d));
+        GpuImage& g = owned[slot++];
+        if (!gpu->CreateImage(img.Desc(), &g)) { ok = false; break; }
+        ImageView v = img.MapCpuRead();
+        if (!gpu->Upload(v, &g)) { ok = false; break; }
+        gin.push_back(&g);
+    }
+    if (ok) {
+        for (Data& d : s.outputs) {
+            Image& img = std::get<Image>(d);
+            GpuImage& g = owned[slot++];
+            if (!gpu->CreateImage(img.Desc(), &g)) { ok = false; break; }
+            gout.push_back(&g);
+        }
+    }
+
+    if (ok) ok = gpu->Dispatch(*s.kernel, gin, gout, s.algo->GpuConstants(), err);
+
+    // Read results back. M3 keeps results CPU-side because viewers and later
+    // CPU stages both expect that.
+    //
+    // This is where the remaining performance is: the kernel itself is ~550x
+    // faster than the CPU path, but a full stage measures ~5x once upload and
+    // readback are counted. Giving Image real GPU residency (so a chain of GPU
+    // stages uploads once, never reads back mid-chain, and displays straight
+    // from the SRV) is what closes that gap.
+    if (ok) {
+        for (size_t i = 0; i < s.outputs.size(); ++i) {
+            Image& img = std::get<Image>(s.outputs[i]);
+            ImageView v = img.MapCpuWrite();
+            if (!gpu->Readback(*gout[i], &v)) { ok = false; break; }
+        }
+    }
+
+    for (GpuImage& g : owned) g.Release();
+    if (!ok && err->empty()) *err = "GPU execution failed";
+    return ok;
 }
 
 } // namespace tglab

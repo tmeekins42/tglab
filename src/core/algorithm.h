@@ -72,8 +72,20 @@ public:
 
     virtual void RunCPU(RunCtx& ctx) = 0;
 
+    // --- GPU path (M3) ------------------------------------------------------
+    // An algorithm opts in by returning true from HasGPU() and providing the
+    // HLSL for a compute kernel. The framework handles residency, descriptor
+    // binding and dispatch, so an algorithm only writes the kernel itself.
     virtual bool HasGPU() const { return false; }
-    // M3: virtual void RunGPU(GpuRunCtx&) {}
+
+    // Compute shader source with a `main` entry point. Bindings by convention:
+    //   t0..t3  inputs        u0..u3  outputs
+    //   b0      uint Width, uint Height, then GpuConstants() below
+    virtual const char* GpuSource() const { return nullptr; }
+
+    // Extra root constants, bit-cast to uint. Floats go through asfloat() in
+    // the shader. Order must match the cbuffer declaration.
+    virtual std::vector<uint32_t> GpuConstants() const { return {}; }
 
     std::span<ParamBase* const> Params() const { return m_params; }
     ParamBase* FindParam(std::string_view name) const;
