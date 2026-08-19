@@ -24,6 +24,15 @@ Dear ImGui is a submodule, so clone recursively:
 git clone --recursive https://github.com/tmeekins42/tglab.git
 cd tglab
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+cmake --build build --config Release
+```
+
+**Build Release for real work.** Debug is roughly 30x slower, which on a
+multi-megapixel scan is the difference between a second and a minute -- long
+enough to look like the app has hung. Build Debug only when you need the
+debugger or the D3D12 validation layer:
+
+```sh
 cmake --build build --config Debug
 ```
 
@@ -35,7 +44,7 @@ Arguments are a `.tgl` script plus any images to preload. Paths are relative to
 the repository root, which is where the app expects to run from.
 
 ```sh
-./build/Debug/tglab.exe scripts/thresholds.tgl assets/test.png
+./build/Release/tglab.exe scripts/thresholds.tgl assets/test.png
 ```
 
 Images can also be **dragged in from Explorer** at any time.
@@ -88,12 +97,8 @@ On an 8 MP scan (3504x2336) the difference is stark:
 | `gaussian_blur` (sigma 8) | ~60 s | 3.1 s |
 
 If a large image feels like it has hung, check the Status panel: it shows
-elapsed time and a spinner while the worker is busy. Build Release for real
-work:
-
-```sh
-cmake --build build --config Release
-```
+elapsed time and a spinner while the worker is busy. The first thing to verify
+is that you are running `build/Release/tglab.exe` and not the Debug build.
 
 Non-power-of-2 image sizes are fine, as are spaces in file paths. Palette
 names are the filename without extension and are **case-sensitive**, so
@@ -102,8 +107,8 @@ names are the filename without extension and are **case-sensitive**, so
 ## Tests
 
 ```sh
-./build/Debug/tglab_tests.exe          # language and pipeline semantics (fast)
-./build/Debug/tglab_runtime_tests.exe  # worker thread, shaders, GPU (needs a device)
+./build/Release/tglab_tests.exe          # language and pipeline semantics (fast)
+./build/Release/tglab_runtime_tests.exe  # worker thread, shaders, GPU (needs a device)
 ```
 
 ---

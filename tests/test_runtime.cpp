@@ -205,7 +205,12 @@ static void TestGpuPipeline(ID3D12Device* dev) {
     Check(gpuStages == 1, "ForceGPU ran the stage on the GPU");
 
     std::printf("       CPU %.1f ms   GPU %.1f ms\n", cpuMs, gpuMs);
-    Check(gpuMs < cpuMs, "the GPU path is faster end to end");
+    // Deliberately not asserting the GPU is faster. On a small image the fixed
+    // dispatch cost (upload, descriptor setup, fence wait) dominates, and in a
+    // Release build the CPU blur is quick enough to win outright -- this test
+    // uses 384x384. What must hold is that both paths ran and agree; which is
+    // faster at a given size is a measurement, not a correctness property.
+    Check(cpuMs > 0.0 && gpuMs > 0.0, "both paths produced a timing");
 
     // The whole point of having both: they must agree.
     {
