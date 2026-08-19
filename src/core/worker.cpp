@@ -24,7 +24,8 @@ void PipelineWorker::Stop() {
     m_thread.join();
 }
 
-uint64_t PipelineWorker::Submit(Pipeline pipe, std::vector<Data> sources) {
+uint64_t PipelineWorker::Submit(Pipeline pipe, std::vector<Data> sources,
+                               std::vector<uint64_t> sourceVersions) {
     uint64_t seq;
     {
         std::lock_guard<std::mutex> lock(m_mtx);
@@ -33,6 +34,7 @@ uint64_t PipelineWorker::Submit(Pipeline pipe, std::vector<Data> sources) {
         job->seq     = seq;
         job->pipe    = std::move(pipe);
         job->sources = std::move(sources);
+        job->sourceVersions = std::move(sourceVersions);
         m_pending    = std::move(job);   // drops any older pending job
         m_busy.store(true, std::memory_order_relaxed);
     }
@@ -125,7 +127,8 @@ void PipelineWorker::Run() {
         std::string err;
         const bool ok = job->pipe.Execute(&job->sources, havePrev ? &prev : nullptr, &err,
                                           haveGpu ? &gpu : nullptr,
-                                          m_mode.load(std::memory_order_relaxed));
+                                          m_mode.load(std::memory_order_relaxed),
+                                          &job->sourceVersions);
         m_lastMs.store(
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
             std::memory_order_relaxed);

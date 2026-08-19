@@ -33,9 +33,12 @@ namespace tglab {
 // `compare` runs the pipeline twice (CPU then GPU) and diffs, instead of the
 // normal single run.
 struct PipelineJob {
-    uint64_t          seq = 0;
-    Pipeline          pipe;
-    std::vector<Data> sources;
+    uint64_t              seq = 0;
+    Pipeline              pipe;
+    std::vector<Data>     sources;
+    // Parallel to `sources`: changes when that palette image is replaced, so
+    // the stage cache can tell a swapped image from the same one.
+    std::vector<uint64_t> sourceVersions;
     bool              compare    = false;
     int               compareStage = -1;   // -1 = last stage
 };
@@ -84,7 +87,8 @@ public:
     // against a run that may take much longer, so queueing them would build an
     // unbounded backlog of results nobody will ever see — only the newest
     // matters. Returns the sequence number assigned to this job.
-    uint64_t Submit(Pipeline pipe, std::vector<Data> sources);
+    uint64_t Submit(Pipeline pipe, std::vector<Data> sources,
+                    std::vector<uint64_t> sourceVersions = {});
 
     // Runs the pipeline twice (CPU then GPU) and diffs the chosen stage.
     // Deliberately not coalesced with normal runs in the caller's mind: it is

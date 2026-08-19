@@ -687,6 +687,69 @@ int main() {
         Check(checksum(p2) != before, "a changed params() value changes the output");
     }
 
+    {
+        // Swapping the image behind a palette slot must invalidate the stage
+        // cache. PortRef{-1, 0} is identical whichever file backs slot 0, so
+        // without a source version the pipeline reuses the cached output and
+        // the app looks like it is ignoring the new image -- until some
+        // unrelated parameter change incidentally busts the cache.
+        auto flat = [](int dim, uint8_t v) {
+            Image img;
+            img.Alloc({dim, dim, Format::RGBA8});
+            ImageView iv = img.MapCpuWrite();
+            for (int i = 0; i < dim * dim; ++i) {
+                iv.data[size_t(i) * 4 + 0] = v;
+                iv.data[size_t(i) * 4 + 1] = v;
+                iv.data[size_t(i) * 4 + 2] = v;
+                iv.data[size_t(i) * 4 + 3] = 255;
+            }
+            return img;
+        };
+        auto checksum = [](Pipeline& p) {
+            ImageView v = std::get<Image>(p.Stages()[0].outputs[0]).MapCpuRead();
+            unsigned long long sum = 0;
+            for (int i = 0; i < v.desc.width * v.desc.height * 4; ++i) sum += v.data[i];
+            return sum;
+        };
+
+        const char* kScript =
+            "src = image(\"test\")\n"
+            "out = brightness(src, gain = 1.0)\n"
+            "display(out)\n";
+        std::vector<SourceImage> names{{"test", 0}};
+        UiState ui;
+        std::string err;
+        Program prog;
+        Parse(kScript, &prog, &err);
+
+        std::vector<Data> s1;
+        s1.push_back(Data{flat(32, 100)});
+        std::vector<uint64_t> v1{1};
+        Pipeline p1;
+        Interpret(prog, names, &ui, &p1);
+        p1.Execute(&s1, nullptr, &err, nullptr, ExecMode::Auto, &v1);
+        const unsigned long long before = checksum(p1);
+
+        // Same image, same version: must still cache.
+        std::vector<Data> s2;
+        s2.push_back(Data{flat(32, 100)});
+        Pipeline p2;
+        Interpret(prog, names, &ui, &p2);
+        p2.Execute(&s2, &p1, &err, nullptr, ExecMode::Auto, &v1);
+        Check(p2.CachedStageCount() == 1, "an unchanged source still hits the cache");
+
+        // Different image, bumped version: what dropping a file on a slot does.
+        std::vector<Data> s3;
+        s3.push_back(Data{flat(32, 200)});
+        std::vector<uint64_t> v3{2};
+        Pipeline p3;
+        Interpret(prog, names, &ui, &p3);
+        p3.Execute(&s3, &p2, &err, nullptr, ExecMode::Auto, &v3);
+        Check(p3.CachedStageCount() == 0, "a swapped source does not hit the cache");
+        Check(checksum(p3) != before,
+              "the output reflects the new image with no other change");
+    }
+
     std::printf("\n%s\n", g_fail == 0 ? "all checks passed" : "FAILURES PRESENT");
     return g_fail == 0 ? 0 : 1;
 }

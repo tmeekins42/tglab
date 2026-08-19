@@ -31,6 +31,9 @@ struct Stage {
     std::vector<PortRef> inputs;
     std::vector<Data>    outputs;
     uint64_t             paramHash = 0;
+    // Versions of the palette images this stage read, so replacing one is
+    // detected as a change rather than looking identical.
+    uint64_t             sourceHash = 0;
     bool                 valid     = false;   // outputs hold a usable result
     int                  line      = 0;       // for error messages
 
@@ -64,8 +67,13 @@ public:
     // `sources` are the palette images, indexed by PortRef::port when stage==-1.
     // Reuses cached outputs from `prev` where the stage is unchanged.
     // `gpu` may be null, in which case everything runs on the CPU.
+    // `sourceVersions` runs parallel to `sources`: a value that changes when
+    // that palette image is replaced. Without it a stage reading PortRef{-1, i}
+    // looks identical no matter which file backs slot i, so swapping an image
+    // would reuse the cached output.
     bool Execute(std::vector<Data>* sources, Pipeline* prev, std::string* err,
-                 ComputeContext* gpu = nullptr, ExecMode mode = ExecMode::Auto);
+                 ComputeContext* gpu = nullptr, ExecMode mode = ExecMode::Auto,
+                 const std::vector<uint64_t>* sourceVersions = nullptr);
 
     // How the last run was split. These add up to the pipeline stage count:
     // stages skipped by the dirty-hash cache are counted separately rather

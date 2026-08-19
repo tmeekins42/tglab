@@ -370,12 +370,16 @@ void App::RunScript() {
     // gets its own copies, since it may still be reading them next frame.
     std::vector<Data> sources;
     std::vector<SourceImage> names;
+    std::vector<uint64_t> versions;
     for (size_t i = 0; i < m_palette.size(); ++i) {
         if (std::holds_alternative<Image>(m_palette[i].data))
             sources.push_back(Data{std::get<Image>(m_palette[i].data).Clone()});
         else
             sources.push_back(Data{});
         names.push_back({m_palette[i].name, int(i)});
+        // Bumped when a drop replaces the file behind this slot, which is what
+        // lets the stage cache notice the pixels changed.
+        versions.push_back(m_palette[i].version);
     }
 
     // Any failure here leaves the last good result on screen and reports the
@@ -404,7 +408,8 @@ void App::RunScript() {
                 m_stageGpuCapable.push_back(s.algo->HasGPU() && s.algo->GpuSource());
             }
 
-            m_pendingSeq = m_worker.Submit(std::move(built), std::move(sources));
+            m_pendingSeq = m_worker.Submit(std::move(built), std::move(sources),
+                                           std::move(versions));
         }
     }
 
@@ -418,12 +423,16 @@ void App::RunScript() {
 void App::RequestCompare() {
     std::vector<Data> sources;
     std::vector<SourceImage> names;
+    std::vector<uint64_t> versions;
     for (size_t i = 0; i < m_palette.size(); ++i) {
         if (std::holds_alternative<Image>(m_palette[i].data))
             sources.push_back(Data{std::get<Image>(m_palette[i].data).Clone()});
         else
             sources.push_back(Data{});
         names.push_back({m_palette[i].name, int(i)});
+        // Bumped when a drop replaces the file behind this slot, which is what
+        // lets the stage cache notice the pixels changed.
+        versions.push_back(m_palette[i].version);
     }
 
     Program prog;

@@ -52,11 +52,34 @@ const Data* Pipeline::Resolve(PortRef r, const std::vector<Data>* sources) const
 
 bool Pipeline::SameStage(const Stage& a, const Stage& b) {
     return a.algoName == b.algoName && a.inputs == b.inputs &&
-           a.paramHash == b.paramHash && a.outputs.size() == b.outputs.size();
+           a.paramHash == b.paramHash && a.sourceHash == b.sourceHash &&
+           a.outputs.size() == b.outputs.size();
 }
 
 bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* err,
-                       ComputeContext* gpu, ExecMode mode) {
+                       ComputeContext* gpu, ExecMode mode,
+                       const std::vector<uint64_t>* sourceVersions) {
+    // Stamp each stage with the versions of the palette images it reads, before
+    // any cache comparison. PortRef{-1, i} is identical whichever file backs
+    // slot i, so without this a swapped image reuses the cached output -- which
+    // looks like the app ignoring the new file until some other parameter
+    // changes and incidentally busts the cache.
+    if (sourceVersions) {
+        for (Stage& s : m_stages) {
+            uint64_t h = 1469598103934665603ull;   // FNV-1a
+            for (const PortRef& r : s.inputs) {
+                if (r.stage >= 0) continue;        // not a palette image
+                const uint64_t v = size_t(r.port) < sourceVersions->size()
+                                       ? (*sourceVersions)[size_t(r.port)] : 0;
+                for (int b = 0; b < 8; ++b) {
+                    h ^= (v >> (b * 8)) & 0xff;
+                    h *= 1099511628211ull;
+                }
+            }
+            s.sourceHash = h;
+        }
+    }
+
     m_gpuStages = 0;
     m_cpuStages = 0;
     m_cachedStages = 0;
