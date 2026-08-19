@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <vector>
@@ -162,6 +163,7 @@ private:
     bool        m_rebuildLayout = false;   // explicit "Reset layout" request
     int         m_layoutCountdown = 0;     // frames until the default layout is built
     int         m_switchCountdown = 0;     // self-test: frames until TGLAB_SWITCH fires
+    int         m_dropTestCountdown = 0;   // self-test: frames until TGLAB_DROPTEST fires
     bool        m_haveSavedLayout = false; // a tglab_layout.ini already existed
     ImGuiID     m_centreNode = 0;          // where new viewers get docked
     ImGuiID     m_dockspaceId = 0;         // fallback when a saved layout exists
@@ -223,6 +225,7 @@ bool App::Init(HWND hwnd) {
     // state you land in launching with no arguments.
     m_layoutCountdown = m_haveSavedLayout ? 0 : 2;
     if (GetEnvironmentVariableA("TGLAB_SWITCH", nullptr, 0) > 0) m_switchCountdown = 120;
+    if (GetEnvironmentVariableA("TGLAB_DROPTEST", nullptr, 0) > 0) m_dropTestCountdown = 120;
 
     AppTrace("imgui context created");
     ImGui_ImplWin32_Init(hwnd);
@@ -1040,11 +1043,15 @@ void App::DrawPalettePanel() {
         }
         ImGui::EndGroup();
 
-        // One invisible hit area over the whole row, for the context menu and
-        // for drop targeting.
+        // Row rect, for drop targeting. Measured from the window's own content
+        // edges rather than the cursor: after EndGroup() the cursor has moved,
+        // so GetContentRegionAvail() there reports what is left below the row,
+        // not the row's width.
         const float rowHeight = std::max(thumbSize, ImGui::GetCursorScreenPos().y - rowStart.y);
-        e.rowMin = rowStart;
-        e.rowMax = ImVec2(rowStart.x + ImGui::GetContentRegionAvail().x + thumbSize, rowStart.y + rowHeight);
+        const float left  = ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMin().x;
+        const float right = ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x;
+        e.rowMin = ImVec2(left, rowStart.y);
+        e.rowMax = ImVec2(right, rowStart.y + rowHeight);
 
         if (ImGui::BeginPopupContextItem("slot")) {
             if (ImGui::MenuItem("Rename...")) BeginRename(i);
@@ -1079,7 +1086,6 @@ void App::DrawPalettePanel() {
 int App::SlotAtScreenPos(int sx, int sy) const {
     for (int i = 0; i < int(m_palette.size()); ++i) {
         const PaletteEntry& e = m_palette[size_t(i)];
-        if (e.rowMax.x <= e.rowMin.x || e.rowMax.y <= e.rowMin.y) continue;   // not drawn yet
         if (float(sx) >= e.rowMin.x && float(sx) < e.rowMax.x &&
             float(sy) >= e.rowMin.y && float(sy) < e.rowMax.y)
             return i;
@@ -1168,6 +1174,27 @@ void App::Frame() {
     // hot reload that introduced new viewer names), so catch any still-floating
     // viewer here now that a target node is resolvable.
     DockLooseViewers();
+
+    // Self-test hook: TGLAB_DROPTEST="x,y,path" simulates dropping `path` at
+    // client point (x,y), which is the one interaction a harness cannot drive
+    // -- a synthetic WM_DROPFILES does not carry a usable drop point.
+    if (m_dropTestCountdown > 0 && --m_dropTestCountdown == 0) {
+        char buf[512] = {};
+        if (GetEnvironmentVariableA("TGLAB_DROPTEST", buf, sizeof(buf)) > 0) {
+            std::string spec(buf);
+            const size_t c1 = spec.find(',');
+            const size_t c2 = spec.find(',', c1 == std::string::npos ? 0 : c1 + 1);
+            if (c1 != std::string::npos && c2 != std::string::npos) {
+                const int dx = std::atoi(spec.substr(0, c1).c_str());
+                const int dy = std::atoi(spec.substr(c1 + 1, c2 - c1 - 1).c_str());
+                const std::string file = spec.substr(c2 + 1);
+                const std::string slot = SlotNameAt(dx, dy);
+                AppTrace(("self-test: drop '" + file + "' at (" + std::to_string(dx) + "," +
+                          std::to_string(dy) + ") -> slot '" + slot + "'").c_str());
+                LoadImageIntoPalette(file, slot);
+            }
+        }
+    }
 
     // Self-test hook: TGLAB_SWITCH=<path> switches to that script after a few
     // frames, driving exactly the path a Scripts-panel click takes. Clicking
@@ -1268,13 +1295,21 @@ LRESULT WINAPI WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             HDROP drop = reinterpret_cast<HDROP>(wParam);
 
             // Where the file was released, so it can replace the slot under the
-            // cursor instead of always adding a new entry.
+            // cursor rather than always adding a new entry.
+            //
+            // ImGui reports window rects in CLIENT coordinates (multi-viewport
+            // is off), so the drop point has to stay in client space too.
+            // DragQueryPoint gives client coordinates already; when it reports
+            // nothing useful, fall back to the actual cursor position converted
+            // the same way.
             POINT pt{};
-            std::string target;
-            if (DragQueryPoint(drop, &pt) || true) {
-                ClientToScreen(hwnd, &pt);
-                if (g_app) target = g_app->SlotNameAt(pt.x, pt.y);
+            if (!DragQueryPoint(drop, &pt) || (pt.x == 0 && pt.y == 0)) {
+                GetCursorPos(&pt);
+                ScreenToClient(hwnd, &pt);
             }
+
+            std::string target;
+            if (g_app) target = g_app->SlotNameAt(pt.x, pt.y);
 
             const UINT n = DragQueryFileA(drop, 0xFFFFFFFF, nullptr, 0);
             for (UINT i = 0; i < n; ++i) {
