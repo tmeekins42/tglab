@@ -74,8 +74,10 @@ public:
     void SetExecMode(ExecMode m) { m_mode.store(m, std::memory_order_relaxed); }
     ExecMode GetExecMode() const { return m_mode.load(std::memory_order_relaxed); }
 
-    // Stages that ran on the GPU in the last completed job.
-    int LastGpuStages() const { return m_lastGpuStages.load(std::memory_order_relaxed); }
+    // How the last completed job split across backends.
+    int LastGpuStages()    const { return m_lastGpuStages.load(std::memory_order_relaxed); }
+    int LastCpuStages()    const { return m_lastCpuStages.load(std::memory_order_relaxed); }
+    int LastCachedStages() const { return m_lastCachedStages.load(std::memory_order_relaxed); }
     double LastRunMs() const { return m_lastMs.load(std::memory_order_relaxed); }
 
     // Replaces any pending job. A slider drag produces ~60 requests/second
@@ -112,6 +114,8 @@ private:
     std::atomic<uint64_t> m_lastFinished{0};
     std::atomic<ExecMode> m_mode{ExecMode::Auto};
     std::atomic<int>      m_lastGpuStages{0};
+    std::atomic<int>      m_lastCpuStages{0};
+    std::atomic<int>      m_lastCachedStages{0};
     std::atomic<double>   m_lastMs{0.0};
     uint64_t              m_nextSeq = 1;
     ID3D12Device*         m_device = nullptr;

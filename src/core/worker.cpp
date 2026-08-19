@@ -130,6 +130,8 @@ void PipelineWorker::Run() {
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
             std::memory_order_relaxed);
         m_lastGpuStages.store(job->pipe.GpuStageCount(), std::memory_order_relaxed);
+        m_lastCpuStages.store(job->pipe.CpuStageCount(), std::memory_order_relaxed);
+        m_lastCachedStages.store(job->pipe.CachedStageCount(), std::memory_order_relaxed);
 
         outcome->ok    = ok;
         outcome->error = err;

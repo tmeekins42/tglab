@@ -67,8 +67,12 @@ public:
     bool Execute(std::vector<Data>* sources, Pipeline* prev, std::string* err,
                  ComputeContext* gpu = nullptr, ExecMode mode = ExecMode::Auto);
 
-    // How many stages actually ran on the GPU last time (for the UI/benchmarks).
-    int GpuStageCount() const { return m_gpuStages; }
+    // How the last run was split. These add up to the pipeline stage count:
+    // stages skipped by the dirty-hash cache are counted separately rather
+    // than vanishing, so "0 CPU, 0 GPU" never means "nothing happened".
+    int GpuStageCount()    const { return m_gpuStages; }
+    int CpuStageCount()    const { return m_cpuStages; }
+    int CachedStageCount() const { return m_cachedStages; }
 
     const Data* Resolve(PortRef r, const std::vector<Data>* sources) const;
 
@@ -88,6 +92,8 @@ private:
     std::vector<Stage>      m_stages;
     std::vector<ViewerDecl> m_viewers;
     int                     m_gpuStages = 0;
+    int                     m_cpuStages = 0;
+    int                     m_cachedStages = 0;
 };
 
 } // namespace tglab

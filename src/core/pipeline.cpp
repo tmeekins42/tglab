@@ -58,6 +58,8 @@ bool Pipeline::SameStage(const Stage& a, const Stage& b) {
 bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* err,
                        ComputeContext* gpu, ExecMode mode) {
     m_gpuStages = 0;
+    m_cpuStages = 0;
+    m_cachedStages = 0;
     // Find the first stage that differs from the previous run. Everything
     // before it can reuse its cached output. Comparing by hash means there is
     // no dirty flag to forget to set.
@@ -73,6 +75,7 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
             m_stages[firstDirty].outputs = std::move(prev->m_stages[firstDirty].outputs);
             m_stages[firstDirty].kernel  = prev->m_stages[firstDirty].kernel;
             m_stages[firstDirty].valid   = true;
+            ++m_cachedStages;
             ++firstDirty;
         }
     }
@@ -152,6 +155,7 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
         if (!ranOnGpu) {
             RunCtx ctx(in, s.outputs);
             s.algo->RunCPU(ctx);
+            ++m_cpuStages;
         }
         s.valid = true;
     }

@@ -1025,16 +1025,26 @@ void App::Frame() {
         }
         ImGui::TextDisabled("%s", m_scriptPath.empty() ? "(no script)" : m_scriptPath.c_str());
 
-        // Timing plus where the work ran — the two numbers you want side by
-        // side when deciding whether a GPU port was worth it.
+        // Timing plus where the work ran — the numbers you want side by side
+        // when deciding whether a GPU port was worth it. Cached stages are
+        // shown too, so the counts always account for every stage rather than
+        // reading as "nothing ran" after a cache hit.
         const char* modeName = "auto";
         switch (m_worker.GetExecMode()) {
             case ExecMode::ForceCPU: modeName = "CPU"; break;
             case ExecMode::ForceGPU: modeName = "GPU"; break;
             case ExecMode::Auto:     modeName = "auto"; break;
         }
-        ImGui::TextDisabled("last run %.1f ms   %d stage(s) on GPU   [%s]",
-                            m_worker.LastRunMs(), m_worker.LastGpuStages(), modeName);
+        const int cached = m_worker.LastCachedStages();
+        if (cached > 0) {
+            ImGui::TextDisabled("last run %.1f ms   %d CPU / %d GPU / %d cached   [%s]",
+                                m_worker.LastRunMs(), m_worker.LastCpuStages(),
+                                m_worker.LastGpuStages(), cached, modeName);
+        } else {
+            ImGui::TextDisabled("last run %.1f ms   %d CPU / %d GPU stage(s)   [%s]",
+                                m_worker.LastRunMs(), m_worker.LastCpuStages(),
+                                m_worker.LastGpuStages(), modeName);
+        }
     }
     ImGui::End();
 
