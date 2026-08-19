@@ -35,6 +35,7 @@ add_library(tglab_core STATIC
     src/core/pipeline.cpp
     src/core/worker.cpp
     src/core/compare.cpp
+    src/algo_util/histogram.cpp
     src/script/lexer.cpp
     src/script/parser.cpp
     src/script/interp.cpp
@@ -52,19 +53,18 @@ target_include_directories(tglab_core PUBLIC
 target_link_libraries(tglab_core PUBLIC imgui d3d12 dxgi dxcompiler)
 
 # ---------------------------------------------------------------------------
-# Algorithms.
+# Algorithms, one subfolder per category.
+#
+# Globbed with CONFIGURE_DEPENDS so dropping a new .cpp into any category
+# folder is picked up on the next build without editing this file — adding an
+# algorithm should cost exactly one file.
 #
 # MUST be an OBJECT library. Algorithms self-register via a static initializer
 # and nothing references their symbols, so a STATIC library would be stripped
 # by the linker and they would silently vanish from the registry.
-add_library(tglab_algorithms OBJECT
-    src/algorithms/brightness.cpp
-    src/algorithms/grayscale.cpp
-    src/algorithms/gaussian_blur.cpp
-    src/algorithms/sobel.cpp
-    src/algorithms/canny_stages.cpp
-    src/algorithms/canny.cpp
-)
+file(GLOB_RECURSE TGLAB_ALGORITHM_SOURCES CONFIGURE_DEPENDS
+     ${CMAKE_SOURCE_DIR}/src/algorithms/*.cpp)
+add_library(tglab_algorithms OBJECT ${TGLAB_ALGORITHM_SOURCES})
 target_link_libraries(tglab_algorithms PUBLIC tglab_core)
 
 # ---------------------------------------------------------------------------
@@ -146,6 +146,8 @@ tglab_copy_dxc(tglab_runtime_tests)
 enable_testing()
 add_test(NAME script_spine COMMAND tglab_tests)
 add_test(NAME runtime      COMMAND tglab_runtime_tests)
+
+
 
 
 

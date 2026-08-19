@@ -64,6 +64,8 @@ private:
     void DrawControlsPanel();
     void DrawPalettePanel();
     void DrawAlgorithmsPanel();
+    void DrawScriptsPanel();
+    void RescanScripts();
     void DrawComparePanel();
     void RequestCompare();
     void SyncViews();
@@ -120,6 +122,12 @@ private:
     bool       m_compareRequested  = false;
     std::vector<std::string> m_stageNames;
     std::vector<bool>        m_stageGpuCapable;
+
+    // Script browser: the .tgl files sitting beside the current script.
+    std::string              m_scriptDir;
+    std::string              m_scriptName;
+    std::vector<std::string> m_scriptList;
+    bool                     m_scriptListDirty = true;
 };
 
 App* g_app = nullptr;
@@ -198,6 +206,14 @@ void App::Shutdown() {
 
 void App::SetScriptPath(const std::string& path) {
     m_scriptPath = path;
+
+    // Split for the script browser: it lists everything beside this file.
+    {
+        const size_t slash = path.find_last_of("/\\");
+        if (slash == std::string::npos) { m_scriptDir = "."; m_scriptName = path; }
+        else { m_scriptDir = path.substr(0, slash); m_scriptName = path.substr(slash + 1); }
+        m_scriptListDirty = true;
+    }
     m_watch.Watch(path);
     if (!ReadTextFile(path, &m_source))
         m_error = "could not read script '" + path + "'";
@@ -477,6 +493,7 @@ void App::BuildDefaultLayout(ImGuiID dockspace) {
 
     ImGui::DockBuilderDockWindow("Images",     leftTop);
     ImGui::DockBuilderDockWindow("Algorithms", leftTop);
+    ImGui::DockBuilderDockWindow("Scripts",    leftTop);
     ImGui::DockBuilderDockWindow("Controls",   leftBottom);
     ImGui::DockBuilderDockWindow("Status",     bottom);
     // Compare gets its own column on the right: it is read side by side with
@@ -757,6 +774,55 @@ void App::DrawComparePanel() {
     ImGui::End();
 }
 
+// Lists every .tgl beside the current script, so switching experiments is a
+// click rather than a relaunch. Scanned on demand rather than watched: the
+// directory changes far less often than the script itself.
+void App::DrawScriptsPanel() {
+    if (!ImGui::Begin("Scripts")) { ImGui::End(); return; }
+
+    if (ImGui::Button("Refresh")) m_scriptListDirty = true;
+    ImGui::SameLine();
+    ImGui::TextDisabled("%s", m_scriptDir.empty() ? "(no directory)" : m_scriptDir.c_str());
+    ImGui::Separator();
+
+    if (m_scriptListDirty) {
+        m_scriptListDirty = false;
+        RescanScripts();
+    }
+
+    if (m_scriptList.empty()) {
+        ImGui::TextDisabled("No .tgl files found.");
+        ImGui::End();
+        return;
+    }
+
+    for (const std::string& name : m_scriptList) {
+        const bool current = (name == m_scriptName);
+        if (ImGui::Selectable(name.c_str(), current) && !current) {
+            SetScriptPath(m_scriptDir + "\\" + name);
+        }
+    }
+    ImGui::End();
+}
+
+// Fills m_scriptList with the .tgl files in m_scriptDir, sorted.
+void App::RescanScripts() {
+    m_scriptList.clear();
+    if (m_scriptDir.empty()) return;
+
+    WIN32_FIND_DATAA fd{};
+    const std::string pattern = m_scriptDir + "\\*.tgl";
+    HANDLE h = FindFirstFileA(pattern.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+            m_scriptList.push_back(fd.cFileName);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+
+    std::sort(m_scriptList.begin(), m_scriptList.end());
+}
+
 void App::DrawPalettePanel() {
     if (!ImGui::Begin("Images")) { ImGui::End(); return; }
 
@@ -823,6 +889,7 @@ void App::Frame() {
 
     DrawMenuBar();
     DrawPalettePanel();
+    DrawScriptsPanel();
     DrawControlsPanel();
     DrawAlgorithmsPanel();
     // DrawComparePanel() uploads a texture, so it must run after BeginFrame()

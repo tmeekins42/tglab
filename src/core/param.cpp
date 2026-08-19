@@ -3,6 +3,7 @@
 #include <cstring>
 
 #include "algorithm.h"
+#include "../script/interp.h"
 #include "../script/value.h"
 
 #include "imgui.h"
@@ -93,6 +94,40 @@ bool Param<bool>::DrawWidget() {
     bool tmp = m_v;
     if (ImGui::Checkbox(m_name, &tmp)) return set(tmp);
     return false;
+}
+// --- control description (for the script's params() builtin) ----------------
+//
+// Each parameter knows its own widget kind, range and default, so params() can
+// build the UI without the script restating any of it.
+
+template <>
+bool Param<float>::DescribeControl(UiControl* out) const {
+    out->kind  = UiControl::Kind::Slider;
+    out->lo    = double(m_lo);
+    out->hi    = double(m_hi);
+    out->def   = double(m_def);
+    out->value = double(m_def);
+    return true;
+}
+
+template <>
+bool Param<int>::DescribeControl(UiControl* out) const {
+    // Ints ride the same slider; the value truncates at the Param boundary.
+    out->kind  = UiControl::Kind::Slider;
+    out->lo    = double(m_lo);
+    out->hi    = double(m_hi);
+    out->def   = double(m_def);
+    out->value = double(m_def);
+    return true;
+}
+
+bool Param<bool>::DescribeControl(UiControl* out) const {
+    out->kind  = UiControl::Kind::Check;
+    out->lo    = 0.0;
+    out->hi    = 1.0;
+    out->def   = m_def ? 1.0 : 0.0;
+    out->value = out->def;
+    return true;
 }
 
 template class Param<float>;

@@ -14,6 +14,7 @@
 namespace tglab {
 
 class AlgorithmBase;
+struct UiControl;
 class Value;
 
 enum class ParamType : uint8_t { Float, Int, Bool };
@@ -34,6 +35,11 @@ public:
     // Returns true if the value actually changed (drives the dirty hash).
     virtual bool SetFromScript(const Value& v, std::string* err) = 0;
     virtual bool DrawWidget() = 0;
+
+    // Fills in kind/range/default so the script can auto-expose this parameter
+    // as a UI control (the params() builtin). Returns false for kinds that have
+    // no widget yet. The label is set by the caller.
+    virtual bool DescribeControl(UiControl* out) const = 0;
 
     // Folded into Stage::paramHash for dirty detection.
     virtual uint64_t HashValue() const = 0;
@@ -69,6 +75,7 @@ public:
     ParamType Type() const override;
     bool      SetFromScript(const Value& v, std::string* err) override;
     bool      DrawWidget() override;
+    bool      DescribeControl(UiControl* out) const override;
     uint64_t  HashValue() const override;
 
 private:
@@ -93,6 +100,7 @@ public:
     ParamType Type() const override { return ParamType::Bool; }
     bool      SetFromScript(const Value& v, std::string* err) override;
     bool      DrawWidget() override;
+    bool      DescribeControl(UiControl* out) const override;
     uint64_t  HashValue() const override { return m_v ? 1ull : 0ull; }
 
 private:

@@ -8,7 +8,7 @@
 #include <cmath>
 #include <vector>
 
-#include "../core/algorithm.h"
+#include "../../core/algorithm.h"
 
 namespace tglab {
 

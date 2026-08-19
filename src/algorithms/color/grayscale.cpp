@@ -2,7 +2,7 @@
 // Also the M1 check that self-registration survives the linker.
 #include <algorithm>
 
-#include "../core/algorithm.h"
+#include "../../core/algorithm.h"
 
 namespace tglab {
 

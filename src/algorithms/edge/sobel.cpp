@@ -6,7 +6,7 @@
 #include <algorithm>
 #include <cmath>
 
-#include "../core/algorithm.h"
+#include "../../core/algorithm.h"
 
 namespace tglab {
 

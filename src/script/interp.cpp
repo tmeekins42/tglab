@@ -281,6 +281,7 @@ private:
         if (calleeName == "slider")  return CallSlider(e, out);
         if (calleeName == "check")   return CallCheck(e, out);
         if (calleeName == "choose")  return CallChoose(e, out);
+        if (calleeName == "params")  return CallParams(e, out);
         if (calleeName == "display") return CallDisplay(e, out);
 
         return CallAlgorithm(calleeName, e, out, wantAll);
@@ -400,6 +401,44 @@ private:
         return true;
     }
 
+    // params(algo) declares a UI control for every parameter the algorithm
+    // has, using its own name, range and default, and returns the algorithm so
+    // the call reads naturally:
+    //
+    //     op  = choose("operator", "threshold")
+    //     out = params(op)(src)
+    //
+    // Switching the dropdown swaps the whole control set, because controls the
+    // run does not re-declare are dropped (UiState::DropUnseen). A newly
+    // written algorithm exposes its parameters with no script edit at all --
+    // the same win choose() gives for algorithm selection.
+    bool CallParams(const Expr& e, std::vector<Value>* out) {
+        EvaledArgs a;
+        if (!EvalArgs(e, &a)) return false;
+        if (a.pos.size() != 1 || !a.pos[0].IsAlgo())
+            return Fail(e.line, "params() takes one algorithm: params(op)");
+
+        const std::string& name = a.pos[0].AsAlgo().name;
+        auto probe = Registry::Get().Create(name);
+        if (!probe) return Fail(e.line, "unknown algorithm '" + name + "'");
+
+        // Prefix the label with the algorithm name so two algorithms that each
+        // have a "window" parameter get separate controls rather than
+        // silently sharing one.
+        ParamValues pv;
+        for (ParamBase* p : probe->Params()) {
+            UiControl proto;
+            proto.label = name + "." + p->Name();
+            if (!p->DescribeControl(&proto)) continue;
+            UiControl& c = m_ui->FindOrAdd(proto);
+            pv.values.emplace_back(p->Name(), c.value);
+        }
+
+        m_pendingParams[name] = std::move(pv);
+        out->push_back(a.pos[0]);   // pass the algorithm through
+        return true;
+    }
+
     bool CallDisplay(const Expr& e, std::vector<Value>* out) {
         EvaledArgs a;
         if (!EvalArgs(e, &a)) return false;
@@ -449,6 +488,17 @@ private:
             inputs.push_back(PortRef{h.stage, h.port});
         }
 
+        // Values from a params() declaration are applied first, so an explicit
+        // named argument in the same call still wins.
+        if (auto pit = m_pendingParams.find(name); pit != m_pendingParams.end()) {
+            for (const auto& [pname, pvalue] : pit->second.values) {
+                if (ParamBase* p = algo->FindParam(pname)) {
+                    std::string perr;
+                    p->SetFromScript(Value(pvalue), &perr);
+                }
+            }
+        }
+
         // Named arguments bind to parameters.
         for (const auto& [pname, pval] : a.named) {
             ParamBase* p = algo->FindParam(pname);
@@ -476,6 +526,10 @@ private:
     std::unordered_map<std::string, Value> m_vars;
     std::unordered_map<std::string, int>   m_stageOfVar;
     int                                    m_lastStage = -1;
+    // Values declared by params(), applied when that algorithm is next called.
+    // Keyed by algorithm name.
+    struct ParamValues { std::vector<std::pair<std::string, double>> values; };
+    std::unordered_map<std::string, ParamValues> m_pendingParams;
     std::string                            m_err;
 };
 

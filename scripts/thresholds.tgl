@@ -1,0 +1,18 @@
+# Thresholding — pick a method from the dropdown; its own parameters appear
+# below automatically via params().
+#
+# Adding a new algorithm with Category()=="threshold" makes it show up here
+# with its controls, without editing this script at all.
+
+src = image("test")
+
+op = choose("method", "threshold")
+
+pre   = slider("pre-blur sigma", 0.0, 8.0, 0.0)
+blurred = gaussian_blur(src, sigma = pre)
+
+mask = params(op)(blurred)
+
+display(src,     "1 source")
+display(blurred, "2 pre-blurred")
+display(mask,    "3 mask")

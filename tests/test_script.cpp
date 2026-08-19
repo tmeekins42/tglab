@@ -1,10 +1,12 @@
 // Headless checks for the script spine: parse -> interpret -> execute.
 // Runs without a window, so failures here are quick to diagnose.
+#include <cmath>
 #include <cstdio>
 #include <string>
 #include <vector>
 
 #include "../src/core/algorithm.h"
+#include "../src/algo_util/histogram.h"
 #include "../src/core/pipeline.h"
 #include "../src/script/interp.h"
 #include "../src/script/parser.h"
@@ -467,6 +469,162 @@ int main() {
         RunScript(kScript, &ui, &p2, &err, &src);
         Check(ui.Controls()[0].def == 2.5,
               "the scripted default survives a re-run, so reset stays correct");
+    }
+
+    // --- params() auto-exposes an algorithm's own controls -------------------
+    {
+        // The point: one script serves a whole category, and each method's own
+        // parameters appear without the script naming any of them.
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        const bool ok = RunScript(
+            "src = image(\"test\")\n"
+            "op = choose(\"method\", \"threshold\")\n"
+            "m = params(op)(src)\n"
+            "display(m)\n", &ui, &p, &err, &src);
+        Check(ok, "params() runs" + (ok ? "" : ": " + err));
+
+        // One dropdown plus one control per parameter of the selected method.
+        bool sawDropdown = false, sawParamControl = false;
+        for (const UiControl& c : ui.Controls()) {
+            if (c.kind == UiControl::Kind::Choose) sawDropdown = true;
+            if (c.label.rfind("threshold.", 0) == 0) sawParamControl = true;
+        }
+        Check(sawDropdown, "choose() declared its dropdown");
+        Check(sawParamControl, "params() declared the algorithm's own controls");
+    }
+    {
+        // Switching the dropdown must swap the control set, not accumulate it:
+        // controls a run does not re-declare are dropped.
+        UiState ui; std::string err; std::vector<Data> src;
+        const char* kScript =
+            "src = image(\"test\")\n"
+            "op = choose(\"method\", [threshold_niblack, threshold_bernsen])\n"
+            "m = params(op)(src)\n"
+            "display(m)\n";
+        Pipeline p1;
+        RunScript(kScript, &ui, &p1, &err, &src);
+        bool niblack = false;
+        for (const UiControl& c : ui.Controls())
+            if (c.label.find("niblack") != std::string::npos) niblack = true;
+        Check(niblack, "the first method's parameters are exposed");
+
+        if (UiControl* c = ui.Find("method")) c->selected = 1;   // switch method
+        Pipeline p2;
+        RunScript(kScript, &ui, &p2, &err, &src);
+
+        bool stillNiblack = false, nowBernsen = false;
+        for (const UiControl& c : ui.Controls()) {
+            if (c.label.find("niblack") != std::string::npos) stillNiblack = true;
+            if (c.label.find("bernsen") != std::string::npos) nowBernsen = true;
+        }
+        Check(nowBernsen, "switching the dropdown exposes the new method's parameters");
+        Check(!stillNiblack, "the previous method's controls are dropped, not accumulated");
+        Check(p2.Stages()[0].algoName == "threshold_bernsen",
+              "the selected algorithm is the one that runs");
+    }
+    {
+        // An explicit named argument must still beat the params() slider.
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        const bool ok = RunScript(
+            "src = image(\"test\")\n"
+            "m = params(threshold_niblack)(src, window = 31)\n"
+            "display(m)\n", &ui, &p, &err, &src);
+        Check(ok, "params() accepts an explicit override" + (ok ? "" : ": " + err));
+        if (ok) {
+            ParamBase* w = p.Stages()[0].algo->FindParam("window");
+            Check(w && w->HashValue() == uint64_t(uint32_t(31)),
+                  "the explicit argument wins over the declared control");
+        }
+    }
+    {
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        RunScript("m = params(42)\n", &ui, &p, &err, &src);
+        Check(!err.empty(), "params() rejects a non-algorithm: \"" + err + "\"");
+    }
+
+    // --- histogram and thresholding -----------------------------------------
+    {
+        // Bimodal: half at 60, half at 200. Every statistic has a known answer.
+        ImageDesc d{64, 64, Format::RGBA8};
+        Image img;
+        img.Alloc(d);
+        ImageView v = img.MapCpuWrite();
+        for (int y = 0; y < 64; ++y)
+            for (int x = 0; x < 64; ++x) {
+                uint8_t* p = v.At<uint8_t>(x, y);
+                const uint8_t g = (x < 32) ? 60 : 200;
+                p[0] = p[1] = p[2] = g;
+                p[3] = 255;
+            }
+
+        Histogram h;
+        h.Build(v);
+        Check(h.Count() == 64 * 64, "histogram counts every pixel");
+        Check(std::fabs(h.Mean() - 130.0) < 2.0, "histogram mean is midway between the modes");
+        Check(h.MinValue() <= 61 && h.MaxValue() >= 199, "histogram min/max span both modes");
+
+        // Every threshold between the modes scores identically, so Otsu returns
+        // the plateau midpoint. Comparing with an ABSOLUTE epsilon here is a
+        // real bug: between-class variance runs to ~1e11, where 1e-9 is below
+        // float resolution and the plateau collapses onto its first bin.
+        const double otsu = h.OtsuThreshold();
+        Check(otsu > 61 && otsu < 199,
+              "Otsu splits between the modes, not on one (" + std::to_string(otsu) + ")");
+        Check(std::fabs(h.IsoDataThreshold() - 130.0) < 12.0, "IsoData lands near the midpoint");
+
+        LocalStats s = WindowStats(v, 10, 10, 3);
+        Check(std::fabs(s.mean - 60.0) < 0.01 && s.stddev < 0.01,
+              "uniform window has the region mean and zero stddev");
+
+        // The integral image is only worth having if it agrees with the direct
+        // computation it replaces.
+        IntegralImage ii;
+        ii.Build(v);
+        LocalStats a = ii.Window(20, 20, 5);
+        LocalStats b = WindowStats(v, 20, 20, 5);
+        Check(std::fabs(a.mean - b.mean) < 0.01, "integral image mean matches direct");
+        Check(std::fabs(a.stddev - b.stddev) < 0.01, "integral image stddev matches direct");
+    }
+    {
+        // Every threshold algorithm must produce a usable mask, not all-on or
+        // all-off, on an image that plainly has two regions.
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        const char* kMethods[] = {
+            "threshold", "threshold_otsu", "threshold_triangle", "threshold_isodata",
+            "threshold_niblack", "threshold_sauvola", "threshold_bernsen",
+            "threshold_adaptive_mean", "threshold_adaptive_gaussian"};
+        int degenerate = 0;
+        for (const char* m : kMethods) {
+            Pipeline pipe;
+            UiState u;
+            std::vector<Data> s;
+            const std::string script =
+                std::string("src = image(\"test\")\nm = ") + m + "(src)\ndisplay(m)\n";
+            if (!RunScript(script.c_str(), &u, &pipe, &err, &s)) {
+                Check(false, std::string(m) + " runs: " + err);
+                continue;
+            }
+            ImageView o = std::get<Image>(pipe.Stages()[0].outputs[0]).MapCpuRead();
+            int on = 0;
+            const int n = o.desc.width * o.desc.height;
+            for (int i = 0; i < n; ++i)
+                if (reinterpret_cast<const float*>(o.data)[i] > 0.5f) ++on;
+            if (on == 0 || on == n) ++degenerate;
+        }
+        Check(degenerate == 0, "no threshold method produced an all-on or all-off mask");
+    }
+    {
+        // Categories must stay interchangeable: choose("x", "threshold") offers
+        // all of these, so every one must take a single image.
+        bool allOneInput = true;
+        const auto names = Registry::Get().NamesInCategory("threshold");
+        for (const std::string& n : names) {
+            auto a = Registry::Get().Create(n);
+            if (!a || a->Inputs().size() != 1) allOneInput = false;
+        }
+        Check(names.size() >= 9, "the threshold category has all the methods (" +
+                                     std::to_string(names.size()) + ")");
+        Check(allOneInput, "every threshold algorithm takes one image");
     }
 
     std::printf("\n%s\n", g_fail == 0 ? "all checks passed" : "FAILURES PRESENT");

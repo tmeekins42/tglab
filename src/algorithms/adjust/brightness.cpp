@@ -4,7 +4,7 @@
 // -> ports -> params -> display), not the math.
 #include <algorithm>
 
-#include "../core/algorithm.h"
+#include "../../core/algorithm.h"
 
 namespace tglab {
 
