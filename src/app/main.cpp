@@ -105,7 +105,8 @@ private:
     std::string m_error;        // last script/run error, empty when fine
     bool        m_dirty = true; // re-run requested
     uint64_t    m_contentVersion = 1;
-    bool        m_rebuildLayout = false;   // set once viewer names are known
+    bool        m_rebuildLayout = false;   // explicit "Reset layout" request
+    int         m_layoutCountdown = 0;     // frames until the default layout is built
     bool        m_haveSavedLayout = false; // a tglab_layout.ini already existed
     ImGuiID     m_centreNode = 0;          // where new viewers get docked
     ImGuiID     m_dockspaceId = 0;         // fallback when a saved layout exists
@@ -157,6 +158,14 @@ bool App::Init(HWND hwnd) {
 
     // If the user already has a layout, never overwrite it with the default.
     m_haveSavedLayout = (GetFileAttributesA(io.IniFilename) != INVALID_FILE_ATTRIBUTES);
+
+    // Build the default arrangement unless the user has a saved one. Deferred
+    // by one frame: DockBuilderDockWindow only binds windows ImGui has already
+    // seen, and none of the panels exist until they have been drawn once.
+    // Doing this here rather than when viewers appear means the panels are
+    // docked even when the script fails before declaring any -- which is the
+    // state you land in launching with no arguments.
+    m_layoutCountdown = m_haveSavedLayout ? 0 : 2;
 
     AppTrace("imgui context created");
     ImGui_ImplWin32_Init(hwnd);
@@ -414,10 +423,12 @@ void App::SyncViews() {
     m_views = std::move(next);
     for (auto& v : m_views) v->SetSharedCamera(m_syncCameras ? &m_sharedCam : nullptr);
 
-    // First time viewers appear, dock them — but only when the user has no
-    // saved layout of their own to preserve.
-    if (before == 0 && !m_views.empty() && !m_haveSavedLayout) m_rebuildLayout = true;
-
+    // The default layout is built once per session, not when viewers first
+    // appear. Gating it on viewers meant that a script which fails before
+    // declaring any (no image loaded, a syntax error) left every panel
+    // floating in a stack — which is exactly the state you land in when
+    // launching with no arguments at all.
+    (void)before;
     DockLooseViewers();
 }
 
@@ -477,7 +488,16 @@ ImGuiID App::CentreDockNode() const {
 // (or after Reset layout). Once tglab_layout.ini exists the user's own
 // arrangement wins and this does nothing.
 void App::BuildDefaultLayout(ImGuiID dockspace) {
-    if (!m_rebuildLayout) return;
+    // Two ways in: a countdown that lets the panels be drawn once before we
+    // dock them (DockBuilderDockWindow only binds windows ImGui has already
+    // seen), or an explicit Reset layout, which can fire immediately because
+    // by then every panel exists.
+    bool build = m_rebuildLayout;
+    if (m_layoutCountdown > 0) {
+        --m_layoutCountdown;
+        if (m_layoutCountdown == 0) build = true;
+    }
+    if (!build) return;
     m_rebuildLayout = false;
 
     ImGui::DockBuilderRemoveNode(dockspace);
@@ -1012,11 +1032,19 @@ int main(int argc, char** argv) {
 
     // Command line: [script.tgl] [image ...]
     std::string script = "scripts/hello.tgl";
+    bool gotImage = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
-        if (a.size() > 4 && a.substr(a.size() - 4) == ".tgl") script = a;
-        else app.LoadImageIntoPalette(a);
+        if (a.size() > 4 && a.substr(a.size() - 4) == ".tgl") {
+            script = a;
+        } else {
+            app.LoadImageIntoPalette(a);
+            gotImage = true;
+        }
     }
+    // Launching bare should show something working, not an error about a
+    // missing palette entry, so load the sample the stock scripts refer to.
+    if (!gotImage) app.LoadImageIntoPalette("assets/test.png");
     app.SetScriptPath(script);
 
     bool running = true;
