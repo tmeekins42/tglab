@@ -41,6 +41,30 @@ void AppTrace(const char* stage) {
     OutputDebugStringA(stage);
 }
 
+// Resolves a data path (scripts/, assets/) whatever directory the app was
+// launched from. Tried in order: as given, then beside the executable, then
+// one/two/three levels up from it -- which is where the repo root sits when
+// running straight out of build/Debug.
+std::string ResolveDataPath(const std::string& rel) {
+    if (GetFileAttributesA(rel.c_str()) != INVALID_FILE_ATTRIBUTES) return rel;
+
+    char exe[MAX_PATH] = {};
+    if (GetModuleFileNameA(nullptr, exe, MAX_PATH) == 0) return rel;
+
+    std::string dir(exe);
+    if (const size_t slash = dir.find_last_of("/\\"); slash != std::string::npos)
+        dir = dir.substr(0, slash);
+
+    for (int up = 0; up < 4; ++up) {
+        const std::string candidate = dir + "\\" + rel;
+        if (GetFileAttributesA(candidate.c_str()) != INVALID_FILE_ATTRIBUTES) return candidate;
+        const size_t slash = dir.find_last_of("/\\");
+        if (slash == std::string::npos) break;
+        dir = dir.substr(0, slash);
+    }
+    return rel;   // let the caller report the failure
+}
+
 struct PaletteEntry {
     std::string name;
     std::string path;
@@ -103,6 +127,7 @@ private:
     bool       m_syncCameras = true;
 
     std::string m_error;        // last script/run error, empty when fine
+    std::string m_loadError;    // script file could not be read (survives a re-run)
     bool        m_dirty = true; // re-run requested
     uint64_t    m_contentVersion = 1;
     bool        m_rebuildLayout = false;   // explicit "Reset layout" request
@@ -224,8 +249,15 @@ void App::SetScriptPath(const std::string& path) {
         m_scriptListDirty = true;
     }
     m_watch.Watch(path);
-    if (!ReadTextFile(path, &m_source))
-        m_error = "could not read script '" + path + "'";
+    if (!ReadTextFile(path, &m_source)) {
+        // Keep the failure visible: an unread script leaves m_source empty,
+        // and an empty script parses fine and declares nothing, so without
+        // this the app would look like it started normally with no panels.
+        m_source.clear();
+        m_loadError = "could not read script '" + path + "'";
+    } else {
+        m_loadError.clear();
+    }
     m_dirty = true;
     UpdateWindowTitle();
 
@@ -268,6 +300,15 @@ void App::LoadImageIntoPalette(const std::string& path) {
 void App::RunScript() {
     const std::string prevError = m_error;
     m_error.clear();
+
+    // A script that could not be read is not an empty script: running one
+    // would silently succeed and declare no panels at all.
+    if (!m_loadError.empty()) {
+        m_error = m_loadError;
+        ReportError(prevError);
+        UpdateWindowTitle();
+        return;
+    }
 
     // Sources are rebuilt each run so PortRef{-1, i} stays in step. The worker
     // gets its own copies, since it may still be reading them next frame.
@@ -1031,7 +1072,7 @@ int main(int argc, char** argv) {
     UpdateWindow(hwnd);
 
     // Command line: [script.tgl] [image ...]
-    std::string script = "scripts/hello.tgl";
+    std::string script = ResolveDataPath("scripts/hello.tgl");
     bool gotImage = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -1044,7 +1085,7 @@ int main(int argc, char** argv) {
     }
     // Launching bare should show something working, not an error about a
     // missing palette entry, so load the sample the stock scripts refer to.
-    if (!gotImage) app.LoadImageIntoPalette("assets/test.png");
+    if (!gotImage) app.LoadImageIntoPalette(ResolveDataPath("assets/test.png"));
     app.SetScriptPath(script);
 
     bool running = true;
