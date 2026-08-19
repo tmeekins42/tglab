@@ -55,6 +55,31 @@ stderr.
 
 Double-click any control to restore its scripted default, or use **Reset all**.
 
+
+### Performance note
+
+Algorithms run on the worker thread, so the UI stays responsive no matter how
+long a run takes — but a **Debug build is roughly 30x slower than Release**.
+On an 8 MP scan (3504x2336) the difference is stark:
+
+| | Debug | Release |
+|---|---|---|
+| `threshold_otsu` | 1.3 s | 0.17 s |
+| `threshold_sauvola` | 3.5 s | 0.33 s |
+| `gaussian_blur` (sigma 8) | ~60 s | 3.1 s |
+
+If a large image feels like it has hung, check the Status panel: it shows
+elapsed time and a spinner while the worker is busy. Build Release for real
+work:
+
+```sh
+cmake --build build --config Release
+```
+
+Non-power-of-2 image sizes are fine, as are spaces in file paths. Palette
+names are the filename without extension and are **case-sensitive**, so
+`IMG_2369.jpg` is referenced as `image("IMG_2369")`.
+
 ## Tests
 
 ```sh
@@ -227,6 +252,9 @@ being algorithms themselves. Currently:
 - `IntegralImage` — summed-area table, making windowed mean and stddev O(1)
   per pixel instead of O(r²). The difference between a usable and an unusable
   local thresholder at large window sizes.
+- `MinMaxFilter` — windowed min/max in two separable passes, O(2r) per pixel.
+  The equivalent trick for statistics an integral image cannot express: at
+  8 MP the direct O(r²) version took over two minutes.
 - `SampleValue()` — reads any format as a double, with clamp-to-edge.
 
 ### Adding a GPU kernel

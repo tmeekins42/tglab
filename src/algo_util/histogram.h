@@ -93,6 +93,28 @@ LocalStats WindowStats(const ImageView& v, int cx, int cy, int radius, int chann
 // Integral images (summed-area tables) make windowed mean/stddev O(1) per
 // pixel instead of O(r^2) — the difference between a usable and an unusable
 // local thresholder at large window sizes.
+// Windowed min/max via two separable passes: horizontal, then vertical. This
+// is O(2r) per pixel instead of the O(r^2) a direct window scan costs, which
+// at 8 MP and a 15x15 window is the difference between ~1 second and minutes.
+//
+// Bernsen needs window min/max, and an integral image cannot provide them --
+// so this is the equivalent trick for that family of statistic.
+class MinMaxFilter {
+public:
+    void Build(const ImageView& v, int radius, int channel = -1);
+
+    double Min(int x, int y) const { return m_min[Index(x, y)]; }
+    double Max(int x, int y) const { return m_max[Index(x, y)]; }
+
+    bool Valid() const { return m_w > 0 && m_h > 0; }
+
+private:
+    size_t Index(int x, int y) const { return size_t(y) * size_t(m_w) + size_t(x); }
+
+    int m_w = 0, m_h = 0;
+    std::vector<double> m_min, m_max;
+};
+
 class IntegralImage {
 public:
     void Build(const ImageView& v, int channel = -1);

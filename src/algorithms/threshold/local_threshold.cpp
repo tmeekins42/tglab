@@ -2,11 +2,12 @@
 // from a window around it. These handle uneven lighting, where any single
 // global threshold necessarily fails somewhere in the image.
 //
-// Niblack, Sauvola and the adaptive-mean pair all need windowed mean/stddev,
-// so they share an integral image — O(1) per pixel instead of O(r^2), which is
-// the difference between usable and unusable at large window sizes. Bernsen
-// needs window min/max, which an integral image cannot provide, so it uses the
-// direct path.
+// Every method here is O(1) or O(2r) per pixel, never O(r^2). Niblack,
+// Sauvola and the adaptive-mean pair need windowed mean/stddev, so they share
+// an integral image; Bernsen needs window min/max, which an integral image
+// cannot give, so it uses a separable min/max filter instead. At 8 MP with a
+// 15x15 window the direct O(r^2) version took over two minutes -- long enough
+// to look like the app had hung.
 #include <algorithm>
 #include <cmath>
 
@@ -56,10 +57,18 @@ public:
                 }
             }
         } else {
+            // Separable min/max rather than a per-pixel window scan. The direct
+            // version is O(r^2): at 8 MP with a 15x15 window that is ~1.8
+            // billion samples, which took over two minutes and looked like the
+            // app had hung.
+            m_minmax.Build(src, radius);
             for (int y = 0; y < h; ++y) {
                 float* row = dst.At<float>(0, y);
                 for (int x = 0; x < w; ++x) {
-                    const LocalStats s = WindowStats(src, x, y, radius);
+                    LocalStats s;
+                    s.minV = m_minmax.Min(x, y);
+                    s.maxV = m_minmax.Max(x, y);
+                    s.mean = 0.5 * (s.minV + s.maxV);   // Bernsen uses the midpoint
                     const double t = Threshold(s);
                     const bool above = SampleValue(src, x, y, -1) > t;
                     row[x] = (above != invert) ? 1.0f : 0.0f;
@@ -77,6 +86,7 @@ protected:
 
 private:
     IntegralImage m_integral;
+    MinMaxFilter  m_minmax;
 };
 
 // --- Niblack ----------------------------------------------------------------
@@ -203,13 +213,29 @@ public:
         const int w = src.desc.width;
         const int h = src.desc.height;
 
+        // Convert to a flat luma buffer once. SampleValue() carries a format
+        // switch and clamping, and the separable passes call it ~2*(2r+1) times
+        // per pixel -- at 8 MP that is hundreds of millions of calls, which is
+        // where the time went rather than in the maths.
+        m_luma.assign(size_t(w) * size_t(h), 0.0f);
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x)
+                m_luma[size_t(y) * size_t(w) + size_t(x)] =
+                    float(SampleValue(src, x, y, -1));
+
+        auto luma = [&](int x, int y) {
+            x = std::clamp(x, 0, w - 1);
+            y = std::clamp(y, 0, h - 1);
+            return double(m_luma[size_t(y) * size_t(w) + size_t(x)]);
+        };
+
         // Horizontal pass into scratch, then vertical while thresholding.
         m_scratch.assign(size_t(w) * size_t(h), 0.0);
         for (int y = 0; y < h; ++y)
             for (int x = 0; x < w; ++x) {
                 double acc = 0;
                 for (int i = -radius; i <= radius; ++i)
-                    acc += SampleValue(src, x + i, y, -1) * k[size_t(i + radius)];
+                    acc += luma(x + i, y) * k[size_t(i + radius)];
                 m_scratch[size_t(y) * size_t(w) + size_t(x)] = acc;
             }
 
@@ -221,7 +247,7 @@ public:
                     const int sy = std::clamp(y + i, 0, h - 1);
                     acc += m_scratch[size_t(sy) * size_t(w) + size_t(x)] * k[size_t(i + radius)];
                 }
-                const bool above = SampleValue(src, x, y, -1) > (acc - c);
+                const bool above = luma(x, y) > (acc - c);
                 row[x] = (above != invert) ? 1.0f : 0.0f;
             }
         }
@@ -234,6 +260,7 @@ private:
     Param<bool>  m_invert{this, "invert", false};
 
     std::vector<double> m_scratch;
+    std::vector<float>  m_luma;
 };
 
 REGISTER_ALGORITHM(AdaptiveGaussianThreshold);

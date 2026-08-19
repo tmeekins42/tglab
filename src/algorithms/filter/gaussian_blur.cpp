@@ -42,30 +42,62 @@ public:
         const int h = src.desc.height;
         const int ch = (src.desc.format == Format::R32F) ? 1 : 4;
 
+        // Unpack to a flat float buffer once. Read() carries a per-call format
+        // branch and the separable passes touch it (2r+1) times per pixel per
+        // channel -- at 8 MP with sigma 8 that is billions of calls, and it is
+        // where the time actually went.
+        m_input.assign(size_t(w) * size_t(h) * size_t(ch), 0.0f);
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x)
+                for (int c = 0; c < ch; ++c)
+                    m_input[(size_t(y) * size_t(w) + size_t(x)) * size_t(ch) + size_t(c)] =
+                        Read(src, x, y, c);
+
         // Horizontal pass into a scratch buffer, then vertical into dst.
         m_scratch.assign(size_t(w) * size_t(h) * size_t(ch), 0.0f);
 
         for (int y = 0; y < h; ++y) {
+            const size_t rowBase = size_t(y) * size_t(w);
             for (int x = 0; x < w; ++x) {
                 float acc[4] = {0, 0, 0, 0};
-                for (int i = -radius; i <= radius; ++i) {
-                    const int sx = std::clamp(x + i, 0, w - 1);   // clamp-to-edge
-                    const float wgt = k[size_t(i + radius)];
-                    for (int c = 0; c < ch; ++c) acc[c] += Read(src, sx, y, c) * wgt;
+                // The interior needs no clamping, which lets the compiler
+                // vectorise the common case; edges take the slow path.
+                if (x >= radius && x + radius < w) {
+                    const float* base = &m_input[(rowBase + size_t(x - radius)) * size_t(ch)];
+                    for (int i = 0; i <= radius * 2; ++i) {
+                        const float wgt = k[size_t(i)];
+                        const float* s = base + size_t(i) * size_t(ch);
+                        for (int c = 0; c < ch; ++c) acc[c] += s[c] * wgt;
+                    }
+                } else {
+                    for (int i = -radius; i <= radius; ++i) {
+                        const int sx = std::clamp(x + i, 0, w - 1);   // clamp-to-edge
+                        const float wgt = k[size_t(i + radius)];
+                        const float* s = &m_input[(rowBase + size_t(sx)) * size_t(ch)];
+                        for (int c = 0; c < ch; ++c) acc[c] += s[c] * wgt;
+                    }
                 }
-                for (int c = 0; c < ch; ++c)
-                    m_scratch[(size_t(y) * size_t(w) + size_t(x)) * size_t(ch) + size_t(c)] = acc[c];
+                float* d = &m_scratch[(rowBase + size_t(x)) * size_t(ch)];
+                for (int c = 0; c < ch; ++c) d[c] = acc[c];
             }
         }
 
         for (int y = 0; y < h; ++y) {
             for (int x = 0; x < w; ++x) {
                 float acc[4] = {0, 0, 0, 0};
-                for (int i = -radius; i <= radius; ++i) {
-                    const int sy = std::clamp(y + i, 0, h - 1);
-                    const float wgt = k[size_t(i + radius)];
-                    for (int c = 0; c < ch; ++c)
-                        acc[c] += m_scratch[(size_t(sy) * size_t(w) + size_t(x)) * size_t(ch) + size_t(c)] * wgt;
+                if (y >= radius && y + radius < h) {
+                    for (int i = 0; i <= radius * 2; ++i) {
+                        const float wgt = k[size_t(i)];
+                        const float* s = &m_scratch[(size_t(y - radius + i) * size_t(w) + size_t(x)) * size_t(ch)];
+                        for (int c = 0; c < ch; ++c) acc[c] += s[c] * wgt;
+                    }
+                } else {
+                    for (int i = -radius; i <= radius; ++i) {
+                        const int sy = std::clamp(y + i, 0, h - 1);
+                        const float wgt = k[size_t(i + radius)];
+                        const float* s = &m_scratch[(size_t(sy) * size_t(w) + size_t(x)) * size_t(ch)];
+                        for (int c = 0; c < ch; ++c) acc[c] += s[c] * wgt;
+                    }
                 }
                 Write(dst, x, y, acc, ch);
             }
@@ -150,6 +182,7 @@ private:
 
     // Reused across runs to avoid reallocating on every slider drag.
     std::vector<float> m_scratch;
+    std::vector<float> m_input;
 };
 
 REGISTER_ALGORITHM(GaussianBlur);

@@ -319,4 +319,52 @@ LocalStats IntegralImage::Window(int cx, int cy, int radius) const {
     return s;
 }
 
+
+// --- separable min/max filter -----------------------------------------------
+
+void MinMaxFilter::Build(const ImageView& v, int radius, int channel) {
+    if (!v.Valid()) { m_w = m_h = 0; return; }
+    m_w = v.desc.width;
+    m_h = v.desc.height;
+    radius = std::max(0, radius);
+
+    const size_t n = size_t(m_w) * size_t(m_h);
+    m_min.assign(n, 0.0);
+    m_max.assign(n, 0.0);
+
+    // Horizontal pass into scratch.
+    std::vector<double> rowMin(n), rowMax(n);
+    for (int y = 0; y < m_h; ++y) {
+        for (int x = 0; x < m_w; ++x) {
+            double lo = 1e300, hi = -1e300;
+            const int x0 = std::max(0, x - radius);
+            const int x1 = std::min(m_w - 1, x + radius);
+            for (int sx = x0; sx <= x1; ++sx) {
+                const double t = SampleValue(v, sx, y, channel);
+                lo = std::min(lo, t);
+                hi = std::max(hi, t);
+            }
+            rowMin[Index(x, y)] = lo;
+            rowMax[Index(x, y)] = hi;
+        }
+    }
+
+    // Vertical pass over the horizontal results. Min/max are separable because
+    // both are associative and idempotent: the min over a rectangle is the min
+    // of the per-row minima.
+    for (int y = 0; y < m_h; ++y) {
+        const int y0 = std::max(0, y - radius);
+        const int y1 = std::min(m_h - 1, y + radius);
+        for (int x = 0; x < m_w; ++x) {
+            double lo = 1e300, hi = -1e300;
+            for (int sy = y0; sy <= y1; ++sy) {
+                lo = std::min(lo, rowMin[Index(x, sy)]);
+                hi = std::max(hi, rowMax[Index(x, sy)]);
+            }
+            m_min[Index(x, y)] = lo;
+            m_max[Index(x, y)] = hi;
+        }
+    }
+}
+
 } // namespace tglab
