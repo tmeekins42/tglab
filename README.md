@@ -1,3 +1,4 @@
+| **Images** | The palette: thumbnail, script name, and source file for each image. |
 # tglab
 
 A lab bench for computer-vision / computer-graphics **algorithm research**.
@@ -55,6 +56,24 @@ stderr.
 
 Double-click any control to restore its scripted default, or use **Reset all**.
 
+
+
+### The image palette
+
+Each row shows a thumbnail, the **name scripts refer to**, and the file it was
+loaded from. Those last two are deliberately separate:
+
+- **Drop a file onto an existing row** to swap what is behind it while keeping
+  the name. `image("test")` keeps working, now backed by the new file — which
+  is the fast way to run the same script over a series of scans.
+- **Drop onto empty space** to add a new entry, named after the file.
+- **Double-click a name** to rename it, or **right-click a row** for rename,
+  reload from disk, and remove.
+
+Names are case-sensitive and are the filename without its extension, so
+`IMG_2369.jpg` arrives as `image("IMG_2369")`. Renaming a slot re-runs the
+script, so a script referring to the old name will report the missing image
+rather than failing silently.
 
 ### Performance note
 

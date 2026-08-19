@@ -65,10 +65,20 @@ std::string ResolveDataPath(const std::string& rel) {
     return rel;   // let the caller report the failure
 }
 
+// One image in the palette. The script-visible `name` is deliberately separate
+// from the file it came from: dropping a new file onto an existing slot keeps
+// the name, so scripts referring to image("test") keep working when the file
+// behind it changes.
 struct PaletteEntry {
-    std::string name;
-    std::string path;
+    std::string name;      // what image("...") refers to
+    std::string path;      // where it was loaded from
     Data        data;
+    GpuTexture  thumb;     // small preview, built lazily
+    uint64_t    version = 1;   // bumped on reload so the thumbnail refreshes
+
+    // Screen rect of this row, recorded while drawing so a WM_DROPFILES at a
+    // given point can find which slot it landed on.
+    ImVec2      rowMin{}, rowMax{};
 };
 
 class App {
@@ -78,7 +88,11 @@ public:
     void Frame();
     void OnResize(UINT w, UINT h) { if (m_dev.Ready()) m_dev.OnResize(w, h); }
 
-    void LoadImageIntoPalette(const std::string& path);
+    void LoadImageIntoPalette(const std::string& path, const std::string& targetSlot = "");
+
+    // Name of the palette slot at a screen point, or "" if none. Used by the
+    // drop handler, which only has the App pointer.
+    std::string SlotNameAt(int sx, int sy) const;
     void SetScriptPath(const std::string& path);
 
 private:
@@ -87,6 +101,9 @@ private:
     void DrawMenuBar();
     void DrawControlsPanel();
     void DrawPalettePanel();
+    void BeginRename(int i);
+    void CommitRename(int i);
+    int  SlotAtScreenPos(int sx, int sy) const;
     void DrawAlgorithmsPanel();
     void DrawScriptsPanel();
     void RescanScripts();
@@ -114,6 +131,9 @@ private:
     UiState        m_ui;
     PipelineWorker m_worker;
     std::vector<PaletteEntry> m_palette;
+    int  m_renamingSlot = -1;      // index being renamed inline, or -1
+    bool m_renameFocused = false;
+    char m_renameBuf[128] = {};
 
     // Viewer names come from phase 1 (immediately); images arrive later from
     // the worker. Keeping them separate lets panels appear and dock straight
@@ -244,6 +264,7 @@ void App::Shutdown() {
     m_views.clear();
     m_retiredViews.clear();
     m_diffTex.Release();
+    for (PaletteEntry& e : m_palette) e.thumb.Release();
 
     ImGui_ImplDX12_Shutdown();
     ImGui_ImplWin32_Shutdown();
@@ -277,23 +298,42 @@ void App::SetScriptPath(const std::string& path) {
     if (GetEnvironmentVariableA("TGLAB_COMPARE", nullptr, 0) > 0) m_compareOpen = true;
 }
 
-void App::LoadImageIntoPalette(const std::string& path) {
+// Loads `path` into the palette. When `targetSlot` names an existing entry,
+// that slot keeps its name and is re-pointed at the new file -- which is what
+// dropping an image onto a palette row does, so scripts referring to the old
+// name keep working. Otherwise the entry is matched (or created) by filename.
+void App::LoadImageIntoPalette(const std::string& path, const std::string& targetSlot) {
     Image img;
     std::string err;
     if (!LoadImageFile(path, &img, &err)) {
         m_error = err;
+        ReportError("");
         return;
     }
 
-    // Name is the filename without extension — what image("...") refers to.
+    // Replace a specific slot, keeping its script-visible name.
+    if (!targetSlot.empty()) {
+        for (PaletteEntry& e : m_palette) {
+            if (e.name == targetSlot) {
+                e.path = path;
+                e.data = Data{std::move(img)};
+                ++e.version;            // makes the thumbnail rebuild
+                m_dirty = true;
+                return;
+            }
+        }
+    }
+
+    // Otherwise the name is the filename without extension.
     std::string name = path;
     if (auto slash = name.find_last_of("/\\"); slash != std::string::npos) name = name.substr(slash + 1);
     if (auto dot = name.find_last_of('.'); dot != std::string::npos) name = name.substr(0, dot);
 
     for (PaletteEntry& e : m_palette) {
-        if (e.name == name) {           // replace in place on reload
+        if (e.name == name) {           // reloading the same name replaces it
             e.path = path;
             e.data = Data{std::move(img)};
+            ++e.version;
             m_dirty = true;
             return;
         }
@@ -929,15 +969,157 @@ void App::DrawPalettePanel() {
 
     if (m_palette.empty()) {
         ImGui::TextDisabled("Drag image files here.");
-    }
-    for (const PaletteEntry& e : m_palette) {
-        ImGui::BulletText("%s", e.name.c_str());
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", e.path.c_str());
+        ImGui::Separator();
+        ImGui::TextDisabled("Reference from a script as image(\"name\")");
+        ImGui::End();
+        return;
     }
 
-    ImGui::Separator();
-    ImGui::TextDisabled("Reference from script as image(\"name\")");
+    const float thumbSize = 48.0f;
+    int removeIndex = -1;
+
+    for (int i = 0; i < int(m_palette.size()); ++i) {
+        PaletteEntry& e = m_palette[size_t(i)];
+        ImGui::PushID(i);
+
+        const ImVec2 rowStart = ImGui::GetCursorScreenPos();
+
+        // Thumbnail. Built from the palette image itself, so it also shows what
+        // a slot is currently backed by after a drop replaced its file.
+        if (std::holds_alternative<Image>(e.data)) {
+            Image& img = std::get<Image>(e.data);
+            if (img.Valid() && e.thumb.Update(m_dev, img, e.version)) {
+                const float iw = float(e.thumb.Width());
+                const float ih = float(e.thumb.Height());
+                const float scale = (iw > 0 && ih > 0) ? std::min(thumbSize / iw, thumbSize / ih) : 1.0f;
+                const ImVec2 size(iw * scale, ih * scale);
+                // Centre inside a fixed box so rows line up whatever the aspect.
+                const ImVec2 p = ImGui::GetCursorScreenPos();
+                ImGui::GetWindowDrawList()->AddImage(
+                    ImTextureRef(static_cast<ImTextureID>(e.thumb.Handle().ptr)),
+                    ImVec2(p.x + (thumbSize - size.x) * 0.5f, p.y + (thumbSize - size.y) * 0.5f),
+                    ImVec2(p.x + (thumbSize + size.x) * 0.5f, p.y + (thumbSize + size.y) * 0.5f));
+            }
+        }
+        ImGui::Dummy(ImVec2(thumbSize, thumbSize));
+        ImGui::SameLine();
+
+        // Name, with the file it came from underneath. Showing both matters now
+        // that they are independent.
+        ImGui::BeginGroup();
+        if (m_renamingSlot == i) {
+            ImGui::SetNextItemWidth(-1.0f);
+            if (ImGui::IsWindowAppearing() || ImGui::IsItemHovered()) {}
+            if (!m_renameFocused) { ImGui::SetKeyboardFocusHere(); m_renameFocused = true; }
+            if (ImGui::InputText("##rename", m_renameBuf, sizeof(m_renameBuf),
+                                 ImGuiInputTextFlags_EnterReturnsTrue) ) {
+                CommitRename(i);
+            }
+            // Clicking away or pressing Escape cancels rather than half-applying.
+            if (ImGui::IsKeyPressed(ImGuiKey_Escape) ||
+                (!ImGui::IsItemActive() && !ImGui::IsItemFocused() && m_renameFocused &&
+                 !ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Left))) {
+                m_renamingSlot = -1;
+                m_renameFocused = false;
+            }
+        } else {
+            ImGui::TextUnformatted(e.name.c_str());
+            if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+                BeginRename(i);
+        }
+
+        // Filename only, with the full path on hover.
+        std::string file = e.path;
+        if (auto slash = file.find_last_of("/\\"); slash != std::string::npos)
+            file = file.substr(slash + 1);
+        ImGui::TextDisabled("%s", file.c_str());
+
+        if (std::holds_alternative<Image>(e.data)) {
+            const ImageDesc& d = std::get<Image>(e.data).Desc();
+            ImGui::TextDisabled("%d x %d", d.width, d.height);
+        }
+        ImGui::EndGroup();
+
+        // One invisible hit area over the whole row, for the context menu and
+        // for drop targeting.
+        const float rowHeight = std::max(thumbSize, ImGui::GetCursorScreenPos().y - rowStart.y);
+        e.rowMin = rowStart;
+        e.rowMax = ImVec2(rowStart.x + ImGui::GetContentRegionAvail().x + thumbSize, rowStart.y + rowHeight);
+
+        if (ImGui::BeginPopupContextItem("slot")) {
+            if (ImGui::MenuItem("Rename...")) BeginRename(i);
+            if (ImGui::MenuItem("Reload from disk")) {
+                const std::string p = e.path, n = e.name;
+                LoadImageIntoPalette(p, n);
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Remove from palette")) removeIndex = i;
+            ImGui::EndPopup();
+        }
+
+        ImGui::PopID();
+        ImGui::Separator();
+    }
+
+    if (removeIndex >= 0) {
+        // Release the GPU texture before the entry goes, while the device lives.
+        m_palette[size_t(removeIndex)].thumb.Release();
+        m_palette.erase(m_palette.begin() + removeIndex);
+        m_dirty = true;
+    }
+
+    ImGui::TextDisabled("Reference from a script as image(\"name\")");
+    ImGui::TextDisabled("Drop a file on a row to swap it, keeping the name.");
     ImGui::End();
+}
+
+
+// Which palette row is under this screen point, or -1. Used to route a dropped
+// file onto a specific slot rather than adding a new one.
+int App::SlotAtScreenPos(int sx, int sy) const {
+    for (int i = 0; i < int(m_palette.size()); ++i) {
+        const PaletteEntry& e = m_palette[size_t(i)];
+        if (e.rowMax.x <= e.rowMin.x || e.rowMax.y <= e.rowMin.y) continue;   // not drawn yet
+        if (float(sx) >= e.rowMin.x && float(sx) < e.rowMax.x &&
+            float(sy) >= e.rowMin.y && float(sy) < e.rowMax.y)
+            return i;
+    }
+    return -1;
+}
+
+std::string App::SlotNameAt(int sx, int sy) const {
+    const int i = SlotAtScreenPos(sx, sy);
+    return i >= 0 ? m_palette[size_t(i)].name : std::string();
+}
+// Starts an inline rename of slot `i`.
+void App::BeginRename(int i) {
+    if (i < 0 || size_t(i) >= m_palette.size()) return;
+    m_renamingSlot = i;
+    m_renameFocused = false;
+    std::snprintf(m_renameBuf, sizeof(m_renameBuf), "%s", m_palette[size_t(i)].name.c_str());
+}
+
+// Applies the pending rename, rejecting names that would collide or be empty --
+// two slots with the same name would make image("x") ambiguous.
+void App::CommitRename(int i) {
+    m_renamingSlot = -1;
+    m_renameFocused = false;
+    if (i < 0 || size_t(i) >= m_palette.size()) return;
+
+    std::string want = m_renameBuf;
+    // Trim, since a trailing space in a script name is invisible and baffling.
+    while (!want.empty() && std::isspace(static_cast<unsigned char>(want.front()))) want.erase(want.begin());
+    while (!want.empty() && std::isspace(static_cast<unsigned char>(want.back())))  want.pop_back();
+    if (want.empty()) return;
+
+    for (int j = 0; j < int(m_palette.size()); ++j)
+        if (j != i && m_palette[size_t(j)].name == want) {
+            m_error = "another image is already named '" + want + "'";
+            return;
+        }
+
+    m_palette[size_t(i)].name = want;
+    m_dirty = true;   // the script may now resolve differently
 }
 
 void App::DrawAlgorithmsPanel() {
@@ -1002,7 +1184,8 @@ void App::Frame() {
     if (ImGui::IsKeyPressed(ImGuiKey_F5, false)) m_dirty = true;
 
     DrawMenuBar();
-    DrawPalettePanel();
+    // DrawPalettePanel() uploads thumbnail textures, so it runs after
+    // BeginFrame() opens the command list -- see below with the image views.
     DrawScriptsPanel();
     DrawControlsPanel();
     DrawAlgorithmsPanel();
@@ -1063,8 +1246,9 @@ void App::Frame() {
         v->Draw(m_dev, img);
     }
 
-    // Also uploads a texture (the diff image), so it belongs here rather than
-    // with the other panels above.
+    // These upload textures, so they belong here rather than with the other
+    // panels above: BeginFrame() has opened the command list by now.
+    DrawPalettePanel();
     DrawComparePanel();
 
     ImGui::Render();
@@ -1082,11 +1266,24 @@ LRESULT WINAPI WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         case WM_DROPFILES: {
             HDROP drop = reinterpret_cast<HDROP>(wParam);
+
+            // Where the file was released, so it can replace the slot under the
+            // cursor instead of always adding a new entry.
+            POINT pt{};
+            std::string target;
+            if (DragQueryPoint(drop, &pt) || true) {
+                ClientToScreen(hwnd, &pt);
+                if (g_app) target = g_app->SlotNameAt(pt.x, pt.y);
+            }
+
             const UINT n = DragQueryFileA(drop, 0xFFFFFFFF, nullptr, 0);
             for (UINT i = 0; i < n; ++i) {
                 char path[MAX_PATH] = {};
-                if (DragQueryFileA(drop, i, path, MAX_PATH) && g_app)
-                    g_app->LoadImageIntoPalette(path);
+                if (DragQueryFileA(drop, i, path, MAX_PATH) && g_app) {
+                    // Only the first file replaces the slot; any others are
+                    // added normally, since one row cannot hold several images.
+                    g_app->LoadImageIntoPalette(path, i == 0 ? target : std::string());
+                }
             }
             DragFinish(drop);
             return 0;
