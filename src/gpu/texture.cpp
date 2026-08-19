@@ -9,15 +9,31 @@
 namespace tglab {
 
 void GpuTexture::Release() {
+    // Frames already submitted may still be sampling this texture or copying
+    // out of its staging buffers -- resizing one mid-flight is the common case,
+    // since a dropped image rarely matches the slot's current dimensions.
+    // Releasing now faults the GPU, and a removed device never signals its
+    // fence, so the next BeginFrame() waits forever. Hand them to the device
+    // instead; it frees them once the fence says the GPU is done.
+    const bool deferrable = m_dev && m_dev->Ready();
+
     if (m_res) {
         // Srv().Free() tolerates being called after the heap is gone, but the
         // descriptor is only meaningful while the device lives.
-        if (m_dev && m_dev->Ready()) m_dev->Srv().Free(m_cpu, m_gpu);
-        m_res->Release();
+        if (deferrable) {
+            m_dev->Srv().Free(m_cpu, m_gpu);
+            m_dev->DeferRelease(m_res);
+        } else {
+            m_res->Release();
+        }
         m_res = nullptr;
     }
     for (int i = 0; i < kMaxFramesInFlight; ++i) {
-        if (m_upload[i]) { m_upload[i]->Release(); m_upload[i] = nullptr; }
+        if (m_upload[i]) {
+            if (deferrable) m_dev->DeferRelease(m_upload[i]);
+            else            m_upload[i]->Release();
+            m_upload[i] = nullptr;
+        }
         m_uploadSize[i] = 0;
     }
     m_desc    = {};

@@ -9,14 +9,15 @@
 
 #include "../core/image.h"
 #include "descriptor_heap.h"
+#include "device.h"
 
 namespace tglab {
 
-class Device;
-
-// Upper bound for the per-frame staging buffers below; must be >= the
-// device's kNumFramesInFlight.
-inline constexpr int kMaxFramesInFlight = 4;
+// One staging buffer per frame-in-flight slot, indexed by Device::FrameSlot().
+// Tied to the device's count rather than merely ">=" it: the slot index is what
+// makes "BeginFrame() already waited on this slot's fence" true, and that
+// reasoning only holds if the two cycle together.
+inline constexpr int kMaxFramesInFlight = kNumFramesInFlight;
 
 class GpuTexture {
 public:

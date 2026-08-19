@@ -154,6 +154,25 @@ void Device::OnResize(UINT width, UINT height) {
     m_backBufferIndex = m_swapChain->GetCurrentBackBufferIndex();
 }
 
+void Device::DeferRelease(ID3D12Resource* res) {
+    if (!res) return;
+    // m_fenceLast is the newest value signalled, so waiting for it covers every
+    // frame already submitted -- including the one still recording, which is
+    // signalled with a higher value in EndFrame().
+    m_pendingReleases.push_back({res, m_fenceLast + 1});
+}
+
+// force: release regardless of the fence, for shutdown after the queue is idle.
+void Device::CollectPendingReleases(bool force) {
+    const UINT64 done = m_fence ? m_fence->GetCompletedValue() : 0;
+    for (auto& p : m_pendingReleases) {
+        if (!force && p.fence > done) continue;
+        p.res->Release();
+        p.res = nullptr;
+    }
+    std::erase_if(m_pendingReleases, [](const PendingRelease& p) { return p.res == nullptr; });
+}
+
 ID3D12GraphicsCommandList* Device::BeginFrame() {
     if (m_swapWaitable) WaitForSingleObject(m_swapWaitable, 1000);
 
@@ -166,6 +185,9 @@ ID3D12GraphicsCommandList* Device::BeginFrame() {
     }
 
     m_backBufferIndex = m_swapChain->GetCurrentBackBufferIndex();
+
+    // Now that this slot's fence has passed, anything it was protecting is free.
+    CollectPendingReleases(false);
 
     f.allocator->Reset();
     m_cmdList->Reset(f.allocator, nullptr);
@@ -242,6 +264,8 @@ void Device::WaitForLastSubmittedFrame() {
 
 void Device::Shutdown() {
     WaitForLastSubmittedFrame();
+    // The queue is idle, so deferred resources can go now regardless of fence.
+    CollectPendingReleases(true);
     ReleaseRenderTargets();
 
     if (m_swapWaitable) { CloseHandle(m_swapWaitable); m_swapWaitable = nullptr; }

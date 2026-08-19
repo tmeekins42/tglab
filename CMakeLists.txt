@@ -35,6 +35,7 @@ add_library(tglab_core STATIC
     src/core/pipeline.cpp
     src/core/worker.cpp
     src/core/compare.cpp
+    src/core/image_loader.cpp
     src/algo_util/histogram.cpp
     src/script/lexer.cpp
     src/script/parser.cpp
@@ -146,14 +147,3 @@ tglab_copy_dxc(tglab_runtime_tests)
 enable_testing()
 add_test(NAME script_spine COMMAND tglab_tests)
 add_test(NAME runtime      COMMAND tglab_runtime_tests)
-
-
-
-
-
-
-
-
-
-
-

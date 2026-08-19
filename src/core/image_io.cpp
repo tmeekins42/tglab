@@ -1,6 +1,8 @@
 #include "image_io.h"
 
+#include <cstdlib>
 #include <cstring>
+#include <windows.h>
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_WINDOWS_UTF8
@@ -13,6 +15,10 @@
 namespace tglab {
 
 bool LoadImageFile(const std::string& path, Image* out, std::string* err) {
+    // TGLAB_SLOWLOAD=<ms> simulates a slow or network drive, so the "loading..."
+    // indicator and the background loader can be exercised from a local disk.
+    if (const char* slow = std::getenv("TGLAB_SLOWLOAD")) Sleep(DWORD(std::atoi(slow)));
+
     int w = 0, h = 0, comp = 0;
     unsigned char* pixels = stbi_load(path.c_str(), &w, &h, &comp, 4);
     if (!pixels) {

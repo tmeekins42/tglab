@@ -4,6 +4,7 @@
 #include <d3d12.h>
 #include <dxgi1_4.h>
 #include <windows.h>
+#include <vector>
 
 #include "descriptor_heap.h"
 
@@ -40,6 +41,16 @@ public:
     // resources index by this; BeginFrame() has already waited on its fence.
     UINT FrameSlot() const { return m_frameIndex; }
 
+    // Hands a resource over to be Release()d once the GPU has finished every
+    // frame submitted so far.
+    //
+    // Releasing a resource the GPU is still reading -- a texture being resized
+    // while an earlier frame still samples it -- faults the device. The device
+    // is then removed, its fence never signals, and BeginFrame() blocks forever
+    // on WaitForSingleObject(m_fenceEvent, INFINITE): the app hangs with no
+    // error. Deferring the Release() to a known-complete fence value avoids it.
+    void DeferRelease(ID3D12Resource* res);
+
     bool Ready() const { return m_device != nullptr && m_swapChain != nullptr; }
 
 private:
@@ -50,6 +61,14 @@ private:
 
     bool CreateRenderTargets();
     void ReleaseRenderTargets();
+
+    // Resources awaiting the GPU, with the fence value that retires each.
+    struct PendingRelease {
+        ID3D12Resource* res   = nullptr;
+        UINT64          fence = 0;
+    };
+    std::vector<PendingRelease> m_pendingReleases;
+    void CollectPendingReleases(bool force);
 
     ID3D12Device*              m_device     = nullptr;
     ID3D12CommandQueue*        m_queue      = nullptr;

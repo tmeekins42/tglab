@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <chrono>
 #include <cstdlib>
 #include <memory>
 #include <string>
@@ -16,6 +17,7 @@
 #include "../core/image_io.h"
 #include "../core/compare.h"
 #include "../core/pipeline.h"
+#include "../core/image_loader.h"
 #include "../core/worker.h"
 #include "../script/interp.h"
 #include "../script/parser.h"
@@ -66,6 +68,51 @@ std::string ResolveDataPath(const std::string& rel) {
     return rel;   // let the caller report the failure
 }
 
+// Box-downsamples `src` so its longest side is at most `maxSide`. Cheap and
+// done once per image, so the palette never uploads a full-resolution texture
+// just to draw a small icon.
+void MakeThumbnail(Image& src, int maxSide, Image* out) {
+    ImageView v = src.MapCpuRead();
+    if (!v.Valid()) { out->Reset(); return; }
+
+    const int sw = v.desc.width;
+    const int sh = v.desc.height;
+    const int step = std::max(1, (std::max(sw, sh) + maxSide - 1) / maxSide);
+    const int dw = std::max(1, sw / step);
+    const int dh = std::max(1, sh / step);
+
+    out->Alloc({dw, dh, Format::RGBA8});
+    ImageView o = out->MapCpuWrite();
+
+    for (int y = 0; y < dh; ++y) {
+        for (int x = 0; x < dw; ++x) {
+            // Average the step x step block, so downsampling does not alias a
+            // scanned page into noise.
+            int acc[4] = {0, 0, 0, 0};
+            int n = 0;
+            for (int sy = y * step; sy < std::min((y + 1) * step, sh); ++sy) {
+                for (int sx = x * step; sx < std::min((x + 1) * step, sw); ++sx) {
+                    if (v.desc.format == Format::R32F) {
+                        const float f = *v.At<float>(sx, sy);
+                        const int g = int(std::clamp(f, 0.0f, 1.0f) * 255.0f);
+                        acc[0] += g; acc[1] += g; acc[2] += g; acc[3] += 255;
+                    } else if (v.desc.format == Format::RGBA32F) {
+                        const float* p = v.At<float>(sx, sy);
+                        for (int c = 0; c < 4; ++c)
+                            acc[c] += int(std::clamp(p[c], 0.0f, 1.0f) * 255.0f);
+                    } else {
+                        const uint8_t* p = v.At<uint8_t>(sx, sy);
+                        for (int c = 0; c < 4; ++c) acc[c] += p[c];
+                    }
+                    ++n;
+                }
+            }
+            uint8_t* d = o.At<uint8_t>(x, y);
+            for (int c = 0; c < 4; ++c) d[c] = uint8_t(n ? acc[c] / n : 0);
+        }
+    }
+}
+
 // One image in the palette. The script-visible `name` is deliberately separate
 // from the file it came from: dropping a new file onto an existing slot keeps
 // the name, so scripts referring to image("test") keep working when the file
@@ -74,7 +121,9 @@ struct PaletteEntry {
     std::string name;      // what image("...") refers to
     std::string path;      // where it was loaded from
     Data        data;
-    GpuTexture  thumb;     // small preview, built lazily
+    GpuTexture  thumb;       // small preview, built lazily
+    Image       thumbImage;  // downsampled copy the texture is built from
+    uint64_t    thumbVersion = 0;   // version thumbImage was built at
     uint64_t    version = 1;   // bumped on reload so the thumbnail refreshes
 
     // Screen rect of this row, recorded while drawing so a WM_DROPFILES at a
@@ -90,6 +139,10 @@ public:
     void OnResize(UINT w, UINT h) { if (m_dev.Ready()) m_dev.OnResize(w, h); }
 
     void LoadImageIntoPalette(const std::string& path, const std::string& targetSlot = "");
+
+    // Queues a load on the loader thread. Used by the drop handler, which runs
+    // on the UI thread and must not block on file I/O.
+    void RequestImageLoad(const std::string& path, const std::string& targetSlot = "");
 
     // Name of the palette slot at a screen point, or "" if none. Used by the
     // drop handler, which only has the App pointer.
@@ -115,6 +168,8 @@ private:
     void ReleaseRetiredViews();
     void ReportError(const std::string& prevError);
     void PollWorker();
+    void PollLoader();
+    void InstallLoadedImage(LoadResult&& r);
     void UpdateWindowTitle();
     ImGuiID CentreDockNode() const;
 
@@ -131,6 +186,7 @@ private:
 
     UiState        m_ui;
     PipelineWorker m_worker;
+    ImageLoader    m_loader;
     std::vector<PaletteEntry> m_palette;
     int  m_renamingSlot = -1;      // index being renamed inline, or -1
     bool m_renameFocused = false;
@@ -205,6 +261,7 @@ bool App::Init(HWND hwnd) {
     // After the device exists: the worker builds its own compute context (and
     // its own compute queue) from it, on the worker thread.
     m_worker.Start(m_dev.Get());
+    m_loader.Start();
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -258,6 +315,7 @@ bool App::Init(HWND hwnd) {
 
 void App::Shutdown() {
     m_worker.Stop();   // before the device: results reference image memory
+    m_loader.Stop();
     m_dev.WaitForLastSubmittedFrame();
 
     // Every GpuTexture holds an SRV descriptor from the device's heap, so all
@@ -301,25 +359,36 @@ void App::SetScriptPath(const std::string& path) {
     if (GetEnvironmentVariableA("TGLAB_COMPARE", nullptr, 0) > 0) m_compareOpen = true;
 }
 
-// Loads `path` into the palette. When `targetSlot` names an existing entry,
-// that slot keeps its name and is re-pointed at the new file -- which is what
-// dropping an image onto a palette row does, so scripts referring to the old
-// name keep working. Otherwise the entry is matched (or created) by filename.
+// Queues a file for background decoding. The read happens on the loader thread
+// because stbi_load() blocks on file I/O, and doing that inside WM_DROPFILES
+// freezes the entire window until it finishes -- badly so for a large scan on
+// a network drive.
+void App::RequestImageLoad(const std::string& path, const std::string& targetSlot) {
+    m_loader.Request(path, targetSlot);
+}
+
+// Installs a decoded image. Called on the UI thread once the loader is done.
 void App::LoadImageIntoPalette(const std::string& path, const std::string& targetSlot) {
-    Image img;
-    std::string err;
-    if (!LoadImageFile(path, &img, &err)) {
-        m_error = err;
+    LoadResult r;
+    r.path       = path;
+    r.targetSlot = targetSlot;
+    r.ok         = LoadImageFile(path, &r.image, &r.error);
+    InstallLoadedImage(std::move(r));
+}
+
+void App::InstallLoadedImage(LoadResult&& r) {
+    if (!r.ok) {
+        m_error = r.error;
         ReportError("");
         return;
     }
 
     // Replace a specific slot, keeping its script-visible name.
-    if (!targetSlot.empty()) {
+    if (!r.targetSlot.empty()) {
         for (PaletteEntry& e : m_palette) {
-            if (e.name == targetSlot) {
-                e.path = path;
-                e.data = Data{std::move(img)};
+            if (e.name == r.targetSlot) {
+                e.path = r.path;
+                e.data = Data{std::move(r.image)};
                 ++e.version;            // makes the thumbnail rebuild
                 m_dirty = true;
                 return;
@@ -328,14 +397,14 @@ void App::LoadImageIntoPalette(const std::string& path, const std::string& targe
     }
 
     // Otherwise the name is the filename without extension.
-    std::string name = path;
+    std::string name = r.path;
     if (auto slash = name.find_last_of("/\\"); slash != std::string::npos) name = name.substr(slash + 1);
     if (auto dot = name.find_last_of('.'); dot != std::string::npos) name = name.substr(0, dot);
 
     for (PaletteEntry& e : m_palette) {
         if (e.name == name) {           // reloading the same name replaces it
-            e.path = path;
-            e.data = Data{std::move(img)};
+            e.path = r.path;
+            e.data = Data{std::move(r.image)};
             ++e.version;
             m_dirty = true;
             return;
@@ -344,10 +413,16 @@ void App::LoadImageIntoPalette(const std::string& path, const std::string& targe
 
     PaletteEntry e;
     e.name = std::move(name);
-    e.path = path;
-    e.data = Data{std::move(img)};
+    e.path = r.path;
+    e.data = Data{std::move(r.image)};
     m_palette.push_back(std::move(e));
     m_dirty = true;
+}
+
+// Picks up finished loads. Called once per frame.
+void App::PollLoader() {
+    LoadResult r;
+    while (m_loader.TryFetch(&r)) InstallLoadedImage(std::move(r));
 }
 
 // Phase 1 only: parse and interpret (microseconds), then hand the recorded
@@ -996,11 +1071,17 @@ void App::DrawPalettePanel() {
 
         const ImVec2 rowStart = ImGui::GetCursorScreenPos();
 
-        // Thumbnail. Built from the palette image itself, so it also shows what
-        // a slot is currently backed by after a drop replaced its file.
+        // Thumbnail. Downsampled ONCE into a small image rather than uploading
+        // the full-resolution source: an 8 MP scan is a 33 MB texture, and
+        // building one every frame to draw a 48 px icon locks the UI thread
+        // solid -- which looks exactly like the whole app hanging.
         if (std::holds_alternative<Image>(e.data)) {
             Image& img = std::get<Image>(e.data);
-            if (img.Valid() && e.thumb.Update(m_dev, img, e.version)) {
+            if (img.Valid() && e.thumbVersion != e.version) {
+                MakeThumbnail(img, int(thumbSize) * 2, &e.thumbImage);
+                e.thumbVersion = e.version;
+            }
+            if (e.thumbImage.Valid() && e.thumb.Update(m_dev, e.thumbImage, e.version)) {
                 const float iw = float(e.thumb.Width());
                 const float ih = float(e.thumb.Height());
                 const float scale = (iw > 0 && ih > 0) ? std::min(thumbSize / iw, thumbSize / ih) : 1.0f;
@@ -1156,7 +1237,33 @@ void App::DrawAlgorithmsPanel() {
     ImGui::End();
 }
 
+// Worst frame time since startup. A drop that makes the app feel frozen shows
+// up here even with no console attached, which is the only way to see it on a
+// machine that is not the developer's.
+static double g_worstFrameMs = 0.0;
+
 void App::Frame() {
+    // TGLAB_FRAMEDBG=1 reports slow frames. A frame is ~16 ms; anything much
+    // over that is UI-thread work that should not be there, and a run of them
+    // is what "the whole app locked up" actually looks like.
+    const auto frameStart = std::chrono::steady_clock::now();
+    struct FrameTimer {
+        std::chrono::steady_clock::time_point t0;
+        ~FrameTimer() {
+            // Recorded unconditionally: the status line shows it, so a hitch is
+            // visible without setting an environment variable first.
+            const double ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count();
+            if (ms > g_worstFrameMs) g_worstFrameMs = ms;
+
+            static const bool on = GetEnvironmentVariableA("TGLAB_FRAMEDBG", nullptr, 0) > 0;
+            if (on && ms > 50.0) {
+                std::fprintf(stderr, "[frame] %.1f ms\n", ms);
+                std::fflush(stderr);
+            }
+        }
+    } frameTimer{frameStart};
+
     if (m_watch.Poll()) {
         if (ReadTextFile(m_watch.Path(), &m_source)) m_dirty = true;
     }
@@ -1168,6 +1275,7 @@ void App::Frame() {
         m_dirty = false;
         RunScript();
     }
+    PollLoader();
     PollWorker();
     ReleaseRetiredViews();
 
@@ -1187,8 +1295,11 @@ void App::Frame() {
     // Self-test hook: TGLAB_DROPTEST="x,y,path" simulates dropping `path` at
     // client point (x,y), which is the one interaction a harness cannot drive
     // -- a synthetic WM_DROPFILES does not carry a usable drop point.
+    // Several files may be listed after the point, separated by ';'. Each is
+    // dropped in turn, a few frames apart, so the texture is resized while
+    // earlier frames are still in flight -- the case that hung the device.
     if (m_dropTestCountdown > 0 && --m_dropTestCountdown == 0) {
-        char buf[512] = {};
+        char buf[1024] = {};
         if (GetEnvironmentVariableA("TGLAB_DROPTEST", buf, sizeof(buf)) > 0) {
             std::string spec(buf);
             const size_t c1 = spec.find(',');
@@ -1196,11 +1307,24 @@ void App::Frame() {
             if (c1 != std::string::npos && c2 != std::string::npos) {
                 const int dx = std::atoi(spec.substr(0, c1).c_str());
                 const int dy = std::atoi(spec.substr(c1 + 1, c2 - c1 - 1).c_str());
-                const std::string file = spec.substr(c2 + 1);
+
+                std::string files = spec.substr(c2 + 1);
+                std::string file  = files;
+                if (const size_t semi = files.find(';'); semi != std::string::npos) {
+                    file = files.substr(0, semi);
+                    // Rewrite the variable so the next firing takes the next file.
+                    SetEnvironmentVariableA(
+                        "TGLAB_DROPTEST",
+                        (spec.substr(0, c2 + 1) + files.substr(semi + 1)).c_str());
+                    m_dropTestCountdown = 20;
+                }
+
                 const std::string slot = SlotNameAt(dx, dy);
                 AppTrace(("self-test: drop '" + file + "' at (" + std::to_string(dx) + "," +
                           std::to_string(dy) + ") -> slot '" + slot + "'").c_str());
-                LoadImageIntoPalette(file, slot);
+                // The real drop path: queue on the loader thread, as
+                // WM_DROPFILES does, rather than decoding inline.
+                RequestImageLoad(file, slot);
             }
         }
     }
@@ -1254,6 +1378,17 @@ void App::Frame() {
             case ExecMode::ForceGPU: modeName = "GPU"; break;
             case ExecMode::Auto:     modeName = "auto"; break;
         }
+        // A large scan on a slow drive takes real time to decode. Saying so
+        // beats an unexplained pause, which reads as a hang.
+        if (const int pending = m_loader.Pending(); pending > 0) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("| loading %d image%s...", pending, pending == 1 ? "" : "s");
+        }
+        if (g_worstFrameMs > 100.0) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("| worst frame %.0f ms", g_worstFrameMs);
+        }
+
         const int cached = m_worker.LastCachedStages();
         if (cached > 0) {
             ImGui::TextDisabled("last run %.1f ms   %d CPU / %d GPU / %d cached   [%s]",
@@ -1326,7 +1461,7 @@ LRESULT WINAPI WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (DragQueryFileA(drop, i, path, MAX_PATH) && g_app) {
                     // Only the first file replaces the slot; any others are
                     // added normally, since one row cannot hold several images.
-                    g_app->LoadImageIntoPalette(path, i == 0 ? target : std::string());
+                    g_app->RequestImageLoad(path, i == 0 ? target : std::string());
                 }
             }
             DragFinish(drop);
