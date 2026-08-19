@@ -1,18 +1,19 @@
-# choose() — swap algorithms from a dropdown without editing the script.
+# choose() + params() — swap algorithms from dropdowns, with each one's own
+# parameters appearing automatically.
 #
-# "edge" is a category, so every algorithm declaring Category()=="edge" appears
-# in the dropdown automatically. Write a new edge detector in C++ and it shows
-# up here with no change to this file.
+# "edge" is a category, so every algorithm declaring Category()=="edge" shows
+# up in that dropdown. Write a new edge detector in C++ and it appears here
+# with its own controls, without editing this file.
 
 src = image("test")
 
 prep   = choose("preprocess", [gaussian_blur, grayscale, brightness])
 edgeOp = choose("edge operator", "edge")
 
-sigma = slider("blur sigma", 0.1, 6.0, 1.4)
-
-prepped = prep(src)
-result  = edgeOp(prepped)
+# params() declares a control for every parameter the selected algorithm has,
+# so switching either dropdown swaps the whole control set below.
+prepped = params(prep)(src)
+result  = params(edgeOp)(prepped)
 
 display(src,     "source")
 display(prepped, "preprocessed")

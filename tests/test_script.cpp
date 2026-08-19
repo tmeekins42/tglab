@@ -627,6 +627,66 @@ int main() {
         Check(allOneInput, "every threshold algorithm takes one image");
     }
 
+    {
+        // A params()-declared slider must reach the algorithm and re-run the
+        // stage. This is what "the slider does nothing and everything shows as
+        // cached" would look like if the value path were broken.
+        //
+        // Needs a bigger image than RunScript's 4x4: at sigma 2 the blur radius
+        // already exceeds 4 px, so every pixel is the whole-image average and
+        // raising sigma changes literally nothing.
+        auto runOn = [](const char* script, UiState* ui, Pipeline* pipe,
+                        std::vector<Data>* src, std::string* err) {
+            ImageDesc d{64, 64, Format::RGBA8};
+            Image img;
+            img.Alloc(d);
+            ImageView v = img.MapCpuWrite();
+            for (int y = 0; y < 64; ++y)
+                for (int x = 0; x < 64; ++x) {
+                    uint8_t* p = v.At<uint8_t>(x, y);
+                    const uint8_t g = ((x / 8) + (y / 8)) % 2 ? 230 : 20;
+                    p[0] = p[1] = p[2] = g;
+                    p[3] = 255;
+                }
+            src->clear();
+            src->push_back(Data{std::move(img)});
+            std::vector<SourceImage> names{{"test", 0}};
+            Program prog;
+            if (!Parse(script, &prog, err)) return false;
+            auto r = Interpret(prog, names, ui, pipe);
+            if (!r.ok) { *err = r.error; return false; }
+            return pipe->Execute(src, nullptr, err);
+        };
+
+        auto checksum = [](Pipeline& p) {
+            ImageView v = std::get<Image>(p.Stages()[0].outputs[0]).MapCpuRead();
+            unsigned long long sum = 0;
+            for (int i = 0; i < v.desc.width * v.desc.height * 4; ++i) sum += v.data[i];
+            return sum;
+        };
+
+        UiState ui; std::string err; std::vector<Data> src;
+        const char* kScript =
+            "src = image(\"test\")\n"
+            "prep = choose(\"preprocess\", [gaussian_blur, grayscale])\n"
+            "out = params(prep)(src)\n"
+            "display(out)\n";
+
+        Pipeline p1;
+        const bool ok1 = runOn(kScript, &ui, &p1, &src, &err);
+        Check(ok1, "params() pipeline runs" + (ok1 ? "" : ": " + err));
+        const unsigned long long before = checksum(p1);
+
+        bool dragged = false;
+        for (UiControl& c : ui.Controls())
+            if (c.label.find("sigma") != std::string::npos) { c.value = 6.0; dragged = true; }
+        Check(dragged, "params() declared a sigma control to drag");
+
+        Pipeline p2;
+        runOn(kScript, &ui, &p2, &src, &err);
+        Check(checksum(p2) != before, "a changed params() value changes the output");
+    }
+
     std::printf("\n%s\n", g_fail == 0 ? "all checks passed" : "FAILURES PRESENT");
     return g_fail == 0 ? 0 : 1;
 }
