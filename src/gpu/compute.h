@@ -54,7 +54,10 @@ public:
     bool Init(ID3D12Device* device);
     void Shutdown();
 
-    bool Ready() const { return m_device != nullptr; }
+    // False once a dispatch has hung or the device was removed; the pipeline
+    // then stops offering the GPU path for the rest of the session.
+    bool Ready() const { return m_device != nullptr && !m_deviceLost; }
+    bool DeviceLost() const { return m_deviceLost; }
 
     // Builds a kernel from HLSL source. Root signature is fixed by convention:
     //   t0..t3  input SRVs
@@ -96,6 +99,7 @@ private:
 
     std::vector<ID3D12Resource*> m_staging;   // upload/readback buffers, freed on flush
     ShaderCompiler               m_compiler;
+    bool                         m_deviceLost = false;
 };
 
 } // namespace tglab

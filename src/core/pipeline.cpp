@@ -5,6 +5,9 @@
 #include "../gpu/compute.h"
 #include "../gpu/gpu_image.h"
 
+#include <windows.h>
+#include <cstdio>
+
 namespace tglab {
 
 void Pipeline::Clear() {
@@ -200,6 +203,15 @@ bool Pipeline::RunStageGpu(Stage& s, const std::vector<const Data*>& in,
         gout.push_back(&g->image);
     }
 
+    // TGLAB_GPUDBG=1 logs every dispatch. Worth keeping: when the device
+    // hung after a script switch, the absence of these lines is what proved
+    // the fault was not in compute at all, but in freeing view textures.
+    if (GetEnvironmentVariableA("TGLAB_GPUDBG", nullptr, 0) > 0) {
+        const ImageDesc& od = std::get<Image>(s.outputs[0]).Desc();
+        std::fprintf(stderr, "[gpu] dispatch %s %dx%d\n",
+                     s.algoName.c_str(), od.width, od.height);
+        std::fflush(stderr);
+    }
     if (!gpu->Dispatch(*s.kernel, gin, gout, s.algo->GpuConstants(), err)) return false;
 
     // No readback here. Outputs stay GPU-resident; whoever needs CPU pixels

@@ -395,7 +395,25 @@ bool ComputeContext::Flush(std::string* err) {
     m_queue->Signal(m_fence, v);
     if (m_fence->GetCompletedValue() < v) {
         m_fence->SetEventOnCompletion(v, m_event);
-        WaitForSingleObject(m_event, INFINITE);
+        // Bounded, not INFINITE. A kernel that overruns the GPU watchdog gets
+        // its device removed, the fence never signals, and an INFINITE wait
+        // parks the worker thread forever -- the app then looks frozen with no
+        // clue why. Five seconds is far longer than any sane dispatch and well
+        // past the ~2s TDR limit.
+        if (WaitForSingleObject(m_event, 5000) != WAIT_OBJECT_0) {
+            m_deviceLost = true;
+            *err = "GPU did not complete in time (device hung or was removed); "
+                   "falling back to the CPU";
+            return false;
+        }
+    }
+
+    // A hang shows up here even when the wait succeeds.
+    if (m_device->GetDeviceRemovedReason() != S_OK) {
+        m_deviceLost = true;
+        *err = "GPU device was removed (a kernel most likely ran too long); "
+               "falling back to the CPU";
+        return false;
     }
 
     // Staging buffers are only safe to free once the GPU is done with them.

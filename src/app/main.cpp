@@ -94,6 +94,7 @@ private:
     void RequestCompare();
     void SyncViews();
     void DockLooseViewers();
+    void ReleaseRetiredViews();
     void ReportError(const std::string& prevError);
     void PollWorker();
     void UpdateWindowTitle();
@@ -123,6 +124,14 @@ private:
     uint64_t                 m_shownSeq   = 0;
 
     std::vector<std::unique_ptr<ImageViewPanel>> m_views;
+
+    // Viewers a script switch removed. Held for a few frames so the GPU is
+    // done with their textures before the destructor frees them.
+    struct RetiredView {
+        std::unique_ptr<ImageViewPanel> view;
+        int framesLeft = 0;
+    };
+    std::vector<RetiredView> m_retiredViews;
     ViewCamera m_sharedCam;
     bool       m_syncCameras = true;
 
@@ -132,10 +141,12 @@ private:
     uint64_t    m_contentVersion = 1;
     bool        m_rebuildLayout = false;   // explicit "Reset layout" request
     int         m_layoutCountdown = 0;     // frames until the default layout is built
+    int         m_switchCountdown = 0;     // self-test: frames until TGLAB_SWITCH fires
     bool        m_haveSavedLayout = false; // a tglab_layout.ini already existed
     ImGuiID     m_centreNode = 0;          // where new viewers get docked
     ImGuiID     m_dockspaceId = 0;         // fallback when a saved layout exists
     ImGuiID     m_compareNode = 0;         // right-hand column for compare
+    ImGuiID     m_lastViewerNode = 0;      // where viewers were docked, for script switches
     int         m_spinner = 0;             // "working..." animation
 
     // Compare mode (M4). TGLAB_COMPARE=1 opens the panel at startup, which is
@@ -191,6 +202,7 @@ bool App::Init(HWND hwnd) {
     // docked even when the script fails before declaring any -- which is the
     // state you land in launching with no arguments.
     m_layoutCountdown = m_haveSavedLayout ? 0 : 2;
+    if (GetEnvironmentVariableA("TGLAB_SWITCH", nullptr, 0) > 0) m_switchCountdown = 120;
 
     AppTrace("imgui context created");
     ImGui_ImplWin32_Init(hwnd);
@@ -230,6 +242,7 @@ void App::Shutdown() {
     // Anything left to a member destructor would run afterwards and free a
     // descriptor against a dangling heap base.
     m_views.clear();
+    m_retiredViews.clear();
     m_diffTex.Release();
 
     ImGui_ImplDX12_Shutdown();
@@ -449,8 +462,6 @@ void App::ReportError(const std::string& prevError) {
 }
 
 void App::SyncViews() {
-    const size_t before = m_views.size();
-
     // Reuse panels by name so layout and camera survive re-runs.
     std::vector<std::unique_ptr<ImageViewPanel>> next;
     for (const std::string& name : m_viewerNames) {
@@ -461,16 +472,29 @@ void App::SyncViews() {
         if (!panel) panel = std::make_unique<ImageViewPanel>(name);
         next.push_back(std::move(panel));
     }
+
+    // Retire the panels this script no longer declares instead of destroying
+    // them here. Their GpuTextures may still be referenced by frames the GPU
+    // has not finished, and freeing those out from under it hangs the device
+    // (TDR) rather than failing cleanly -- which looks exactly like the app
+    // locking up. Switching scripts replaces every viewer at once, so this is
+    // the path that hits it.
+    for (auto& v : m_views)
+        if (v) m_retiredViews.push_back({std::move(v), kNumFramesInFlight + 1});
+
     m_views = std::move(next);
     for (auto& v : m_views) v->SetSharedCamera(m_syncCameras ? &m_sharedCam : nullptr);
 
-    // The default layout is built once per session, not when viewers first
-    // appear. Gating it on viewers meant that a script which fails before
-    // declaring any (no image loaded, a syntax error) left every panel
-    // floating in a stack — which is exactly the state you land in when
-    // launching with no arguments at all.
-    (void)before;
     DockLooseViewers();
+}
+
+// Frees retired viewers once the GPU can no longer be referencing their
+// textures. Called once per frame.
+void App::ReleaseRetiredViews() {
+    for (auto& r : m_retiredViews) {
+        if (r.framesLeft > 0) --r.framesLeft;
+    }
+    std::erase_if(m_retiredViews, [](const RetiredView& r) { return r.framesLeft == 0; });
 }
 
 // Any viewer without a dock node would open as a small floating window. This
@@ -511,17 +535,33 @@ void App::DockLooseViewers() {
 //   3. the dockspace's central node — the case that matters when a *saved*
 //      layout exists but has never seen these viewer names.
 ImGuiID App::CentreDockNode() const {
+    // 1. Beside a viewer that is already docked, so viewers stay together
+    //    wherever the user dragged them.
     for (const auto& v : m_views) {
         ImGuiWindow* w = ImGui::FindWindowByName(v->Name().c_str());
-        if (w && w->DockId != 0) return w->DockId;
+        if (w && w->DockId != 0) {
+            const_cast<App*>(this)->m_lastViewerNode = w->DockId;
+            return w->DockId;
+        }
     }
+    // 2. The node recorded when this session built the default layout.
     if (m_centreNode != 0) return m_centreNode;
 
+    // 3. Where the previous viewers were docked. Switching scripts destroys
+    //    every viewer at once (the new script uses different names), so this
+    //    is the branch that matters for a script switch, and with a saved
+    //    layout m_centreNode was never set.
+    if (m_lastViewerNode != 0) return m_lastViewerNode;
+
+    // 4. The dockspace central node, but only if it is a usable leaf. Handing
+    //    DockBuilder a non-leaf node wedges the whole UI rather than failing.
     if (m_dockspaceId != 0) {
         if (ImGuiDockNode* node = ImGui::DockBuilderGetCentralNode(m_dockspaceId))
-            return node->ID;
-        return m_dockspaceId;
+            if (node->IsLeafNode()) return node->ID;
     }
+
+    // 4. Nothing safe to dock into. Returning 0 leaves the viewer floating,
+    //    which is recoverable; docking into a bad node is not.
     return 0;
 }
 
@@ -932,6 +972,7 @@ void App::Frame() {
         RunScript();
     }
     PollWorker();
+    ReleaseRetiredViews();
 
     ImGui_ImplDX12_NewFrame();
     ImGui_ImplWin32_NewFrame();
@@ -945,6 +986,18 @@ void App::Frame() {
     // hot reload that introduced new viewer names), so catch any still-floating
     // viewer here now that a target node is resolvable.
     DockLooseViewers();
+
+    // Self-test hook: TGLAB_SWITCH=<path> switches to that script after a few
+    // frames, driving exactly the path a Scripts-panel click takes. Clicking
+    // cannot be driven reliably from a test harness, and this is the one
+    // interaction that wedged the UI.
+    if (m_switchCountdown > 0 && --m_switchCountdown == 0) {
+        char buf[MAX_PATH] = {};
+        if (GetEnvironmentVariableA("TGLAB_SWITCH", buf, MAX_PATH) > 0) {
+            AppTrace(("self-test: switching to " + std::string(buf)).c_str());
+            SetScriptPath(buf);
+        }
+    }
 
     if (ImGui::IsKeyPressed(ImGuiKey_F5, false)) m_dirty = true;
 

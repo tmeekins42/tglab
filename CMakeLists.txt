@@ -156,3 +156,9 @@ add_test(NAME runtime      COMMAND tglab_runtime_tests)
 
 
 
+
+
+add_executable(dbg_switch tests/dbg_switch.cpp src/app/file_watch.cpp $<TARGET_OBJECTS:tglab_algorithms>)
+target_link_libraries(dbg_switch PRIVATE tglab_core imgui d3d12 dxgi)
+target_compile_definitions(dbg_switch PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+tglab_copy_dxc(dbg_switch)

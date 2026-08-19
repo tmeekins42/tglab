@@ -77,7 +77,12 @@ public:
     // intermediate target, which the current one-dispatch-per-algorithm model
     // does not express. Still far faster than the CPU path, and it makes the
     // CPU/GPU comparison in M4 an honest one (same maths, different hardware).
-    bool HasGPU() const override { return true; }
+    // Only when the radius stays small enough for a single O(r^2) dispatch.
+    // Beyond that the pipeline falls back to the separable CPU path, which is
+    // both correct and (at those radii) not much slower -- and crucially does
+    // not trip the GPU watchdog, which takes the whole device down.
+    static constexpr float kMaxGpuSigma = 4.0f;
+    bool HasGPU() const override { return float(m_sigma) <= kMaxGpuSigma; }
 
     const char* GpuSource() const override {
         return R"(
@@ -95,7 +100,10 @@ void main(uint3 tid : SV_DispatchThreadID) {
     if (tid.x >= Width || tid.y >= Height) return;
 
     float sigma  = max(asfloat(SigmaBits), 0.01);
-    int   radius = min(int(ceil(sigma * 3.0)), 64);
+    // Matches HasGPU()'s ceiling. A single O(r^2) pass at radius 60 would be
+    // ~14,600 fetches per pixel -- billions per dispatch on a 512x512 image --
+    // which trips the GPU watchdog (TDR) and removes the device.
+    int   radius = min(int(ceil(sigma * 3.0)), 12);
     float twoSS  = 2.0 * sigma * sigma;
 
     float4 sum    = 0.0;
