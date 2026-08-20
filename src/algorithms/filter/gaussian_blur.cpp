@@ -155,7 +155,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
 )";
     }
 
-    std::vector<uint32_t> GpuConstants() const override {
+    std::vector<uint32_t> GpuConstants(int) const override {
         const float sigma = m_sigma;
         uint32_t bits;
         std::memcpy(&bits, &sigma, sizeof(bits));
@@ -178,7 +178,11 @@ private:
             p[c] = uint8_t(std::clamp(acc[c], 0.0f, 255.0f));
     }
 
-    Param<float> m_sigma{this, "sigma", 2.0f, 0.1f, 20.0f};
+    Param<float> m_sigma{
+        this, "sigma", 2.0f, 0.1f, 20.0f,
+        {.help = "Width of the Gaussian, in pixels. Higher blurs more. "
+                 "The kernel reaches about 3x this far.",
+         .step = 0.1, .softMin = 0.1, .softMax = 5.0}};
 
     // Reused across runs to avoid reallocating on every slider drag.
     std::vector<float> m_scratch;

@@ -239,10 +239,71 @@ bool Pipeline::RunStageGpu(Stage& s, const std::vector<const Data*>& in,
                      s.algoName.c_str(), od.width, od.height);
         std::fflush(stderr);
     }
-    if (!gpu->Dispatch(*s.kernel, gin, gout, s.algo->GpuConstants(), err)) return false;
+    const int iterations = std::max(1, s.algo->GpuIterations());
 
-    // No readback here. Outputs stay GPU-resident; whoever needs CPU pixels
-    // (a later CPU stage, or a viewer) triggers the transfer via MapCpuRead().
+    if (iterations == 1) {
+        if (!gpu->Dispatch(*s.kernel, gin, gout, s.algo->GpuConstants(0), err)) return false;
+        // No readback here. Outputs stay GPU-resident; whoever needs CPU pixels
+        // (a later CPU stage, or a viewer) triggers the transfer via
+        // MapCpuRead().
+        return true;
+    }
+
+    // Iterative: ping-pong between the real output and one scratch image.
+    //
+    // Each pass must read the *completed* previous pass, which a single
+    // dispatch cannot provide -- threads within one dispatch have no ordering
+    // relative to each other. Writing into the image being read would be a
+    // race, so two buffers alternate.
+    //
+    // Only single-input, single-output stages iterate; anything else has no
+    // obvious pairing to alternate between.
+    if (gin.size() != 1 || gout.size() != 1) {
+        *err = "iterative GPU stages must have exactly one input and one output";
+        return false;
+    }
+
+    const ImageDesc desc = std::get<Image>(s.outputs[0]).Desc();
+    if (!s.gpuScratch) {
+        s.gpuScratch = std::make_shared<GpuImage>();
+        if (!gpu->CreateImage(desc, s.gpuScratch.get())) {
+            s.gpuScratch.reset();
+            *err = "could not allocate the scratch image for an iterative stage";
+            return false;
+        }
+        s.scratchDesc = desc;
+    } else if (s.scratchDesc.width != desc.width || s.scratchDesc.height != desc.height ||
+               s.scratchDesc.format != desc.format) {
+        // The image changed size, so the cached scratch no longer matches.
+        s.gpuScratch = std::make_shared<GpuImage>();
+        if (!gpu->CreateImage(desc, s.gpuScratch.get())) {
+            s.gpuScratch.reset();
+            *err = "could not resize the scratch image for an iterative stage";
+            return false;
+        }
+        s.scratchDesc = desc;
+    }
+
+    // Choose the starting parity so the LAST pass lands in the real output;
+    // otherwise the result would sit in scratch and be silently discarded.
+    // With an odd count, start by writing into the output; with an even count,
+    // start in scratch so the final flip ends up there.
+    const GpuImage* readFrom = gin[0];
+    GpuImage*       writeTo  = (iterations % 2 == 1) ? gout[0] : s.gpuScratch.get();
+
+    for (int i = 0; i < iterations; ++i) {
+        const std::vector<const GpuImage*> passIn{readFrom};
+        const std::vector<GpuImage*>       passOut{writeTo};
+        if (!gpu->Dispatch(*s.kernel, passIn, passOut, s.algo->GpuConstants(i), err))
+            return false;
+
+        // This pass's output becomes the next pass's input, and the buffer just
+        // read becomes the next target -- except on the first pass, where the
+        // input is the upstream image and must not be overwritten.
+        readFrom = writeTo;
+        writeTo  = (writeTo == gout[0]) ? s.gpuScratch.get() : gout[0];
+    }
+
     return true;
 }
 

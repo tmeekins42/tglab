@@ -21,9 +21,24 @@ struct UiControl {
     enum class Kind { Slider, Check, Choose };
 
     Kind        kind = Kind::Slider;
+
+    // Identity, kept distinct from what the user reads. `label` must be unique
+    // across the whole panel -- it is how a control's value is matched across
+    // re-runs -- so for params() it carries the algorithm and instance name.
+    // Showing that full string is what clipped the panel and made the controls
+    // unreadable, hence `display`: the short text drawn next to the widget,
+    // with `group` naming the box it sits in.
     std::string label;
+    std::string display;   // empty = use `label`
+    std::string group;     // empty = ungrouped, drawn at the top level
+    std::string help;      // one-line description, shown in the tooltip
     double      value = 0;       // Slider / Check
     double      lo = 0, hi = 1, def = 0;
+
+    // Widget tuning carried over from the parameter's ParamOpts, so a control
+    // built by params() drags exactly like the algorithm's own inspector row.
+    double      step = 0.0;                  // 0 = continuous
+    double      softLo = 0.0, softHi = 0.0;  // equal = use [lo, hi]
 
     // Choose (M2): candidate algorithm names and the selected index.
     std::vector<std::string> options;

@@ -35,6 +35,12 @@ UiControl& UiState::FindOrAdd(const UiControl& proto) {
         existing->lo      = proto.lo;
         existing->hi      = proto.hi;
         existing->def     = proto.def;
+        existing->display = proto.display;
+        existing->group   = proto.group;
+        existing->help    = proto.help;
+        existing->step    = proto.step;
+        existing->softLo  = proto.softLo;
+        existing->softHi  = proto.softHi;
         existing->options = proto.options;
         if (existing->kind == UiControl::Kind::Slider)
             existing->value = std::clamp(existing->value, proto.lo, proto.hi);
@@ -259,6 +265,12 @@ private:
         // The callee may be a bare name (builtin or registry algorithm) or any
         // expression evaluating to an algorithm handle.
         std::string calleeName;
+
+        // Which params() declaration applies to this call, if any. It travels
+        // on the algorithm value rather than being looked up by name, so
+        // params(op, "A") and params(op, "B") stay distinct.
+        std::string paramsKey;
+
         if (e.lhs && e.lhs->kind == ExprKind::Ident) {
             calleeName = e.lhs->text;
             // A variable holding an algorithm shadows the registry name.
@@ -267,6 +279,7 @@ private:
                 if (!it->second.IsAlgo())
                     return Fail(e.line, "'" + calleeName + "' is " +
                                             std::string(it->second.TypeName()) + ", not something callable");
+                paramsKey  = it->second.AsAlgo().paramsKey;
                 calleeName = it->second.AsAlgo().name;
             }
         } else if (e.lhs) {
@@ -274,6 +287,7 @@ private:
             if (!Eval(*e.lhs, &v)) return false;
             if (!v.IsAlgo())
                 return Fail(e.line, std::string("cannot call ") + v.TypeName());
+            paramsKey  = v.AsAlgo().paramsKey;
             calleeName = v.AsAlgo().name;
         }
 
@@ -284,7 +298,7 @@ private:
         if (calleeName == "params")  return CallParams(e, out);
         if (calleeName == "display") return CallDisplay(e, out);
 
-        return CallAlgorithm(calleeName, e, out, wantAll);
+        return CallAlgorithm(calleeName, paramsKey, e, out, wantAll);
     }
 
     // Evaluates arguments once, splitting positional from named.
@@ -415,27 +429,53 @@ private:
     bool CallParams(const Expr& e, std::vector<Value>* out) {
         EvaledArgs a;
         if (!EvalArgs(e, &a)) return false;
-        if (a.pos.size() != 1 || !a.pos[0].IsAlgo())
-            return Fail(e.line, "params() takes one algorithm: params(op)");
+        if (a.pos.empty() || a.pos.size() > 2 || !a.pos[0].IsAlgo())
+            return Fail(e.line,
+                        "params() takes an algorithm and an optional name: "
+                        "params(op) or params(op, \"A\")");
+        if (a.pos.size() == 2 && !a.pos[1].IsString())
+            return Fail(e.line, "params()'s second argument must be a name");
 
         const std::string& name = a.pos[0].AsAlgo().name;
         auto probe = Registry::Get().Create(name);
         if (!probe) return Fail(e.line, "unknown algorithm '" + name + "'");
 
-        // Prefix the label with the algorithm name so two algorithms that each
-        // have a "window" parameter get separate controls rather than
-        // silently sharing one.
+        // The optional instance name is what lets the same algorithm appear
+        // twice with independent settings. Without it, params(op) twice on one
+        // algorithm shares a single set of controls -- so a script comparing an
+        // algorithm against itself could not vary anything.
+        const std::string instance = a.pos.size() == 2 ? a.pos[1].AsString() : std::string();
+        const std::string key      = instance.empty() ? name : name + "@" + instance;
+
+        // The group is what the user sees, so it leads with the instance name
+        // when there is one: "A (bilateral)" reads better than the reverse.
+        const std::string group =
+            instance.empty() ? name : instance + " (" + name + ")";
+
         ParamValues pv;
         for (ParamBase* p : probe->Params()) {
             UiControl proto;
-            proto.label = name + "." + p->Name();
+            // Unique across the panel; never shown.
+            proto.label   = key + "." + p->Name();
+            // Shown inside the group box, where the algorithm name is already
+            // in the header and repeating it is what clipped the panel.
+            proto.display = p->Name();
+            proto.group   = group;
+            if (const char* h = p->Help()) proto.help = h;
             if (!p->DescribeControl(&proto)) continue;
             UiControl& c = m_ui->FindOrAdd(proto);
             pv.values.emplace_back(p->Name(), c.value);
         }
 
-        m_pendingParams[name] = std::move(pv);
-        out->push_back(a.pos[0]);   // pass the algorithm through
+        // Keyed by the same instance-aware key, so two params() calls on one
+        // algorithm no longer overwrite each other's pending values.
+        m_pendingParams[key] = std::move(pv);
+
+        // The algorithm value carries the key forward, so the call site knows
+        // which pending set belongs to it.
+        AlgoHandle h = a.pos[0].AsAlgo();
+        h.paramsKey = key;
+        out->push_back(Value(h));
         return true;
     }
 
@@ -459,8 +499,8 @@ private:
         return true;
     }
 
-    bool CallAlgorithm(const std::string& name, const Expr& e,
-                       std::vector<Value>* out, bool wantAll) {
+    bool CallAlgorithm(const std::string& name, const std::string& paramsKey,
+                       const Expr& e, std::vector<Value>* out, bool wantAll) {
         if (name.empty()) return Fail(e.line, "cannot call this expression");
         auto algo = Registry::Get().Create(name);
         if (!algo) return Fail(e.line, "unknown algorithm '" + name + "'");
@@ -490,7 +530,10 @@ private:
 
         // Values from a params() declaration are applied first, so an explicit
         // named argument in the same call still wins.
-        if (auto pit = m_pendingParams.find(name); pit != m_pendingParams.end()) {
+        // Looked up by the key params() attached to this algorithm value, so
+        // two params() calls on one algorithm apply their own settings.
+        if (auto pit = m_pendingParams.find(paramsKey.empty() ? name : paramsKey);
+            pit != m_pendingParams.end()) {
             for (const auto& [pname, pvalue] : pit->second.values) {
                 if (ParamBase* p = algo->FindParam(pname)) {
                     std::string perr;

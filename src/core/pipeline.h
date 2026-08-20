@@ -24,6 +24,7 @@ struct PortRef {
 };
 
 struct ComputeKernel;   // gpu/compute.h
+struct GpuImage;        // gpu/gpu_image.h
 
 struct Stage {
     std::unique_ptr<AlgorithmBase> algo;
@@ -41,6 +42,12 @@ struct Stage {
     // every frame. shared_ptr because Stage is moved between pipelines and the
     // kernel outlives any single run.
     std::shared_ptr<ComputeKernel> kernel;
+
+    // Second GPU image for iterative stages to ping-pong against, cached for
+    // the same reason as the kernel: reallocating it per slider drag would cost
+    // more than the iterations themselves.
+    std::shared_ptr<GpuImage> gpuScratch;
+    ImageDesc                 scratchDesc{};
 };
 
 // A viewer declared by the script via display().

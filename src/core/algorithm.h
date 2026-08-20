@@ -85,7 +85,25 @@ public:
 
     // Extra root constants, bit-cast to uint. Floats go through asfloat() in
     // the shader. Order must match the cbuffer declaration.
-    virtual std::vector<uint32_t> GpuConstants() const { return {}; }
+    //
+    // `iteration` is the 0-based pass index, for iterative algorithms; it is 0
+    // for everything else. A kernel that behaves the same every pass can ignore
+    // it entirely.
+    virtual std::vector<uint32_t> GpuConstants(int iteration = 0) const {
+        (void)iteration;
+        return {};
+    }
+
+    // How many times to dispatch the kernel, feeding each pass's output back in
+    // as the next pass's input. 1 (the default) is the ordinary single-dispatch
+    // case.
+    //
+    // Iterative schemes -- Perona-Malik being the motivating one -- cannot be
+    // expressed as a single dispatch: each step must see the *completed*
+    // previous step, and threads within one dispatch have no such ordering. The
+    // framework ping-pongs between two GPU images and hands back whichever
+    // holds the final result, so the algorithm only writes one pass.
+    virtual int GpuIterations() const { return 1; }
 
     std::span<ParamBase* const> Params() const { return m_params; }
     ParamBase* FindParam(std::string_view name) const;

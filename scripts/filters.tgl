@@ -1,0 +1,25 @@
+# Blur and edge-preserving filters — pick two from the dropdowns and compare
+# them side by side on the same image. Each one's own parameters appear below
+# automatically via params(), so no edit here is needed to tune them.
+#
+# Adding any algorithm with Category()=="filter" makes it show up in both
+# dropdowns with its controls, without touching this script.
+#
+# Cost varies enormously across this family. box_blur and guided_filter are
+# effectively free; bilateral and kuwahara_generalized are seconds per
+# megapixel; nonlocal_means is far slower still. Compare on a crop first.
+
+src = image("test")
+
+a = choose("filter A", "filter")
+b = choose("filter B", "filter")
+
+# The second argument names this set of controls. Without it both calls would
+# share one set, so picking the same algorithm twice could not be compared at
+# two different settings -- which is most of the point of this script.
+outA = params(a, "A")(src)
+outB = params(b, "B")(src)
+
+display(src,  "1 source")
+display(outA, "2 filter A")
+display(outB, "3 filter B")

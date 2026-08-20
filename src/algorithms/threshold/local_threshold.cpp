@@ -81,8 +81,9 @@ protected:
     virtual double Threshold(const LocalStats& s) const = 0;
     virtual bool   UsesIntegralImage() const { return true; }
 
-    Param<int>  m_window{this, "window", 15, 3, 201};
-    Param<bool> m_invert{this, "invert", false};
+    Param<int>  m_window{this, "window", 15, 3, 201, {.help = "Side length of the neighbourhood each pixel's threshold is computed from, in pixels. Should be larger than the strokes you want to keep but smaller than the illumination changes you want to correct. Odd values only.", .step = 2, .softMin = 3, .softMax = 51}};
+    Param<bool> m_invert{this, "invert", false,
+                         "Swap foreground and background: on gives white text on black."};
 
 private:
     IntegralImage m_integral;
@@ -103,7 +104,11 @@ protected:
     }
 
 private:
-    Param<float> m_k{this, "k", -0.2f, -1.0f, 1.0f};
+    Param<float> m_k{this, "k", -0.2f, -1.0f, 1.0f,
+                     {.help = "Weight on the local standard deviation. Niblack sets the "
+                              "threshold at mean + k*stddev, so more negative keeps more "
+                              "foreground. Typically around -0.2.",
+                      .step = 0.01}};
 };
 
 REGISTER_ALGORITHM(NiblackThreshold);
@@ -123,10 +128,17 @@ protected:
     }
 
 private:
-    Param<float> m_k{this, "k", 0.2f, 0.0f, 1.0f};
+    Param<float> m_k{this, "k", 0.2f, 0.0f, 1.0f,
+                     {.help = "Sensitivity to local contrast. Sauvola sets the threshold at "
+                              "mean * (1 + k*(stddev/r - 1)), so HIGHER k thins strokes and "
+                              "removes more background stain. Typically 0.2 to 0.5.",
+                      .step = 0.01}};
     // R is the expected dynamic range of the stddev; 128 is the standard
     // choice for 8-bit input.
-    Param<float> m_r{this, "r", 128.0f, 1.0f, 255.0f};
+    Param<float> m_r{this, "r", 128.0f, 1.0f, 255.0f,
+                     {.help = "Expected dynamic range of the local standard deviation. "
+                              "Rarely needs changing from 128 for 8-bit scans.",
+                      .step = 1.0}};
 };
 
 REGISTER_ALGORITHM(SauvolaThreshold);
@@ -154,9 +166,14 @@ protected:
     }
 
 private:
-    Param<float> m_contrastMin{this, "contrast_min", 15.0f, 0.0f, 128.0f};
+    Param<float> m_contrastMin{this, "contrast_min", 15.0f, 0.0f, 128.0f,
+        {.help = "Below this local contrast (max minus min) the window is treated as "
+                 "uniform and uniform_level is used instead. Stops blank paper from "
+                 "being thresholded into noise."}};
     // Which way a low-contrast window resolves.
-    Param<float> m_globalLevel{this, "uniform_level", 128.0f, 0.0f, 255.0f};
+    Param<float> m_globalLevel{this, "uniform_level", 128.0f, 0.0f, 255.0f,
+        {.help = "Threshold used where local contrast falls below contrast_min. "
+                 "Set above the paper brightness so blank areas come out as background."}};
 };
 
 REGISTER_ALGORITHM(BernsenThreshold);
@@ -174,7 +191,9 @@ protected:
     }
 
 private:
-    Param<float> m_c{this, "c", 5.0f, -64.0f, 64.0f};
+    Param<float> m_c{this, "c", 5.0f, -64.0f, 64.0f,
+        {.help = "Constant subtracted from the local mean. Higher removes more faint "
+                 "background; negative keeps more foreground."}};
 };
 
 REGISTER_ALGORITHM(AdaptiveMeanThreshold);
@@ -254,8 +273,11 @@ public:
     }
 
 private:
-    Param<int>   m_window{this, "window", 15, 3, 201};
-    Param<float> m_sigma {this, "sigma", 3.0f, 0.1f, 32.0f};
+    Param<int>   m_window{this, "window", 15, 3, 201, {.help = "Side length of the neighbourhood each pixel's threshold is computed from, in pixels. Should be larger than the strokes you want to keep but smaller than the illumination changes you want to correct. Odd values only.", .step = 2, .softMin = 3, .softMax = 51}};
+    Param<float> m_sigma {this, "sigma", 3.0f, 0.1f, 32.0f,
+        {.help = "Width of the Gaussian weighting within the window, in pixels. "
+                 "Lower weights nearby pixels more heavily than distant ones.",
+         .step = 0.1, .softMin = 0.1, .softMax = 8.0}};
     Param<float> m_c     {this, "c", 5.0f, -64.0f, 64.0f};
     Param<bool>  m_invert{this, "invert", false};
 

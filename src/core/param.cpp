@@ -24,6 +24,39 @@ ParamBase::ParamBase(AlgorithmBase* owner, const char* name) : m_name(name) {
     owner->m_params.push_back(this);
 }
 
+namespace {
+
+// Fine-tuning affordances shared by the numeric widgets, all of them hidden
+// until used so the panel stays one row per parameter:
+//   - left/right arrows step by exactly one increment while the slider is
+//     active, which is the "fixed increments" a drag cannot give;
+//   - ctrl+click types an exact value (ImGui built-in, but undiscoverable);
+//   - right-click resets to the declared default.
+// Returns the requested delta in steps, and sets `reset` when the value should
+// go back to its default.
+int StepInput(bool* reset, const char* help) {
+    *reset = false;
+    int steps = 0;
+
+    if (ImGui::IsItemActive() || ImGui::IsItemFocused()) {
+        if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow,  true)) --steps;
+        if (ImGui::IsKeyPressed(ImGuiKey_RightArrow, true)) ++steps;
+    }
+    if (ImGui::IsItemHovered()) {
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) *reset = true;
+        ImGui::BeginTooltip();
+        if (help && *help) {
+            ImGui::TextUnformatted(help);
+            ImGui::Separator();
+        }
+        ImGui::TextDisabled("ctrl+click to type   arrows to step   right-click to reset");
+        ImGui::EndTooltip();
+    }
+    return steps;
+}
+
+} // namespace
+
 // --- float ------------------------------------------------------------------
 
 template <> ParamType Param<float>::Type() const { return ParamType::Float; }
@@ -41,8 +74,27 @@ bool Param<float>::SetFromScript(const Value& v, std::string* err) {
 template <>
 bool Param<float>::DrawWidget() {
     float tmp = m_v;
-    if (ImGui::SliderFloat(m_name, &tmp, m_lo, m_hi)) return set(tmp);
-    return false;
+    // AlwaysClamp keeps a typed value inside the real range even when the
+    // slider only spans the soft one. Ctrl+click to type an exact value;
+    // the tooltip says so, since the affordance is invisible otherwise.
+    const ImGuiSliderFlags flags = ImGuiSliderFlags_AlwaysClamp;
+    const char* fmt = m_opts.HasStep() && m_opts.step >= 0.01 ? "%.2f" : "%.3f";
+
+    bool changed = false;
+    if (ImGui::SliderFloat(m_name, &tmp, SliderMin(), SliderMax(), fmt, flags))
+        changed = set(tmp);
+
+    bool reset = false;
+    const int steps = StepInput(&reset, Help());
+    if (reset) changed |= set(m_def);
+    else if (steps) {
+        // Without a declared step, fall back to 1% of the slider extent so the
+        // arrows still do something sensible.
+        const float s = m_opts.HasStep() ? float(m_opts.step)
+                                         : (SliderMax() - SliderMin()) * 0.01f;
+        changed |= set(m_v + float(steps) * s);
+    }
+    return changed;
 }
 
 template <>
@@ -70,8 +122,19 @@ bool Param<int>::SetFromScript(const Value& v, std::string* err) {
 template <>
 bool Param<int>::DrawWidget() {
     int tmp = m_v;
-    if (ImGui::SliderInt(m_name, &tmp, m_lo, m_hi)) return set(tmp);
-    return false;
+    bool changed = false;
+    if (ImGui::SliderInt(m_name, &tmp, SliderMin(), SliderMax(), "%d",
+                         ImGuiSliderFlags_AlwaysClamp))
+        changed = set(tmp);
+
+    bool reset = false;
+    const int steps = StepInput(&reset, Help());
+    if (reset) changed |= set(m_def);
+    else if (steps) {
+        const int s = m_opts.HasStep() ? int(m_opts.step) : 1;
+        changed |= set(m_v + steps * s);
+    }
+    return changed;
 }
 
 template <>
@@ -92,8 +155,9 @@ bool Param<bool>::SetFromScript(const Value& v, std::string* err) {
 
 bool Param<bool>::DrawWidget() {
     bool tmp = m_v;
-    if (ImGui::Checkbox(m_name, &tmp)) return set(tmp);
-    return false;
+    const bool changed = ImGui::Checkbox(m_name, &tmp) && set(tmp);
+    if (m_help && *m_help && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", m_help);
+    return changed;
 }
 // --- control description (for the script's params() builtin) ----------------
 //
@@ -107,6 +171,9 @@ bool Param<float>::DescribeControl(UiControl* out) const {
     out->hi    = double(m_hi);
     out->def   = double(m_def);
     out->value = double(m_def);
+    out->step   = m_opts.step;
+    out->softLo = m_opts.softMin;
+    out->softHi = m_opts.softMax;
     return true;
 }
 
@@ -118,6 +185,9 @@ bool Param<int>::DescribeControl(UiControl* out) const {
     out->hi    = double(m_hi);
     out->def   = double(m_def);
     out->value = double(m_def);
+    out->step   = m_opts.step;
+    out->softLo = m_opts.softMin;
+    out->softHi = m_opts.softMax;
     return true;
 }
 

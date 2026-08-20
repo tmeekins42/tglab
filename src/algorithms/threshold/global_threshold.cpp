@@ -81,7 +81,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
 }
 )";
     }
-    std::vector<uint32_t> GpuConstants() const override {
+    std::vector<uint32_t> GpuConstants(int) const override {
         const float level = m_level;
         uint32_t bits;
         std::memcpy(&bits, &level, sizeof(bits));

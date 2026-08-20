@@ -108,6 +108,7 @@ names are the filename without extension and are **case-sensitive**, so
 
 ```sh
 ./build/Release/tglab_tests.exe          # language and pipeline semantics (fast)
+./build/Release/tglab_filter_tests.exe   # filter behaviour: noise, edges, flat-field
 ./build/Release/tglab_runtime_tests.exe  # worker thread, shaders, GPU (needs a device)
 ```
 
@@ -140,6 +141,7 @@ kernel = [[-1,0,1],[-2,0,2],[-1,0,1]]   # matrix literal
 | `choose("label", [a, b, c])` | Dropdown of algorithms; returns the selected one. |
 | `choose("label", "category")` | Same, but offers every algorithm in a category. |
 | `params(algo)` | Declares a control for each of `algo`'s parameters; returns `algo`. |
+| `params(algo, "name")` | The same, as an independently-controlled instance, so one algorithm can appear twice. |
 | `display(data)` / `display(data, "name")` | Opens a viewer panel. |
 
 ### Calling algorithms
@@ -195,6 +197,26 @@ Explicit named arguments still win over `params()`:
 ```
 mask = params(op)(src, window = 31)     # window is fixed, the rest are sliders
 ```
+
+**Naming an instance.** A second argument names the control set, which is what
+lets the *same* algorithm appear twice with independent settings:
+
+```
+a = choose("filter A", "filter")
+b = choose("filter B", "filter")
+
+outA = params(a, "A")(src)
+outB = params(b, "B")(src)
+```
+
+Without the name, both calls key their controls by algorithm name alone, so
+picking the same algorithm in both dropdowns would give one shared set — and
+comparing it against itself at two settings would be impossible.
+
+Each named set becomes its own collapsing group in the Controls panel, showing
+short parameter names (`k`, `window`) since the algorithm is already named in
+the group header. Hovering any control shows its full identifier, range, and
+default.
 
 ### Example
 
@@ -258,6 +280,50 @@ REGISTER_ALGORITHM(MyThreshold);
 it, the UI writes it, the algorithm reads it. There is nothing to keep in sync,
 and `params()` exposes it automatically.
 
+**Document every parameter.** `help` is one line saying what the parameter
+actually does, shown at the top of its tooltip. A name and a range do not tell
+you what `k` or `eps` controls, and for an unfamiliar algorithm that is the
+whole question. Say what changes and in which direction:
+
+```cpp
+Param<float> m_k{this, "k", 0.05f, 0.001f, 1.0f,
+                 {.help = "Edge threshold, as a fraction of the intensity "
+                          "range. Note this runs OPPOSITE to a blur radius: "
+                          "LOWER k preserves more."}};
+```
+
+A test asserts that every parameter of every `"filter"` algorithm has help
+text, so an undocumented one fails the build rather than reaching the panel.
+
+**Tuning the widget.** The same `ParamOpts` says how a parameter wants to be
+driven, which matters when the declared range is far wider than the range worth
+dragging through:
+
+```cpp
+// Sigma is legal up to 20 but tuned around 0.5..3, so the slider covers the
+// useful part and larger values stay reachable by typing.
+Param<float> m_sigma{this, "sigma", 2.0f, 0.1f, 20.0f,
+                     {.step = 0.1, .softMin = 0.1, .softMax = 5.0}};
+
+// Only odd window sizes are meaningful, so step past the even ones.
+Param<int> m_window{this, "window", 15, 3, 201,
+                    {.step = 2, .softMin = 3, .softMax = 51}};
+```
+
+- `step` — quantum for the arrow keys and for snapping. Applied in
+  `Param::set()`, so a typed or script-assigned value lands on the same grid as
+  a dragged one.
+- `softMin`/`softMax` — the slider's extent. The full `[lo, hi]` range stays
+  reachable by ctrl+click; `ImGuiSliderFlags_AlwaysClamp` keeps a typed value
+  inside it.
+
+Omit the argument and the parameter behaves exactly as before.
+
+Every numeric row supports **ctrl+click to type an exact value**, **left/right
+arrows to step** while the slider is focused, and **right-click to reset** to
+the declared default. None of these add chrome, so the panel stays one row per
+parameter.
+
 **Categories must hold interchangeable algorithms.** `choose(label, category)`
 offers every member in one dropdown, so they need the same call shape. That is
 why Canny's internal stages sit in `"edge stage"` rather than `"edge"` — they
@@ -277,6 +343,52 @@ being algorithms themselves. Currently:
   per pixel instead of O(r²). The difference between a usable and an unusable
   local thresholder at large window sizes.
 - `MinMaxFilter` — windowed min/max in two separable passes, O(2r) per pixel.
+- `PixelBuffer` — unpacks an image to flat floats and packs it back, so a
+  spatial filter gets branch-free neighbour access and correct handling of all
+  three formats without repeating the format switch. `AtClamped()` gives the
+  edge-clamped reads every windowed filter needs at the border, and
+  `ValueScale()` reports 255 or 1 so a parameter expressed as a fraction of the
+  intensity range means the same thing whatever the source format.
+
+### Filters
+
+Everything in `Category()=="filter"` is interchangeable, so
+[scripts/filters.tgl](scripts/filters.tgl) puts two of them side by side from
+dropdowns. Roughly in order of cost, measured at 1 MP in Release:
+
+CPU cost is per megapixel in Release; the GPU column is the measured speedup
+where a compute kernel exists.
+
+| Filter | CPU | GPU | Preserves edges | Notes |
+|---|---|---|---|---|
+| `box_blur` | ~75 ms | 3x | no | Running sum, O(1) in radius. The baseline. |
+| `gaussian_blur` | ~140 ms | 5x | no | Separable on the CPU, single-pass on the GPU. |
+| `guided_filter` | ~230 ms | — | yes | O(1) in radius, no gradient reversal. Usually the best default. |
+| `median_blur` | ~680 ms | — | yes | Sliding 256-bin histogram for 8-bit. The impulse-noise filter. |
+| `symmetric_nearest` | ~590 ms | 13x | yes | Cheap, no preferred orientation. |
+| `kuwahara` | ~810 ms | 15x | yes | Four quadrants; painterly, slightly blocky. |
+| `anisotropic_diffusion` | ~920 ms | 17x | yes | Perona-Malik. Iterative; `k` is the edge/noise boundary. |
+| `kuwahara_generalized` | ~2.4 s | — | yes | Papari-Petkov-Campisi; smooth sector weighting. |
+| `bilateral` | ~3.1 s | **108x** | yes | The classic; O(r²) and prone to halos. |
+| `nonlocal_means` | ~11 s | — | yes | Patch-similarity denoiser. Best on repeating texture; by far the slowest. |
+
+The remaining three resist a straightforward kernel: `median_blur` and
+`nonlocal_means` need per-pixel sorting or a large search, and
+`kuwahara_generalized` needs its precomputed sector weight maps as a second
+input, which the one-input dispatch shape does not yet express.
+
+A GPU path is used only within the radius each kernel declares safe. Beyond
+that the stage falls back to the CPU, because a single dispatch doing millions
+of fetches per pixel trips the GPU watchdog and takes the whole device down.
+
+Two behaviours worth knowing before tuning, both asserted in the tests:
+
+- **Perona-Malik's `k` runs backwards from a blur radius.** Small `k` preserves
+  more, because anything above it counts as an edge. A ±255 impulse is a very
+  strong gradient, so small `k` *keeps* impulse noise rather than removing it.
+- **`nonlocal_means` is not an impulse filter.** Patch distances around an
+  impulse are enormous, so it treats one as structure. It is for broad-band
+  noise on repeating texture — scanned paper grain, weave, halftone.
   The equivalent trick for statistics an integral image cannot express: at
   8 MP the direct O(r²) version took over two minutes.
 - `SampleValue()` — reads any format as a double, with clamp-to-edge.
@@ -305,7 +417,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
 )";
 }
 
-std::vector<uint32_t> GpuConstants() const override {
+std::vector<uint32_t> GpuConstants(int iteration) const override {
     const float level = m_level;
     uint32_t bits; std::memcpy(&bits, &level, sizeof(bits));
     return {bits};
@@ -315,6 +427,24 @@ std::vector<uint32_t> GpuConstants() const override {
 Bindings are fixed by convention: `t0..t3` inputs, `u0..u3` outputs, and `b0`
 holding `Width`, `Height`, then whatever `GpuConstants()` returns (floats
 bit-cast through `uint`, read back with `asfloat`). Thread groups are 8×8.
+
+**Iterative kernels.** Some schemes cannot be one dispatch: each step must see
+the *completed* previous step, and threads within a dispatch have no ordering
+relative to each other. Returning more than 1 from `GpuIterations()` makes the
+framework run the kernel that many times, ping-ponging between two GPU images
+and feeding each pass's output back in:
+
+```cpp
+int GpuIterations() const override { return m_iterations; }
+```
+
+The algorithm still writes a single pass. The framework picks the starting
+buffer so the last pass lands in the real output, allocates the scratch image
+once, and caches it across runs. This is what makes Perona-Malik interactive:
+its ~17x speedup is on top of running every iteration.
+
+Only single-input, single-output stages may iterate — anything else has no
+obvious pair of buffers to alternate between.
 
 A kernel that fails to compile falls back to the CPU rather than failing the
 run, with the DXC diagnostics reported — a shader you are mid-way through

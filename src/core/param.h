@@ -7,6 +7,7 @@
 // list, so declaring a member *is* declaring the descriptor.
 #pragma once
 
+#include <cmath>
 #include <algorithm>
 #include <cstdint>
 #include <string>
@@ -18,6 +19,34 @@ struct UiControl;
 class Value;
 
 enum class ParamType : uint8_t { Float, Int, Bool };
+
+// Optional tuning for a numeric parameter's widget.
+//
+// The full [lo, hi] range is often far wider than the range actually worth
+// dragging through: sigma is declared 0.1..20 but tuned around 0.5..3, so a
+// plain slider spends most of its travel on values nobody wants and makes the
+// useful part impossible to hit. These let a parameter say how it wants to be
+// driven without the script or the UI restating it.
+struct ParamOpts {
+    // One line saying what this parameter actually controls, shown in the
+    // tooltip. A name and a range do not tell you what `k` or `eps` does, and
+    // for an unfamiliar algorithm that is the whole question. Say what changes
+    // and in which direction -- "higher keeps more edges" beats "edge
+    // threshold".
+    const char* help = nullptr;
+
+    // Quantum for arrow keys and dragging. 0 means continuous.
+    double step = 0.0;
+
+    // Preferred slider extent. When set, the slider covers [softMin, softMax]
+    // while values outside it stay reachable by typing (ctrl+click). 0/0 means
+    // "use the full range".
+    double softMin = 0.0;
+    double softMax = 0.0;
+
+    bool HasStep() const { return step > 0.0; }
+    bool HasSoftRange() const { return softMin != softMax; }
+};
 
 const char* ParamTypeName(ParamType t);
 
@@ -46,6 +75,9 @@ public:
 
     const char* Name() const { return m_name; }
 
+    // One-line description, or nullptr. Declared through ParamOpts.
+    virtual const char* Help() const { return nullptr; }
+
 protected:
     const char* m_name;
 };
@@ -53,15 +85,18 @@ protected:
 template <class T>
 class Param : public ParamBase {
 public:
-    Param(AlgorithmBase* owner, const char* name, T def, T lo, T hi)
-        : ParamBase(owner, name), m_v(def), m_lo(lo), m_hi(hi), m_def(def) {}
+    Param(AlgorithmBase* owner, const char* name, T def, T lo, T hi, ParamOpts opts = {})
+        : ParamBase(owner, name), m_v(def), m_lo(lo), m_hi(hi), m_def(def), m_opts(opts) {}
 
     // Read as a plain T — no lookup, no string, usable in inner loops.
     operator T() const { return m_v; }
     T get() const { return m_v; }
 
-    // The only mutator. Clamps to range; returns true if the value changed.
+    // The only mutator. Snaps to the step, clamps to range; returns true if the
+    // value changed. Snapping lives here rather than in the widget so a typed
+    // or script-assigned value lands on the same grid as a dragged one.
     bool set(T nv) {
+        nv = Snap(nv);
         nv = std::clamp(nv, m_lo, m_hi);
         if (nv == m_v) return false;
         m_v = nv;
@@ -71,6 +106,12 @@ public:
     T Min() const { return m_lo; }
     T Max() const { return m_hi; }
     T Default() const { return m_def; }
+    const ParamOpts& Opts() const { return m_opts; }
+    const char* Help() const override { return m_opts.help; }
+
+    // Slider extent: the soft range when one is declared, else the full range.
+    T SliderMin() const { return m_opts.HasSoftRange() ? T(m_opts.softMin) : m_lo; }
+    T SliderMax() const { return m_opts.HasSoftRange() ? T(m_opts.softMax) : m_hi; }
 
     ParamType Type() const override;
     bool      SetFromScript(const Value& v, std::string* err) override;
@@ -79,15 +120,29 @@ public:
     uint64_t  HashValue() const override;
 
 private:
+    // Rounds to the nearest multiple of the step measured from m_lo, so a
+    // window declared 3..201 step 2 snaps to odd sizes rather than even ones.
+    T Snap(T v) const {
+        if (!m_opts.HasStep()) return v;
+        const double s = m_opts.step;
+        const double n = std::round((double(v) - double(m_lo)) / s);
+        return T(double(m_lo) + n * s);
+    }
+
     T m_v, m_lo, m_hi, m_def;
+    ParamOpts m_opts;
 };
 
 // Bool has no meaningful range; provide a narrower constructor.
 template <>
 class Param<bool> : public ParamBase {
 public:
-    Param(AlgorithmBase* owner, const char* name, bool def)
-        : ParamBase(owner, name), m_v(def), m_def(def) {}
+    // Bools have no range to tune, but they still benefit from help: a flag
+    // named `exponential` says nothing about what it selects.
+    Param(AlgorithmBase* owner, const char* name, bool def, const char* help = nullptr)
+        : ParamBase(owner, name), m_v(def), m_def(def), m_help(help) {}
+
+    const char* Help() const override { return m_help; }
 
     operator bool() const { return m_v; }
     bool get() const { return m_v; }
@@ -105,6 +160,7 @@ public:
 
 private:
     bool m_v, m_def;
+    const char* m_help = nullptr;
 };
 
 extern template class Param<float>;

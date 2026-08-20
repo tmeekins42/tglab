@@ -94,7 +94,7 @@ private:
         m_hyst  = Registry::Get().Create("hysteresis");
     }
 
-    Param<float> m_sigma{this, "sigma", 1.4f, 0.1f, 20.0f};
+    Param<float> m_sigma{this, "sigma", 1.4f, 0.1f, 20.0f, {.step = 0.1, .softMin = 0.1, .softMax = 5.0}};
     Param<float> m_low  {this, "low",   0.10f, 0.0f, 4.0f};
     Param<float> m_high {this, "high",  0.30f, 0.0f, 4.0f};
 

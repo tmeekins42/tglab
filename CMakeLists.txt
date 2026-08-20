@@ -37,6 +37,7 @@ add_library(tglab_core STATIC
     src/core/compare.cpp
     src/core/image_loader.cpp
     src/algo_util/histogram.cpp
+    src/algo_util/pixel_buffer.cpp
     src/script/lexer.cpp
     src/script/parser.cpp
     src/script/interp.cpp
@@ -144,6 +145,18 @@ if(MSVC)
 endif()
 tglab_copy_dxc(tglab_runtime_tests)
 
+# Behavioural checks for the filter family: noise reduction, edge preservation,
+# and flat-field stability. No window and no GPU, so it runs with the spine.
+add_executable(tglab_filter_tests
+    tests/test_filters.cpp
+    $<TARGET_OBJECTS:tglab_algorithms>
+)
+target_link_libraries(tglab_filter_tests PRIVATE tglab_core imgui d3d12 dxgi)
+if(MSVC)
+    target_compile_definitions(tglab_filter_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
 enable_testing()
 add_test(NAME script_spine COMMAND tglab_tests)
+add_test(NAME filters      COMMAND tglab_filter_tests)
 add_test(NAME runtime      COMMAND tglab_runtime_tests)

@@ -330,6 +330,133 @@ static void TestResidency(ID3D12Device* dev) {
     gpu.Shutdown();
 }
 
+// Every GPU kernel must agree with its CPU implementation. A kernel that
+// merely runs and produces a plausible image is not verified: the whole point
+// of having both is that they compute the same thing, and compare mode is
+// only trustworthy if that holds.
+static void TestGpuAgreement(ID3D12Device* dev) {
+    Section("CPU/GPU agreement");
+
+    ComputeContext gpu;
+    if (!gpu.Init(dev)) { Check(false, "compute context"); return; }
+
+    struct Case {
+        const char* name;
+        const char* script;
+        double      tolerance;      // max, in 0..255 units
+        double      meanTolerance;  // average, which is what catches real bugs
+    };
+
+    // Tolerances reflect real numerical differences, not sloppiness: the GPU
+    // works in normalised floats and the CPU in 0..255, so rounding differs by
+    // roughly an LSB. Iterative schemes accumulate that over their passes.
+    const Case cases[] = {
+        {"box_blur",
+         "src = image(\"test\")\n"
+         "o = box_blur(src, radius = 3)\n"
+         "display(o)\n", 2.0, 1.0},
+
+        {"gaussian_blur",
+         "src = image(\"test\")\n"
+         "o = gaussian_blur(src, sigma = 2.0)\n"
+         "display(o)\n", 2.0, 1.0},
+
+        {"bilateral",
+         "src = image(\"test\")\n"
+         "o = bilateral(src, sigma_space = 3.0, sigma_range = 0.15)\n"
+         "display(o)\n", 3.0, 1.0},
+
+        {"kuwahara",
+         "src = image(\"test\")\n"
+         "o = kuwahara(src, radius = 3)\n"
+         "display(o)\n", 3.0, 1.0},
+
+        // Looser max than the rest, for a reason specific to this filter: it
+        // picks one member of each symmetric pair by an exact comparison
+        // (da <= db), evaluated at 0..255 on the CPU and normalised 0..1 on
+        // the GPU. Where the two are exactly tied -- common on the flat regions
+        // of the checkerboard fixture -- the sides can keep different pixels,
+        // which is a genuine difference in value rather than rounding. The mean
+        // check below is what confirms it stays isolated.
+        {"symmetric_nearest",
+         "src = image(\"test\")\n"
+         "o = symmetric_nearest(src, radius = 3)\n"
+         "display(o)\n", 5.0, 1.0},
+
+        // Iterative: exercises the ping-pong path, where a parity mistake
+        // would leave the result in the scratch image and show the input
+        // unchanged -- which a "did it run" check would not catch.
+        {"anisotropic_diffusion",
+         "src = image(\"test\")\n"
+         "o = anisotropic_diffusion(src, iterations = 8, lambda = 0.2, k = 0.1)\n"
+         "display(o)\n", 6.0, 1.0},
+    };
+
+    for (const Case& c : cases) {
+        UiState ui; Pipeline pipe; std::vector<Data> src; std::string e;
+        if (!BuildPipeline(c.script, 1024, &ui, &pipe, &src, &e)) {
+            Check(false, std::string(c.name) + " builds: " + e);
+            continue;
+        }
+
+        const CompareResult r = CompareCpuGpu(pipe, &src, &gpu, -1);
+        if (!r.ok) {
+            Check(false, std::string(c.name) + " compares: " + r.error);
+            continue;
+        }
+
+        Check(r.algorithm == c.name,
+              std::string("compare selected ") + c.name + " (got " + r.algorithm + ")");
+        Check(r.stats.maxAbsDiff <= c.tolerance,
+              std::string(c.name) + " GPU matches CPU (max diff " +
+                  std::to_string(r.stats.maxAbsDiff) + " <= " +
+                  std::to_string(c.tolerance) + ")");
+
+        // The mean is the real check. A wrong kernel is wrong more or less
+        // everywhere, so it moves the average well beyond a rounding step;
+        // per-pixel LSB differences cannot, however many pixels have them.
+        //
+        // The bound is one LSB: the two sides quantise differently (the CPU
+        // rounds from 0..255 values, the GPU from normalised floats), so every
+        // pixel may legitimately land one step apart, but no more. Anything
+        // above that is a difference in the maths, not in the rounding.
+        Check(r.stats.meanAbsDiff <= c.meanTolerance,
+              std::string(c.name) + " differs only by quantisation (mean " +
+                  std::to_string(r.stats.meanAbsDiff) + " <= " +
+                  std::to_string(c.meanTolerance) + ")");
+
+        // Reported, not asserted: at 128x128 the dispatch overhead dominates,
+        // so a speedup here would be measuring the wrong thing. The point of
+        // the GPU path is interactive sliders on megapixel scans.
+        std::printf("       %-24s cpu %7.1f ms   gpu %7.1f ms   %.1fx\n",
+                    c.name, r.cpuMs, r.gpuMs, r.Speedup());
+    }
+
+    // An iterative stage must actually change the image. Getting the ping-pong
+    // parity wrong yields the *input* rather than the result, which still
+    // "matches" nothing and would slip past a tolerance check alone.
+    {
+        UiState ui; Pipeline pipe; std::vector<Data> src; std::string e;
+        const char* script =
+            "src = image(\"test\")\n"
+            "o = anisotropic_diffusion(src, iterations = 12, lambda = 0.25, k = 0.5)\n"
+            "display(o)\n";
+        if (BuildPipeline(script, 128, &ui, &pipe, &src, &e) &&
+            pipe.Execute(&src, nullptr, &e, &gpu, ExecMode::ForceGPU)) {
+            Check(pipe.GpuStageCount() == 1, "the iterative stage ran on the GPU");
+
+            const Data* d = pipe.Resolve({0, 0}, &src);
+            Image& out = const_cast<Image&>(std::get<Image>(*d));
+            Image& in  = std::get<Image>(src[0]);
+            const CompareStats s = CompareImages(in, out, 0.0);
+            Check(s.maxAbsDiff > 1.0,
+                  "the iterative GPU result differs from its input (ping-pong parity)");
+        } else {
+            Check(false, "iterative GPU stage ran: " + e);
+        }
+    }
+}
+
 static void TestCompare(ID3D12Device* dev) {
     Section("compare mode");
 
@@ -446,6 +573,7 @@ int main() {
         TestGpuPipeline(dev);
         TestResidency(dev);
         TestCompare(dev);
+        TestGpuAgreement(dev);
         dev->Release();
     } else {
         std::printf("\n(no D3D12 device — GPU tests skipped)\n");

@@ -24,6 +24,13 @@ struct PortHandle {
 struct AlgoHandle {
     std::string name;
 
+    // Set by params() to the instance-aware key of the control set declared for
+    // this particular use. Empty when the algorithm was not passed through
+    // params(). Carried on the value so that calling it applies that set rather
+    // than one keyed by algorithm name alone, which two params() calls on the
+    // same algorithm would share.
+    std::string paramsKey;
+
     bool operator==(const AlgoHandle&) const = default;
 };
 

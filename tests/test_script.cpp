@@ -750,6 +750,145 @@ int main() {
               "the output reflects the new image with no other change");
     }
 
+    // --- params() with an instance name -------------------------------------
+    //
+    // The comparison case: the same algorithm twice, at different settings.
+    // Keyed by algorithm name alone, the two calls shared one control set and
+    // one pending-value entry, so the second silently had no controls at all.
+    {
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        const bool ok = RunScript(
+            "src = image(\"test\")\n"
+            "a = params(threshold_niblack, \"A\")(src)\n"
+            "b = params(threshold_niblack, \"B\")(src)\n"
+            "display(a)\n"
+            "display(b)\n", &ui, &p, &err, &src);
+        Check(ok, "the same algorithm can be declared twice" + (ok ? "" : ": " + err));
+
+        int aControls = 0, bControls = 0;
+        for (const UiControl& c : ui.Controls()) {
+            if (c.label.rfind("threshold_niblack@A.", 0) == 0) ++aControls;
+            if (c.label.rfind("threshold_niblack@B.", 0) == 0) ++bControls;
+        }
+        Check(aControls > 0 && aControls == bControls,
+              "each instance gets its own full set of controls");
+
+        // Grouping and short names are what make the panel readable.
+        bool grouped = false, shortNamed = false;
+        for (const UiControl& c : ui.Controls()) {
+            if (c.group == "A (threshold_niblack)") grouped = true;
+            // The row shows "k", not "threshold_niblack@A.k".
+            if (c.display == "k") shortNamed = true;
+        }
+        Check(grouped, "params() names a group per instance");
+        Check(shortNamed, "controls carry a short display name distinct from the key");
+    }
+    {
+        // Independence has to hold for the values, not just the labels: setting
+        // one instance's parameter must not move the other's.
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        const bool ok = RunScript(
+            "src = image(\"test\")\n"
+            "a = params(threshold_niblack, \"A\")(src)\n"
+            "b = params(threshold_niblack, \"B\")(src)\n"
+            "display(a)\n"
+            "display(b)\n", &ui, &p, &err, &src);
+        Check(ok, "two instances run" + (ok ? "" : ": " + err));
+
+        UiControl* ak = ui.Find("threshold_niblack@A.k");
+        UiControl* bk = ui.Find("threshold_niblack@B.k");
+        if (ak && bk) {
+            ak->value = 0.5;
+            Check(bk->value != 0.5, "changing instance A's k leaves B's alone");
+        } else {
+            Check(false, "both instances declared a 'k' control");
+        }
+    }
+    {
+        // Without a name, the old spelling must keep working unchanged.
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        const bool ok = RunScript(
+            "src = image(\"test\")\n"
+            "m = params(threshold_niblack)(src)\n"
+            "display(m)\n", &ui, &p, &err, &src);
+        Check(ok, "params() without a name still works" + (ok ? "" : ": " + err));
+        Check(ui.Find("threshold_niblack.k") != nullptr,
+              "an unnamed params() keys controls by algorithm name as before");
+    }
+
+    // --- parameter help text ------------------------------------------------
+    //
+    // Help is declared on the Param and has to survive the trip through
+    // DescribeControl into the UiControl the panel draws from, or the tooltip
+    // silently shows nothing.
+    {
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        const bool ok = RunScript(
+            "src = image(\"test\")\n"
+            "m = params(threshold_sauvola, \"S\")(src)\n"
+            "display(m)\n", &ui, &p, &err, &src);
+        Check(ok, "a script using a documented algorithm runs" + (ok ? "" : ": " + err));
+
+        const UiControl* k = ui.Find("threshold_sauvola@S.k");
+        Check(k && !k->help.empty(), "help text reaches the control the panel draws");
+
+        // Every filter parameter should be documented: an undocumented one is
+        // exactly the case the user could not interpret.
+        int undocumented = 0;
+        std::string missing;
+        for (const std::string& name : Registry::Get().Names()) {
+            auto a = Registry::Get().Create(name);
+            if (!a || std::string(a->Category()) != "filter") continue;
+            for (ParamBase* pb : a->Params())
+                if (!pb->Help() || !*pb->Help()) {
+                    ++undocumented;
+                    missing += " " + name + "." + pb->Name();
+                }
+        }
+        Check(undocumented == 0, "every filter parameter has help text" +
+                                     (undocumented ? ":" + missing : ""));
+    }
+
+    // --- parameter step / soft range ---------------------------------------
+    //
+    // Snapping lives in Param::set(), so it must apply to script and typed
+    // values too, not only to dragging.
+    {
+        struct Dummy : AlgorithmBase {
+            const char* Name() const override { return "dummy"; }
+            PortList Inputs()  const override { return {}; }
+            PortList Outputs() const override { return {}; }
+            void RunCPU(RunCtx&) override {}
+            // Odd window sizes, as the local-threshold algorithms declare them.
+            Param<int>   window{this, "window", 15, 3, 201, {.step = 2, .softMin = 3, .softMax = 51}};
+            Param<float> k     {this, "k", -0.2f, -1.0f, 1.0f, {.step = 0.01}};
+            Param<float> plain {this, "plain", 0.5f, 0.0f, 1.0f};
+        } d;
+
+        d.window.set(14);
+        Check(d.window.get() == 15, "an even window snaps to the odd grid");
+        d.window.set(20);
+        Check(d.window.get() == 21, "snapping measures from the minimum, not zero");
+
+        d.k.set(-0.184f);
+        Check(std::abs(d.k.get() - (-0.18f)) < 1e-5f, "k snaps to hundredths");
+
+        d.plain.set(0.3456f);
+        Check(std::abs(d.plain.get() - 0.3456f) < 1e-6f,
+              "a parameter with no step stays continuous");
+
+        // The slider spans the soft range; the full range remains settable.
+        Check(d.window.SliderMin() == 3 && d.window.SliderMax() == 51,
+              "the slider covers the soft range when one is declared");
+        d.window.set(199);
+        Check(d.window.get() == 199, "values beyond the soft range are still reachable");
+        d.window.set(500);
+        Check(d.window.get() == 201, "the hard maximum still clamps");
+
+        Check(d.k.SliderMin() == -1.0f && d.k.SliderMax() == 1.0f,
+              "without a soft range the slider covers the full range");
+    }
+
     std::printf("\n%s\n", g_fail == 0 ? "all checks passed" : "FAILURES PRESENT");
     return g_fail == 0 ? 0 : 1;
 }

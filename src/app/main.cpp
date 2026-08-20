@@ -154,6 +154,7 @@ private:
     void BuildDefaultLayout(ImGuiID dockspace);
     void DrawMenuBar();
     void DrawControlsPanel();
+    void DrawControl(UiControl& c);
     void DrawPalettePanel();
     void BeginRename(int i);
     void CommitRename(int i);
@@ -806,19 +807,106 @@ void App::DrawControlsPanel() {
     ImGui::TextDisabled("(double-click a control to reset it)");
     ImGui::Separator();
 
-    for (UiControl& c : m_ui.Controls()) {
+    // Grouped controls are drawn inside a collapsing header, in first-seen
+    // order. params() puts each algorithm instance in its own group, so a
+    // script comparing two filters gets two independently foldable boxes
+    // instead of one flat list of ambiguous names.
+    std::vector<std::string> groups;          // "" first, then in declaration order
+    for (const UiControl& c : m_ui.Controls())
+        if (std::find(groups.begin(), groups.end(), c.group) == groups.end())
+            groups.push_back(c.group);
+
+    for (const std::string& group : groups) {
+        bool open = true;
+        if (!group.empty()) {
+            ImGui::PushID(group.c_str());
+            open = ImGui::CollapsingHeader(group.c_str(), ImGuiTreeNodeFlags_DefaultOpen);
+        }
+
+        if (open) {
+            // Give the label column a fixed share so long names are readable
+            // and the sliders still line up. Without this the widget takes the
+            // full width and the text is pushed off the panel.
+            const float avail = ImGui::GetContentRegionAvail().x;
+            ImGui::PushItemWidth(std::max(80.0f, avail * 0.55f));
+            for (UiControl& c : m_ui.Controls()) {
+                if (c.group != group) continue;
+                DrawControl(c);
+            }
+            ImGui::PopItemWidth();
+        }
+
+        if (!group.empty()) ImGui::PopID();
+    }
+    ImGui::End();
+}
+
+// One control row, plus the reset gestures shared by all of them.
+void App::DrawControl(UiControl& c) {
+    // The visible text; `label` stays unique but is often far too long to read.
+    const std::string& shown = c.display.empty() ? c.label : c.display;
+    // ImGui identifies widgets by label, so the unique one goes after "##".
+    const std::string widgetId = shown + "##" + c.label;
+
+    {
         switch (c.kind) {
             case UiControl::Kind::Slider: {
                 float v = float(c.value);
-                if (ImGui::SliderFloat(c.label.c_str(), &v, float(c.lo), float(c.hi))) {
-                    c.value = v;
+                // Drag over the soft range when one is declared; the full range
+                // stays reachable by ctrl+click, which AlwaysClamp bounds.
+                const bool soft = c.softLo != c.softHi;
+                const float slo = float(soft ? c.softLo : c.lo);
+                const float shi = float(soft ? c.softHi : c.hi);
+                const char* fmt = (c.step > 0.0 && c.step >= 0.01) ? "%.2f" : "%.3f";
+
+                bool changed = false;
+                if (ImGui::SliderFloat(widgetId.c_str(), &v, slo, shi, fmt,
+                                       ImGuiSliderFlags_AlwaysClamp))
+                    changed = true;
+
+                // Same fine-tuning affordances as the inspector rows: arrows
+                // step, right-click resets, ctrl+click types.
+                if (ImGui::IsItemActive() || ImGui::IsItemFocused()) {
+                    const float s = c.step > 0.0 ? float(c.step) : (shi - slo) * 0.01f;
+                    if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow,  true)) { v -= s; changed = true; }
+                    if (ImGui::IsKeyPressed(ImGuiKey_RightArrow, true)) { v += s; changed = true; }
+                }
+                if (ImGui::IsItemHovered()) {
+                    if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+                        v = float(c.def);
+                        changed = true;
+                    }
+                    // What it does comes first -- that is the question an
+                    // unfamiliar algorithm raises. Then the full name (the row
+                    // shows only the short one), then the range, then the
+                    // gestures, which are the least interesting once known.
+                    ImGui::BeginTooltip();
+                    if (!c.help.empty()) {
+                        ImGui::TextUnformatted(c.help.c_str());
+                        ImGui::Separator();
+                    }
+                    ImGui::TextDisabled("%s", c.label.c_str());
+                    ImGui::TextDisabled("range %g .. %g   default %g", c.lo, c.hi, c.def);
+                    ImGui::TextDisabled(
+                        "ctrl+click to type   arrows to step   right-click to reset");
+                    ImGui::EndTooltip();
+                }
+
+                if (changed) {
+                    // Snap to the step from the declared minimum, so a window
+                    // of 3..201 step 2 lands on odd sizes.
+                    if (c.step > 0.0) {
+                        const double n = std::round((double(v) - c.lo) / c.step);
+                        v = float(c.lo + n * c.step);
+                    }
+                    c.value = std::clamp(double(v), c.lo, c.hi);
                     m_dirty = true;
                 }
                 break;
             }
             case UiControl::Kind::Check: {
                 bool b = c.value != 0;
-                if (ImGui::Checkbox(c.label.c_str(), &b)) {
+                if (ImGui::Checkbox(widgetId.c_str(), &b)) {
                     c.value = b ? 1 : 0;
                     m_dirty = true;
                 }
@@ -827,7 +915,7 @@ void App::DrawControlsPanel() {
             case UiControl::Kind::Choose: {
                 if (c.options.empty()) break;
                 const int sel = std::clamp(c.selected, 0, int(c.options.size()) - 1);
-                if (ImGui::BeginCombo(c.label.c_str(), c.options[size_t(sel)].c_str())) {
+                if (ImGui::BeginCombo(widgetId.c_str(), c.options[size_t(sel)].c_str())) {
                     for (int i = 0; i < int(c.options.size()); ++i) {
                         const bool chosen = (i == sel);
                         if (ImGui::Selectable(c.options[size_t(i)].c_str(), chosen)) {
@@ -853,10 +941,20 @@ void App::DrawControlsPanel() {
                 m_dirty = true;
             }
         }
-        if (ImGui::IsItemHovered() && IsModified(c))
-            ImGui::SetTooltip("default: %s\ndouble-click to reset", DefaultText(c).c_str());
+        // Sliders set their own richer tooltip above; this covers the rest.
+        if (c.kind != UiControl::Kind::Slider && ImGui::IsItemHovered()) {
+            ImGui::BeginTooltip();
+            if (!c.help.empty()) {
+                ImGui::TextUnformatted(c.help.c_str());
+                ImGui::Separator();
+            }
+            ImGui::TextDisabled("%s", c.label.c_str());
+            if (IsModified(c))
+                ImGui::TextDisabled("default: %s   double-click to reset",
+                                    DefaultText(c).c_str());
+            ImGui::EndTooltip();
+        }
     }
-    ImGui::End();
 }
 
 bool App::IsModified(const UiControl& c) {
