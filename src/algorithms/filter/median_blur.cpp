@@ -39,8 +39,8 @@ public:
         m_out.AllocLike(m_in);
 
         const int radius = std::max(1, int(m_radius));
-        if (src.desc.format == Format::RGBA8) RunHistogram(radius);
-        else                                  RunSelection(radius);
+        if (src.desc.format == Format::RGBA8) RunHistogram(radius, ctx);
+        else                                  RunSelection(radius, ctx);
 
         m_out.PackInto(dst);
     }
@@ -48,7 +48,7 @@ public:
 private:
     // Huang's sliding histogram. Values are 0..255, so 256 bins suffice and the
     // median is found by walking bins until half the window's weight is passed.
-    void RunHistogram(int radius) {
+    void RunHistogram(int radius, const RunCtx& ctx) {
         const int w = m_in.Width(), h = m_in.Height(), ch = m_in.Channels();
         const int windowCount = (radius * 2 + 1) * (radius * 2 + 1);
         const int half = windowCount / 2;
@@ -60,6 +60,7 @@ private:
         std::vector<int> hist(256, 0);
 
         for (int y = 0; y < h; ++y) {
+            if (ctx.Cancelled()) return;   // per row, like the other slow filters
             for (int c = 0; c < filtered; ++c) {
                 std::fill(hist.begin(), hist.end(), 0);
 
@@ -91,7 +92,7 @@ private:
     }
 
     // nth_element selects the median without fully sorting the window.
-    void RunSelection(int radius) {
+    void RunSelection(int radius, const RunCtx& ctx) {
         const int w = m_in.Width(), h = m_in.Height(), ch = m_in.Channels();
         const int filtered = (ch == 1) ? 1 : 3;
 
@@ -99,6 +100,7 @@ private:
         window.reserve(size_t(radius * 2 + 1) * size_t(radius * 2 + 1));
 
         for (int y = 0; y < h; ++y) {
+            if (ctx.Cancelled()) return;   // per row, like the other slow filters
             for (int x = 0; x < w; ++x) {
                 for (int c = 0; c < filtered; ++c) {
                     window.clear();

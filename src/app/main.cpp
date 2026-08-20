@@ -17,7 +17,10 @@
 #include "../core/image_io.h"
 #include "../core/compare.h"
 #include "../core/pipeline.h"
+#include "../algo_util/histogram.h"
+#include "../core/exif.h"
 #include "../core/image_loader.h"
+#include "../core/image_stats.h"
 #include "../core/worker.h"
 #include "../script/interp.h"
 #include "../script/parser.h"
@@ -163,13 +166,16 @@ private:
     void DrawScriptsPanel();
     void RescanScripts();
     void DrawComparePanel();
+    void DrawInfoPanel();
     void RequestCompare();
     void SyncViews();
     void DockLooseViewers();
+    void DockOnDemandPanels();
     void ReleaseRetiredViews();
     void ReportError(const std::string& prevError);
     void PollWorker();
     void PollLoader();
+    void PollStats();
     void InstallLoadedImage(LoadResult&& r);
     void UpdateWindowTitle();
     ImGuiID CentreDockNode() const;
@@ -221,6 +227,8 @@ private:
     int         m_layoutCountdown = 0;     // frames until the default layout is built
     int         m_switchCountdown = 0;     // self-test: frames until TGLAB_SWITCH fires
     int         m_dropTestCountdown = 0;   // self-test: frames until TGLAB_DROPTEST fires
+    int         m_infoTestCountdown = 0;   // self-test: frames until TGLAB_INFOTEST fires
+    bool        m_infoTestNudged    = false;
     bool        m_haveSavedLayout = false; // a tglab_layout.ini already existed
     ImGuiID     m_centreNode = 0;          // where new viewers get docked
     ImGuiID     m_dockspaceId = 0;         // fallback when a saved layout exists
@@ -233,6 +241,25 @@ private:
     std::shared_ptr<CompareResult> m_compare;
     GpuTexture m_diffTex;
     bool       m_compareOpen       = false;
+
+    // Info panel: dimensions, per-channel histogram, and capture settings for
+    // whichever image is being looked at.
+    bool       m_infoOpen          = false;
+    // Histograms are computed on their own thread: four 256-bin passes over an
+    // 8 MP image is far too much to spend in a frame for a panel that is purely
+    // informational, and it was noticeably slowing the app when done inline.
+    // Which viewer the info panel describes: the last one selected, not the one
+    // focused right now, since touching any control takes focus away from it.
+    std::string m_infoViewer;
+
+    ImageStats  m_statsWorker;
+    StatsResult m_stats;                     // newest result, drawn as-is
+    bool        m_statsRequested   = false;  // a request is outstanding
+    std::string m_requestedSource;           // what that request was for
+    uint64_t    m_requestedVersion = 0;
+
+    ExifData   m_infoExif;
+    std::string m_infoExifPath;              // avoids re-reading the same file
     int        m_compareStage      = -1;   // -1 = last stage
     uint64_t   m_compareVersion    = 1;
     bool       m_compareRequested  = false;
@@ -263,6 +290,7 @@ bool App::Init(HWND hwnd) {
     // its own compute queue) from it, on the worker thread.
     m_worker.Start(m_dev.Get());
     m_loader.Start();
+    m_statsWorker.Start();
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -284,6 +312,7 @@ bool App::Init(HWND hwnd) {
     m_layoutCountdown = m_haveSavedLayout ? 0 : 2;
     if (GetEnvironmentVariableA("TGLAB_SWITCH", nullptr, 0) > 0) m_switchCountdown = 120;
     if (GetEnvironmentVariableA("TGLAB_DROPTEST", nullptr, 0) > 0) m_dropTestCountdown = 120;
+    if (GetEnvironmentVariableA("TGLAB_INFOTEST", nullptr, 0) > 0) m_infoTestCountdown = 120;
 
     AppTrace("imgui context created");
     ImGui_ImplWin32_Init(hwnd);
@@ -317,6 +346,7 @@ bool App::Init(HWND hwnd) {
 void App::Shutdown() {
     m_worker.Stop();   // before the device: results reference image memory
     m_loader.Stop();
+    m_statsWorker.Stop();
     m_dev.WaitForLastSubmittedFrame();
 
     // Every GpuTexture holds an SRV descriptor from the device's heap, so all
@@ -358,6 +388,9 @@ void App::SetScriptPath(const std::string& path) {
     UpdateWindowTitle();
 
     if (GetEnvironmentVariableA("TGLAB_COMPARE", nullptr, 0) > 0) m_compareOpen = true;
+    // Self-test hook: opens the info panel at startup so its cost can be
+    // measured without driving the menus.
+    if (GetEnvironmentVariableA("TGLAB_INFO", nullptr, 0) > 0) m_infoOpen = true;
 }
 
 // Queues a file for background decoding. The read happens on the loader thread
@@ -424,6 +457,18 @@ void App::InstallLoadedImage(LoadResult&& r) {
 void App::PollLoader() {
     LoadResult r;
     while (m_loader.TryFetch(&r)) InstallLoadedImage(std::move(r));
+}
+
+// Picks up a finished histogram. Called once per frame.
+void App::PollStats() {
+    StatsResult s;
+    if (!m_statsWorker.TryFetch(&s)) return;
+    m_stats = std::move(s);
+    // Only clear the outstanding flag when this is the result we asked for; a
+    // late arrival for an older image must not stop the current request from
+    // being re-issued.
+    if (m_stats.source == m_requestedSource && m_stats.version == m_requestedVersion)
+        m_statsRequested = false;
 }
 
 // Phase 1 only: parse and interpret (microseconds), then hand the recorded
@@ -590,6 +635,14 @@ void App::ReportError(const std::string& prevError) {
 }
 
 void App::SyncViews() {
+    // A script switch replaces every viewer, so a remembered selection may name
+    // one that no longer exists. Drop it rather than leave the info panel
+    // pointing at nothing.
+    if (!m_infoViewer.empty() &&
+        std::find(m_viewerNames.begin(), m_viewerNames.end(), m_infoViewer) ==
+            m_viewerNames.end())
+        m_infoViewer.clear();
+
     // Reuse panels by name so layout and camera survive re-runs.
     std::vector<std::unique_ptr<ImageViewPanel>> next;
     for (const std::string& name : m_viewerNames) {
@@ -644,16 +697,35 @@ void App::DockLooseViewers() {
             ImGui::DockBuilderDockWindow(v->Name().c_str(), target);
     }
 
-    // The compare panel is created on demand, so it misses the initial layout
-    // pass and would otherwise open as a small floating window over the others.
-    // m_compareNode is only set when the default layout was built, so fall back
-    // to the viewers' node — same reasoning as CentreDockNode() above.
-    if (m_compareOpen) {
-        const ImGuiID node = m_compareNode != 0 ? m_compareNode : target;
-        ImGuiWindow* w = ImGui::FindWindowByName("Compare CPU / GPU");
-        if (node != 0 && (w == nullptr || w->DockId == 0))
-            ImGui::DockBuilderDockWindow("Compare CPU / GPU", node);
-    }
+    DockOnDemandPanels();
+}
+
+// Compare and Image Info are opened from a menu rather than declared by the
+// script, so they are drawn near the end of the frame and never exist when the
+// default layout is built. DockBuilderDockWindow only binds windows ImGui has
+// already seen, so both used to open as floating windows over the viewers --
+// and stayed that way, since a floating window with no DockId is exactly what
+// this checks for.
+//
+// Called both from DockLooseViewers() and again after the panels draw, so the
+// first appearance is caught on the following frame.
+void App::DockOnDemandPanels() {
+    // m_compareNode is only set when this session built the default layout, so
+    // fall back to the viewers' node -- same reasoning as CentreDockNode().
+    const ImGuiID fallback = CentreDockNode();
+    const ImGuiID node = m_compareNode != 0 ? m_compareNode : fallback;
+    if (node == 0) return;
+
+    auto dock = [&](bool open, const char* name) {
+        if (!open) return;
+        ImGuiWindow* w = ImGui::FindWindowByName(name);
+        // Only when ImGui has seen it and it is not docked: re-docking a window
+        // the user has deliberately dragged elsewhere would fight them.
+        if (w != nullptr && w->DockId == 0) ImGui::DockBuilderDockWindow(name, node);
+    };
+
+    dock(m_compareOpen, "Compare CPU / GPU");
+    dock(m_infoOpen,    "Image Info");
 }
 
 // Where new viewers should go, in order of preference:
@@ -725,9 +797,11 @@ void App::BuildDefaultLayout(ImGuiID dockspace) {
     ImGui::DockBuilderDockWindow("Scripts",    leftTop);
     ImGui::DockBuilderDockWindow("Controls",   leftBottom);
     ImGui::DockBuilderDockWindow("Status",     bottom);
-    // Compare gets its own column on the right: it is read side by side with
-    // the viewers, not instead of them.
+    // Compare and Image Info share the right-hand column: both are read
+    // alongside the viewers rather than instead of them, and tabbing them
+    // together keeps the centre as wide as possible.
     ImGui::DockBuilderDockWindow("Compare CPU / GPU", right);
+    ImGui::DockBuilderDockWindow("Image Info",        right);
 
     // Viewers declared by the script share the centre node, so several
     // display() calls tab together rather than piling up as floating windows.
@@ -753,6 +827,8 @@ void App::DrawMenuBar() {
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("View")) {
+        if (ImGui::MenuItem("Image Info", nullptr, m_infoOpen)) m_infoOpen = !m_infoOpen;
+        ImGui::Separator();
         if (ImGui::MenuItem("Sync pan/zoom", nullptr, &m_syncCameras)) SyncViews();
         if (ImGui::MenuItem("Reset layout")) m_rebuildLayout = true;
         ImGui::EndMenu();
@@ -983,6 +1059,200 @@ std::string App::DefaultText(const UiControl& c) {
 
 // CPU vs GPU for one algorithm: both results, their difference, and the
 // numbers. A kernel that merely *looks* right is not verified.
+// Image information: dimensions, an RGB histogram, and capture settings.
+//
+// The histogram is what a photo editor shows and for the same reason: it says
+// at a glance whether an image is clipped, low-contrast, or badly exposed,
+// which is exactly what decides how a filter or threshold will behave on it.
+void App::DrawInfoPanel() {
+    if (!m_infoOpen) return;
+    if (!ImGui::Begin("Image Info", &m_infoOpen)) { ImGui::End(); return; }
+
+    // Describes whichever viewer was selected last, falling back to the first
+    // palette entry when none has been.
+    //
+    // Deliberately the *last* selection rather than what is focused right now:
+    // clicking a slider moves focus to the Controls panel, so a live focus test
+    // reports no viewer at all and the panel silently reverts to describing the
+    // source image -- exactly when the user is watching the histogram to see
+    // what their parameter change did.
+    Image*      shown = nullptr;
+    std::string shownName;
+    std::string filePath;
+
+    for (auto& v : m_views)
+        if (v->Focused()) { m_infoViewer = v->Name(); break; }
+
+    if (!m_infoViewer.empty()) {
+        for (ViewerImage& vi : m_viewerImages)
+            if (vi.name == m_infoViewer && vi.image.Valid()) {
+                shown     = &vi.image;
+                shownName = vi.name;
+                break;
+            }
+    }
+    if (!shown) {
+        for (PaletteEntry& e : m_palette) {
+            if (!std::holds_alternative<Image>(e.data)) continue;
+            Image& img = std::get<Image>(e.data);
+            if (!img.Valid()) continue;
+            shown     = &img;
+            shownName = e.name;
+            filePath  = e.path;
+            break;
+        }
+    } else {
+        // A viewer shows a processed result, so its EXIF is that of whichever
+        // palette image fed the pipeline -- there is only one source in
+        // practice, and claiming otherwise would be worse than saying nothing.
+        for (PaletteEntry& e : m_palette)
+            if (std::holds_alternative<Image>(e.data)) { filePath = e.path; break; }
+    }
+
+    if (!shown) {
+        ImGui::TextDisabled("No image.");
+        ImGui::End();
+        return;
+    }
+
+    const ImageDesc d = shown->Desc();
+    ImGui::TextUnformatted(shownName.c_str());
+    ImGui::Separator();
+
+    const char* fmt = "?";
+    switch (d.format) {
+        case Format::RGBA8:   fmt = "RGBA8";   break;
+        case Format::R32F:    fmt = "R32F";    break;
+        case Format::RGBA32F: fmt = "RGBA32F"; break;
+        default: break;
+    }
+    ImGui::Text("%d x %d  (%.1f MP)", d.width, d.height,
+                double(d.width) * double(d.height) / 1e6);
+    ImGui::Text("%s   %.1f MB", fmt, double(d.SizeInBytes()) / 1e6);
+    if (!filePath.empty()) {
+        ImGui::TextDisabled("%s", filePath.c_str());
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", filePath.c_str());
+    }
+
+    // --- histogram ----------------------------------------------------------
+    ImGui::Spacing();
+    ImGui::SeparatorText("Histogram");
+
+    // Computed on a background thread. Four 256-bin passes over an 8 MP image
+    // is tens of milliseconds -- far too much to spend in a frame for a panel
+    // that is purely informational. A request goes out when the subject or the
+    // content changes; until it returns, the previous bins stay on screen.
+    if (m_stats.source != shownName || m_stats.version != m_contentVersion) {
+        if (!m_statsRequested ||
+            m_requestedSource != shownName || m_requestedVersion != m_contentVersion) {
+            if (GetEnvironmentVariableA("TGLAB_INFODBG", nullptr, 0) > 0) {
+                std::fprintf(stderr, "[info] subject=%s version=%llu\n",
+                             shownName.c_str(), (unsigned long long)m_contentVersion);
+                std::fflush(stderr);
+            }
+            m_statsWorker.Request(*shown, shownName, m_contentVersion);
+            m_statsRequested   = true;
+            m_requestedSource  = shownName;
+            m_requestedVersion = m_contentVersion;
+        }
+    }
+
+    // Drawn by hand rather than with PlotHistogram: three overlapping additive
+    // curves is what makes an RGB histogram readable, and stacked separate
+    // plots would not show where the channels diverge.
+    {
+        const ImVec2 size(ImGui::GetContentRegionAvail().x, 120.0f);
+        const ImVec2 p0 = ImGui::GetCursorScreenPos();
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+
+        dl->AddRectFilled(p0, ImVec2(p0.x + size.x, p0.y + size.y),
+                          IM_COL32(20, 20, 24, 255));
+
+        auto curve = [&](const std::vector<float>& bins, ImU32 colour) {
+            if (bins.empty()) return;
+            const float dx = size.x / float(255);
+            for (int i = 0; i < 255; ++i) {
+                const float h0 = std::min(bins[size_t(i)] / m_stats.peak, 1.0f);
+                const float h1 = std::min(bins[size_t(i + 1)] / m_stats.peak, 1.0f);
+                dl->AddLine(ImVec2(p0.x + dx * float(i),     p0.y + size.y * (1.0f - h0)),
+                            ImVec2(p0.x + dx * float(i + 1), p0.y + size.y * (1.0f - h1)),
+                            colour, 1.0f);
+            }
+        };
+
+        if (m_stats.valid) {
+            if (m_stats.r.empty()) {
+                curve(m_stats.luma, IM_COL32(200, 200, 200, 255));
+            } else {
+                curve(m_stats.r, IM_COL32(255, 80, 80, 200));
+                curve(m_stats.g, IM_COL32(80, 220, 80, 200));
+                curve(m_stats.b, IM_COL32(90, 140, 255, 200));
+            }
+        }
+
+        // Quarter marks, so a clipped highlight or crushed shadow is locatable
+        // rather than merely visible.
+        for (int i = 1; i < 4; ++i) {
+            const float x = p0.x + size.x * float(i) / 4.0f;
+            dl->AddLine(ImVec2(x, p0.y), ImVec2(x, p0.y + size.y),
+                        IM_COL32(255, 255, 255, 24), 1.0f);
+        }
+
+        ImGui::Dummy(size);
+    }
+
+    if (!m_stats.valid) {
+        ImGui::TextDisabled("computing...");
+    } else {
+        ImGui::Text("mean %.1f   median %.1f   stddev %.1f",
+                    m_stats.mean, m_stats.median, m_stats.stddev);
+        // Clipping is the thing worth flagging: it is unrecoverable, and it
+        // changes what a threshold or a normalising filter will do.
+        if (m_stats.clipLow > 0.01 || m_stats.clipHigh > 0.01)
+            ImGui::TextDisabled("clipped: %.1f%% black, %.1f%% white",
+                                m_stats.clipLow * 100.0, m_stats.clipHigh * 100.0);
+        // Says plainly that what is on screen is one image behind, rather than
+        // letting a stale curve look current.
+        if (m_stats.source != shownName || m_stats.version != m_contentVersion)
+            ImGui::TextDisabled("(updating...)");
+    }
+
+    // --- capture settings ---------------------------------------------------
+    if (!filePath.empty() && filePath != m_infoExifPath) {
+        m_infoExifPath = filePath;
+        m_infoExif     = ReadExif(filePath);
+    }
+
+    ImGui::Spacing();
+    ImGui::SeparatorText("Capture");
+    if (!m_infoExif.present) {
+        // Said plainly: most scans and every PNG have none, and an empty
+        // section would read as a bug.
+        ImGui::TextDisabled("No EXIF metadata in this file.");
+    } else {
+        auto row = [](const char* label, const std::string& value) {
+            if (value.empty()) return;
+            ImGui::TextDisabled("%-9s", label);
+            ImGui::SameLine();
+            ImGui::TextUnformatted(value.c_str());
+        };
+        std::string camera = m_infoExif.cameraMake;
+        if (!m_infoExif.cameraModel.empty()) {
+            if (!camera.empty()) camera += " ";
+            camera += m_infoExif.cameraModel;
+        }
+        row("camera", camera);
+        row("lens", m_infoExif.lens);
+        row("exposure", m_infoExif.exposureTime);
+        row("aperture", m_infoExif.aperture);
+        row("iso", m_infoExif.iso);
+        row("focal", m_infoExif.focalLength);
+        row("taken", m_infoExif.dateTaken);
+    }
+
+    ImGui::End();
+}
+
 void App::DrawComparePanel() {
     if (!m_compareOpen) return;
 
@@ -1374,6 +1644,7 @@ void App::Frame() {
         RunScript();
     }
     PollLoader();
+    PollStats();
     PollWorker();
     ReleaseRetiredViews();
 
@@ -1396,6 +1667,31 @@ void App::Frame() {
     // Several files may be listed after the point, separated by ';'. Each is
     // dropped in turn, a few frames apart, so the texture is resized while
     // earlier frames are still in flight -- the case that hung the device.
+    // Self-test hook: TGLAB_INFOTEST="<viewer>" selects that viewer for the
+    // info panel, then a few frames later nudges the first slider. Reproduces
+    // the sequence that made the panel silently revert to the source image --
+    // selecting a viewer and then touching a control cannot be driven any other
+    // way, and a live focus test passes right up until the control is touched.
+    if (m_infoTestCountdown > 0 && --m_infoTestCountdown == 0) {
+        char buf[128] = {};
+        if (GetEnvironmentVariableA("TGLAB_INFOTEST", buf, sizeof(buf)) > 0) {
+            if (!m_infoTestNudged) {
+                m_infoViewer = buf;          // as if the user clicked that viewer
+                AppTrace(("self-test: info panel following '" + m_infoViewer + "'").c_str());
+                m_infoTestNudged   = true;
+                m_infoTestCountdown = 30;    // then change a parameter
+            } else {
+                for (UiControl& c : m_ui.Controls()) {
+                    if (c.kind != UiControl::Kind::Slider) continue;
+                    c.value = c.value + (c.hi - c.lo) * 0.1;
+                    m_dirty = true;
+                    AppTrace("self-test: nudged a slider");
+                    break;
+                }
+            }
+        }
+    }
+
     if (m_dropTestCountdown > 0 && --m_dropTestCountdown == 0) {
         char buf[1024] = {};
         if (GetEnvironmentVariableA("TGLAB_DROPTEST", buf, sizeof(buf)) > 0) {
@@ -1519,6 +1815,13 @@ void App::Frame() {
     // panels above: BeginFrame() has opened the command list by now.
     DrawPalettePanel();
     DrawComparePanel();
+    DrawInfoPanel();
+
+    // Compare and Image Info are drawn here, *after* the DockLooseViewers()
+    // call earlier in the frame, so on the frame one of them first appears
+    // that call had no window to dock -- and both opened floating. Docking
+    // them again now that they exist takes effect on the next frame.
+    DockOnDemandPanels();
 
     ImGui::Render();
     ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), cl);

@@ -58,7 +58,8 @@ bool Pipeline::SameStage(const Stage& a, const Stage& b) {
 
 bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* err,
                        ComputeContext* gpu, ExecMode mode,
-                       const std::vector<uint64_t>* sourceVersions) {
+                       const std::vector<uint64_t>* sourceVersions,
+                       const CancelToken* cancel) {
     // Stamp each stage with the versions of the palette images it reads, before
     // any cache comparison. PortRef{-1, i} is identical whichever file backs
     // slot i, so without this a swapped image reuses the cached output -- which
@@ -115,6 +116,11 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
     }
 
     for (size_t i = firstDirty; i < m_stages.size(); ++i) {
+        // Between stages as well as within them: a pipeline of several
+        // moderately slow stages should abandon at the next boundary even if no
+        // single algorithm polls the token itself.
+        if (cancel && cancel->Cancelled()) { *err = kCancelled; return false; }
+
         Stage& s = m_stages[i];
         s.valid = false;
 
@@ -176,9 +182,18 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
         }
 
         if (!ranOnGpu) {
-            RunCtx ctx(in, s.outputs);
+            RunCtx ctx(in, s.outputs, cancel);
             s.algo->RunCPU(ctx);
             ++m_cpuStages;
+
+            // An algorithm that honoured the token has written only part of its
+            // output. Leaving the stage valid would cache that partial result
+            // and, worse, let a later run reuse it as though it were finished.
+            if (cancel && cancel->Cancelled()) {
+                s.valid = false;
+                *err = kCancelled;
+                return false;
+            }
         }
         s.valid = true;
     }

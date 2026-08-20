@@ -2,11 +2,16 @@
 // Runs without a window, so failures here are quick to diagnose.
 #include <cmath>
 #include <cstdio>
+#include <chrono>
+#include <cstring>
+#include <thread>
 #include <string>
 #include <vector>
 
 #include "../src/core/algorithm.h"
 #include "../src/algo_util/histogram.h"
+#include "../src/core/exif.h"
+#include "../src/core/image_stats.h"
 #include "../src/core/pipeline.h"
 #include "../src/script/interp.h"
 #include "../src/script/parser.h"
@@ -40,6 +45,77 @@ static bool RunScript(const std::string& src, UiState* ui, Pipeline* pipe,
     if (!r.ok) { *err = r.error; return false; }
 
     return pipe->Execute(sources, nullptr, err);
+}
+
+// Writes a minimal JPEG carrying EXIF with known values, so ReadExif can be
+// checked against ground truth. Hand-built rather than committed as a binary:
+// the expected values are then visible right here beside the assertions.
+static bool WriteExifFixture(const std::string& path) {
+    using B = std::vector<uint8_t>;
+    auto u16 = [](B& b, uint16_t v) { b.push_back(uint8_t(v)); b.push_back(uint8_t(v >> 8)); };
+    auto u32 = [](B& b, uint32_t v) { for (int i = 0; i < 4; ++i) b.push_back(uint8_t(v >> (8 * i))); };
+
+    const char* make  = "TestCam";
+    const char* model = "Model X100";
+    const char* lens  = "TestLens 50mm";
+
+    B tiff;
+    tiff.push_back('I'); tiff.push_back('I');   // little-endian
+    u16(tiff, 42);
+    u32(tiff, 8);                                // IFD0 immediately follows
+
+    // Values longer than 4 bytes sit in a heap after both IFDs, so their
+    // offsets have to be computed before the entries are written.
+    const uint32_t ifd0Size  = 2 + 3 * 12 + 4;
+    const uint32_t exifIfdAt = 8 + ifd0Size;
+    const uint32_t exifCount = 5;
+    const uint32_t exifSize  = 2 + exifCount * 12 + 4;
+    uint32_t heap = exifIfdAt + exifSize;
+
+    const uint32_t makeAt  = heap; heap += uint32_t(std::strlen(make) + 1);
+    const uint32_t modelAt = heap; heap += uint32_t(std::strlen(model) + 1);
+    const uint32_t lensAt  = heap; heap += uint32_t(std::strlen(lens) + 1);
+    const uint32_t expAt   = heap; heap += 8;
+    const uint32_t fnumAt  = heap; heap += 8;
+    const uint32_t focAt   = heap; heap += 8;
+
+    u16(tiff, 3);
+    u16(tiff, 0x010F); u16(tiff, 2); u32(tiff, uint32_t(std::strlen(make) + 1));  u32(tiff, makeAt);
+    u16(tiff, 0x0110); u16(tiff, 2); u32(tiff, uint32_t(std::strlen(model) + 1)); u32(tiff, modelAt);
+    u16(tiff, 0x8769); u16(tiff, 4); u32(tiff, 1);                                u32(tiff, exifIfdAt);
+    u32(tiff, 0);                                // no IFD1
+
+    u16(tiff, uint16_t(exifCount));
+    u16(tiff, 0x829A); u16(tiff, 5); u32(tiff, 1); u32(tiff, expAt);   // ExposureTime
+    u16(tiff, 0x829D); u16(tiff, 5); u32(tiff, 1); u32(tiff, fnumAt);  // FNumber
+    u16(tiff, 0x8827); u16(tiff, 3); u32(tiff, 1); u32(tiff, 800);     // ISO, stored inline
+    u16(tiff, 0x920A); u16(tiff, 5); u32(tiff, 1); u32(tiff, focAt);   // FocalLength
+    u16(tiff, 0xA434); u16(tiff, 2); u32(tiff, uint32_t(std::strlen(lens) + 1)); u32(tiff, lensAt);
+    u32(tiff, 0);
+
+    auto str = [&](const char* s) {
+        for (const char* p = s; *p; ++p) tiff.push_back(uint8_t(*p));
+        tiff.push_back(0);
+    };
+    str(make); str(model); str(lens);
+    u32(tiff, 1);  u32(tiff, 250);   // 1/250 s
+    u32(tiff, 28); u32(tiff, 10);    // f/2.8
+    u32(tiff, 50); u32(tiff, 1);     // 50 mm
+
+    B jpg{0xFF, 0xD8, 0xFF, 0xE1};
+    const uint32_t segLen = uint32_t(tiff.size()) + 8;
+    jpg.push_back(uint8_t(segLen >> 8));
+    jpg.push_back(uint8_t(segLen));
+    const char sig[6] = {'E', 'x', 'i', 'f', 0, 0};
+    jpg.insert(jpg.end(), sig, sig + 6);
+    jpg.insert(jpg.end(), tiff.begin(), tiff.end());
+    jpg.push_back(0xFF); jpg.push_back(0xD9);
+
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) return false;
+    std::fwrite(jpg.data(), 1, jpg.size(), f);
+    std::fclose(f);
+    return true;
 }
 
 int main() {
@@ -814,6 +890,102 @@ int main() {
         Check(ok, "params() without a name still works" + (ok ? "" : ": " + err));
         Check(ui.Find("threshold_niblack.k") != nullptr,
               "an unnamed params() keys controls by algorithm name as before");
+    }
+
+    // --- EXIF ---------------------------------------------------------------
+    //
+    // Built here rather than checked against a sample file, so the expected
+    // values are known exactly. stb_image discards metadata, so this parser is
+    // the only source of capture settings, and a silent misparse would show
+    // plausible-but-wrong numbers in the info panel.
+    {
+        const std::string path = "exif_test_fixture.jpg";
+        Check(WriteExifFixture(path), "wrote a JPEG carrying known EXIF");
+
+        const ExifData e = ReadExif(path);
+        Check(e.present, "EXIF is detected");
+        Check(e.cameraMake == "TestCam", "make: " + e.cameraMake);
+        Check(e.cameraModel == "Model X100", "model: " + e.cameraModel);
+        Check(e.lens == "TestLens 50mm", "lens: " + e.lens);
+        // Rationals, the part most easily got wrong: 1/250, 28/10, 50/1.
+        Check(e.exposureTime == "1/250 s", "exposure: " + e.exposureTime);
+        Check(e.aperture == "f/2.8", "aperture: " + e.aperture);
+        Check(e.focalLength == "50 mm", "focal length: " + e.focalLength);
+        // A SHORT stored inline in the offset field rather than at an offset.
+        Check(e.iso == "ISO 800", "iso: " + e.iso);
+
+        std::remove(path.c_str());
+    }
+    {
+        // Absence and malformation are normal inputs, not errors: a PNG has no
+        // EXIF, and a truncated header must not read past the buffer.
+        Check(!ReadExif("assets/test.png").present, "a PNG reports no EXIF");
+        Check(!ReadExif("no_such_file_at_all.jpg").present,
+              "a missing file reports no EXIF rather than failing");
+
+        const std::string junk = "exif_truncated_fixture.jpg";
+        if (FILE* f = std::fopen(junk.c_str(), "wb")) {
+            // A JPEG that claims EXIF and then simply stops.
+            const unsigned char bytes[] = {0xFF, 0xD8, 0xFF, 0xE1, 0x00, 0x40,
+                                           'E', 'x', 'i', 'f', 0, 0, 'I', 'I', 42, 0};
+            std::fwrite(bytes, 1, sizeof bytes, f);
+            std::fclose(f);
+            Check(!ReadExif(junk).present, "a truncated EXIF header is handled safely");
+            std::remove(junk.c_str());
+        }
+    }
+
+    // --- image statistics ---------------------------------------------------
+    //
+    // The info panel's histogram is computed off a subsample, so the statistics
+    // it reports must still match the full image. If they drift, the panel is
+    // quietly lying about the data a filter is being tuned against.
+    {
+        // A gradient plus a black and a white block, so mean, spread and
+        // clipping all have known-ish values to compare against.
+        Image img;
+        img.Alloc({800, 600, Format::RGBA8});
+        ImageView v = img.MapCpuWrite();
+        for (int y = 0; y < 600; ++y)
+            for (int x = 0; x < 800; ++x) {
+                uint8_t* p = v.At<uint8_t>(x, y);
+                uint8_t s = uint8_t(x * 255 / 799);
+                if (y < 60)  s = 0;      // 10% pure black
+                if (y >= 540) s = 255;   // 10% pure white
+                p[0] = p[1] = p[2] = s;
+                p[3] = 255;
+            }
+
+        Histogram full;
+        full.Build(img.MapCpuRead(), -1);
+
+        ImageStats stats;
+        stats.Start();
+        stats.Request(img, "test", 1);
+
+        StatsResult r;
+        for (int i = 0; i < 500 && !stats.TryFetch(&r); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        stats.Stop();
+
+        Check(r.valid, "the stats worker returns a result");
+        if (r.valid) {
+            // Within a bin's width: subsampling shifts which exact pixels are
+            // counted, not the distribution they came from.
+            Check(std::abs(r.mean - full.Mean()) < 2.0,
+                  "subsampled mean matches the full image (" +
+                      std::to_string(r.mean) + " vs " + std::to_string(full.Mean()) + ")");
+            Check(std::abs(r.stddev - full.StdDev()) < 2.0,
+                  "subsampled stddev matches the full image");
+            // Clipping is the one thing subsampling could plausibly hide, and
+            // it is the reason to point-sample rather than average.
+            Check(r.clipLow > 0.08 && r.clipLow < 0.12,
+                  "black clipping is measured (~10%): " + std::to_string(r.clipLow));
+            Check(r.clipHigh > 0.08 && r.clipHigh < 0.12,
+                  "white clipping is measured (~10%): " + std::to_string(r.clipHigh));
+            Check(r.r.size() == 256 && r.luma.size() == 256,
+                  "per-channel and luma bins are populated");
+        }
     }
 
     // --- parameter help text ------------------------------------------------

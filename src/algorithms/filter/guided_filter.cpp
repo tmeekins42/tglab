@@ -69,6 +69,7 @@ public:
 
         // Each channel is filtered independently, guided by itself.
         for (int c = 0; c < filtered; ++c) {
+            if (ctx.Cancelled()) return;   // per channel: each is a full set of passes
             for (int y = 0; y < h; ++y)
                 for (int x = 0; x < w; ++x)
                     m_plane[size_t(y) * size_t(w) + size_t(x)] = m_in.Get(x, y, c);

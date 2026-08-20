@@ -20,6 +20,7 @@
 #include <thread>
 #include <vector>
 
+#include "cancel.h"
 #include "compare.h"
 #include "pipeline.h"
 
@@ -111,6 +112,12 @@ private:
     std::condition_variable m_cv;
 
     std::unique_ptr<PipelineJob>     m_pending;    // at most one, newest wins
+
+    // Token for the job currently executing, so a newly submitted job can
+    // abandon it. Guarded by m_mtx like m_pending; the worker clears it when
+    // the run finishes. shared_ptr because the worker thread keeps using it
+    // after releasing the lock.
+    CancelTokenPtr                   m_running;
     std::unique_ptr<PipelineOutcome> m_result;     // awaiting UI pickup
 
     std::atomic<bool>     m_quit{false};

@@ -66,6 +66,9 @@ public:
         PixelBuffer* next = &m_b;
 
         for (int it = 0; it < iterations; ++it) {
+            // Per iteration rather than per row: one iteration is a cheap pass,
+            // and it is the count that makes this slow.
+            if (ctx.Cancelled()) return;
             for (int y = 0; y < h; ++y) {
                 for (int x = 0; x < w; ++x) {
                     const float* c0 = cur->At(x, y);

@@ -57,6 +57,9 @@ public:
                                    {-radius, 0},       {0, 0}};
 
         for (int y = 0; y < h; ++y) {
+            // Checked per row: cancelling only between stages is useless when a
+            // single stage is the slow one.
+            if (ctx.Cancelled()) return;
             for (int x = 0; x < w; ++x) {
                 float bestMean[4] = {0, 0, 0, 0};
                 float bestVar     = 0.0f;

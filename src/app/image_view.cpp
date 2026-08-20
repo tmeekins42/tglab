@@ -10,9 +10,11 @@ namespace tglab {
 void ImageViewPanel::Draw(Device& dev, Image* img) {
     // Keep the panel identity stable so ImGui remembers docking across runs.
     if (!ImGui::Begin(m_name.c_str())) {
+        m_focused = false;
         ImGui::End();
         return;
     }
+    m_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows);
 
     if (!img || !img->Valid()) {
         ImGui::TextDisabled("computing...");

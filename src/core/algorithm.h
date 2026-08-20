@@ -10,6 +10,7 @@
 #include <string_view>
 #include <vector>
 
+#include "cancel.h"
 #include "data.h"
 #include "image.h"
 #include "param.h"
@@ -27,8 +28,17 @@ using PortList = std::vector<Port>;
 // Handed to an algorithm at run time. Indices match the declared port order.
 class RunCtx {
 public:
-    RunCtx(std::span<const Data* const> in, std::span<Data> out)
-        : m_in(in), m_out(out) {}
+    RunCtx(std::span<const Data* const> in, std::span<Data> out,
+           const CancelToken* cancel = nullptr)
+        : m_in(in), m_out(out), m_cancel(cancel) {}
+
+    // True when this run has been superseded and should stop.
+    //
+    // A long algorithm should check this every row or two and return early.
+    // Returning with a partly-written output is safe: the pipeline marks a
+    // cancelled stage invalid, so the partial result is never displayed or
+    // cached, and the newer run recomputes it from scratch.
+    bool Cancelled() const { return m_cancel && m_cancel->Cancelled(); }
 
     // Image convenience accessors (M1 has only image ports).
     ImageView In(size_t i) const;
@@ -46,6 +56,7 @@ public:
 private:
     std::span<const Data* const> m_in;
     std::span<Data>              m_out;
+    const CancelToken*           m_cancel = nullptr;
 };
 
 class AlgorithmBase {

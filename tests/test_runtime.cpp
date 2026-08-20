@@ -127,6 +127,104 @@ static void TestWorker() {
     worker.Stop();
 }
 
+// Superseding a slow job must abandon it, not wait it out.
+//
+// Coalescing already drops *queued* jobs, but a job that had started ran to
+// completion -- so nudging a slider during a minute-long filter meant waiting
+// for the old value before the new one even began.
+static void TestCancellation() {
+    Section("cancellation");
+
+    // Deliberately expensive: NLM at a large search radius on a big image.
+    const char* kSlow =
+        "src = image(\"test\")\n"
+        "o = nonlocal_means(src, patch = 1, search = 6)\n"
+        "display(o, \"out\")\n";
+    const int dim = 192;   // ~1 s: long enough to interrupt unambiguously,
+                           // short enough not to dominate the suite.
+
+    PipelineWorker worker;
+    worker.Start(nullptr);
+    worker.SetExecMode(ExecMode::ForceCPU);
+
+    // Time one run alone, to know what "waiting it out" would have cost.
+    double baselineMs = 0;
+    {
+        UiState ui; Pipeline pipe; std::vector<Data> src; std::string err;
+        if (!BuildPipeline(kSlow, dim, &ui, &pipe, &src, &err)) {
+            Check(false, "build: " + err);
+            worker.Stop();
+            return;
+        }
+        const auto t0 = clockt::now();
+        worker.Submit(std::move(pipe), std::move(src));
+        PipelineOutcome out;
+        while (!worker.TryFetch(&out)) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        baselineMs = std::chrono::duration<double, std::milli>(clockt::now() - t0).count();
+    }
+    Check(baselineMs > 300.0,
+          "the fixture is slow enough to be worth cancelling (" +
+              std::to_string(int(baselineMs)) + " ms)");
+
+    // Start one, let it get going, then supersede it. The replacement must
+    // finish sooner than two full runs would have taken -- which is what it
+    // costs if the first is waited out rather than abandoned.
+    {
+        UiState ui1; Pipeline p1; std::vector<Data> s1; std::string err;
+        if (!BuildPipeline(kSlow, dim, &ui1, &p1, &s1, &err)) {
+            Check(false, "build: " + err);
+            worker.Stop();
+            return;
+        }
+        const auto t0 = clockt::now();
+        worker.Submit(std::move(p1), std::move(s1));
+
+        // Long enough to be well inside the first run, short enough that it
+        // cannot have finished.
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(int(baselineMs / 3)));
+
+        UiState ui2; Pipeline p2; std::vector<Data> s2;
+        if (!BuildPipeline(kSlow, dim, &ui2, &p2, &s2, &err)) {
+            Check(false, "build: " + err);
+            worker.Stop();
+            return;
+        }
+        const uint64_t secondSeq = worker.Submit(std::move(p2), std::move(s2));
+
+        PipelineOutcome out;
+        uint64_t got = 0;
+        const auto deadline = clockt::now() + std::chrono::seconds(60);
+        while (clockt::now() < deadline) {
+            if (worker.TryFetch(&out)) {
+                got = out.seq;
+                if (got == secondSeq) break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        const double totalMs =
+            std::chrono::duration<double, std::milli>(clockt::now() - t0).count();
+
+        std::printf("       baseline %.0f ms, superseded run total %.0f ms\n",
+                    baselineMs, totalMs);
+
+        Check(got == secondSeq, "the superseding job is the one delivered");
+        // Waiting the first out would cost the interruption point plus a full
+        // second run; abandoning costs only the second. Allow generous slack
+        // for scheduling, but the two are far enough apart to distinguish.
+        Check(totalMs < baselineMs * 1.8,
+              "the first run was abandoned rather than waited out");
+
+        // A cancelled run must not surface as an error: nothing went wrong.
+        Check(out.ok && out.error.empty(),
+              "cancellation is not reported as a failure");
+        Check(!out.viewers.empty() && out.viewers[0].image.Valid(),
+              "the replacement result is complete");
+    }
+
+    worker.Stop();
+}
+
 static void TestShaderCompiler() {
     Section("shader compilation");
 
@@ -566,6 +664,7 @@ static void TestCompare(ID3D12Device* dev) {
 
 int main() {
     TestWorker();
+    TestCancellation();
     TestShaderCompiler();
 
     ID3D12Device* dev = nullptr;

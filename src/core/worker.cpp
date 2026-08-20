@@ -36,6 +36,9 @@ uint64_t PipelineWorker::Submit(Pipeline pipe, std::vector<Data> sources,
         job->sources = std::move(sources);
         job->sourceVersions = std::move(sourceVersions);
         m_pending    = std::move(job);   // drops any older pending job
+        // Abandon whatever is running: this newer job supersedes it, and for a
+        // slow filter the old value would otherwise have to finish first.
+        if (m_running) m_running->Cancel();
         m_busy.store(true, std::memory_order_relaxed);
     }
     m_cv.notify_one();
@@ -55,6 +58,7 @@ uint64_t PipelineWorker::SubmitCompare(Pipeline pipe, std::vector<Data> sources,
         job->compare      = true;
         job->compareStage = stageIndex;
         m_pending         = std::move(job);
+        if (m_running) m_running->Cancel();
         m_busy.store(true, std::memory_order_relaxed);
     }
     m_cv.notify_one();
@@ -86,11 +90,16 @@ void PipelineWorker::Run() {
 
     for (;;) {
         std::unique_ptr<PipelineJob> job;
+        CancelTokenPtr token;
         {
             std::unique_lock<std::mutex> lock(m_mtx);
             m_cv.wait(lock, [this] { return m_quit.load() || m_pending != nullptr; });
             if (m_quit.load()) break;
             job = std::move(m_pending);
+            // A fresh token per job. Submit() cancels through this while the
+            // run is in flight.
+            m_running = std::make_shared<CancelToken>();
+            token = m_running;
         }
 
         auto outcome = std::make_unique<PipelineOutcome>();
@@ -117,6 +126,7 @@ void PipelineWorker::Run() {
             {
                 std::lock_guard<std::mutex> lock(m_mtx);
                 m_result = std::move(outcome);
+                m_running.reset();
                 if (!m_pending) m_busy.store(false, std::memory_order_relaxed);
             }
             m_lastFinished.store(seq, std::memory_order_relaxed);
@@ -128,13 +138,32 @@ void PipelineWorker::Run() {
         const bool ok = job->pipe.Execute(&job->sources, havePrev ? &prev : nullptr, &err,
                                           haveGpu ? &gpu : nullptr,
                                           m_mode.load(std::memory_order_relaxed),
-                                          &job->sourceVersions);
+                                          &job->sourceVersions, token.get());
         m_lastMs.store(
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
             std::memory_order_relaxed);
         m_lastGpuStages.store(job->pipe.GpuStageCount(), std::memory_order_relaxed);
         m_lastCpuStages.store(job->pipe.CpuStageCount(), std::memory_order_relaxed);
         m_lastCachedStages.store(job->pipe.CachedStageCount(), std::memory_order_relaxed);
+
+        // A cancelled run is not a failure and has nothing to show: a newer job
+        // is already queued. Publishing it would flash a stale or partial image
+        // and, if reported, an error the user never caused.
+        const bool cancelled = !ok && err == Pipeline::kCancelled;
+        if (cancelled) {
+            // The abandoned pipeline's stage cache is half-finished, so it
+            // cannot seed the next run -- a cancelled stage is marked invalid,
+            // but dropping the whole thing is simpler than reasoning about
+            // which prefix survived.
+            havePrev = false;
+            prev.Clear();
+            {
+                std::lock_guard<std::mutex> lock(m_mtx);
+                m_running.reset();
+                if (!m_pending) m_busy.store(false, std::memory_order_relaxed);
+            }
+            continue;
+        }
 
         outcome->ok    = ok;
         outcome->error = err;
@@ -159,6 +188,7 @@ void PipelineWorker::Run() {
         {
             std::lock_guard<std::mutex> lock(m_mtx);
             m_result = std::move(outcome);
+            m_running.reset();
             // Only idle when nothing newer arrived while we were working.
             if (!m_pending) m_busy.store(false, std::memory_order_relaxed);
         }

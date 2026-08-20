@@ -19,6 +19,10 @@ public:
     explicit ImageViewPanel(std::string name) : m_name(std::move(name)) {}
 
     const std::string& Name() const override { return m_name; }
+
+    // True when this viewer had focus at its last Draw(). Lets the info panel
+    // describe what the user is actually looking at rather than a fixed image.
+    bool Focused() const { return m_focused; }
     void Draw(Device& dev, Image* image) override;
 
     void SetSharedCamera(ViewCamera* cam) { m_shared = cam; }
@@ -33,6 +37,7 @@ private:
     ViewCamera  m_own;
     ViewCamera* m_shared  = nullptr;
     uint64_t    m_version = 0;
+    bool        m_focused = false;
 };
 
 } // namespace tglab

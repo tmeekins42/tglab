@@ -55,6 +55,9 @@ public:
         const float patchNorm = 1.0f / float((patch * 2 + 1) * (patch * 2 + 1) * filtered);
 
         for (int y = 0; y < hgt; ++y) {
+            // Checked per row: cancelling only between stages is useless when a
+            // single stage is the slow one.
+            if (ctx.Cancelled()) return;
             for (int x = 0; x < w; ++x) {
                 float acc[4]    = {0, 0, 0, 0};
                 float weightSum = 0.0f;

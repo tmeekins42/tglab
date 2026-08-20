@@ -78,9 +78,18 @@ public:
     // that palette image is replaced. Without it a stage reading PortRef{-1, i}
     // looks identical no matter which file backs slot i, so swapping an image
     // would reuse the cached output.
+    // `cancel`, if given, is polled between stages and handed to each algorithm
+    // so a slow one can abandon its own inner loop. Execute returns false with
+    // `err` set to kCancelled; the caller is expected to discard the result
+    // rather than report it, since a newer run is already on its way.
     bool Execute(std::vector<Data>* sources, Pipeline* prev, std::string* err,
                  ComputeContext* gpu = nullptr, ExecMode mode = ExecMode::Auto,
-                 const std::vector<uint64_t>* sourceVersions = nullptr);
+                 const std::vector<uint64_t>* sourceVersions = nullptr,
+                 const CancelToken* cancel = nullptr);
+
+    // Sentinel error text for an abandoned run, so the caller can tell "the
+    // user moved on" apart from a real failure worth showing.
+    static constexpr const char* kCancelled = "cancelled";
 
     // How the last run was split. These add up to the pipeline stage count:
     // stages skipped by the dirty-hash cache are counted separately rather

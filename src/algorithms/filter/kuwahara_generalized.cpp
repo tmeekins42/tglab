@@ -68,6 +68,9 @@ public:
         std::vector<float> weightSum(size_t(sectors), 0.0f);
 
         for (int y = 0; y < h; ++y) {
+            // Checked per row: cancelling only between stages is useless when a
+            // single stage is the slow one.
+            if (ctx.Cancelled()) return;
             for (int x = 0; x < w; ++x) {
                 std::fill(sum.begin(), sum.end(), 0.0f);
                 std::fill(sumSq.begin(), sumSq.end(), 0.0f);

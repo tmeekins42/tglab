@@ -56,6 +56,7 @@ Images can also be **dragged in from Explorer** at any time.
 | **Algorithms** | Every registered algorithm, with its ports and parameters. |
 | **Controls** | Sliders and dropdowns the script declared. |
 | **Status** | Errors, run time, and how many stages used the GPU. |
+| **Image Info** | Opened from the View menu: size, RGB histogram, and EXIF capture settings. |
 | **Compare CPU / GPU** | Opened from the Compute menu. See below. |
 
 Editing the script file and saving re-runs it (or press **F5**). Slider values
@@ -99,6 +100,16 @@ On an 8 MP scan (3504x2336) the difference is stark:
 If a large image feels like it has hung, check the Status panel: it shows
 elapsed time and a spinner while the worker is busy. The first thing to verify
 is that you are running `build/Release/tglab.exe` and not the Debug build.
+
+**A run in progress is abandoned when you change something.** Moving a slider
+or switching algorithm mid-run cancels the old value rather than queueing
+behind it, so the wait is always for the *current* settings and never for a
+stale one. That matters most where it costs most: dragging a slider on a filter
+taking a minute would otherwise mean a minute per nudge.
+
+Cancellation is cooperative — algorithms check between rows — so an
+unresponsive one finishes its current pass and is then discarded. Nothing
+partial is ever displayed or cached.
 
 Non-power-of-2 image sizes are fine, as are spaces in file paths. Palette
 names are the filename without extension and are **case-sensitive**, so

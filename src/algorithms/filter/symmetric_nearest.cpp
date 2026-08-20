@@ -44,6 +44,9 @@ public:
         const int filtered = (ch == 1) ? 1 : 3;
 
         for (int y = 0; y < h; ++y) {
+            // Checked per row: cancelling only between stages is useless when a
+            // single stage is the slow one.
+            if (ctx.Cancelled()) return;
             for (int x = 0; x < w; ++x) {
                 const float* centre = m_in.At(x, y);
 
