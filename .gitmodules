@@ -2,3 +2,6 @@
 	path = third_party/imgui
 	url = https://github.com/ocornut/imgui.git
 	branch = docking
+[submodule "third_party/libraw"]
+	path = third_party/libraw
+	url = https://github.com/LibRaw/LibRaw.git

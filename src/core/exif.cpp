@@ -6,6 +6,8 @@
 #include <cstring>
 #include <vector>
 
+#include "raw_io.h"
+
 namespace tglab {
 namespace {
 
@@ -79,6 +81,12 @@ std::string FormatExposure(double seconds) {
 
 ExifData ReadExif(const std::string& path) {
     ExifData out;
+
+    // Raw files carry EXIF too, but not in a JPEG APP1 segment: CR3 is
+    // ISO-BMFF, and CR2/ARW/NEF are TIFF variants whose IFD layouts differ per
+    // vendor. LibRaw already parses all of them, so ask it rather than teaching
+    // this reader several more container formats.
+    if (IsRawExtension(path) && ReadRawMetadata(path, &out)) return out;
 
     FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) return out;

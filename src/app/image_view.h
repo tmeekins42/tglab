@@ -23,6 +23,11 @@ public:
     // True when this viewer had focus at its last Draw(). Lets the info panel
     // describe what the user is actually looking at rather than a fixed image.
     bool Focused() const { return m_focused; }
+
+    // True when the panel was actually on screen at its last Draw(): its tab is
+    // on top and it is not collapsed. Distinct from Focused(), which needs a
+    // click -- a tab can be the one you are looking at without having focus.
+    bool Visible() const { return m_visible; }
     void Draw(Device& dev, Image* image) override;
 
     void SetSharedCamera(ViewCamera* cam) { m_shared = cam; }
@@ -38,6 +43,7 @@ private:
     ViewCamera* m_shared  = nullptr;
     uint64_t    m_version = 0;
     bool        m_focused = false;
+    bool        m_visible = false;
 };
 
 } // namespace tglab

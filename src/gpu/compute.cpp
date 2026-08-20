@@ -183,6 +183,25 @@ bool ComputeContext::CreateImage(const ImageDesc& d, GpuImage* out) {
     return true;
 }
 
+// Opens the command list for recording, reusing the batch already in progress.
+//
+// This is what makes lazy flushing safe. Every recording site used to begin
+// with m_alloc->Reset() + m_list->Reset(), which DISCARDS anything recorded but
+// not yet submitted. Once Dispatch() stopped flushing, a second dispatch would
+// silently throw the first one away -- the pipeline would report success and
+// display an image missing a stage.
+//
+// Resetting only when nothing is pending means consecutive dispatches
+// accumulate into one command list, and a UAV barrier (recorded by Dispatch)
+// orders them against each other.
+bool ComputeContext::BeginRecording() {
+    if (m_pendingWork) return true;   // keep appending to the open list
+
+    if (FAILED(m_alloc->Reset())) return false;
+    if (FAILED(m_list->Reset(m_alloc, nullptr))) return false;
+    return true;
+}
+
 bool ComputeContext::Upload(const ImageView& src, GpuImage* dst) {
     if (!src.Valid() || !dst->Valid()) return false;
 
@@ -218,8 +237,7 @@ bool ComputeContext::Upload(const ImageView& src, GpuImage* dst) {
                     src.data + size_t(y) * rowPitch, rowPitch);
     staging->Unmap(0, nullptr);
 
-    m_alloc->Reset();
-    m_list->Reset(m_alloc, nullptr);
+    if (!BeginRecording()) return false;
 
     D3D12_TEXTURE_COPY_LOCATION d = {};
     d.pResource = dst->res;
@@ -237,6 +255,7 @@ bool ComputeContext::Upload(const ImageView& src, GpuImage* dst) {
     m_list->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr);
 
     m_staging.push_back(staging);
+    m_pendingWork = true;   // the copy above still has to be submitted
     std::string err;
     return Flush(&err);
 }
@@ -268,8 +287,7 @@ bool ComputeContext::Readback(const GpuImage& src, ImageView* dst) {
                                                  nullptr, IID_PPV_ARGS(&staging))))
         return false;
 
-    m_alloc->Reset();
-    m_list->Reset(m_alloc, nullptr);
+    if (!BeginRecording()) return false;
 
     D3D12_TEXTURE_COPY_LOCATION d = {};
     d.pResource                          = staging;
@@ -286,6 +304,7 @@ bool ComputeContext::Readback(const GpuImage& src, ImageView* dst) {
 
     m_list->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr);
 
+    m_pendingWork = true;   // the copy above still has to be submitted
     std::string err;
     if (!Flush(&err)) { staging->Release(); return false; }
 
@@ -312,8 +331,7 @@ bool ComputeContext::Dispatch(const ComputeKernel& k,
         return false;
     }
 
-    m_alloc->Reset();
-    m_list->Reset(m_alloc, nullptr);
+    if (!BeginRecording()) return false;
 
     // Build the descriptor table: SRVs first, then UAVs at a fixed offset.
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = m_srvHeap->GetCPUDescriptorHandleForHeapStart();
@@ -382,10 +400,27 @@ bool ComputeContext::Dispatch(const ComputeKernel& k,
         m_list->ResourceBarrier(1, &b);
     }
 
-    return Flush(err);
+    // Recorded, not submitted. The barrier above already orders this dispatch
+    // against the next one on the same resource, so a fence wait here would buy
+    // nothing and cost a full submit-and-block per stage. Whoever needs the
+    // pixels -- Upload, Readback, or an explicit Flush -- submits.
+    m_pendingWork = true;
+    (void)err;
+    return true;
 }
 
 bool ComputeContext::Flush(std::string* err) {
+    // Nothing recorded: succeed rather than trying to close an already-closed
+    // command list, which fails. Flush() is called both by the pipeline's
+    // success path and by its cleanup guard, so the second call routinely
+    // arrives with nothing to do and must not report an error for it.
+    if (!m_pendingWork) return true;
+
+    // Submitting clears the batch either way: on success the work is done, and
+    // on failure the list is closed and must be reset before anything else can
+    // record into it.
+    m_pendingWork = false;
+
     if (FAILED(m_list->Close())) { *err = "could not close command list"; return false; }
 
     ID3D12CommandList* lists[] = {m_list};

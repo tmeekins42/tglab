@@ -81,8 +81,28 @@ public:
 
     ShaderCompiler& Compiler() { return m_compiler; }
 
+    // Submits any recorded work and waits for it.
+    //
+    // Dispatch() only *records*; consecutive dispatches accumulate into one
+    // command list and are submitted together. Nothing needs the pixels between
+    // two GPU stages -- the intermediate stays on the device and a UAV barrier
+    // orders them -- so flushing after each one was a submit-and-block per
+    // stage for no benefit. Measured at ~20% of a 12-stage chain.
+    //
+    // Upload() and Readback() flush on their own, because those genuinely move
+    // pixels across the bus; callers only need this when they want completion
+    // for its own sake, such as before tearing down resources.
+    bool Flush(std::string* err);
+
 private:
-    bool Flush(std::string* err);   // execute + wait
+    // Opens the command list, reusing an in-progress batch rather than
+    // discarding it. See the definition for why this matters.
+    bool BeginRecording();
+
+
+    // True when work is recorded but not yet submitted, so BeginRecording()
+    // knows not to reset the list out from under it.
+    bool                       m_pendingWork = false;
 
     ID3D12Device*              m_device    = nullptr;
     ID3D12CommandQueue*        m_queue     = nullptr;

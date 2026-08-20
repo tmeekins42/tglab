@@ -11,7 +11,9 @@
 #include "../src/core/algorithm.h"
 #include "../src/algo_util/histogram.h"
 #include "../src/core/exif.h"
+#include "../src/core/image_io.h"
 #include "../src/core/image_stats.h"
+#include "../src/core/raw_io.h"
 #include "../src/core/pipeline.h"
 #include "../src/script/interp.h"
 #include "../src/script/parser.h"
@@ -933,6 +935,94 @@ int main() {
             Check(!ReadExif(junk).present, "a truncated EXIF header is handled safely");
             std::remove(junk.c_str());
         }
+    }
+
+    // --- controls stay in declaration order ---------------------------------
+    //
+    // The panel draws groups in the order UiState holds them, so that order
+    // must follow the script. FindOrAdd() used to append new controls and leave
+    // existing ones alone, which meant re-declaring a control moved it to the
+    // end: switching filter A's algorithm dropped A's controls and re-added
+    // them *after* B's, silently swapping the two groups in the panel.
+    {
+        UiState ui; std::string err; std::vector<Data> src;
+        const char* kScript =
+            "src = image(\"test\")\n"
+            "a = params(threshold_niblack, \"A\")(src)\n"
+            "b = params(threshold_sauvola, \"B\")(src)\n"
+            "display(a)\n"
+            "display(b)\n";
+
+        Pipeline p1;
+        RunScript(kScript, &ui, &p1, &err, &src);
+
+        auto firstGroup = [&](UiState& s) {
+            for (const UiControl& c : s.Controls())
+                if (!c.group.empty()) return c.group;
+            return std::string();
+        };
+        Check(firstGroup(ui).rfind("A ", 0) == 0,
+              "A's group comes first: " + firstGroup(ui));
+
+        // Now the case that broke it: A changes algorithm, B does not.
+        const char* kSwitched =
+            "src = image(\"test\")\n"
+            "a = params(threshold_bernsen, \"A\")(src)\n"
+            "b = params(threshold_sauvola, \"B\")(src)\n"
+            "display(a)\n"
+            "display(b)\n";
+        Pipeline p2;
+        RunScript(kSwitched, &ui, &p2, &err, &src);
+
+        Check(firstGroup(ui).rfind("A ", 0) == 0,
+              "A's group still comes first after A changes algorithm: " +
+                  firstGroup(ui));
+    }
+
+    // --- a script error survives a re-run ------------------------------------
+    //
+    // The app clears m_error when a new image load starts, so a failed drop's
+    // message does not linger over the next (possibly slow) load. That must not
+    // lose a *script* error, which is still true regardless of what is loading:
+    // the drop triggers a re-run, and the re-run has to report it again.
+    {
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        RunScript("src = image(\"test\")\nout = brightness(src, nosuchparam = 1)\n",
+                  &ui, &p, &err, &src);
+        Check(!err.empty(), "a bad script reports an error");
+
+        // Re-running the same bad script must report it again rather than
+        // succeeding silently.
+        UiState ui2; Pipeline p2; std::string err2; std::vector<Data> src2;
+        RunScript("src = image(\"test\")\nout = brightness(src, nosuchparam = 1)\n",
+                  &ui2, &p2, &err2, &src2);
+        Check(err2 == err, "the same error is reported on every run, not just the first");
+    }
+
+    // --- camera raw ---------------------------------------------------------
+    //
+    // Only the dispatch is tested here: decoding needs a real camera file,
+    // which is far too large to commit. What must hold without one is that raw
+    // files are routed to LibRaw, everything else is not, and a file that
+    // cannot be read reports why instead of failing silently.
+    {
+        Check(IsRawExtension("shot.CR3"), "CR3 is recognised as raw");
+        Check(IsRawExtension("shot.cr2"), "extension matching is case-insensitive");
+        Check(IsRawExtension("a/b/c.NEF"), "a path prefix does not confuse it");
+        Check(!IsRawExtension("scan.png"), "PNG is not raw");
+        Check(!IsRawExtension("scan.jpg"), "JPEG is not raw");
+        Check(!IsRawExtension("noextension"), "a file with no extension is not raw");
+        // A dot in a directory name is not an extension, which would otherwise
+        // send "my.photos/scan" (no extension) down the raw path.
+        Check(!IsRawExtension("my.raw.folder/image"),
+              "a dot in a directory name is not an extension");
+
+        Image img;
+        std::string err;
+        Check(!LoadImageFile("no_such_file.cr3", &img, &err),
+              "a missing raw file fails rather than returning an empty image");
+        Check(err.find("no_such_file.cr3") != std::string::npos,
+              "the error names the file: \"" + err + "\"");
     }
 
     // --- image statistics ---------------------------------------------------

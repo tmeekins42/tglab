@@ -115,6 +115,21 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
         }
     }
 
+    // Any exit from the stage loop -- an error, a cancellation, or falling off
+    // the end -- must submit what the GPU stages recorded. Dispatch() no longer
+    // flushes, so leaving early would strand a half-built command list, and the
+    // *next* run's BeginRecording() would append to it rather than starting
+    // clean. There are several early returns below, so this is a guard rather
+    // than a line repeated at each of them.
+    struct GpuBatchGuard {
+        ComputeContext* gpu;
+        ~GpuBatchGuard() {
+            if (!gpu || !gpu->Ready()) return;
+            std::string ignored;
+            gpu->Flush(&ignored);   // the caller already has the real error
+        }
+    } batchGuard{gpu};
+
     for (size_t i = firstDirty; i < m_stages.size(); ++i) {
         // Between stages as well as within them: a pipeline of several
         // moderately slow stages should abandon at the next boundary even if no
@@ -196,6 +211,19 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
             }
         }
         s.valid = true;
+    }
+
+    // Submit explicitly on the success path so a failure here is *reported*.
+    // The guard above would flush anyway, but it deliberately swallows the
+    // error -- on an early return the caller already has a better one, whereas
+    // here this is the only thing that went wrong. Flushing twice is harmless:
+    // the second call finds nothing pending.
+    if (gpu && gpu->Ready()) {
+        std::string flushErr;
+        if (!gpu->Flush(&flushErr)) {
+            *err = flushErr;
+            return false;
+        }
     }
 
     return true;
@@ -315,6 +343,24 @@ bool Pipeline::RunStageGpu(Stage& s, const std::vector<const Data*>& in,
         // This pass's output becomes the next pass's input, and the buffer just
         // read becomes the next target -- except on the first pass, where the
         // input is the upstream image and must not be overwritten.
+        // Submit before the next pass, which READS what this one just wrote.
+        //
+        // Dispatch()'s UAV barrier orders write-against-write on the same
+        // binding; it does not order a write followed by a read through an SRV.
+        // A state-transition barrier does not help either -- transitioning out
+        // and back gives the driver nothing to synchronise against -- so the
+        // ordering has to come from a submit. That was free while every
+        // dispatch flushed, and became a garbage image the moment they started
+        // batching.
+        //
+        // The cost is bounded: only iterative stages pay it, and only between
+        // their own passes. Ordinary chains still batch, which is where the
+        // measured win came from.
+        if (i + 1 < iterations) {
+            std::string fe;
+            if (!gpu->Flush(&fe)) { *err = fe; return false; }
+        }
+
         readFrom = writeTo;
         writeTo  = (writeTo == gout[0]) ? s.gpuScratch.get() : gout[0];
     }

@@ -1,0 +1,17 @@
+# Basic photographic development — the controls a raw developer gives you,
+# all in one GPU pass.
+#
+# Deliberately one algorithm rather than ten chained ones. Chained GPU stages
+# are bandwidth-bound: at 36 MP each stage reads and writes a 144 MB
+# intermediate, so ten of them would move ~2.9 GB and cost roughly half a
+# second per slider nudge. Fused, the image is read once and written once and
+# every adjustment happens in registers.
+#
+# Drop a raw file (.CR3, .ARW, .NEF, ...) onto the "test" row to develop it.
+
+src = image("test")
+
+developed = params(basic_adjust)(src)
+
+display(src,       "1 original")
+display(developed, "2 developed")

@@ -44,6 +44,10 @@ struct UiControl {
     std::vector<std::string> options;
     int                      selected = 0;
 
+    // Position in this run's declaration sequence. The panel draws in this
+    // order, so it must follow the script rather than when a control was first
+    // created -- re-declaring one would otherwise move it to the end.
+    int  declOrder   = 0;
     bool seenThisRun = false;
 };
 
@@ -61,6 +65,7 @@ public:
 
 private:
     std::vector<UiControl> m_controls;
+    int                    m_declOrder = 0;   // counts declarations this run
 };
 
 // Named source images available to the script via image("name").

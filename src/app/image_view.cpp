@@ -10,10 +10,19 @@ namespace tglab {
 void ImageViewPanel::Draw(Device& dev, Image* img) {
     // Keep the panel identity stable so ImGui remembers docking across runs.
     if (!ImGui::Begin(m_name.c_str())) {
+        // Begin() returns false when the panel is collapsed or its tab is
+        // hidden behind another -- either way the user cannot see it.
         m_focused = false;
+        m_visible = false;
         ImGui::End();
         return;
     }
+    // Visible and focused are different questions, and the info panel needs
+    // both. A tab that is on top is *visible* but does not have keyboard focus
+    // until it is clicked, so a focus test alone reports nothing at startup --
+    // the histogram then described the source image while the user was plainly
+    // looking at a result.
+    m_visible = true;
     m_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows);
 
     if (!img || !img->Valid()) {

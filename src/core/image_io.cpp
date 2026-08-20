@@ -1,5 +1,7 @@
 #include "image_io.h"
 
+#include "raw_io.h"
+
 #include <cstdlib>
 #include <cstring>
 #include <windows.h>
@@ -18,6 +20,11 @@ bool LoadImageFile(const std::string& path, Image* out, std::string* err) {
     // TGLAB_SLOWLOAD=<ms> simulates a slow or network drive, so the "loading..."
     // indicator and the background loader can be exercised from a local disk.
     if (const char* slow = std::getenv("TGLAB_SLOWLOAD")) Sleep(DWORD(std::atoi(slow)));
+
+    // Camera raw goes to LibRaw; everything else to stb_image. Dispatching on
+    // the extension keeps both call sites (the drop handler and the loader
+    // thread) unaware that raw exists at all.
+    if (IsRawExtension(path)) return LoadRawFile(path, out, err);
 
     int w = 0, h = 0, comp = 0;
     unsigned char* pixels = stbi_load(path.c_str(), &w, &h, &comp, 4);

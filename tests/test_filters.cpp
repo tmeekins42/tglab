@@ -430,6 +430,160 @@ int main() {
         }
     }
 
+    // --- basic_adjust: each control does what its help text claims -----------
+    //
+    // Ten controls fused into one kernel means a mistake in any of them is
+    // invisible in the others' output. Each is checked in isolation, in the
+    // direction a photographer would expect.
+    {
+        // Mid-grey with a colour cast and a bright and dark patch, so tonal
+        // controls have something in each band to act on.
+        auto makeTest = []() {
+            Image img;
+            img.Alloc({64, 64, Format::RGBA8});
+            ImageView v = img.MapCpuWrite();
+            for (int y = 0; y < 64; ++y)
+                for (int x = 0; x < 64; ++x) {
+                    uint8_t* p = v.At<uint8_t>(x, y);
+                    if (y < 16)      { p[0] = 230; p[1] = 230; p[2] = 230; }  // highlights
+                    else if (y >= 48){ p[0] = 25;  p[1] = 25;  p[2] = 25;  }  // shadows
+                    else             { p[0] = 140; p[1] = 120; p[2] = 100; }  // warm midtone
+                    p[3] = 255;
+                }
+            return img;
+        };
+
+        // Mean over a band of rows, as a proxy for "did that band get brighter".
+        auto bandMean = [](Image& img, int y0, int y1) {
+            ImageView v = img.MapCpuRead();
+            double sum = 0; int n = 0;
+            for (int y = y0; y < y1; ++y)
+                for (int x = 0; x < 64; ++x) {
+                    const uint8_t* p = v.At<uint8_t>(x, y);
+                    sum += (p[0] + p[1] + p[2]) / 3.0;
+                    ++n;
+                }
+            return n ? sum / n : 0.0;
+        };
+        // Mean channel spread, as a proxy for saturation.
+        auto chroma = [](Image& img, int y0, int y1) {
+            ImageView v = img.MapCpuRead();
+            double sum = 0; int n = 0;
+            for (int y = y0; y < y1; ++y)
+                for (int x = 0; x < 64; ++x) {
+                    const uint8_t* p = v.At<uint8_t>(x, y);
+                    const int mx = std::max(p[0], std::max(p[1], p[2]));
+                    const int mn = std::min(p[0], std::min(p[1], p[2]));
+                    sum += mx - mn;
+                    ++n;
+                }
+            return n ? sum / n : 0.0;
+        };
+
+        Image base;
+        if (!RunFilter("basic_adjust", makeTest(), {}, &base, &err)) {
+            Check(false, "basic_adjust runs with defaults: " + err);
+        } else {
+            // Defaults must be a no-op, or every other control is measured
+            // against a moving baseline -- and the user's untouched image
+            // would silently change just by adding the algorithm.
+            double worst = 0.0;
+            // Held in a named Image: a view into a temporary would dangle the
+            // moment the statement ended.
+            Image pristine = makeTest();
+            ImageView a = pristine.MapCpuRead();
+            ImageView b = base.MapCpuRead();
+            for (int y = 0; y < 64; ++y)
+                for (int x = 0; x < 64; ++x)
+                    for (int c = 0; c < 3; ++c)
+                        worst = std::max(worst,
+                                         std::abs(double(a.At<uint8_t>(x, y)[c]) -
+                                                  double(b.At<uint8_t>(x, y)[c])));
+            Check(worst <= 1.0,
+                  "defaults leave the image unchanged (max drift " +
+                      std::to_string(worst) + ")");
+        }
+
+        struct Case {
+            const char* param;
+            double      value;
+            const char* claim;
+        };
+
+        // Each claim is the direction the help text promises.
+        Image out;
+        auto run = [&](const char* p, double v) {
+            return RunFilter("basic_adjust", makeTest(), {{p, v}}, &out, &err);
+        };
+
+        if (run("exposure", 1.0))
+            Check(bandMean(out, 16, 48) > bandMean(base, 16, 48) + 20,
+                  "exposure +1 stop brightens the midtones");
+        if (run("exposure", -1.0))
+            Check(bandMean(out, 16, 48) < bandMean(base, 16, 48) - 20,
+                  "exposure -1 stop darkens the midtones");
+
+        // Highlights and shadows must act on their own band and largely leave
+        // the other alone -- that is the whole point of them over exposure.
+        if (run("highlights", -0.8)) {
+            const double hi = bandMean(out, 0, 16), sh = bandMean(out, 48, 64);
+            Check(hi < bandMean(base, 0, 16) - 10,
+                  "negative highlights recovers the bright band");
+            Check(std::abs(sh - bandMean(base, 48, 64)) < 8,
+                  "...without disturbing the shadows");
+        }
+        if (run("shadows", 0.8)) {
+            const double hi = bandMean(out, 0, 16), sh = bandMean(out, 48, 64);
+            Check(sh > bandMean(base, 48, 64) + 5,
+                  "positive shadows opens up the dark band");
+            Check(std::abs(hi - bandMean(base, 0, 16)) < 8,
+                  "...without disturbing the highlights");
+        }
+
+        if (run("contrast", 0.5))
+            Check(bandMean(out, 0, 16) - bandMean(out, 48, 64) >
+                  bandMean(base, 0, 16) - bandMean(base, 48, 64),
+                  "positive contrast widens the gap between bands");
+
+        if (run("saturation", -1.0))
+            Check(chroma(out, 16, 48) < 2.0,
+                  "saturation -1 is greyscale (chroma " +
+                      std::to_string(chroma(out, 16, 48)) + ")");
+        if (run("saturation", 0.5))
+            Check(chroma(out, 16, 48) > chroma(base, 16, 48) + 2,
+                  "positive saturation increases chroma");
+        if (run("vibrance", 0.8))
+            Check(chroma(out, 16, 48) > chroma(base, 16, 48),
+                  "positive vibrance increases chroma on a muted colour");
+
+        // Temperature must move red and blue in opposition without changing
+        // overall brightness -- the gains are luminance-normalised precisely so
+        // warming an image is not also an exposure change.
+        if (run("temperature", 0.5)) {
+            ImageView v = out.MapCpuRead();
+            ImageView bv = base.MapCpuRead();
+            const uint8_t* p = v.At<uint8_t>(32, 32);
+            const uint8_t* q = bv.At<uint8_t>(32, 32);
+            Check(p[0] > q[0] && p[2] < q[2], "positive temperature warms (R up, B down)");
+            Check(std::abs(bandMean(out, 16, 48) - bandMean(base, 16, 48)) < 12,
+                  "...without a large brightness shift");
+        }
+        if (run("temperature", -0.5)) {
+            ImageView v = out.MapCpuRead();
+            ImageView bv = base.MapCpuRead();
+            const uint8_t* p = v.At<uint8_t>(32, 32);
+            const uint8_t* q = bv.At<uint8_t>(32, 32);
+            Check(p[0] < q[0] && p[2] > q[2], "negative temperature cools (R down, B up)");
+        }
+
+        if (run("blacks", -0.5))
+            Check(bandMean(out, 48, 64) < bandMean(base, 48, 64),
+                  "negative blacks crushes the shadows");
+        if (run("whites", 0.5))
+            Check(bandMean(out, 0, 16) >= bandMean(base, 0, 16),
+                  "positive whites raises the white point");
+    }
+
     // --- cost, on request ---------------------------------------------------
     //
     // TGLAB_FILTER_BENCH=1 times each filter at a realistic scan size. These

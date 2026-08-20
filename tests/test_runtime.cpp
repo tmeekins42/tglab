@@ -464,6 +464,17 @@ static void TestGpuAgreement(ID3D12Device* dev) {
          "o = bilateral(src, sigma_space = 3.0, sigma_range = 0.15)\n"
          "display(o)\n", 3.0, 1.0},
 
+        // Ten controls fused into one kernel, so a mistake in any of them is
+        // invisible in the others' output. Exercised with every control off its
+        // default at once. If the two paths drift, compare mode is worthless
+        // and the fast version is not the same algorithm as the readable one.
+        {"basic_adjust",
+         "src = image(\"test\")\n"
+         "o = basic_adjust(src, exposure = 0.7, contrast = 0.3, "
+         "highlights = -0.4, shadows = 0.5, whites = 0.2, blacks = -0.2, "
+         "temperature = 0.3, tint = -0.2, vibrance = 0.4, saturation = 0.2)\n"
+         "display(o)\n", 4.0, 1.0},
+
         {"kuwahara",
          "src = image(\"test\")\n"
          "o = kuwahara(src, radius = 3)\n"

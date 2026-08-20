@@ -167,6 +167,7 @@ private:
     void RescanScripts();
     void DrawComparePanel();
     void DrawInfoPanel();
+    bool ViewerVisible(const std::string& name) const;
     void RequestCompare();
     void SyncViews();
     void DockLooseViewers();
@@ -398,6 +399,18 @@ void App::SetScriptPath(const std::string& path) {
 // freezes the entire window until it finishes -- badly so for a large scan on
 // a network drive.
 void App::RequestImageLoad(const std::string& path, const std::string& targetSlot) {
+    // Clear any previous error before the load starts.
+    //
+    // Otherwise a failed drop (an unsupported file, say) leaves its message on
+    // screen while the *next* file decodes -- and a large raw takes seconds --
+    // so the new load looks like it has already failed. The error belongs to
+    // the file that produced it, and that file is no longer what the user is
+    // waiting on.
+    const std::string prevError = m_error;
+    m_error.clear();
+    ReportError(prevError);
+    UpdateWindowTitle();
+
     m_loader.Request(path, targetSlot);
 }
 
@@ -1059,6 +1072,18 @@ std::string App::DefaultText(const UiControl& c) {
 
 // CPU vs GPU for one algorithm: both results, their difference, and the
 // numbers. A kernel that merely *looks* right is not verified.
+// True when the named viewer was on screen at its last Draw().
+//
+// Used to decide whether a remembered selection is still worth following: when
+// viewers are tabbed together, selecting a different tab hides the previous
+// one, and the info panel should move with it rather than keep describing an
+// image the user can no longer see.
+bool App::ViewerVisible(const std::string& name) const {
+    for (const auto& v : m_views)
+        if (v->Name() == name) return v->Visible();
+    return false;
+}
+
 // Image information: dimensions, an RGB histogram, and capture settings.
 //
 // The histogram is what a photo editor shows and for the same reason: it says
@@ -1080,8 +1105,19 @@ void App::DrawInfoPanel() {
     std::string shownName;
     std::string filePath;
 
+    // Clicking a viewer selects it explicitly.
     for (auto& v : m_views)
         if (v->Focused()) { m_infoViewer = v->Name(); break; }
+
+    // Otherwise follow whichever viewer is actually on screen. Without this the
+    // panel described the source image at startup: nothing has been clicked
+    // yet, so no viewer reports focus, even though a result tab is plainly the
+    // one being looked at. It also keeps the panel in step when the user
+    // switches tabs by any means other than a click.
+    if (m_infoViewer.empty() || !ViewerVisible(m_infoViewer)) {
+        for (auto& v : m_views)
+            if (v->Visible()) { m_infoViewer = v->Name(); break; }
+    }
 
     if (!m_infoViewer.empty()) {
         for (ViewerImage& vi : m_viewerImages)

@@ -18,7 +18,7 @@ Adding an experiment costs one `.cpp` file and a few lines of script.
 Requires Visual Studio 2022 (or newer) with the Windows SDK. CMake and Ninja
 ship with VS, so nothing extra to install.
 
-Dear ImGui is a submodule, so clone recursively:
+Dear ImGui and LibRaw are submodules, so clone recursively:
 
 ```sh
 git clone --recursive https://github.com/tmeekins42/tglab.git
@@ -36,7 +36,9 @@ debugger or the D3D12 validation layer:
 cmake --build build --config Debug
 ```
 
-(In an existing clone, `git submodule update --init` fetches ImGui.)
+(In an existing clone, `git submodule update --init` fetches both. LibRaw is
+built from source and adds about a minute to a clean build; it is only
+recompiled when the submodule moves.)
 
 ## Run
 
@@ -84,6 +86,34 @@ Names are case-sensitive and are the filename without its extension, so
 `IMG_2369.jpg` arrives as `image("IMG_2369")`. Renaming a slot re-runs the
 script, so a script referring to the old name will report the missing image
 rather than failing silently.
+
+### Camera raw
+
+`.CR3`, `.CR2`, `.NEF`, `.ARW`, `.DNG` and the other common raw formats load
+like any other image, decoded by LibRaw. Dispatch is by extension, so nothing
+else in the app knows raw exists.
+
+LibRaw does the whole conversion here — black level, white balance, demosaic,
+colour matrix, gamma — and hands back RGB. That means **you are working on
+someone else's demosaic**, which is the right default for "just show me the
+picture" and the wrong one for researching demosaicing itself. The plan is for
+the sensor's Bayer mosaic to become a data type in its own right, with a
+`"demosaic"` category alongside `"filter"` and `"threshold"`, so the
+interpolation becomes an algorithm to compare rather than something that
+already happened.
+
+Two things worth knowing:
+
+- **Decoding is slow** — about 6 s for a 45 MP CR3, most of it demosaicing. It
+  runs on the loader thread, so the UI stays responsive and the Images panel
+  says "loading...", but the wait is real.
+- **Auto-brightening is on.** Turning it off does *not* give unscaled data:
+  LibRaw still applies a gamma curve, just against a fixed white point of
+  0x2000, and a correctly-exposed frame then comes out at roughly 20/255 —
+  essentially black. With it on, the white point is chosen by percentile, which
+  preserves relative exposure between frames rather than normalising them all
+  to the same level. `TGLAB_RAW_NOBRIGHT=1` selects the fixed white point for
+  anyone who wants it.
 
 ### Performance note
 
@@ -360,6 +390,49 @@ being algorithms themselves. Currently:
   edge-clamped reads every windowed filter needs at the border, and
   `ValueScale()` reports 255 or 1 so a parameter expressed as a fraction of the
   intensity range means the same thing whatever the source format.
+
+### Photographic adjustments
+
+`basic_adjust` is the standard raw-developer control set — temperature, tint,
+exposure, contrast, highlights, shadows, whites, blacks, vibrance, saturation
+— in **one** algorithm rather than ten. [scripts/develop.tgl](scripts/develop.tgl)
+uses it.
+
+That is against this lab's usual grain, and the reason is measured. Chained GPU
+stages are **bandwidth-bound, not compute-bound**: at 36 MP a *trivial*
+one-fetch-per-pixel kernel still costs ~50 ms per stage, because each stage
+reads and writes a full 144 MB intermediate, while a kernel doing nine times
+the arithmetic costs only ~20% more.
+
+| stages | 9 MP | 36 MP |
+|---|---|---|
+| 1 | 29 ms | 74 ms |
+| 4 | 67 ms | 190 ms |
+| 12 | 188 ms | 664 ms |
+
+Ten chained adjustments at 36 MP would move ~2.9 GB and cost roughly half a
+second per slider nudge. Fused, the image is read once and written once and
+every adjustment happens in registers, where it is effectively free.
+
+Dispatches are also **batched**: `Dispatch()` only records, and the command list
+is submitted when something actually needs the pixels (a readback, or the end of
+a run). Nothing needs them between two GPU stages, so the old submit-and-block
+per stage bought nothing. That takes a 12-stage chain from 831 ms to 543 ms —
+worth having, but not a substitute for fusing, since the bandwidth cost remains.
+
+Iterative stages are the exception: each pass reads what the previous one wrote
+through an SRV, and a UAV barrier does not order that. They flush between
+passes. (A state-transition barrier was tried instead and does not work —
+transitioning out and back gives the driver nothing to synchronise against.)
+
+Everything is computed in **linear light**: the shader decodes sRGB on read and
+re-encodes on write. Exposure is a multiply, and multiplying gamma-encoded
+values gives the wrong answer — highlights roll off incorrectly and colours
+shift as they brighten.
+
+The line to draw: settled operations that always run together belong fused;
+anything worth *experimenting* with stays a separate algorithm, where
+`choose()` and the compare panel can reach it.
 
 ### Filters
 

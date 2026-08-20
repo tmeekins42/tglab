@@ -47,19 +47,39 @@ UiControl& UiState::FindOrAdd(const UiControl& proto) {
         if (!existing->options.empty())
             existing->selected = std::clamp(existing->selected, 0, int(existing->options.size()) - 1);
         existing->seenThisRun = true;
+        existing->declOrder   = m_declOrder++;
         return *existing;
     }
     m_controls.push_back(proto);
     m_controls.back().seenThisRun = true;
+    m_controls.back().declOrder   = m_declOrder++;
     return m_controls.back();
 }
 
 void UiState::BeginRun() {
     for (UiControl& c : m_controls) c.seenThisRun = false;
+    m_declOrder = 0;
 }
 
 void UiState::DropUnseen() {
     std::erase_if(m_controls, [](const UiControl& c) { return !c.seenThisRun; });
+
+    // Reorder to match this run's declarations.
+    //
+    // FindOrAdd() appends new controls but leaves existing ones in place, so
+    // the vector holds first-*ever*-seen order rather than the script's. That
+    // is invisible until a control is re-declared: switching one algorithm in a
+    // two-instance script drops its controls and re-adds them at the end, which
+    // silently swaps the two groups in the panel -- so the slider labelled A
+    // sits under B's header and adjusting it appears to do nothing.
+    //
+    // stable_sort so controls sharing a declaration index (which cannot happen
+    // today, but would if one call ever declared several) keep their relative
+    // order.
+    std::stable_sort(m_controls.begin(), m_controls.end(),
+                     [](const UiControl& a, const UiControl& b) {
+                         return a.declOrder < b.declOrder;
+                     });
 }
 
 // --- Interpreter ------------------------------------------------------------

@@ -12,6 +12,10 @@ endif()
 set(IMGUI_DIR ${CMAKE_SOURCE_DIR}/third_party/imgui)
 
 # ---------------------------------------------------------------------------
+# LibRaw (camera raw decoding). Built from source; see cmake/libraw.cmake.
+include(${CMAKE_SOURCE_DIR}/cmake/libraw.cmake)
+
+# ---------------------------------------------------------------------------
 # Dear ImGui (docking branch) + win32/dx12 backends
 add_library(imgui STATIC
     ${IMGUI_DIR}/imgui.cpp
@@ -40,6 +44,7 @@ add_library(tglab_core STATIC
     src/algo_util/pixel_buffer.cpp
     src/core/exif.cpp
     src/core/image_stats.cpp
+    src/core/raw_io.cpp
     src/script/lexer.cpp
     src/script/parser.cpp
     src/script/interp.cpp
@@ -54,7 +59,7 @@ target_include_directories(tglab_core PUBLIC
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/third_party/stb
 )
-target_link_libraries(tglab_core PUBLIC imgui d3d12 dxgi dxcompiler)
+target_link_libraries(tglab_core PUBLIC imgui libraw d3d12 dxgi dxcompiler)
 
 # ---------------------------------------------------------------------------
 # Algorithms, one subfolder per category.
