@@ -10,8 +10,8 @@
 
 raw = mosaic("test")
 
-a = choose("method A", "demosaic")
-b = choose("method B", "demosaic")
+a = choose("method A", "demosaic", demosaic_bilinear)
+b = choose("method B", "demosaic", demosaic_passthrough)
 
 outA = params(a, "A")(raw)
 outB = params(b, "B")(raw)

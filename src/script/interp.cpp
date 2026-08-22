@@ -42,6 +42,7 @@ UiControl& UiState::FindOrAdd(const UiControl& proto) {
         existing->softLo  = proto.softLo;
         existing->softHi  = proto.softHi;
         existing->options = proto.options;
+        existing->defaultIndex = proto.defaultIndex;
         if (existing->kind == UiControl::Kind::Slider)
             existing->value = std::clamp(existing->value, proto.lo, proto.hi);
         if (!existing->options.empty())
@@ -452,9 +453,11 @@ private:
     bool CallChoose(const Expr& e, std::vector<Value>* out) {
         EvaledArgs a;
         if (!EvalArgs(e, &a)) return false;
-        if (a.pos.size() != 2 || !a.pos[0].IsString())
+        if (a.pos.size() < 2 || a.pos.size() > 3 || !a.pos[0].IsString())
             return Fail(e.line,
-                        "choose() takes (\"label\", [algo, ...]) or (\"label\", \"category\")");
+                        "choose() takes (\"label\", [algo, ...]) or (\"label\", "
+                        "\"category\"), with an optional third argument naming "
+                        "the default");
 
         std::vector<std::string> options;
 
@@ -480,6 +483,29 @@ private:
         proto.kind    = UiControl::Kind::Choose;
         proto.label   = a.pos[0].AsString();
         proto.options = options;
+
+        // An optional third argument names which option starts selected.
+        //
+        // Without it the default is whichever algorithm sorts first in the registry,
+        // which is alphabetical and therefore arbitrary -- "demosaic_bilinear"
+        // beats "demosaic_passthrough" by accident of spelling. The script
+        // should be able to say what it means, and the dropdown still overrides
+        // it at run time.
+        if (a.pos.size() == 3) {
+            std::string want;
+            if (a.pos[2].IsString())      want = a.pos[2].AsString();
+            else if (a.pos[2].IsAlgo())   want = a.pos[2].AsAlgo().name;
+            else return Fail(e.line, std::string("choose()'s default must be an "
+                                                 "algorithm or its name, got ") +
+                                         a.pos[2].TypeName());
+
+            const auto it = std::find(options.begin(), options.end(), want);
+            if (it == options.end())
+                return Fail(e.line, "'" + want + "' is not one of the options for '" +
+                                        proto.label + "'");
+            proto.defaultIndex = int(it - options.begin());
+            proto.selected     = proto.defaultIndex;
+        }
 
         UiControl& c = m_ui->FindOrAdd(proto);
         const int sel = std::clamp(c.selected, 0, int(options.size()) - 1);

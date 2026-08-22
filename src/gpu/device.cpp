@@ -105,6 +105,19 @@ bool Device::Init(HWND hwnd, bool enableDebugLayer) {
     Trace("dxgi factory", hr);
     if (FAILED(hr)) return false;
 
+    // Keep the adapter for QueryVideoMemoryInfo(). Intermediates at 45 MP are
+    // hundreds of megabytes each, so knowing how close the pipeline is to the
+    // card's budget is the difference between "it is slow" and "it is paging".
+    {
+        IDXGIAdapter1* adapter1 = nullptr;
+        if (SUCCEEDED(factory->EnumAdapters1(0, &adapter1))) {
+            // IDXGIAdapter3 is where QueryVideoMemoryInfo lives; a machine
+            // without it simply reports no usage rather than failing to start.
+            adapter1->QueryInterface(IID_PPV_ARGS(&m_adapter));
+            adapter1->Release();
+        }
+    }
+
     IDXGISwapChain1* sc1 = nullptr;
     hr = factory->CreateSwapChainForHwnd(m_queue, hwnd, &sd, nullptr, nullptr, &sc1);
     factory->Release();
@@ -152,6 +165,19 @@ void Device::OnResize(UINT width, UINT height) {
 
     CreateRenderTargets();
     m_backBufferIndex = m_swapChain->GetCurrentBackBufferIndex();
+}
+
+void Device::VideoMemory(uint64_t* used, uint64_t* budget) const {
+    *used = 0;
+    *budget = 0;
+    if (!m_adapter) return;
+
+    DXGI_QUERY_VIDEO_MEMORY_INFO info = {};
+    if (SUCCEEDED(m_adapter->QueryVideoMemoryInfo(
+            0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info))) {
+        *used   = info.CurrentUsage;
+        *budget = info.Budget;
+    }
 }
 
 void Device::DeferRelease(ID3D12Resource* res) {
@@ -270,6 +296,7 @@ void Device::Shutdown() {
 
     if (m_swapWaitable) { CloseHandle(m_swapWaitable); m_swapWaitable = nullptr; }
     if (m_swapChain)    { m_swapChain->Release();      m_swapChain = nullptr; }
+    if (m_adapter)      { m_adapter->Release();        m_adapter = nullptr; }
     if (m_cmdList)      { m_cmdList->Release();        m_cmdList = nullptr; }
     for (auto& f : m_frames) {
         if (f.allocator) { f.allocator->Release(); f.allocator = nullptr; }

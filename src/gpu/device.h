@@ -51,6 +51,15 @@ public:
     // error. Deferring the Release() to a known-complete fence value avoids it.
     void DeferRelease(ID3D12Resource* res);
 
+    // Video memory the process is using, and the driver's budget for it, in
+    // bytes. Both zero when the adapter cannot report it.
+    //
+    // Worth surfacing because a 45 MP intermediate is ~340 MB in RGBA16F, so a
+    // pipeline of several stages can approach a card's budget -- at which point
+    // the driver starts paging and everything slows down for a reason that is
+    // otherwise invisible.
+    void VideoMemory(uint64_t* used, uint64_t* budget) const;
+
     bool Ready() const { return m_device != nullptr && m_swapChain != nullptr; }
 
 private:
@@ -74,6 +83,7 @@ private:
     ID3D12CommandQueue*        m_queue      = nullptr;
     ID3D12GraphicsCommandList* m_cmdList    = nullptr;
     IDXGISwapChain3*           m_swapChain  = nullptr;
+    IDXGIAdapter3*             m_adapter    = nullptr;
     HANDLE                     m_swapWaitable = nullptr;
 
     ID3D12DescriptorHeap*       m_rtvHeap = nullptr;

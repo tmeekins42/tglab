@@ -1,4 +1,3 @@
-| **Images** | The palette: thumbnail, script name, and source file for each image. |
 # tglab
 
 A lab bench for computer-vision / computer-graphics **algorithm research**.
@@ -159,6 +158,7 @@ names are the filename without extension and are **case-sensitive**, so
 ```sh
 ./build/Release/tglab_tests.exe          # language and pipeline semantics (fast)
 ./build/Release/tglab_filter_tests.exe   # filter behaviour: noise, edges, flat-field
+./build/Release/tglab_demosaic_tests.exe # demosaic: reconstruction, CFA phase, colour
 ./build/Release/tglab_runtime_tests.exe  # worker thread, shaders, GPU (needs a device)
 ```
 
@@ -191,6 +191,7 @@ kernel = [[-1,0,1],[-2,0,2],[-1,0,1]]   # matrix literal
 | `check("label", default)` | Declares a checkbox; returns 0 or 1. |
 | `choose("label", [a, b, c])` | Dropdown of algorithms; returns the selected one. |
 | `choose("label", "category")` | Same, but offers every algorithm in a category. |
+| `choose("label", opts, default)` | An optional third argument names which option starts selected, and which a reset returns to. |
 | `params(algo)` | Declares a control for each of `algo`'s parameters; returns `algo`. |
 | `params(algo, "name")` | The same, as an independently-controlled instance, so one algorithm can appear twice. |
 | `display(data)` / `display(data, "name")` | Opens a viewer panel. |

@@ -43,6 +43,9 @@ struct UiControl {
     // Choose (M2): candidate algorithm names and the selected index.
     std::vector<std::string> options;
     int                      selected = 0;
+    // Which option a reset returns to. Defaults to the first, which without a
+    // script-declared default is alphabetical and therefore arbitrary.
+    int                      defaultIndex = 0;
 
     // Position in this run's declaration sequence. The panel draws in this
     // order, so it must follow the script rather than when a control was first

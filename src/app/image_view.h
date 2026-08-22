@@ -1,5 +1,7 @@
 #pragma once
 
+#include "imgui.h"
+
 #include "../gpu/texture.h"
 #include "view.h"
 
@@ -36,7 +38,17 @@ public:
     // texture re-uploads only then rather than every frame.
     void SetContentVersion(uint64_t v) { m_version = v; }
 
+    // The 1:1 loupe, for inspecting individual pixels.
+    void SetLoupe(bool on) { m_loupe = on; }
+    bool Loupe() const { return m_loupe; }
+
 private:
+    // Drawn from CPU pixels rather than the GPU texture, so the magnified view
+    // is truly point-sampled. See the definition for why.
+    void DrawLoupe(Image& img, const ImVec2& mouse, const ImVec2& imgOrigin,
+                   float zoom, ImDrawList* dl);
+    static void SampleRgb(const ImageView& v, int x, int y, float* rgb);
+
     std::string m_name;
     GpuTexture  m_tex;
     ViewCamera  m_own;
@@ -44,6 +56,7 @@ private:
     uint64_t    m_version = 0;
     bool        m_focused = false;
     bool        m_visible = false;
+    bool        m_loupe   = false;
 };
 
 } // namespace tglab

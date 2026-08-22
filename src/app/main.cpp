@@ -1077,12 +1077,14 @@ void App::DrawControl(UiControl& c) {
 }
 
 bool App::IsModified(const UiControl& c) {
-    if (c.kind == UiControl::Kind::Choose) return c.selected != 0;
+    if (c.kind == UiControl::Kind::Choose) return c.selected != c.defaultIndex;
     return c.value != c.def;
 }
 
 void App::ResetControl(UiControl& c) {
-    if (c.kind == UiControl::Kind::Choose) c.selected = 0;   // first listed option
+    // Back to the script-declared default, which is the first option only
+    // when the script did not name one.
+    if (c.kind == UiControl::Kind::Choose) c.selected = c.defaultIndex;
     else                                   c.value = c.def;
 }
 
@@ -1092,7 +1094,9 @@ std::string App::DefaultText(const UiControl& c) {
         case UiControl::Kind::Check:
             return c.def != 0 ? "on" : "off";
         case UiControl::Kind::Choose:
-            return c.options.empty() ? std::string("-") : c.options[0];
+            return c.options.empty() ? std::string("-")
+                                     : c.options[size_t(std::clamp(c.defaultIndex, 0,
+                                           int(c.options.size()) - 1))];
         case UiControl::Kind::Slider:
         default:
             std::snprintf(buf, sizeof(buf), "%.3f", c.def);
@@ -1868,6 +1872,25 @@ void App::Frame() {
             ImGui::TextDisabled("last run %.1f ms   %d CPU / %d GPU stage(s)   [%s]",
                                 m_worker.LastRunMs(), m_worker.LastCpuStages(),
                                 m_worker.LastGpuStages(), modeName);
+        }
+
+        // Video memory. A 45 MP intermediate is ~340 MB in RGBA16F, so a
+        // pipeline of several stages can approach the card's budget -- at which
+        // point the driver starts paging and everything slows down for a reason
+        // that is otherwise completely invisible.
+        {
+            uint64_t used = 0, budget = 0;
+            m_dev.VideoMemory(&used, &budget);
+            if (budget > 0) {
+                const double pct = 100.0 * double(used) / double(budget);
+                const ImVec4 colour =
+                    pct > 90.0 ? ImVec4(1.0f, 0.4f, 0.4f, 1.0f)     // paging territory
+                  : pct > 75.0 ? ImVec4(1.0f, 0.8f, 0.3f, 1.0f)
+                               : ImVec4(0.5f, 0.5f, 0.5f, 1.0f);
+                ImGui::TextColored(colour, "vram %.0f / %.0f MB  (%.0f%%)",
+                                   double(used) / (1024.0 * 1024.0),
+                                   double(budget) / (1024.0 * 1024.0), pct);
+            }
         }
     }
     ImGui::End();

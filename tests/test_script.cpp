@@ -999,6 +999,49 @@ int main() {
         Check(err2 == err, "the same error is reported on every run, not just the first");
     }
 
+    // --- choose() takes a default -------------------------------------------
+    //
+    // Without one the initial selection is whichever name sorts first in the
+    // registry, which is alphabetical and therefore arbitrary. A script should
+    // be able to say which method it means, with the dropdown still overriding.
+    {
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        const bool ok = RunScript(
+            "src = image(\"test\")\n"
+            "op = choose(\"method\", \"threshold\", threshold_otsu)\n"
+            "m = op(src)\n"
+            "display(m)\n", &ui, &p, &err, &src);
+        Check(ok, "choose() accepts a default" + (ok ? "" : ": " + err));
+
+        const UiControl* c = ui.Find("method");
+        Check(c && !c->options.empty(), "the dropdown was declared");
+        if (c) {
+            Check(c->options[size_t(c->selected)] == "threshold_otsu",
+                  "the named default is selected, not the alphabetical first");
+            Check(c->options[size_t(c->defaultIndex)] == "threshold_otsu",
+                  "and a reset returns to it");
+        }
+    }
+    {
+        // A default naming something not in the list is a script error, not a
+        // silent fallback -- a typo should say so.
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        RunScript("src = image(\"test\")\n"
+                  "op = choose(\"method\", \"threshold\", gaussian_blur)\n"
+                  "display(op(src))\n", &ui, &p, &err, &src);
+        Check(err.find("not one of the options") != std::string::npos,
+              "a default outside the list is reported: \"" + err + "\"");
+    }
+    {
+        // The old two-argument form must keep working unchanged.
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        const bool ok = RunScript(
+            "src = image(\"test\")\n"
+            "op = choose(\"method\", \"threshold\")\n"
+            "display(op(src))\n", &ui, &p, &err, &src);
+        Check(ok, "choose() without a default still works" + (ok ? "" : ": " + err));
+    }
+
     // --- image() demosaics a mosaic automatically ---------------------------
     //
     // The requirement: a script must not have to mention demosaicing on the
