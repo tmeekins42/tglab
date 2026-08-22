@@ -538,17 +538,118 @@ int main() {
 
         if (RunFilter("basic_adjust", makeDim(), {{"highlights", -1.0}}, &out, &err)) {
             const double hl = bandMax(out, 0, 16);
-            // Computed, not guessed. At lum 0.7 with the band toe at 0.35:
-            // the old 1.0 shoulder gives weight 0.558, so k = 0.442 and the
-            // result is 0.310. The 0.70 shoulder gives weight 1.0, k floors at
-            // 0.15, and the result is 0.105. 0.20 separates them cleanly.
-            Check(hl < 0.20,
+            // Computed, not guessed, and recomputed when the recovery formula
+            // changed from a uniform multiply to a pull-toward-the-top.
+            //
+            // At lum 0.7, band toe 0.35: with the 0.70 shoulder the weight is
+            // 1.0, nothing sits above the top so the pull is a no-op, and the
+            // residual darkening (1 - 0.35) gives 0.455. With the old 1.0
+            // shoulder the weight would be 0.558, and the same arithmetic gives
+            // 0.563. 0.50 separates them.
+            Check(hl < 0.50,
                   "linear input: highlights reach a sub-1.0 highlight (0.7 -> " +
                       std::to_string(hl) + ")");
             Check(std::abs(bandMax(out, 16, 32) - 0.2) < 0.02,
                   "linear input: a sub-1.0 pull still leaves midtones alone");
         } else {
             Check(false, "basic_adjust on a dim linear image: " + err);
+        }
+
+        // Highlight recovery must DESATURATE a saturated highlight, not merely
+        // darken it.
+        //
+        // A blown highlight is blown because a channel clipped, so recovering it
+        // means bringing that channel back toward the others. Scaling all three
+        // by one factor preserves their ratios exactly, so the region comes out
+        // dark and just as colour-dense as before -- more so relative to its
+        // surroundings, which is what reads as colour crushing.
+        //
+        // Measured with the uniform multiply: a 1.20/0.35/0.20 red held
+        // saturation 0.833 at every slider position from 0 to -1.
+        {
+            auto makeColoured = []() {
+                ImageDesc d{16, 16, Format::RGBA16F};
+                d.linear = true;
+                Image img;
+                img.Alloc(d);
+                ImageView v = img.MapCpuWrite();
+                for (int y = 0; y < 16; ++y)
+                    for (int x = 0; x < 16; ++x) {
+                        uint16_t* p = v.At<uint16_t>(x, y);
+                        p[0] = FloatToHalf(1.20f);   // red clipped past the top
+                        p[1] = FloatToHalf(0.35f);
+                        p[2] = FloatToHalf(0.20f);
+                        p[3] = FloatToHalf(1.0f);
+                    }
+                return img;
+            };
+
+            auto saturationOf = [](Image& img) {
+                ImageView v = img.MapCpuRead();
+                const uint16_t* p = v.At<uint16_t>(8, 8);
+                const float r = HalfToFloat(p[0]);
+                const float g = HalfToFloat(p[1]);
+                const float b = HalfToFloat(p[2]);
+                const float mx = std::max({r, g, b});
+                const float mn = std::min({r, g, b});
+                return mx > 1e-6f ? double((mx - mn) / mx) : 0.0;
+            };
+            auto redOf = [](Image& img) {
+                ImageView v = img.MapCpuRead();
+                return double(HalfToFloat(v.At<uint16_t>(8, 8)[0]));
+            };
+
+            Image before, after;
+            std::string e;
+            if (RunFilter("basic_adjust", makeColoured(), {}, &before, &e) &&
+                RunFilter("basic_adjust", makeColoured(), {{"highlights", -1.0}}, &after, &e)) {
+
+                Check(redOf(after) < redOf(before) * 0.9,
+                      "coloured highlight: recovery brings the clipped channel down (" +
+                          std::to_string(redOf(before)) + " -> " +
+                          std::to_string(redOf(after)) + ")");
+
+                // The check that fails for a uniform multiply, where saturation
+                // is identical to six decimal places.
+                Check(saturationOf(after) < saturationOf(before) - 0.01,
+                      "coloured highlight: recovery DESATURATES rather than only darkening"
+                      " (" + std::to_string(saturationOf(before)) + " -> " +
+                          std::to_string(saturationOf(after)) + ")");
+            } else {
+                Check(false, "basic_adjust on a coloured highlight: " + e);
+            }
+        }
+
+        // And it must not be brutal on a neutral one. Recovery is meant to
+        // reveal detail, not to dim the whole region towards black: the first
+        // version took 0.90 down to 0.135, losing 85% of the brightness.
+        {
+            auto makeNeutral = []() {
+                ImageDesc d{16, 16, Format::RGBA16F};
+                d.linear = true;
+                Image img;
+                img.Alloc(d);
+                ImageView v = img.MapCpuWrite();
+                for (int y = 0; y < 16; ++y)
+                    for (int x = 0; x < 16; ++x) {
+                        uint16_t* p = v.At<uint16_t>(x, y);
+                        for (int c = 0; c < 3; ++c) p[c] = FloatToHalf(0.90f);
+                        p[3] = FloatToHalf(1.0f);
+                    }
+                return img;
+            };
+
+            Image out;
+            std::string e;
+            if (RunFilter("basic_adjust", makeNeutral(), {{"highlights", -1.0}}, &out, &e)) {
+                ImageView v = out.MapCpuRead();
+                const double got = double(HalfToFloat(v.At<uint16_t>(8, 8)[0]));
+                Check(got < 0.85 && got > 0.30,
+                      "neutral highlight: -1 darkens meaningfully but does not crush "
+                      "(0.90 -> " + std::to_string(got) + ")");
+            } else {
+                Check(false, "basic_adjust on a neutral highlight: " + e);
+            }
         }
 
         // Gamma-encoded input must be unaffected by all of the above: the sRGB

@@ -246,9 +246,18 @@ void main(uint3 tid : SV_DispatchThreadID) {
     if (abs(hi) > 1e-4) {
         float wp = asfloat(HighlightTop);
         float w = SmoothBand(lum, 0.35, wp);
-        // Floored: see the CPU path -- at full weight this reaches exactly 0
-        // for hi = -1 and erases the highlights instead of recovering them.
-        c *= max(1.0 + hi * w, 0.15);
+
+        // Pull each channel toward the band top rather than scaling all three.
+        // See the CPU path: a uniform multiply preserves channel ratios, so a
+        // saturated highlight only darkens and never desaturates -- which reads
+        // as colour crushing rather than recovery.
+        float amount = -hi * w;
+        if (amount > 0.0) {
+            c -= max(c - wp, 0.0) * amount;
+            c *= (1.0 - 0.35 * amount);
+        } else if (amount < 0.0) {
+            c *= (1.0 - amount);
+        }
     }
     float sh = asfloat(Shadows);
     if (abs(sh) > 1e-4) {
@@ -366,13 +375,37 @@ private:
         const float hi = float(m_highlights);
         if (std::abs(hi) > 1e-4f) {
             const float w = SmoothBand(lum, 0.35f, white);
-            // Floored well above zero: at full weight, k = 1 + hi*w reaches
-            // exactly 0 for hi = -1, wiping highlights to black rather than
-            // recovering them. Harmless on 8-bit input, where the band seldom
-            // reached full weight, but reachable on scene-linear data, where
-            // it now does. -1 means "pull hard", not "erase".
-            const float k = std::max(1.0f + hi * w, 0.15f);
-            r *= k; g *= k; b *= k;
+
+            // Recovery pulls each channel toward the band's top, rather than
+            // scaling all three by one factor.
+            //
+            // A uniform multiply preserves the ratios between channels, so a
+            // saturated highlight only gets darker -- measured, a 1.20/0.35/0.20
+            // red held saturation 0.833 at every slider position, coming out
+            // dark and MORE colour-dense than its surroundings. That is the
+            // colour crushing, and it is what "recovery" must not do: a blown
+            // highlight is blown because one channel clipped, so bringing it
+            // back means moving that channel down toward the others.
+            //
+            // Pulling toward `white` does exactly that. A channel already below
+            // the target is left alone (max with 0), so a dark blue in a bright
+            // red does not get dragged upward.
+            const float amount = -hi * w;   // hi is negative when recovering
+            if (amount > 0.0f) {
+                r -= std::max(r - white, 0.0f) * amount;
+                g -= std::max(g - white, 0.0f) * amount;
+                b -= std::max(b - white, 0.0f) * amount;
+
+                // Below the top there is nothing clipped to pull back, so fall
+                // back to a gentle overall darkening -- which is what the
+                // control means for a merely-bright region.
+                const float k = 1.0f - 0.35f * amount;
+                r *= k; g *= k; b *= k;
+            } else if (amount < 0.0f) {
+                // Positive highlights: push the band up, ratios preserved.
+                const float k = 1.0f - amount;
+                r *= k; g *= k; b *= k;
+            }
         }
         const float sh = float(m_shadows);
         if (std::abs(sh) > 1e-4f) {
