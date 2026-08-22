@@ -256,6 +256,10 @@ private:
     int         m_infoTestCountdown = 0;   // self-test: frames until TGLAB_INFOTEST fires
     bool        m_infoTestNudged    = false;
     bool        m_haveSavedLayout = false; // a tglab_layout.ini already existed
+
+    // A viewer to bring to the front next frame. Set when a display() is first
+    // docked; applied a frame later, once the window actually exists.
+    std::string m_selectViewer;
     ImGuiID     m_centreNode = 0;          // where new viewers get docked
     ImGuiID     m_dockspaceId = 0;         // fallback when a saved layout exists
     ImGuiID     m_compareNode = 0;         // right-hand column for compare
@@ -784,12 +788,35 @@ void App::DockLooseViewers() {
     const ImGuiID target = CentreDockNode();
     if (target == 0) return;
 
+    // The last display() that had to be docked afresh, which is the one to
+    // bring to the front. See below for why the LAST rather than the first.
+    const View* newest = nullptr;
+
     for (auto& v : m_views) {
         ImGuiWindow* w = ImGui::FindWindowByName(v->Name().c_str());
         // Never seen before, or known but not docked anywhere.
-        if (w == nullptr || w->DockId == 0)
+        if (w == nullptr || w->DockId == 0) {
             ImGui::DockBuilderDockWindow(v->Name().c_str(), target);
+            newest = v.get();
+        }
     }
+
+    // Select it, so a script opens showing its result rather than its input.
+    //
+    // ImGui persists the selected tab per dock node in tglab_layout.ini, so
+    // without this the tab that happened to be active last session stays on top
+    // -- for hello.tgl that is "original", and moving the brightness slider then
+    // appears to do nothing at all because the visible tab is the source image.
+    // Tim hit exactly that and reasonably read it as a broken algorithm.
+    //
+    // The LAST declared viewer, because a script builds towards its result:
+    // display(src) comes first and display(adjusted) last. Only on the frame a
+    // viewer is first docked, so a tab the user has since chosen is left alone.
+    //
+    // Deferred by one frame, and not done with SetWindowFocus: the window has
+    // only just been handed to DockBuilderDockWindow and does not exist as an
+    // ImGui window yet, so focusing it now is a no-op. Next frame it does.
+    if (newest) m_selectViewer = newest->Name();
 
     DockOnDemandPanels();
 }
@@ -1826,6 +1853,15 @@ void App::Frame() {
     // hot reload that introduced new viewer names), so catch any still-floating
     // viewer here now that a target node is resolvable.
     DockLooseViewers();
+
+    // Bring a newly declared viewer to the front, now that it exists as a
+    // window. See DockLooseViewers for why this is deferred.
+    if (!m_selectViewer.empty()) {
+        if (ImGui::FindWindowByName(m_selectViewer.c_str())) {
+            ImGui::SetWindowFocus(m_selectViewer.c_str());
+            m_selectViewer.clear();
+        }
+    }
 
     // Self-test hook: TGLAB_DROPTEST="x,y,path" simulates dropping `path` at
     // client point (x,y), which is the one interaction a harness cannot drive
