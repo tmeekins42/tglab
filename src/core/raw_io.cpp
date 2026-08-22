@@ -219,6 +219,29 @@ bool LoadRawMosaic(const std::string& path, Image* out, std::string* err) {
         d.camMul[2] = (m[2] > 0.0f) ? m[2] / g : 1.0f;
     }
 
+    // The camera's DAYLIGHT reference: the gains that make a D65 white neutral
+    // on this sensor. Distinct from cam_mul, which is what the camera chose for
+    // this particular shot.
+    //
+    // Without it a temperature control can only be relative -- "a bit warmer
+    // than however this was shot" -- because nothing says where neutral is.
+    // With it, the ratio between as-shot and daylight gives the shot's actual
+    // colour temperature, and the slider can name a Kelvin value and mean it.
+    //
+    // Measured: a 5D3 frame shot under tungsten reads as-shot 1.454/1/2.370
+    // against a daylight 2.251/1/1.418 -- a factor of 0.65 in red and 1.67 in
+    // blue, far outside the +-40% a relative control could reach.
+    {
+        const float* p = raw.imgdata.color.pre_mul;
+        const float g = (p[1] > 0.0f) ? p[1] : 1.0f;
+        if (p[0] > 0.0f && p[2] > 0.0f) {
+            d.preMul[0] = p[0] / g;
+            d.preMul[1] = 1.0f;
+            d.preMul[2] = p[2] / g;
+            d.hasDaylightWb = true;
+        }
+    }
+
     // Camera primaries -> sRGB. Sensor filters are not sRGB primaries, so even
     // perfectly balanced data has the wrong hues without this -- greens too
     // yellow, blues too purple. LibRaw derives it from the embedded profile.

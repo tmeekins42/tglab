@@ -134,8 +134,122 @@ double FlatRegionStdDev(Image& img) {
 
 } // namespace
 
+
+// The Kelvin white-balance control.
+//
+// Absolute, unlike `temperature`: it names the illuminant the scene was under,
+// and setting it to the actual light neutralises the cast. That needs two
+// references from the raw file -- the gains the camera chose for the shot
+// (camMul) and the camera's daylight reference (preMul) -- and the ratio
+// between them is what says where neutral actually is.
+//
+// The relative control could never do this. It scaled red and blue by at most
+// +-40%, while a tungsten frame measured here sits a factor of 0.65 in red and
+// 1.67 in blue away from daylight: outside its reach entirely, which is why a
+// warm image could not be corrected.
+static void TestKelvinWhiteBalance() {
+    std::printf("\n--- kelvin white balance ---\n");
+
+    // A camera whose daylight reference and as-shot gains differ, i.e. a shot
+    // taken under something other than daylight.
+    auto make = [](bool withDaylightRef) {
+        ImageDesc d{16, 16, Format::RGBA16F};
+        d.linear = true;
+        d.camMul[0] = 1.4541f; d.camMul[1] = 1.0f; d.camMul[2] = 2.3701f;  // as shot
+        d.preMul[0] = 2.2513f; d.preMul[1] = 1.0f; d.preMul[2] = 1.4180f;  // daylight
+        d.hasDaylightWb = withDaylightRef;
+        Image img;
+        img.Alloc(d);
+        ImageView v = img.MapCpuWrite();
+        for (int y = 0; y < 16; ++y)
+            for (int x = 0; x < 16; ++x) {
+                uint16_t* p = v.At<uint16_t>(x, y);
+                for (int c = 0; c < 3; ++c) p[c] = FloatToHalf(0.40f);
+                p[3] = FloatToHalf(1.0f);
+            }
+        return img;
+    };
+
+    auto ratioOf = [](Image& img) {
+        ImageView v = img.MapCpuRead();
+        const uint16_t* p = v.At<uint16_t>(8, 8);
+        const float r = HalfToFloat(p[0]);
+        const float b = HalfToFloat(p[2]);
+        return b > 1e-6f ? double(r / b) : 0.0;
+    };
+
+    Image out;
+    std::string err;
+
+    // kelvin = 0 means "leave the camera's white balance alone", so the image
+    // must come through untouched. A control that jumped to daylight on load
+    // would change every picture before the user touched anything.
+    Image asShot;
+    if (!RunFilter("basic_adjust", make(true), {}, &asShot, &err)) {
+        Check(false, "basic_adjust runs on a raw-like image: " + err);
+        return;
+    }
+    Check(std::abs(ratioOf(asShot) - 1.0) < 0.01,
+          "kelvin 0 leaves the camera's own white balance alone (R/B " +
+              std::to_string(ratioOf(asShot)) + ")");
+
+    // Warmer request -> warmer render, cooler -> cooler, and monotonic between.
+    double prev = -1.0;
+    bool monotonic = true;
+    for (float k : {2500.0f, 3500.0f, 5000.0f, 6500.0f, 9000.0f}) {
+        if (!RunFilter("basic_adjust", make(true), {{"kelvin", double(k)}}, &out, &err)) {
+            Check(false, "basic_adjust at " + std::to_string(k) + " K: " + err);
+            return;
+        }
+        const double ratio = ratioOf(out);
+        if (prev >= 0.0 && ratio <= prev) { monotonic = false; break; }
+        prev = ratio;
+    }
+    Check(monotonic,
+          "raising kelvin renders progressively warmer (R/B rises monotonically)");
+
+    // The round trip: asking for the illuminant the shot was ALREADY balanced
+    // for must be a no-op. This is what proves the control is anchored to the
+    // file rather than applying an arbitrary curve -- the as-shot and requested
+    // corrections have to cancel.
+    //
+    // The fixture's camMul/preMul ratio corresponds to roughly 3800 K, so a
+    // request near there should land close to unchanged, and much closer than
+    // daylight does.
+    Image atShot, atDaylight;
+    if (RunFilter("basic_adjust", make(true), {{"kelvin", 3800.0}}, &atShot, &err) &&
+        RunFilter("basic_adjust", make(true), {{"kelvin", 6504.0}}, &atDaylight, &err)) {
+        const double dShot     = std::abs(ratioOf(atShot) - 1.0);
+        const double dDaylight = std::abs(ratioOf(atDaylight) - 1.0);
+        Check(dShot < dDaylight,
+              "requesting the shot's own temperature changes it less than requesting "
+              "daylight (" + std::to_string(dShot) + " vs " + std::to_string(dDaylight) + ")");
+    } else {
+        Check(false, "round-trip runs: " + err);
+    }
+
+    // No daylight reference -- a JPEG, or a raw whose profile lacks one. The
+    // control has nothing to anchor to, so it must do nothing rather than guess.
+    Image noRef;
+    if (RunFilter("basic_adjust", make(false), {{"kelvin", 2500.0}}, &noRef, &err)) {
+        Check(std::abs(ratioOf(noRef) - 1.0) < 0.01,
+              "without a daylight reference, kelvin does nothing rather than guessing");
+    } else {
+        Check(false, "basic_adjust without a daylight reference: " + err);
+    }
+
+    // The relative control still works alongside it, and still works on its own.
+    if (RunFilter("basic_adjust", make(false), {{"temperature", 0.5}}, &out, &err)) {
+        Check(ratioOf(out) > 1.1,
+              "the relative temperature control still warms without a daylight ref (R/B " +
+                  std::to_string(ratioOf(out)) + ")");
+    } else {
+        Check(false, "relative temperature: " + err);
+    }
+}
 int main() {
     std::string err;
+    TestKelvinWhiteBalance();
 
     // --- the shared plumbing ------------------------------------------------
     {

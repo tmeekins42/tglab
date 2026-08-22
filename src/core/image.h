@@ -87,6 +87,16 @@ struct ImageDesc {
     // what an undemosaiced image looks like if you forget them.
     float camMul[3] = {1.0f, 1.0f, 1.0f};
 
+    // The camera's DAYLIGHT white balance -- the gains that make a D65 white
+    // neutral on this sensor -- also normalised so green is 1.
+    //
+    // camMul says what the camera chose for this shot; this says where neutral
+    // actually is. The ratio between them is the shot's colour temperature, and
+    // it is what lets a temperature control name a Kelvin value rather than
+    // being a relative nudge from an unknown starting point.
+    float preMul[3] = {1.0f, 1.0f, 1.0f};
+    bool  hasDaylightWb = false;   // false for a non-raw image, which has none
+
     // Camera colour space -> sRGB, row-major. Sensor primaries are not sRGB
     // primaries, so without this even correctly balanced data has the wrong
     // hues. Identity for a non-raw image.
