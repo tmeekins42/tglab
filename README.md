@@ -514,6 +514,29 @@ Two things that fell out of measuring this, both counter-intuitive:
   peak is a property of the scene. Nor can it be the image's own peak, which
   would make the same slider position mean something different on every shot.
 
+#### Point operations on the GPU
+
+`brightness` and `grayscale` are one fetch and a few instructions per pixel, so
+they belong on the device even though they are the two simplest algorithms here.
+At 21 MP, measured:
+
+| | CPU | GPU |
+|---|---|---|
+| `brightness` | 847 ms | 91 ms |
+| `grayscale` | 839 ms | 92 ms |
+| chained, as `hello.tgl` runs them | 1854 ms | **209 ms** |
+
+The chained figure is the one that matters: the intermediate never leaves the
+device, so two stages cost barely more than one.
+
+**The units differ between the two paths, deliberately.** `brightness` is an
+offset expressed as a fraction of the intensity range, so the CPU — which works
+in the source's own units — multiplies it by 255 for an RGBA8 image. A UNORM
+SRV hands the shader 0..1 whatever the storage format, so the shader must *not*.
+Scaling in both places would apply the offset 255 times over, and nothing but
+the CPU/GPU agreement test would notice. That test now covers both algorithms;
+`brightness` agrees exactly, `grayscale` to within one LSB of rounding.
+
 #### Colour temperature
 
 Two axes, which is what white balance actually has: a colour temperature along

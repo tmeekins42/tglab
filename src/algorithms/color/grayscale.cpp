@@ -6,6 +6,8 @@
 // demosaiced raw came out pure black, and because grayscale is the first stage
 // in hello.tgl, everything downstream of it did too.
 #include <algorithm>
+#include <cstring>
+#include <vector>
 
 #include "../../algo_util/pixel_buffer.h"
 #include "../../core/algorithm.h"
@@ -52,6 +54,49 @@ public:
         }
 
         m_out.PackInto(dst);
+    }
+
+    // --- GPU implementation -------------------------------------------------
+    // One dot product per pixel.
+    bool HasGPU() const override { return true; }
+
+    const char* GpuSource() const override {
+        return R"(
+Texture2D<float4>   Src : register(t0);
+RWTexture2D<float4> Dst : register(u0);
+
+cbuffer Params : register(b0) {
+    uint Width;
+    uint Height;
+    uint WrBits, WgBits, WbBits;   // already divided by their sum
+};
+
+[numthreads(8, 8, 1)]
+void main(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= Width || tid.y >= Height) return;
+
+    float4 c = Src[int2(tid.xy)];
+    float3 w = float3(asfloat(WrBits), asfloat(WgBits), asfloat(WbBits));
+    float g = dot(c.rgb, w);
+
+    // Alpha untouched, as on the CPU path.
+    Dst[tid.xy] = float4(g, g, g, c.a);
+}
+)";
+    }
+
+    std::vector<uint32_t> GpuConstants(int) const override {
+        auto bits = [](float f) {
+            uint32_t u;
+            std::memcpy(&u, &f, sizeof(u));
+            return u;
+        };
+
+        // Normalised here rather than in the shader, so the division happens
+        // once per dispatch instead of once per pixel -- and so the two paths
+        // share one expression of what the weights mean.
+        const float sum = std::max(0.0001f, float(m_wr) + float(m_wg) + float(m_wb));
+        return {bits(float(m_wr) / sum), bits(float(m_wg) / sum), bits(float(m_wb) / sum)};
     }
 
 private:

@@ -620,9 +620,14 @@ static void TestGpuPipeline(ID3D12Device* dev) {
         Check(run(ExecMode::Auto, &a, &ms, &st, &e), "Auto runs");
         Check(st == 1, "Auto chose the GPU");
     }
+    // guided_filter as the CPU-only example, deliberately: it is genuinely
+    // CPU-only (a box-filtered local linear fit, not a per-pixel kernel), where
+    // grayscale and sobel merely had not been ported yet and since have been.
+    // A test whose premise is "this one is slow" quietly stops testing anything
+    // the day someone speeds it up.
     {
         UiState ui; Pipeline pipe; std::vector<Data> src; std::string e;
-        BuildPipeline("src = image(\"test\")\ng = grayscale(src)\ndisplay(g)\n",
+        BuildPipeline("src = image(\"test\")\ng = guided_filter(src)\ndisplay(g)\n",
                       dim, &ui, &pipe, &src, &e);
         Check(pipe.Execute(&src, nullptr, &e, &gpu, ExecMode::Auto),
               "CPU-only algorithm runs under Auto");
@@ -631,7 +636,7 @@ static void TestGpuPipeline(ID3D12Device* dev) {
     {
         UiState ui; Pipeline pipe; std::vector<Data> src; std::string e;
         BuildPipeline("src = image(\"test\")\nb = gaussian_blur(src, sigma = 2)\n"
-                      "gx, gy, mag = sobel(b)\ndisplay(mag)\n",
+                      "g = guided_filter(b)\ndisplay(g)\n",
                       dim, &ui, &pipe, &src, &e);
         Check(pipe.Execute(&src, nullptr, &e, &gpu, ExecMode::Auto),
               "mixed CPU/GPU pipeline runs" + (e.empty() ? "" : ": " + e));
@@ -928,6 +933,22 @@ static void TestGpuAgreement(ID3D12Device* dev) {
     // works in normalised floats and the CPU in 0..255, so rounding differs by
     // roughly an LSB. Iterative schemes accumulate that over their passes.
     const Case cases[] = {
+        // brightness is where the two paths express the same thing DIFFERENTLY,
+        // which is the interesting case for an agreement test. Its offset is a
+        // fraction of the intensity range: the CPU works in the source's units
+        // and multiplies it by 255 for an RGBA8 image, while a UNORM SRV hands
+        // the shader 0..1 and it must not. Scaling in both places would apply
+        // the offset 255 times over, and nothing but this check would notice.
+        {"brightness",
+         "src = image(\"test\")\n"
+         "o = brightness(src, brightness = 0.2, gain = 1.5)\n"
+         "display(o)\n", 2.0, 1.0},
+
+        {"grayscale",
+         "src = image(\"test\")\n"
+         "o = grayscale(src, r_weight = 0.4, g_weight = 0.4, b_weight = 0.2)\n"
+         "display(o)\n", 2.0, 1.0},
+
         {"box_blur",
          "src = image(\"test\")\n"
          "o = box_blur(src, radius = 3)\n"
@@ -1199,7 +1220,7 @@ static void TestCompare(ID3D12Device* dev) {
     // comparing something against itself.
     {
         UiState ui; Pipeline pipe; std::vector<Data> src; std::string e;
-        BuildPipeline("src = image(\"test\")\ng = grayscale(src)\ndisplay(g)\n",
+        BuildPipeline("src = image(\"test\")\ng = guided_filter(src)\ndisplay(g)\n",
                       128, &ui, &pipe, &src, &e);
         const CompareResult r = CompareCpuGpu(pipe, &src, &gpu, -1);
         Check(!r.ok && r.error.find("no stage") != std::string::npos,
@@ -1208,10 +1229,10 @@ static void TestCompare(ID3D12Device* dev) {
     // Naming a specific CPU-only stage reports that stage by name.
     {
         UiState ui; Pipeline pipe; std::vector<Data> src; std::string e;
-        BuildPipeline("src = image(\"test\")\ng = grayscale(src)\ndisplay(g)\n",
+        BuildPipeline("src = image(\"test\")\ng = guided_filter(src)\ndisplay(g)\n",
                       128, &ui, &pipe, &src, &e);
         const CompareResult r = CompareCpuGpu(pipe, &src, &gpu, 0);
-        Check(!r.ok && r.error.find("grayscale") != std::string::npos,
+        Check(!r.ok && r.error.find("guided_filter") != std::string::npos,
               "an explicitly chosen CPU-only stage names itself: " + r.error);
     }
     // Auto-selection skips CPU-only stages to find a comparable one — a

@@ -10,7 +10,7 @@ BUGS / SMALL FEATURES
 
 FEATURES
 - Add an about menu... probably should also list third party libs / licenses if necessary.
-- Can we release pre-compiled executables on github? Do we need to start tracking version numbers?
+- Can we release pre-compiled executables on github? Do we need to start tracking version numbers / or release number? maybe release number.. not sure this app with ever be "finished".
 - add support for additional image channels, such as alpha channels and depth channels
 - channel merging. Astronomy images are captured single channel with colored filters. How to merge them?
 - image export
@@ -37,6 +37,7 @@ FEATURES
 - denoising algorithms
 - can we run a script (develop?) on every image in a group, then run an algorithm, like panorama that works on the entire group?
 - can we detect dead/stuck pixels from the raw capure? test: d:\lrwork\little\_MG_96732.CR2 has a stuck solid red pixel on the right eye. (this is a common issue on cameras)
+- can algorithms be toggled on/off?
 
 NOTES
 - if we need matrix functions, I suggest the Euler library and Ceres for bundle solving
@@ -101,3 +102,11 @@ DONE (recent, pruned periodically)
   float image because their `level` is fixed at 0..255 while the values are
   0..1. That is the same "ranges do not follow the format" issue as
   basic_adjust's, not a "did not run" bug.
+- GPU kernels for brightness and grayscale. At 21 MP, chained as hello.tgl runs
+  them: 1854 ms -> 209 ms. Note the units differ between the paths on purpose --
+  brightness's offset is scaled by 255 on the CPU (which works in the source's
+  units) and NOT in the shader (a UNORM SRV already gives 0..1). Only the
+  CPU/GPU agreement test would catch getting that wrong.
+  Three tests had used grayscale/sobel as their "CPU-only algorithm" example and
+  broke once those gained kernels; they now use guided_filter, which is
+  genuinely CPU-only rather than merely not-ported-yet.

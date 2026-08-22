@@ -9,6 +9,8 @@
 // no error anywhere. PixelBuffer exists for exactly this, and unpacking through
 // it is both shorter and complete.
 #include <algorithm>
+#include <cstring>
+#include <vector>
 
 #include "../../algo_util/pixel_buffer.h"
 #include "../../core/algorithm.h"
@@ -54,6 +56,54 @@ public:
         }
 
         m_out.PackInto(dst);
+    }
+
+    // --- GPU implementation -------------------------------------------------
+    // One fetch, two operations, one store. Nothing here is interesting except
+    // the units, which are the one place the two paths could disagree.
+    bool HasGPU() const override { return true; }
+
+    const char* GpuSource() const override {
+        return R"(
+Texture2D<float4>   Src : register(t0);
+RWTexture2D<float4> Dst : register(u0);
+
+cbuffer Params : register(b0) {
+    uint Width;
+    uint Height;
+    uint OffsetBits;   // already in 0..1, see below
+    uint GainBits;
+};
+
+[numthreads(8, 8, 1)]
+void main(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= Width || tid.y >= Height) return;
+
+    float4 c = Src[int2(tid.xy)];
+    float offset = asfloat(OffsetBits);
+    float gain   = asfloat(GainBits);
+
+    // Alpha carried through: brightening should not change transparency.
+    Dst[tid.xy] = float4(c.rgb * gain + offset, c.a);
+}
+)";
+    }
+
+    std::vector<uint32_t> GpuConstants(int) const override {
+        auto bits = [](float f) {
+            uint32_t u;
+            std::memcpy(&u, &f, sizeof(u));
+            return u;
+        };
+
+        // NOT scaled by 255 the way the CPU path scales it.
+        //
+        // The CPU works in the source's own units, so an RGBA8 image needs the
+        // offset multiplied up to 0..255. A UNORM SRV hands the shader 0..1
+        // whatever the storage format, so scaling here would apply the offset
+        // 255 times over. The two paths therefore look different and agree,
+        // which is exactly what the CPU/GPU agreement test exists to confirm.
+        return {bits(float(m_brightness)), bits(float(m_gain))};
     }
 
 private:
