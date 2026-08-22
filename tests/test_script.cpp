@@ -1066,8 +1066,13 @@ int main() {
         UiState ui; Pipeline p;
         const auto r = Interpret(prog, names, &ui, &p);
         Check(r.ok, "it interprets against a mosaic source" + (r.ok ? "" : ": " + r.error));
-        Check(p.Stages().size() == 1 && p.Stages()[0].algoName == "demosaic_bilinear",
-              "image() inserted the default demosaic without the script asking");
+        // Asserts a demosaic was inserted, not *which* one: the default is an
+        // app setting, and pinning the name here would make changing it a test
+        // failure rather than a decision.
+        Check(p.Stages().size() == 1 &&
+                  p.Stages()[0].algoName.rfind("demosaic_", 0) == 0,
+              "image() inserted the default demosaic without the script asking"
+              + (p.Stages().empty() ? std::string() : " (" + p.Stages()[0].algoName + ")"));
 
         // Two image() calls on one source must share the stage rather than
         // demosaicing the same sensor data twice.

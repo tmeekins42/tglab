@@ -256,6 +256,104 @@ int main() {
         }
     }
 
+    // --- Malvar beats bilinear where bilinear actually fails ----------------
+    //
+    // On a smooth gradient every method is near-exact, so that fixture cannot
+    // tell them apart. Bilinear's characteristic failure is colour fringing at
+    // high-contrast edges: averaging across a boundary invents colour that was
+    // never there. Malvar corrects using the centre channel's second
+    // derivative, so this is the fixture that shows the difference.
+    {
+        // A fine radial pattern: neutral grey, but with detail at the sampling
+        // frequency, which is what actually separates demosaic methods.
+        //
+        // A step edge was tried first and does NOT discriminate -- measured,
+        // both methods fringe identically there (0.087 each), and the flat
+        // regions on either side are exactly zero for both. Malvar's whole
+        // premise is that the centre channel's second derivative predicts the
+        // others, and a step is locally flat everywhere except two columns. It
+        // needs structure at every pixel to have anything to work with.
+        auto makeEdge = [](CfaPattern cfa) {
+            Image img;
+            ImageDesc d{kW, kH, Format::R32F};
+            d.cfa = cfa;
+            d.whiteLevel = 1.0f;
+            img.Alloc(d);
+            ImageView v = img.MapCpuWrite();
+            for (int y = 0; y < kH; ++y)
+                for (int x = 0; x < kW; ++x) {
+                    const float fx = float(x) - kW * 0.5f;
+                    const float fy = float(y) - kH * 0.5f;
+                    const float r  = std::sqrt(fx * fx + fy * fy);
+                    // Grey, so R == G == B in the true scene and any colour in
+                    // the result is entirely interpolation error.
+                    const float s  = 0.5f + 0.45f * std::sin(r * 1.1f);
+                    *v.At<float>(x, y) = s;
+                }
+            return img;
+        };
+
+        // Mean colour spread on a scene that has none. Anything above zero is
+        // fringing, so lower is strictly better.
+        auto fringing = [](Image& img) {
+            ImageView v = img.MapCpuRead();
+            double sum = 0.0;
+            int    n   = 0;
+            for (int y = 3; y < kH - 3; ++y)
+                for (int x = 3; x < kW - 3; ++x) {
+                    const float r = HalfToFloat(v.At<uint16_t>(x, y)[0]);
+                    const float g = HalfToFloat(v.At<uint16_t>(x, y)[1]);
+                    const float b = HalfToFloat(v.At<uint16_t>(x, y)[2]);
+                    sum += std::max({r, g, b}) - std::min({r, g, b});
+                    ++n;
+                }
+            return n ? sum / n : 0.0;
+        };
+
+        Image bil, mal;
+        const bool a = RunDemosaic("demosaic_bilinear", makeEdge(CfaPattern::RGGB),
+                                   {}, &bil, &err);
+        const bool b = RunDemosaic("demosaic_malvar", makeEdge(CfaPattern::RGGB),
+                                   {}, &mal, &err);
+        if (a && b) {
+            const double fb = fringing(bil), fm = fringing(mal);
+            Check(fb > 0.05, "bilinear fringes on fine detail (" +
+                                 std::to_string(fb) + ")");
+            // Measured at roughly half: 0.078 against 0.137.
+            Check(fm < fb * 0.75, "Malvar fringes substantially less (" +
+                               std::to_string(fm) + " vs " + std::to_string(fb) + ")");
+        } else {
+            Check(false, "both methods ran: " + err);
+        }
+    }
+    {
+        // With its gains at zero Malvar reduces to exactly bilinear. That is
+        // what makes the correction term testable rather than taken on trust.
+        Image bil, mal;
+        std::string e1, e2;
+        const bool a = RunDemosaic("demosaic_bilinear", MakeMosaic(CfaPattern::RGGB),
+                                   {}, &bil, &e1);
+        const bool b = RunDemosaic("demosaic_malvar", MakeMosaic(CfaPattern::RGGB),
+                                   {{"alpha", 0.0}, {"beta", 0.0}, {"gamma", 0.0}},
+                                   &mal, &e2);
+        if (a && b) {
+            ImageView va = bil.MapCpuRead();
+            ImageView vb = mal.MapCpuRead();
+            double worst = 0.0;
+            for (int y = 3; y < kH - 3; ++y)
+                for (int x = 3; x < kW - 3; ++x)
+                    for (int c = 0; c < 3; ++c)
+                        worst = std::max(worst,
+                            std::abs(double(HalfToFloat(va.At<uint16_t>(x, y)[c])) -
+                                     double(HalfToFloat(vb.At<uint16_t>(x, y)[c]))));
+            Check(worst < 0.002,
+                  "Malvar with zero gains is exactly bilinear (worst " +
+                      std::to_string(worst) + ")");
+        } else {
+            Check(false, "both methods ran: " + (a ? e2 : e1));
+        }
+    }
+
     // --- white balance and the colour matrix are applied --------------------
     //
     // A sensor's green photosites are roughly twice as sensitive as its red and
@@ -337,7 +435,8 @@ int main() {
         if (SUCCEEDED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev)))) {
             ComputeContext gpu;
             if (gpu.Init(dev)) {
-                for (const char* name : {"demosaic_passthrough", "demosaic_bilinear"}) {
+                for (const char* name : {"demosaic_passthrough", "demosaic_bilinear",
+                                         "demosaic_malvar"}) {
                     for (CfaPattern cfa : {CfaPattern::RGGB, CfaPattern::BGGR,
                                            CfaPattern::GRBG, CfaPattern::GBRG}) {
                         Image cpuOut, gpuOut;

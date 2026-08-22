@@ -104,8 +104,17 @@ CR3 is dropped on the slot. `mosaic("name")` returns the undemosaiced sensor
 data, which is what [scripts/demosaic.tgl](scripts/demosaic.tgl) uses to compare
 two methods side by side.
 
-`demosaic_passthrough` shows the mosaic as it actually is: zoom in and the
-colour filter array is visible, one colour per pixel, before any interpolation.
+Three methods, all with GPU kernels:
+
+| Method | What it is |
+|---|---|
+| `demosaic_passthrough` | The mosaic as it actually is — zoom in and the colour filter array is visible, one colour per pixel, before any interpolation. |
+| `demosaic_bilinear` | The standard baseline. Averages the nearest neighbours of each missing colour; fringes visibly at edges. |
+| `demosaic_malvar` | Malvar-He-Cutler (2004), the default. Corrects bilinear using the centre channel's second derivative, which predicts how the other channels change. Roughly **half** the colour fringing on fine detail (measured 0.078 against 0.136) for barely more arithmetic. |
+
+Malvar's gains are exposed as parameters rather than baked in: set `alpha`,
+`beta` and `gamma` to zero and it reduces to exactly bilinear, which makes the
+correction term something you can test rather than take on trust.
 
 `TGLAB_RAW_RGB=1` falls back to LibRaw's own conversion, as an escape hatch if a
 camera's mosaic cannot be read.
