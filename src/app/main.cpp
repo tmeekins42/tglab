@@ -165,6 +165,18 @@ public:
     std::string SlotNameAt(int sx, int sy) const;
     void SetScriptPath(const std::string& path);
 
+    // Moves the first slider and re-runs, as dragging one does. Exists for the
+    // drag test: sustained dragging is what exhausts the display descriptor
+    // heap, and that cannot be reached without driving real frames.
+    void NudgeControlForTest(double value) {
+        for (UiControl& c : m_ui.Controls()) {
+            if (c.kind != UiControl::Kind::Slider) continue;
+            c.value = std::clamp(value, c.lo, c.hi);
+            m_dirty = true;
+            return;
+        }
+    }
+
 private:
     void RunScript();
     void BuildDefaultLayout(ImGuiID dockspace);
@@ -1997,6 +2009,17 @@ void App::Frame() {
     ImGui::Render();
     ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), cl);
     m_dev.EndFrame();
+
+    // Print anything the debug layer flagged this frame.
+    //
+    // It was collecting messages that nobody ever read, so a Debug run looked
+    // clean while the layer had plenty to say -- which is how a descriptor bug
+    // survived several rounds of "the debug layer is silent". In Debug only:
+    // the layer is not installed in Release, and the query would cost a
+    // per-frame QueryInterface for nothing.
+#ifdef _DEBUG
+    m_dev.DrainValidationMessages();
+#endif
 }
 
 LRESULT WINAPI WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {

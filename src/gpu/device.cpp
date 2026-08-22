@@ -205,9 +205,22 @@ ID3D12GraphicsCommandList* Device::BeginFrame() {
     FrameCtx& f = m_frames[m_frameIndex];
 
     // Wait until this frame slot's previous work has completed.
+    //
+    // Bounded, not INFINITE. A faulted GPU is removed by the driver and its
+    // fence never signals again, so an infinite wait here is the difference
+    // between an app that reports a problem and one that simply freezes with no
+    // clue why -- which is exactly how a descriptor-aliasing bug presented.
+    // Five seconds is far beyond any real frame and well past the ~2s TDR limit.
     if (f.fenceValue != 0 && m_fence->GetCompletedValue() < f.fenceValue) {
         m_fence->SetEventOnCompletion(f.fenceValue, m_fenceEvent);
-        WaitForSingleObject(m_fenceEvent, INFINITE);
+        if (WaitForSingleObject(m_fenceEvent, 5000) != WAIT_OBJECT_0) {
+            const HRESULT reason = m_device ? m_device->GetDeviceRemovedReason() : S_OK;
+            std::fprintf(stderr,
+                         "[gpu] frame fence did not signal within 5s; "
+                         "device removed reason 0x%08lX\n",
+                         static_cast<unsigned long>(reason));
+            std::fflush(stderr);
+        }
     }
 
     m_backBufferIndex = m_swapChain->GetCurrentBackBufferIndex();

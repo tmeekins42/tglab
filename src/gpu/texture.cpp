@@ -1,6 +1,7 @@
 #include "texture.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 
@@ -314,14 +315,32 @@ struct DisplayPipeline {
     // without disturbing ImGui's own heap allocations.
     ID3D12DescriptorHeap* heap = nullptr;
     UINT stride = 0;
-    UINT cursor = 0;
+
+    // Where the next conversion takes its two descriptors, and which frame slot
+    // that cursor belongs to. See kDisplaySlots for why both are needed.
+    UINT cursor    = 0;
+    UINT frameSlot = UINT(-1);
 
     bool valid = false;
 };
 
 DisplayPipeline g_display;
 
-constexpr UINT kDisplaySlots = 64;   // (SRV + UAV) per view, several views
+// Descriptors per frame-in-flight, and the region each frame owns.
+//
+// A conversion's descriptors are read when the command list EXECUTES, which is
+// at least a frame after they were written -- so a cursor that simply wrapped
+// would hand frame N+1 the slots frame N is still reading from. At two viewers
+// per frame that wrapped in about sixteen frames: a fraction of a second of
+// dragging a slider, after which the GPU sampled whatever had been written over
+// its descriptors. It showed as blocks of garbage in the image and then a hang,
+// because a faulted device never signals the fence that BeginFrame() waits on.
+//
+// So each frame-in-flight gets its own block, reset when that frame comes round
+// again. BeginFrame() has already waited on the frame's fence by then, so the
+// GPU is provably finished with everything in it.
+constexpr UINT kDisplaySlotsPerFrame = 64;   // 32 conversions per frame
+constexpr UINT kDisplaySlots = kDisplaySlotsPerFrame * kMaxFramesInFlight;
 
 bool EnsureDisplayPipeline(Device& dev) {
     if (g_display.valid) return true;
@@ -537,7 +556,26 @@ bool GpuTexture::UpdateFromGpu(Device& dev, const SharedGpuTexture& src,
     // executes, so two views sharing slot 0 within a frame would both sample
     // whichever was written last -- the same trap as batched compute
     // dispatches.
-    if (g_display.cursor + 2 > kDisplaySlots) g_display.cursor = 0;
+    // This frame's own block, restarted when the frame slot comes round. Frames
+    // in flight therefore never share descriptors, which is the whole point.
+    const UINT frameSlot = dev.FrameSlot() % kMaxFramesInFlight;
+    const UINT blockBase = frameSlot * kDisplaySlotsPerFrame;
+    if (g_display.frameSlot != frameSlot) {
+        g_display.frameSlot = frameSlot;
+        g_display.cursor    = blockBase;
+    }
+
+    // More conversions in one frame than the block holds -- 32 viewers all
+    // changing at once, which nothing does today. Reusing a slot within a frame
+    // would alias two live dispatches, so skip the conversion instead and let
+    // the viewer draw the texture it already has: one stale frame, rather than a
+    // corrupted one. Reported as success for that reason.
+    if (g_display.cursor + 2 > blockBase + kDisplaySlotsPerFrame) {
+        m_version = UINT64_MAX;   // so the next frame re-converts rather than
+                                  // believing this one succeeded
+        return true;
+    }
+
     const UINT slot = g_display.cursor;
     g_display.cursor += 2;
 
