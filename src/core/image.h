@@ -162,6 +162,17 @@ public:
     Image& operator=(const Image&) = delete;
 
     void Alloc(const ImageDesc& d);
+
+    // Takes on a descriptor without allocating pixels, for an image whose data
+    // lives somewhere else -- a result the UI draws straight from its GPU
+    // texture, where the descriptor is all the UI needs.
+    //
+    // Distinct from Alloc(): that zero-fills a full CPU buffer, so using it for
+    // a shell would both burn the memory it was meant to save (84 MB for a
+    // 21 MP RGBA16F result, per viewer, per run) and, worse, report
+    // Residency::Cpu -- so callers would happily read a full image of zeros and
+    // believe it.
+    void AdoptDesc(const ImageDesc& d);
     void Reset();
 
     const ImageDesc& Desc() const { return m_desc; }

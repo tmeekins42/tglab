@@ -125,6 +125,16 @@ void Image::EnsureCpuStorage() {
         m_cpu.assign(m_desc.SizeInBytes(), 0);
 }
 
+void Image::AdoptDesc(const ImageDesc& d) {
+    m_desc = d;
+    m_cpu.clear();
+    m_gpu.reset();
+    // No pixels anywhere as far as this object is concerned. MapCpuRead() then
+    // returns an invalid view rather than a buffer of zeros, which is what
+    // makes "there are no pixels here" detectable instead of silently wrong.
+    m_res = Residency::None;
+}
+
 void Image::Alloc(const ImageDesc& d) {
     m_desc = d;
     m_gpu.reset();

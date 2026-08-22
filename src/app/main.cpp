@@ -1182,14 +1182,27 @@ void App::DrawInfoPanel() {
             if (v->Visible()) { m_infoViewer = v->Name(); break; }
     }
 
+    // True when the subject is a viewer whose pixels live only on the GPU: the
+    // panel can describe it (size, format, and the histogram the worker
+    // measured on the device) but has nothing to walk on the CPU.
+    bool subjectIsGpuOnly = false;
+
     if (!m_infoViewer.empty()) {
         for (ViewerImage& vi : m_viewerImages)
             if (vi.name == m_infoViewer && vi.image.Valid()) {
-                shown     = &vi.image;
                 shownName = vi.name;
+                // The shell carries a full, correct descriptor -- size, format,
+                // sensor metadata -- which is everything the panel reads
+                // directly. Only the histogram needs pixels, and for this case
+                // it arrives already measured from the worker.
+                shown = &vi.image;
+                subjectIsGpuOnly = (vi.gpu != nullptr);
                 break;
             }
     }
+    // Only fall back to the palette when there is no viewer subject at all.
+    // Falling back merely because the pixels are on the GPU would silently
+    // switch the panel to describing the source image instead of the result.
     if (!shown) {
         for (PaletteEntry& e : m_palette) {
             if (!std::holds_alternative<Image>(e.data)) continue;
@@ -1258,13 +1271,7 @@ void App::DrawInfoPanel() {
     // The stats thread is the fallback, for subjects the worker cannot measure:
     // a palette image (never went through the pipeline) and a CPU-only stage
     // (no GPU residency). Asking for both would compute it twice.
-    const bool workerMeasures = [&] {
-        for (const ViewerImage& vi : m_viewerImages)
-            if (vi.name == shownName) return vi.gpu != nullptr;
-        return false;
-    }();
-
-    if (!workerMeasures &&
+    if (!subjectIsGpuOnly &&
         (m_stats.source != shownName || m_stats.version != shownVersion)) {
         if (!m_statsRequested ||
             m_requestedSource != shownName || m_requestedVersion != shownVersion) {

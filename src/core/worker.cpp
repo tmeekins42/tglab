@@ -318,9 +318,11 @@ void PipelineWorker::Run() {
                 vi.version = ver;
                 vi.gpu     = shared;
                 if (shared) {
-                    // Descriptor only. Anything that wants CPU pixels has to
-                    // ask the pipeline, not this shell.
-                    vi.image = Image(result.Desc());
+                    // Descriptor only -- deliberately NOT Image(desc), which
+                    // allocates and zero-fills a full CPU buffer and reports
+                    // itself CPU-resident. That would spend the 84 MB this path
+                    // exists to save and hand every reader an image of zeros.
+                    vi.image.AdoptDesc(result.Desc());
                 } else {
                     vi.image = const_cast<Image&>(result).Clone();
                 }

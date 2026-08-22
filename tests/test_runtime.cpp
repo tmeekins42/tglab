@@ -134,6 +134,52 @@ static void TestWorker() {
 // completion -- so nudging a slider during a minute-long filter meant waiting
 // for the old value before the new one even began.
 
+// A viewer whose result stays on the GPU carries a descriptor, not pixels.
+//
+// The whole point of drawing from the GPU is that the image is never read back.
+// If the shell handed to the UI allocated a CPU buffer anyway, that saving
+// would be spent on memory instead of bandwidth -- 169 MB for a 21 MP RGBA16F
+// result, per viewer, per run, on every frame of a slider drag.
+//
+// Worse than the memory: Alloc() zero-fills and marks the image CPU-resident,
+// so MapCpuRead() would hand back a full image of zeros that looks entirely
+// valid. The histogram would describe it, the loupe would sample it, and
+// nothing would report an error.
+static void TestGpuOnlyShell() {
+    Section("GPU-resident viewer shell");
+
+    const ImageDesc d{1024, 768, Format::RGBA16F};
+
+    // What Image(desc) does, for contrast: this is the trap.
+    Image allocated(d);
+    Check(allocated.HasCpu(), "Image(desc) allocates CPU pixels (the thing to avoid)");
+
+    Image shell;
+    shell.AdoptDesc(d);
+
+    Check(!shell.HasCpu(), "AdoptDesc allocates no CPU pixels");
+    Check(!shell.MapCpuRead().Valid(),
+          "AdoptDesc: MapCpuRead reports no pixels rather than returning zeros");
+
+    // The descriptor still has to be complete: the UI reads size and format
+    // from it, and the view draws using its dimensions.
+    Check(shell.Desc().width == d.width && shell.Desc().height == d.height &&
+              shell.Desc().format == d.format,
+          "AdoptDesc preserves the descriptor");
+    Check(shell.Desc().Valid(), "AdoptDesc leaves the descriptor valid (the view draws it)");
+
+    // Sensor metadata rides on the descriptor too, and the info panel shows it.
+    ImageDesc raw{2048, 1536, Format::RGBA16F};
+    raw.linear     = true;
+    raw.whiteLevel = 15600.0f;
+    raw.camMul[0]  = 2.266f;
+    Image rawShell;
+    rawShell.AdoptDesc(raw);
+    Check(rawShell.Desc().linear && rawShell.Desc().whiteLevel == 15600.0f &&
+              rawShell.Desc().camMul[0] == 2.266f,
+          "AdoptDesc carries sensor metadata through");
+}
+
 // Per-viewer content versions.
 //
 // display(src, ...) next to a slider-driven stage is the common shape -- it is
@@ -1029,6 +1075,7 @@ static void TestCompare(ID3D12Device* dev) {
 
 int main() {
     TestWorker();
+    TestGpuOnlyShell();
     TestViewerVersions();
     TestCancellation();
     TestShaderCompiler();
