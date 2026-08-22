@@ -1,5 +1,7 @@
 #include "pixel_buffer.h"
 
+#include <cstdio>
+
 #include <algorithm>
 
 namespace tglab {
@@ -44,13 +46,32 @@ void PixelBuffer::Unpack(const ImageView& v) {
                 }
             break;
 
-        default:   // RGBA8
+        case Format::RGBA8:
             for (int y = 0; y < m_h; ++y)
                 for (int x = 0; x < m_w; ++x) {
                     const uint8_t* p = v.At<uint8_t>(x, y);
                     for (int c = 0; c < 4; ++c)
                         m_data[Index(x, y) + size_t(c)] = float(p[c]);
                 }
+            break;
+
+        // Every format is named, and a new one lands HERE rather than being
+        // quietly read as RGBA8.
+        //
+        // This is one switch behind thirteen algorithms, so a `default: // RGBA8`
+        // meant a future format would be misread by all of them at once, with no
+        // error anywhere -- 16-bit data reinterpreted as bytes looks like noise,
+        // not like a missing case. Failing loudly costs one branch on a path
+        // that runs once per image.
+        case Format::Unknown:
+        default:
+            std::fprintf(stderr,
+                         "[pixel_buffer] unhandled format %d -- add a case to "
+                         "PixelBuffer::Unpack\n",
+                         int(m_format));
+            std::fflush(stderr);
+            m_w = m_h = m_ch = 0;
+            m_data.clear();
             break;
     }
 }
@@ -93,7 +114,7 @@ void PixelBuffer::PackInto(ImageView& dst) const {
                 }
             break;
 
-        default: {  // RGBA8
+        case Format::RGBA8: {
             for (int y = 0; y < h; ++y)
                 for (int x = 0; x < w; ++x) {
                     uint8_t* p = dst.At<uint8_t>(x, y);
@@ -108,6 +129,17 @@ void PixelBuffer::PackInto(ImageView& dst) const {
                 }
             break;
         }
+
+        // As in Unpack: a new format lands here rather than being written as
+        // bytes and looking like noise.
+        case Format::Unknown:
+        default:
+            std::fprintf(stderr,
+                         "[pixel_buffer] unhandled format %d -- add a case to "
+                         "PixelBuffer::PackInto\n",
+                         int(dst.desc.format));
+            std::fflush(stderr);
+            break;
     }
 }
 

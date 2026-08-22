@@ -1,7 +1,4 @@
 BUGS / SMALL FEATURES
-- many algorithms use the switch-default and if-else to have RGB8 as the default format. please change this to the default case is an error message so we can find unimplemented formats.
-- the brightness algorithm only implements two formats, see above.
-- brightness algorithm sliders should be named brightness and gain.
 - would a tty / stdio backend make the app easier to debug?
 - add GPU implementation for local_threshold and use the new GPU histogram
 - add faint gridlines around the pixels in the loupe
@@ -25,6 +22,7 @@ FEATURES
 - Exposure stacking -> HDR
 - Focus stacking
 - feature tracking support, numerous algorithms
+- features should be associated with the image. Feature tracking is used for matching images, so every image in a group/image list will have a feature list.
 - photo alignment from features
 - fine photo alignment from optimizing solver?
 - panorama photo merging, multiple projections
@@ -33,6 +31,10 @@ FEATURES
 - are there any public lens correction databases we could take advantage of?
 - denoising algorithms
 - can we run a script (develop?) on every image in a group, then run an algorithm, like panorama that works on the entire group?
+- can we detect dead/stuck pixels from the raw capure? test: d:\lrwork\little\_MG_96732.CR2 has a stuck solid red pixel on the right eye. (this is a common issue on cameras)
+
+NOTES
+- if we need matrix functions, I suggest the Euler library and Ceres for bundle solving
 
 FROM CLAUDE (raised in conversation, not yet in the list above)
 - basic_adjust ranges scaling with bit depth. Different raws have different bit
@@ -41,6 +43,7 @@ FROM CLAUDE (raised in conversation, not yet in the list above)
   display window rather than the data: values pushed above 1.0 leave the visible
   range instead of stretching it. Related: showing where the SDR window sits
   within the full range, which Tim suggested as a way to make headroom legible.
+  if the histogram shows the entire image, and what is displayed, can we show a window around the displayed area?
 - blue-channel clipping at high exposure, seen on a warm image before Kelvin
   white balance existed. Worth re-checking now the cast can be corrected first.
 - proxy resolution for interactive edits: work at view resolution while a slider
@@ -57,3 +60,17 @@ FROM CLAUDE (raised in conversation, not yet in the list above)
 ANSWERED, NO ACTION
 - mosaic() erroring on a non-raw image: recommended keeping the error, since a
   script asking for sensor data on a JPEG has made a mistake worth reporting.
+
+DONE (recent, pruned periodically)
+- brightness: handled only RGBA8 and R32F and silently produced ZEROS on
+  anything else -- a demosaiced raw came out black with no error. Now goes
+  through PixelBuffer like every other algorithm, so all four formats work.
+- brightness sliders renamed: amount -> brightness, gain unchanged.
+- PixelBuffer's `default: // RGBA8` in Unpack and PackInto now name every format
+  explicitly and complain about an unknown one. That switch sits behind thirteen
+  algorithms, so it was the single place a new format would be misread by all of
+  them at once.
+  NOTE: gaussian_blur, median_blur and sobel were checked and are fine -- they
+  branch on format to pick a STRATEGY (single- vs multi-channel), not to decide
+  whether to do anything, and the paths that matter go through PixelBuffer.
+  Measured on an RGBA16F input: only brightness was broken.

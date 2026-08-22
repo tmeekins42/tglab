@@ -405,11 +405,24 @@ being algorithms themselves. Currently:
   local thresholder at large window sizes.
 - `MinMaxFilter` — windowed min/max in two separable passes, O(2r) per pixel.
 - `PixelBuffer` — unpacks an image to flat floats and packs it back, so a
-  spatial filter gets branch-free neighbour access and correct handling of all
-  three formats without repeating the format switch. `AtClamped()` gives the
+  spatial filter gets branch-free neighbour access and correct handling of every
+  format without repeating the format switch. `AtClamped()` gives the
   edge-clamped reads every windowed filter needs at the border, and
   `ValueScale()` reports 255 or 1 so a parameter expressed as a fraction of the
   intensity range means the same thing whatever the source format.
+
+  Its switch names every format and **complains about an unknown one** rather
+  than falling through to RGBA8. That switch sits behind thirteen algorithms, so
+  it is the single place a newly added format would otherwise be misread by all
+  of them at once — and 16-bit data reinterpreted as bytes looks like noise, not
+  like a missing case.
+
+  The one algorithm that did not go through it, `brightness`, handled RGBA8 and
+  R32F by hand and silently produced **zeros** for anything else: a demosaiced
+  raw came out black, with no error anywhere. Worth stating as a rule — an `if`
+  chain that handles the formats it knows and does nothing otherwise looks
+  correct until a new format arrives, then fails in the way that is hardest to
+  trace.
 
 `ComputeContext::BuildHistogram()` is the same thing on the GPU, used by the
 info panel. Two dispatches — an order-preserving float-to-uint min/max, then

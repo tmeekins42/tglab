@@ -135,7 +135,7 @@ int main() {
         const bool ok = RunScript(
             "src = image(\"test\")\n"
             "a = slider(\"amount\", -1, 1, 0.5)\n"
-            "out = brightness(src, amount = a)\n"
+            "out = brightness(src, brightness = a)\n"
             "display(out, \"result\")\n",
             &ui, &p, &err, &src);
         Check(ok, "basic script runs" + (ok ? "" : ": " + err));
@@ -151,10 +151,10 @@ int main() {
         UiState ui; std::string err; std::vector<Data> src;
         Pipeline p1, p2;
         RunScript("a = slider(\"amount\", 0, 10, 1)\nsrc = image(\"test\")\n"
-                  "o = brightness(src, amount = a)\ndisplay(o)\n", &ui, &p1, &err, &src);
+                  "o = brightness(src, brightness = a)\ndisplay(o)\n", &ui, &p1, &err, &src);
         ui.Controls()[0].value = 7.0;    // user drags the slider
         RunScript("a = slider(\"amount\", 0, 10, 1)\nsrc = image(\"test\")\n"
-                  "o = brightness(src, amount = a)\ndisplay(o)\n", &ui, &p2, &err, &src);
+                  "o = brightness(src, brightness = a)\ndisplay(o)\n", &ui, &p2, &err, &src);
         Check(ui.Controls().size() == 1 && ui.Controls()[0].value == 7.0,
               "slider value survives a re-run");
     }

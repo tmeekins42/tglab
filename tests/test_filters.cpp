@@ -319,6 +319,94 @@ int main() {
     std::string err;
     TestKelvinWhiteBalance();
 
+
+// --- brightness handles every pixel format ---------------------------------
+//
+// It branched on RGBA8 and R32F by hand and fell out of the bottom for anything
+// else, so a demosaiced raw (RGBA16F) came out as ZEROS -- a black image, no
+// error anywhere. Measured before the fix: 0.5 in, 0.0000 out.
+//
+// The general form of this is worth stating: an `if` chain that handles the
+// formats it knows and silently does nothing otherwise looks correct until a
+// new format arrives, and then fails in the way that is hardest to trace. Every
+// other algorithm goes through PixelBuffer, whose switch now names each format
+// and complains about anything else.
+{
+    struct Case { const char* label; Format fmt; };
+    const Case cases[] = {
+        {"RGBA8",   Format::RGBA8},
+        {"R32F",    Format::R32F},
+        {"RGBA16F", Format::RGBA16F},
+        {"RGBA32F", Format::RGBA32F},
+    };
+
+    for (const Case& tc : cases) {
+        Image img;
+        img.Alloc({8, 8, tc.fmt});
+        {
+            ImageView v = img.MapCpuWrite();
+            for (int y = 0; y < 8; ++y)
+                for (int x = 0; x < 8; ++x) {
+                    switch (tc.fmt) {
+                        case Format::RGBA8: {
+                            uint8_t* p = v.At<uint8_t>(x, y);
+                            p[0] = p[1] = p[2] = 128; p[3] = 255;
+                            break;
+                        }
+                        case Format::R32F:
+                            *v.At<float>(x, y) = 0.5f;
+                            break;
+                        case Format::RGBA16F: {
+                            uint16_t* p = v.At<uint16_t>(x, y);
+                            for (int c = 0; c < 3; ++c) p[c] = FloatToHalf(0.5f);
+                            p[3] = FloatToHalf(1.0f);
+                            break;
+                        }
+                        default: {
+                            float* p = v.At<float>(x, y);
+                            p[0] = p[1] = p[2] = 0.5f; p[3] = 1.0f;
+                            break;
+                        }
+                    }
+                }
+        }
+
+        // gain 2 doubles the value, whatever the format's units.
+        Image out;
+        std::string e;
+        if (!RunFilter("brightness", std::move(img), {{"gain", 2.0}}, &out, &e)) {
+            Check(false, std::string(tc.label) + ": brightness runs: " + e);
+            continue;
+        }
+
+        ImageView v = out.MapCpuRead();
+        double got = 0.0;
+        switch (tc.fmt) {
+            case Format::RGBA8:   got = double(v.At<uint8_t>(4, 4)[0]) / 255.0; break;
+            case Format::R32F:    got = double(*v.At<float>(4, 4));             break;
+            case Format::RGBA16F: got = double(HalfToFloat(v.At<uint16_t>(4, 4)[0])); break;
+            default:              got = double(v.At<float>(4, 4)[0]);           break;
+        }
+
+        // 0.5 doubled is 1.0, which RGBA8 clamps to exactly 1.0 (255).
+        Check(got > 0.9,
+              std::string(tc.label) + ": gain 2 doubles the value (0.5 -> " +
+                  std::to_string(got) + ", NOT zeros)");
+    }
+
+    // The parameters say what they do. `amount` said nothing -- an amount of
+    // what? -- and sat next to `gain`, which does.
+    auto probe = Registry::Get().Create("brightness");
+    bool hasBrightness = false, hasGain = false, hasAmount = false;
+    for (ParamBase* p : probe->Params()) {
+        const std::string n = p->Name();
+        if (n == "brightness") hasBrightness = true;
+        if (n == "gain")       hasGain = true;
+        if (n == "amount")     hasAmount = true;
+    }
+    Check(hasBrightness && hasGain, "brightness exposes 'brightness' and 'gain'");
+    Check(!hasAmount, "...and no longer exposes 'amount'");
+}
     // --- the shared plumbing ------------------------------------------------
     {
         Image img = MakeEdgeImage(false);

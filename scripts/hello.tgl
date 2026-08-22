@@ -3,11 +3,11 @@
 
 src = image("test")
 
-amount = slider("brightness", -1.0, 1.0, 0.0)
+bright = slider("brightness", -1.0, 1.0, 0.0)
 gain   = slider("gain", 0.0, 4.0, 1.0)
 
 grey     = grayscale(src)
-adjusted = brightness(grey, amount = amount, gain = gain)
+adjusted = brightness(grey, brightness = bright, gain = gain)
 
 display(src,      "original")
 display(grey,     "greyscale")
