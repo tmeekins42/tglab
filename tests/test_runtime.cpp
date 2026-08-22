@@ -359,6 +359,84 @@ static void TestGpuPipeline(ID3D12Device* dev) {
     gpu.Shutdown();
 }
 
+// Several GPU stages reading the SAME source in one batch.
+//
+// Regression test for a bug that made every viewer but the last show a black
+// image. Dispatch() wrote its descriptors to the start of the shared heap on
+// every call, which is fine when each dispatch is submitted immediately -- but
+// with lazy flush a batch is recorded first and executed later, so all of its
+// dispatches read whichever descriptors were written last. The earlier stages
+// ran with the final stage's bindings and wrote nothing to their own outputs.
+//
+// A single-stage script cannot catch this, and neither can a chain: it needs
+// two or more stages *in the same batch* whose bindings differ. Fan-out from
+// one source is the natural shape, and it is exactly what demosaic.tgl does.
+static void TestBatchedBindings(ID3D12Device* dev) {
+    Section("batched dispatch bindings");
+
+    ComputeContext gpu;
+    if (!gpu.Init(dev) || !gpu.Ready()) { Check(false, "compute context initialises"); return; }
+
+    // Ten stages, one shared input, no stage feeding another -- so nothing
+    // forces a flush between them and they all land in one batch.
+    //
+    // Ten rather than three on purpose: the descriptor heap holds eight
+    // dispatches, so this also exercises the flush-and-restart path that the
+    // slice allocation needs when a batch runs out of room.
+    std::string kScript = "src = image(\"test\")\n";
+    for (int i = 1; i <= 10; ++i) {
+        const std::string n = std::to_string(i);
+        kScript += "s" + n + " = gaussian_blur(src, sigma = " + n + ")\n";
+        kScript += "display(s" + n + ", \"v" + n + "\")\n";
+    }
+    const size_t kStages = 10;
+    const int dim = 128;
+
+    auto meanOf = [](Image& img) {
+        ImageView v = img.MapCpuRead();
+        double sum = 0; long long n = 0;
+        for (int y = 0; y < v.desc.height; ++y)
+            for (int x = 0; x < v.desc.width; ++x)
+                for (int c = 0; c < 3; ++c) { sum += v.At<uint8_t>(x, y)[c]; ++n; }
+        return sum / double(n);
+    };
+
+    auto run = [&](ExecMode mode, std::vector<double>* means, std::string* err) {
+        UiState ui; Pipeline pipe; std::vector<Data> src;
+        if (!BuildPipeline(kScript.c_str(), dim, &ui, &pipe, &src, err)) return false;
+        if (!pipe.Execute(&src, nullptr, err, &gpu, mode)) return false;
+        for (const auto& vw : pipe.Viewers()) {
+            const Data* d = pipe.Resolve(vw.source, &src);
+            Image img = const_cast<Image&>(std::get<Image>(*d)).Clone();
+            means->push_back(meanOf(img));
+        }
+        return true;
+    };
+
+    std::vector<double> cpu, gpuMeans;
+    std::string err;
+    if (!run(ExecMode::ForceCPU, &cpu, &err))      { Check(false, "ForceCPU runs: " + err); return; }
+    if (!run(ExecMode::ForceGPU, &gpuMeans, &err)) { Check(false, "ForceGPU runs: " + err); return; }
+
+    Check(cpu.size() == kStages && gpuMeans.size() == kStages,
+          "all " + std::to_string(kStages) + " viewers resolved");
+    if (cpu.size() != kStages || gpuMeans.size() != kStages) return;
+
+    // The bug left the earlier stages' outputs untouched -- allocated, zeroed,
+    // never written -- so this is the check that fails without the fix.
+    for (size_t i = 0; i < gpuMeans.size(); ++i)
+        Check(gpuMeans[i] > 1.0,
+              "stage " + std::to_string(i) + " of a batch wrote its own output (mean " +
+                  std::to_string(gpuMeans[i]) + ")");
+
+    // Not merely non-black: each must match what the CPU produced, which is
+    // what proves it ran with *its own* bindings rather than a neighbour's.
+    for (size_t i = 0; i < gpuMeans.size(); ++i)
+        Check(std::abs(cpu[i] - gpuMeans[i]) < 1.0,
+              "stage " + std::to_string(i) + " matches the CPU (cpu " +
+                  std::to_string(cpu[i]) + " gpu " + std::to_string(gpuMeans[i]) + ")");
+}
+
 static void TestResidency(ID3D12Device* dev) {
     Section("GPU residency");
 
@@ -681,6 +759,7 @@ int main() {
     ID3D12Device* dev = nullptr;
     if (SUCCEEDED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev)))) {
         TestGpuPipeline(dev);
+        TestBatchedBindings(dev);
         TestResidency(dev);
         TestCompare(dev);
         TestGpuAgreement(dev);

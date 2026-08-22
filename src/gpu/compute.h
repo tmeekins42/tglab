@@ -117,6 +117,12 @@ private:
     ID3D12DescriptorHeap* m_srvHeap = nullptr;
     UINT                  m_srvStride = 0;
 
+    // Descriptors are consumed by the GPU when the command list *executes*,
+    // not when Dispatch() records it. Batched dispatches must therefore each
+    // own a distinct slice of the heap -- reusing slot 0 every time silently
+    // gives every dispatch in a batch the last one's bindings.
+    UINT                  m_heapCursor = 0;
+
     std::vector<ID3D12Resource*> m_staging;   // upload/readback buffers, freed on flush
     ShaderCompiler               m_compiler;
     bool                         m_deviceLost = false;

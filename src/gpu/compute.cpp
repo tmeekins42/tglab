@@ -198,6 +198,7 @@ bool ComputeContext::CreateImage(const ImageDesc& d, GpuImage* out) {
 bool ComputeContext::BeginRecording() {
     if (m_pendingWork) return true;   // keep appending to the open list
 
+    m_heapCursor = 0;   // a fresh list starts at the top of the heap
     if (FAILED(m_alloc->Reset())) return false;
     if (FAILED(m_list->Reset(m_alloc, nullptr))) return false;
     return true;
@@ -335,8 +336,26 @@ bool ComputeContext::Dispatch(const ComputeKernel& k,
     if (!BeginRecording()) return false;
 
     // Build the descriptor table: SRVs first, then UAVs at a fixed offset.
-    D3D12_CPU_DESCRIPTOR_HANDLE cpu = m_srvHeap->GetCPUDescriptorHandleForHeapStart();
-    D3D12_GPU_DESCRIPTOR_HANDLE gpu = m_srvHeap->GetGPUDescriptorHandleForHeapStart();
+    //
+    // Each dispatch takes its OWN slice of the heap. The GPU reads these
+    // descriptors when the list executes, which -- with batching -- is long
+    // after every dispatch in the batch has been recorded. Writing them all to
+    // slot 0 would leave every dispatch seeing the last one's bindings.
+    constexpr UINT kSlotsPerDispatch = kMaxSrv + kMaxUav;
+    if (m_heapCursor + kSlotsPerDispatch > kHeapSize) {
+        // Out of heap for this batch: submit what is recorded so the slots are
+        // free again. Correctness over batching -- the alternative is silently
+        // aliasing another dispatch's descriptors.
+        if (!Flush(err)) return false;
+        if (!BeginRecording()) return false;
+    }
+    const UINT base = m_heapCursor;
+    m_heapCursor += kSlotsPerDispatch;
+
+    D3D12_CPU_DESCRIPTOR_HANDLE heapCpu = m_srvHeap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_GPU_DESCRIPTOR_HANDLE heapGpu = m_srvHeap->GetGPUDescriptorHandleForHeapStart();
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = {heapCpu.ptr + SIZE_T(base) * m_srvStride};
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu = {heapGpu.ptr + SIZE_T(base) * m_srvStride};
 
     for (UINT i = 0; i < kMaxSrv; ++i) {
         D3D12_CPU_DESCRIPTOR_HANDLE h = {cpu.ptr + SIZE_T(i) * m_srvStride};
