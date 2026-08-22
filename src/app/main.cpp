@@ -1189,7 +1189,12 @@ void App::DrawInfoPanel() {
 
     if (!m_infoViewer.empty()) {
         for (ViewerImage& vi : m_viewerImages)
-            if (vi.name == m_infoViewer && vi.image.Valid()) {
+            // Image::Valid() asks whether pixels exist somewhere, which is
+            // false for a GPU-resident result -- it carries only a descriptor.
+            // The panel reads that descriptor and takes its histogram from the
+            // worker, so a valid descriptor is the right test here.
+            if (vi.name == m_infoViewer &&
+                (vi.gpu ? vi.image.Desc().Valid() : vi.image.Valid())) {
                 shownName = vi.name;
                 // The shell carries a full, correct descriptor -- size, format,
                 // sensor metadata -- which is everything the panel reads

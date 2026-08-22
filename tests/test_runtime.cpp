@@ -180,6 +180,100 @@ static void TestGpuOnlyShell() {
           "AdoptDesc carries sensor metadata through");
 }
 
+// A GPU-resident result is drawable, and its pixels come out right.
+//
+// "Is there something to draw?" is not the same question as Image::Valid(),
+// which asks whether pixels exist *somewhere*. A result that lives only on the
+// GPU carries a descriptor and no pixels, so Image::Valid() is false while
+// there is a perfectly good texture to convert from.
+//
+// Getting that distinction wrong showed every GPU-resident viewer as
+// "computing..." forever -- a black panel on a run the status bar reported as
+// finished. Nothing crashed and nothing logged an error, which is exactly why
+// it needs a test rather than a smoke run.
+static void TestGpuResultIsDrawable(ID3D12Device* dev) {
+    Section("GPU-resident results are drawable");
+
+    ComputeContext gpu;
+    if (!gpu.Init(dev) || !gpu.Ready()) { Check(false, "compute context initialises"); return; }
+    InstallGpuResidencyHooks();
+
+    // A known input: mid grey, so the output value is predictable.
+    const int w = 64, h = 48;
+    Image src;
+    src.Alloc({w, h, Format::RGBA8});
+    {
+        ImageView v = src.MapCpuWrite();
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                uint8_t* p = v.At<uint8_t>(x, y);
+                p[0] = p[1] = p[2] = 128;
+                p[3] = 255;
+            }
+    }
+
+    std::vector<Data> sources;
+    sources.push_back(Data{std::move(src)});
+    Pipeline pipe;
+    // basic_adjust rather than brightness: brightness is CPU-only, so the run
+    // would fall back and produce no GPU residency at all -- the fixture has to
+    // actually exercise the path it is testing.
+    pipe.AddStage(Registry::Get().Create("basic_adjust"), "basic_adjust", {{-1, 0}}, 1, 1);
+
+    std::string err;
+    if (!pipe.Execute(&sources, nullptr, &err, &gpu, ExecMode::ForceGPU)) {
+        Check(false, "GPU run: " + err);
+        return;
+    }
+
+    const Data* d = pipe.Resolve({0, 0}, &sources);
+    if (!d || !std::holds_alternative<Image>(*d)) { Check(false, "resolved an image"); return; }
+    const Image& result = std::get<Image>(*d);
+
+    auto shared = ShareGpuTexture(result);
+    Check(shared != nullptr, "a GPU-resident result yields a shareable texture");
+    if (!shared) return;
+
+    // The shell, exactly as the worker builds it.
+    Image shell;
+    shell.AdoptDesc(result.Desc());
+
+    // The trap, stated as an assertion so it cannot quietly come back: the
+    // shell is NOT Image::Valid(), and a viewer that tests only that shows
+    // "computing..." forever.
+    Check(!shell.Valid(),
+          "the shell is not Image::Valid() -- pixels live only on the device");
+    Check(shell.Desc().Valid(),
+          "...but its descriptor is valid, which is what makes it drawable");
+
+    // What the view actually decides.
+    const bool viewWouldDraw = (shared != nullptr) || shell.Valid();
+    Check(viewWouldDraw, "a viewer with a GPU source draws rather than showing 'computing...'");
+
+    Check(shared->desc.width == w && shared->desc.height == h,
+          "the shared texture has the result's dimensions");
+
+    // And the pixels are real, not a blank texture. A black panel is precisely
+    // the failure being guarded against, and every check above would still pass
+    // if the texture were empty.
+    ImageView rv = const_cast<Image&>(result).MapCpuRead();
+    if (rv.Valid()) {
+        double sum = 0;
+        int n = 0;
+        for (int y = 0; y < rv.desc.height; y += 4)
+            for (int x = 0; x < rv.desc.width; x += 4) {
+                sum += rv.At<uint8_t>(x, y)[0];
+                ++n;
+            }
+        const double mean = n ? sum / n : 0.0;
+        Check(mean > 1.0,
+              "the result carries real pixels, not a blank texture (mean " +
+                  std::to_string(mean) + ")");
+    } else {
+        Check(false, "could read the result back for verification");
+    }
+}
+
 // Per-viewer content versions.
 //
 // display(src, ...) next to a slider-driven stage is the common shape -- it is
@@ -1087,6 +1181,7 @@ int main() {
         TestResidency(dev);
         TestLinearAdjustAgreement(dev);
         TestCompare(dev);
+        TestGpuResultIsDrawable(dev);
         TestGpuHistogram(dev);
         TestGpuAgreement(dev);
         dev->Release();

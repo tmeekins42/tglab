@@ -25,7 +25,16 @@ void ImageViewPanel::Draw(Device& dev, Image* img) {
     m_visible = true;
     m_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows);
 
-    if (!img || !img->Valid()) {
+    // "Is there something to draw?" -- which is not the same as
+    // Image::Valid(), and the difference matters now that a result can live
+    // only on the GPU. Such an image holds a descriptor and no pixels, so
+    // Image::Valid() is false (it asks whether pixels exist *somewhere*), yet
+    // there is a perfectly good texture to convert from.
+    //
+    // Getting this wrong showed every GPU-resident viewer as "computing..."
+    // forever, on a run the status bar reported as finished.
+    const bool haveSomething = m_gpuSrc || (img && img->Valid());
+    if (!haveSomething || !img || !img->Desc().Valid()) {
         ImGui::TextDisabled("computing...");
         ImGui::End();
         return;
