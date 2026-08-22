@@ -163,19 +163,48 @@ void main(uint3 tid : SV_DispatchThreadID) {
     }
 
 private:
+    // Every format, not an R32F branch with an RGBA8 fallthrough -- that read a
+    // half- or 32-bit-float image as bytes, which is not zeros but
+    // plausible-looking nonsense. Values stay in the source's own units, which
+    // is what the separable passes and the clamp on write both assume.
     static float Read(const ImageView& v, int x, int y, int c) {
-        if (v.desc.format == Format::R32F) return *v.At<float>(x, y);
-        return float(v.At<uint8_t>(x, y)[c]);
+        switch (v.desc.format) {
+            case Format::R32F:    return *v.At<float>(x, y);
+            case Format::RGBA32F: return v.At<float>(x, y)[c];
+            case Format::RGBA16F: return HalfToFloat(v.At<uint16_t>(x, y)[c]);
+            case Format::RGBA8:   return float(v.At<uint8_t>(x, y)[c]);
+            default:              return 0.0f;
+        }
     }
 
     static void Write(ImageView& v, int x, int y, const float* acc, int ch) {
-        if (v.desc.format == Format::R32F) {
-            *v.At<float>(x, y) = acc[0];
-            return;
+        switch (v.desc.format) {
+            case Format::R32F:
+                *v.At<float>(x, y) = acc[0];
+                return;
+            case Format::RGBA32F: {
+                float* p = v.At<float>(x, y);
+                for (int c = 0; c < ch; ++c) p[c] = acc[c];
+                // A 1-channel accumulator carries no alpha; keep it opaque.
+                if (ch < 4) p[3] = 1.0f;
+                return;
+            }
+            case Format::RGBA16F: {
+                uint16_t* p = v.At<uint16_t>(x, y);
+                for (int c = 0; c < ch; ++c) p[c] = FloatToHalf(acc[c]);
+                if (ch < 4) p[3] = FloatToHalf(1.0f);
+                return;
+            }
+            case Format::RGBA8: {
+                uint8_t* p = v.At<uint8_t>(x, y);
+                for (int c = 0; c < ch; ++c)
+                    p[c] = uint8_t(std::clamp(acc[c], 0.0f, 255.0f));
+                if (ch < 4) p[3] = 255;
+                return;
+            }
+            default:
+                return;
         }
-        uint8_t* p = v.At<uint8_t>(x, y);
-        for (int c = 0; c < ch; ++c)
-            p[c] = uint8_t(std::clamp(acc[c], 0.0f, 255.0f));
     }
 
     Param<float> m_sigma{

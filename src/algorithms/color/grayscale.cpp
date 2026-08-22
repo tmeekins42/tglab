@@ -1,7 +1,13 @@
 // grayscale — second algorithm, added without touching any central file.
 // Also the M1 check that self-registration survives the linker.
+//
+// It originally bailed out on anything but RGBA8 -- `if (format != RGBA8)
+// return;` -- which left the output buffer as allocated, i.e. all zeros. A
+// demosaiced raw came out pure black, and because grayscale is the first stage
+// in hello.tgl, everything downstream of it did too.
 #include <algorithm>
 
+#include "../../algo_util/pixel_buffer.h"
 #include "../../core/algorithm.h"
 
 namespace tglab {
@@ -18,31 +24,42 @@ public:
         const ImageView src = ctx.In(0);
         ImageView       dst = ctx.Out(0);
         if (!src.Valid() || !dst.Valid()) return;
-        if (src.desc.format != Format::RGBA8) return;
+
+        m_in.Unpack(src);
+        if (!m_in.Valid()) return;
+        m_out.AllocLike(m_in);
+
+        const int w = m_in.Width(), h = m_in.Height(), ch = m_in.Channels();
 
         // Rec.601 by default; the sliders let the weights be explored, which
         // is the kind of thing this lab is for.
         const float wr = m_wr, wg = m_wg, wb = m_wb;
         const float sum = std::max(0.0001f, wr + wg + wb);
 
-        const int w = src.desc.width;
-        const int h = src.desc.height;
         for (int y = 0; y < h; ++y) {
-            const uint8_t* s = src.At<uint8_t>(0, y);
-            uint8_t*       d = dst.At<uint8_t>(0, y);
-            for (int x = 0; x < w * 4; x += 4) {
-                const float g = (float(s[x]) * wr + float(s[x + 1]) * wg + float(s[x + 2]) * wb) / sum;
-                const uint8_t v = uint8_t(std::clamp(g, 0.0f, 255.0f));
-                d[x] = d[x + 1] = d[x + 2] = v;
-                d[x + 3] = s[x + 3];
+            if (ctx.Cancelled()) return;
+            for (int x = 0; x < w; ++x) {
+                // A single-channel image is already grey; weighting it against
+                // absent channels would only scale it.
+                const float g =
+                    (ch == 1) ? m_in.Get(x, y, 0)
+                              : (m_in.Get(x, y, 0) * wr + m_in.Get(x, y, 1) * wg +
+                                 m_in.Get(x, y, 2) * wb) / sum;
+
+                for (int c = 0; c < std::min(ch, 3); ++c) m_out.Set(x, y, c, g);
+                if (ch == 4) m_out.Set(x, y, 3, m_in.Get(x, y, 3));   // alpha untouched
             }
         }
+
+        m_out.PackInto(dst);
     }
 
 private:
     Param<float> m_wr{this, "r_weight", 0.299f, 0.0f, 1.0f};
     Param<float> m_wg{this, "g_weight", 0.587f, 0.0f, 1.0f};
     Param<float> m_wb{this, "b_weight", 0.114f, 0.0f, 1.0f};
+
+    PixelBuffer m_in, m_out;
 };
 
 REGISTER_ALGORITHM(Grayscale);

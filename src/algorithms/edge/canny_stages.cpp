@@ -8,6 +8,7 @@
 #include <cmath>
 #include <vector>
 
+#include "../../algo_util/pixel_buffer.h"
 #include "../../core/algorithm.h"
 
 namespace tglab {
@@ -92,8 +93,18 @@ public:
         ImageView out = ctx.Out(0);
         if (!src.Valid() || !out.Valid()) return;
 
-        const int w = src.desc.width;
-        const int h = src.desc.height;
+        // Through PixelBuffer rather than reading At<float> directly.
+        //
+        // The input port declares R32F, but that is documentation: the pipeline
+        // uses FormatSpec to size OUTPUTS and never converts an input, so an
+        // RGBA8 image reaching here had its bytes read as floats -- garbage,
+        // and the thresholds below then rejected everything.
+        m_in.Unpack(src);
+        if (!m_in.Valid()) return;
+
+        const int w = m_in.Width();
+        const int h = m_in.Height();
+        const float unit = m_in.ValueScale();   // 255 for RGBA8, 1 for float
         const float lo = std::min(float(m_low), float(m_high));
         const float hi = std::max(float(m_low), float(m_high));
 
@@ -103,7 +114,7 @@ public:
 
         for (int y = 0; y < h; ++y) {
             for (int x = 0; x < w; ++x) {
-                const float v = *src.At<float>(x, y);
+                const float v = m_in.Get(x, y, 0) / unit;
                 const size_t i = size_t(y) * size_t(w) + size_t(x);
                 if (v >= hi)      { m_mark[i] = 2; m_stack.push_back(int(i)); }
                 else if (v >= lo) { m_mark[i] = 1; }
@@ -140,6 +151,7 @@ private:
     Param<float> m_low {this, "low",  0.10f, 0.0f, 4.0f};
     Param<float> m_high{this, "high", 0.30f, 0.0f, 4.0f};
 
+    PixelBuffer          m_in;
     std::vector<uint8_t> m_mark;
     std::vector<int>     m_stack;
 };

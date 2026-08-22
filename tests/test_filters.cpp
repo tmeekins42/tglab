@@ -407,6 +407,126 @@ int main() {
     Check(hasBrightness && hasGain, "brightness exposes 'brightness' and 'gain'");
     Check(!hasAmount, "...and no longer exposes 'amount'");
 }
+
+// --- every single-input algorithm handles every format ---------------------
+//
+// Two format bugs were found one at a time by hand, both AFTER a grep-based
+// survey said the code was clean: brightness produced zeros on the float
+// formats, and grayscale bailed out on anything but RGBA8 -- `if (format !=
+// RGBA8) return;` -- leaving its output as allocated, i.e. black. Since
+// grayscale is the first stage in hello.tgl, everything downstream went black
+// too, which read as a broken brightness slider.
+//
+// Enumerating the registry is the only way to be sure there is not a third.
+// Anything that produces an all-zero output from a non-zero input has not run
+// at all: outputs are allocated zero-filled.
+{
+    struct FmtCase { const char* label; Format fmt; };
+    const FmtCase fmts[] = {
+        {"RGBA8",   Format::RGBA8},
+        {"R32F",    Format::R32F},
+        {"RGBA16F", Format::RGBA16F},
+        {"RGBA32F", Format::RGBA32F},
+    };
+
+    // A step edge, so an edge detector has something to find -- on a flat or
+    // smoothly-varying image it legitimately outputs zeros and would look
+    // broken.
+    auto makeInput = [](Format fmt) {
+        Image img;
+        img.Alloc({24, 24, fmt});
+        ImageView v = img.MapCpuWrite();
+        for (int y = 0; y < 24; ++y)
+            for (int x = 0; x < 24; ++x) {
+                const float t = (x < 12) ? 0.2f : 0.8f;
+                switch (fmt) {
+                    case Format::RGBA8: {
+                        uint8_t* p = v.At<uint8_t>(x, y);
+                        p[0] = uint8_t(t * 255); p[1] = uint8_t(t * 200);
+                        p[2] = uint8_t(t * 150); p[3] = 255;
+                        break;
+                    }
+                    case Format::R32F:
+                        *v.At<float>(x, y) = t;
+                        break;
+                    case Format::RGBA16F: {
+                        uint16_t* p = v.At<uint16_t>(x, y);
+                        p[0] = FloatToHalf(t); p[1] = FloatToHalf(t * 0.8f);
+                        p[2] = FloatToHalf(t * 0.6f); p[3] = FloatToHalf(1.0f);
+                        break;
+                    }
+                    default: {
+                        float* p = v.At<float>(x, y);
+                        p[0] = t; p[1] = t * 0.8f; p[2] = t * 0.6f; p[3] = 1.0f;
+                        break;
+                    }
+                }
+            }
+        return img;
+    };
+
+    auto meanOf = [](const ImageView& v) {
+        double sum = 0; long long n = 0;
+        for (int y = 0; y < v.desc.height; ++y)
+            for (int x = 0; x < v.desc.width; ++x) {
+                switch (v.desc.format) {
+                    case Format::RGBA8:   sum += v.At<uint8_t>(x, y)[0] / 255.0; break;
+                    case Format::R32F:    sum += *v.At<float>(x, y);             break;
+                    case Format::RGBA16F: sum += HalfToFloat(v.At<uint16_t>(x, y)[0]); break;
+                    default:              sum += v.At<float>(x, y)[0];           break;
+                }
+                ++n;
+            }
+        return n ? sum / n : -1.0;
+    };
+
+    // Excluded, with reasons -- not blanket exemptions.
+    //
+    // The threshold family maps values to 0 or 1 against a level whose range is
+    // fixed at 0..255, so on a float image everything falls below it and black
+    // is the correct answer for that level. The level not following the format
+    // is a real issue, tracked in todo.txt alongside basic_adjust's ranges, but
+    // it is a different bug from "the algorithm never ran".
+    auto excluded = [](const std::string& n) {
+        return n.rfind("threshold", 0) == 0 || n.rfind("mosaic", 0) == 0;
+    };
+
+    std::string offenders;
+    for (const std::string& name : Registry::Get().Names()) {
+        if (excluded(name)) continue;
+
+        auto probe = Registry::Get().Create(name);
+        if (!probe) continue;
+        // Wiring one source into a multi-input stage would read unset ports.
+        if (probe->Inputs().size() != 1) continue;
+        const size_t outs = probe->Outputs().size();
+
+        for (const FmtCase& f : fmts) {
+            auto algo = Registry::Get().Create(name);
+            Pipeline pipe;
+            std::vector<Data> sources;
+            sources.push_back(Data{makeInput(f.fmt)});
+            pipe.AddStage(std::move(algo), name, {{-1, 0}}, outs, 1);
+
+            std::string e;
+            if (!pipe.Execute(&sources, nullptr, &e)) continue;   // a real refusal
+
+            const Data* out = pipe.Resolve({0, 0}, &sources);
+            if (!out || !std::holds_alternative<Image>(*out)) continue;
+            ImageView v = const_cast<Image&>(std::get<Image>(*out)).MapCpuRead();
+            if (!v.Valid()) continue;
+
+            if (meanOf(v) < 1e-6) {
+                offenders += (offenders.empty() ? "" : ", ");
+                offenders += name + " on " + f.label;
+            }
+        }
+    }
+
+    Check(offenders.empty(),
+          "no algorithm leaves its output untouched on any format" +
+              (offenders.empty() ? std::string() : " (" + offenders + ")"));
+}
     // --- the shared plumbing ------------------------------------------------
     {
         Image img = MakeEdgeImage(false);
