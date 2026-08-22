@@ -37,22 +37,42 @@ std::wstring Widen(const std::string& s) {
 
 } // namespace
 
+// How many live ShaderCompilers hold the globals above.
+//
+// The DXC objects are process-global, but ShaderCompiler looks like an ordinary
+// per-instance object -- so one instance's Shutdown() used to tear them down
+// for every other. That is not theoretical: the display-conversion pipeline
+// compiles its shader on the UI thread and shut its compiler down afterwards,
+// which reset g_compiler out from under the worker thread. The worker's next
+// CreateKernel() dereferenced null and crashed the app, reproducibly, on
+// dropping a file -- because a drop is when a new stage first needs a kernel
+// compiled after the display pipeline exists.
+//
+// Refcounted, so the globals live until the last user is done with them and an
+// ownership mistake cannot break an unrelated thread.
+int g_refCount = 0;
+
 bool ShaderCompiler::Init() {
     if (m_ready) return true;
 
-    if (FAILED(DxcCreateInstance(CLSID_DxcUtils, IID_PPV_ARGS(&g_utils))))    return false;
-    if (FAILED(DxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(&g_compiler)))) return false;
-    if (FAILED(g_utils->CreateDefaultIncludeHandler(&g_includes)))            return false;
-
+    if (g_refCount == 0) {
+        if (FAILED(DxcCreateInstance(CLSID_DxcUtils, IID_PPV_ARGS(&g_utils))))       return false;
+        if (FAILED(DxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(&g_compiler)))) return false;
+        if (FAILED(g_utils->CreateDefaultIncludeHandler(&g_includes)))               return false;
+    }
+    ++g_refCount;
     m_ready = true;
     return true;
 }
 
 void ShaderCompiler::Shutdown() {
+    if (!m_ready) return;
+    m_ready = false;
+    if (--g_refCount > 0) return;   // someone else is still compiling
+
     g_includes.Reset();
     g_compiler.Reset();
     g_utils.Reset();
-    m_ready = false;
 }
 
 bool ShaderCompiler::CompileCompute(const std::string& source,

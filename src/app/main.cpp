@@ -4,6 +4,7 @@
 // slider-driven parameters, display the result. Everything on the UI thread.
 #include <windows.h>
 #include <shellapi.h>   // DragAcceptFiles / DragQueryFile
+#include <dbghelp.h>    // stack trace in the crash handler
 
 #include <algorithm>
 #include <cstdio>
@@ -2051,8 +2052,71 @@ LRESULT WINAPI WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 } // namespace
 } // namespace tglab
 
+
+// Prints a stack trace when the app faults, instead of vanishing.
+//
+// A GUI app that crashes leaves nothing behind unless it is under a debugger,
+// and "it crashed" is not a report anyone can act on. This turns a fault into
+// the one thing that is actually diagnostic: where it happened.
+//
+// Costs nothing when nothing goes wrong.
+LONG WINAPI CrashHandler(EXCEPTION_POINTERS* ep) {
+    std::fprintf(stderr, "\n*** tglab crashed: exception 0x%08lX at %p\n",
+                 ep->ExceptionRecord->ExceptionCode,
+                 ep->ExceptionRecord->ExceptionAddress);
+
+    if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
+        ep->ExceptionRecord->NumberParameters >= 2) {
+        std::fprintf(stderr, "    %s address %p\n",
+                     ep->ExceptionRecord->ExceptionInformation[0] ? "writing" : "reading",
+                     reinterpret_cast<void*>(ep->ExceptionRecord->ExceptionInformation[1]));
+    }
+
+    HANDLE proc = GetCurrentProcess();
+    SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES | SYMOPT_UNDNAME);
+    SymInitialize(proc, nullptr, TRUE);
+
+    CONTEXT ctx = *ep->ContextRecord;
+    STACKFRAME64 frame = {};
+    frame.AddrPC.Offset    = ctx.Rip;
+    frame.AddrPC.Mode      = AddrModeFlat;
+    frame.AddrFrame.Offset = ctx.Rbp;
+    frame.AddrFrame.Mode   = AddrModeFlat;
+    frame.AddrStack.Offset = ctx.Rsp;
+    frame.AddrStack.Mode   = AddrModeFlat;
+
+    for (int i = 0; i < 48; ++i) {
+        if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64, proc, GetCurrentThread(), &frame, &ctx,
+                         nullptr, SymFunctionTableAccess64, SymGetModuleBase64, nullptr))
+            break;
+        if (frame.AddrPC.Offset == 0) break;
+
+        char symBuf[sizeof(SYMBOL_INFO) + 512] = {};
+        auto* sym = reinterpret_cast<SYMBOL_INFO*>(symBuf);
+        sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+        sym->MaxNameLen   = 511;
+        DWORD64 disp = 0;
+
+        if (SymFromAddr(proc, frame.AddrPC.Offset, &disp, sym)) {
+            IMAGEHLP_LINE64 line = {sizeof(line)};
+            DWORD lineDisp = 0;
+            if (SymGetLineFromAddr64(proc, frame.AddrPC.Offset, &lineDisp, &line))
+                std::fprintf(stderr, "  %2d  %s  (%s:%lu)\n", i, sym->Name,
+                             line.FileName, line.LineNumber);
+            else
+                std::fprintf(stderr, "  %2d  %s\n", i, sym->Name);
+        } else {
+            std::fprintf(stderr, "  %2d  0x%llX\n", i,
+                         (unsigned long long)frame.AddrPC.Offset);
+        }
+    }
+    std::fflush(stderr);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
 int main(int argc, char** argv) {
     using namespace tglab;
+
+    SetUnhandledExceptionFilter(CrashHandler);
 
     WNDCLASSEXA wc = {sizeof(wc), CS_CLASSDC, WndProc, 0, 0,
                       GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr,

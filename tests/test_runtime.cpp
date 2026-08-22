@@ -442,6 +442,71 @@ static void TestCancellation() {
     worker.Stop();
 }
 
+
+// One ShaderCompiler shutting down must not disable another.
+//
+// The DXC objects behind ShaderCompiler are process-global, but the class looks
+// like an ordinary per-instance object -- so one instance's Shutdown() used to
+// reset them for everybody. That crashed the app on dropping a file: the
+// display-conversion pipeline compiled its shader on the UI thread and shut its
+// compiler down afterwards, and the worker thread's next CreateKernel()
+// dereferenced a null compiler.
+//
+// The crash needed two things to line up -- a GPU display already built, then a
+// new stage needing a kernel -- which is why it survived a clean debug-layer run
+// and four passing suites.
+static void TestShaderCompilerSharing() {
+    Section("shader compiler sharing");
+
+    const char* kTrivial =
+        "RWTexture2D<float4> Dst : register(u0);\n"
+        "cbuffer Params : register(b0) { uint Width; uint Height; };\n"
+        "[numthreads(8,8,1)] void main(uint3 tid : SV_DispatchThreadID) {\n"
+        "    if (tid.x >= Width || tid.y >= Height) return;\n"
+        "    Dst[tid.xy] = float4(1,1,1,1);\n"
+        "}\n";
+
+    ShaderCompiler a;
+    Check(a.Init(), "first compiler initialises");
+
+    ShaderBlob blob;
+    std::string err;
+    Check(a.CompileCompute(kTrivial, "main", "t", &blob, &err),
+          "first compiler compiles" + (err.empty() ? "" : ": " + err));
+
+    {
+        // A second user, as the display pipeline is: initialises, compiles, and
+        // then shuts down while the first is still live.
+        ShaderCompiler b;
+        Check(b.Init(), "second compiler initialises");
+        ShaderBlob blobB;
+        Check(b.CompileCompute(kTrivial, "main", "t2", &blobB, &err),
+              "second compiler compiles" + (err.empty() ? "" : ": " + err));
+        b.Shutdown();
+    }
+
+    // The check that matters: `a` never called Init() again, so its m_ready is
+    // still true and it will go straight to the globals. Before refcounting,
+    // b.Shutdown() had already reset them and this crashed on a null compiler
+    // -- which is precisely what happened on the worker thread.
+    ShaderBlob after;
+    err.clear();
+    Check(a.CompileCompute(kTrivial, "main", "t3", &after, &err),
+          "the first compiler still works after the second shut down" +
+              (err.empty() ? "" : ": " + err));
+    Check(after.Valid(), "...and still produces DXIL");
+
+    a.Shutdown();
+
+    // And it all comes back afterwards, so shutdown is not one-way.
+    ShaderCompiler c;
+    Check(c.Init(), "a compiler initialises again after the last one shut down");
+    ShaderBlob revived;
+    err.clear();
+    Check(c.CompileCompute(kTrivial, "main", "t4", &revived, &err),
+          "...and compiles" + (err.empty() ? "" : ": " + err));
+    c.Shutdown();
+}
 static void TestShaderCompiler() {
     Section("shader compilation");
 
@@ -1172,6 +1237,7 @@ int main() {
     TestGpuOnlyShell();
     TestViewerVersions();
     TestCancellation();
+    TestShaderCompilerSharing();
     TestShaderCompiler();
 
     ID3D12Device* dev = nullptr;

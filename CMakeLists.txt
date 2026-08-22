@@ -83,7 +83,7 @@ add_executable(tglab
     src/app/file_watch.cpp
     $<TARGET_OBJECTS:tglab_algorithms>
 )
-target_link_libraries(tglab PRIVATE tglab_core imgui d3d12 dxgi)
+target_link_libraries(tglab PRIVATE tglab_core imgui d3d12 dxgi dbghelp)
 
 if(MSVC)
     target_compile_options(tglab PRIVATE /W4 /permissive-)

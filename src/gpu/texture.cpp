@@ -326,6 +326,15 @@ constexpr UINT kDisplaySlots = 64;   // (SRV + UAV) per view, several views
 bool EnsureDisplayPipeline(Device& dev) {
     if (g_display.valid) return true;
 
+    // ShaderCompiler is a handle onto PROCESS-GLOBAL DXC objects, not an
+    // independent instance -- so Shutdown() tears them down for everyone.
+    // Calling it here reset the globals out from under the worker thread, whose
+    // next CreateKernel() then dereferenced a null compiler. It crashed on
+    // dropping a file, because that is when a new stage first needs a kernel
+    // compiled after the display pipeline has been built.
+    //
+    // So: Init() is idempotent and safe to call, but this must never Shutdown().
+    // The app owns that, once, at exit.
     ShaderCompiler compiler;
     if (!compiler.Init()) return false;
 
@@ -333,7 +342,6 @@ bool EnsureDisplayPipeline(Device& dev) {
     std::string errors;
     if (!compiler.CompileCompute(kDisplayHlsl, "main", "display_convert", &blob, &errors)) {
         std::fprintf(stderr, "[display] shader: %s\n", errors.c_str());
-        compiler.Shutdown();
         return false;
     }
 
@@ -362,7 +370,6 @@ bool EnsureDisplayPipeline(Device& dev) {
     if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1,
                                            &sig, &sigErr))) {
         if (sigErr) sigErr->Release();
-        compiler.Shutdown();
         return false;
     }
     HRESULT hr = dev.Get()->CreateRootSignature(0, sig->GetBufferPointer(),
@@ -370,17 +377,15 @@ bool EnsureDisplayPipeline(Device& dev) {
                                                 IID_PPV_ARGS(&g_display.root));
     sig->Release();
     if (sigErr) sigErr->Release();
-    if (FAILED(hr)) { compiler.Shutdown(); return false; }
+    if (FAILED(hr)) { return false; }
 
     D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
     pd.pRootSignature   = g_display.root;
     pd.CS.pShaderBytecode = blob.dxil.data();
     pd.CS.BytecodeLength  = blob.dxil.size();
     if (FAILED(dev.Get()->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_display.pso)))) {
-        compiler.Shutdown();
         return false;
     }
-    compiler.Shutdown();
 
     // Shader-visible: the table is bound for the dispatch.
     D3D12_DESCRIPTOR_HEAP_DESC hd = {};
