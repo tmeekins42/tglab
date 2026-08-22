@@ -19,6 +19,7 @@
 #include "../core/compare.h"
 #include "../core/pipeline.h"
 #include "../algo_util/histogram.h"
+#include "../algo_util/white_balance.h"
 #include "../core/exif.h"
 #include "../core/image_loader.h"
 #include "../core/image_stats.h"
@@ -549,8 +550,12 @@ void App::RunScript() {
             si.index = int(i);
             // Tells the interpreter to insert a demosaic for this source, so a
             // script never has to mention one.
-            if (std::holds_alternative<Image>(m_palette[i].data))
-                si.isMosaic = std::get<Image>(m_palette[i].data).Desc().IsMosaic();
+            if (std::holds_alternative<Image>(m_palette[i].data)) {
+                const ImageDesc& sd = std::get<Image>(m_palette[i].data).Desc();
+                si.isMosaic = sd.IsMosaic();
+                // So the kelvin control can open at what the camera chose.
+                AsShotWhiteBalance(sd, &si.asShotKelvin, &si.asShotTint);
+            }
             names.push_back(si);
         }
         // Bumped when a drop replaces the file behind this slot, which is what
@@ -611,8 +616,12 @@ void App::RequestCompare() {
             si.index = int(i);
             // Tells the interpreter to insert a demosaic for this source, so a
             // script never has to mention one.
-            if (std::holds_alternative<Image>(m_palette[i].data))
-                si.isMosaic = std::get<Image>(m_palette[i].data).Desc().IsMosaic();
+            if (std::holds_alternative<Image>(m_palette[i].data)) {
+                const ImageDesc& sd = std::get<Image>(m_palette[i].data).Desc();
+                si.isMosaic = sd.IsMosaic();
+                // So the kelvin control can open at what the camera chose.
+                AsShotWhiteBalance(sd, &si.asShotKelvin, &si.asShotTint);
+            }
             names.push_back(si);
         }
         // Bumped when a drop replaces the file behind this slot, which is what

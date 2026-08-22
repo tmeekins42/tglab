@@ -951,7 +951,7 @@ static void TestGpuAgreement(ID3D12Device* dev) {
          "src = image(\"test\")\n"
          "o = basic_adjust(src, exposure = 0.7, contrast = 0.3, "
          "highlights = -0.4, shadows = 0.5, whites = 0.2, blacks = -0.2, "
-         "temperature = 0.3, tint = -0.2, vibrance = 0.4, saturation = 0.2)\n"
+         "kelvin = 4200, tint = -0.2, vibrance = 0.4, saturation = 0.2)\n"
          "display(o)\n", 4.0, 1.0},
 
         {"kuwahara",

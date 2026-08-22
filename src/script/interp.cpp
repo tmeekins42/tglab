@@ -538,6 +538,20 @@ private:
         auto probe = Registry::Get().Create(name);
         if (!probe) return Fail(e.line, "unknown algorithm '" + name + "'");
 
+        // Let the algorithm derive defaults from the source before its controls
+        // are described -- basic_adjust opens its kelvin slider at whatever
+        // temperature the camera chose, rather than at a sentinel.
+        //
+        // params() names an algorithm, not a call, so there is no single source
+        // to point at; the first raw one is used. In practice a develop script
+        // has exactly one, and a control's default is a starting point rather
+        // than a claim about a specific image.
+        for (const SourceImage& s : m_sources) {
+            if (!s.isMosaic) continue;
+            probe->PrepareDefaults(true, s.asShotKelvin, s.asShotTint);
+            break;
+        }
+
         // The optional instance name is what lets the same algorithm appear
         // twice with independent settings. Without it, params(op) twice on one
         // algorithm shares a single set of controls -- so a script comparing an

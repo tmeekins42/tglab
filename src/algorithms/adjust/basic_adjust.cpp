@@ -38,6 +38,7 @@
 #include <vector>
 
 #include "../../algo_util/pixel_buffer.h"
+#include "../../algo_util/white_balance.h"
 #include "../../core/algorithm.h"
 
 namespace tglab {
@@ -101,10 +102,6 @@ inline float Luma(float r, float g, float b) {
 // leaves it alone.
 constexpr float kLinearShoulder = 0.70f;
 
-// The white point the sRGB primaries assume, and therefore the reference the
-// camera daylight gains are expressed against.
-constexpr float kD65Kelvin = 6504.0f;
-
 // A smooth 0..1 window used to target a tonal band without a hard edge, which
 // would show as banding on a gradient.
 inline float SmoothBand(float x, float lo, float hi) {
@@ -113,83 +110,6 @@ inline float SmoothBand(float x, float lo, float hi) {
 }
 
 
-// --- colour temperature ------------------------------------------------------
-
-// The chromaticity of a black body at `kelvin`, as CIE xy.
-//
-// Kim et al.'s cubic approximation of the Planckian locus, the same one every
-// raw developer uses. Accurate to within a few units of xy over 1667..25000 K,
-// which is far finer than anyone can see, and vastly cheaper than integrating
-// Planck's law per slider tick.
-inline void PlanckianXy(float kelvin, float* outX, float* outY) {
-    const float T = std::clamp(kelvin, 1667.0f, 25000.0f);
-    const float t1 = 1e3f / T, t2 = 1e6f / (T * T), t3 = 1e9f / (T * T * T);
-
-    float x;
-    if (T <= 4000.0f) x = -0.2661239f * t3 - 0.2343589f * t2 + 0.8776956f * t1 + 0.179910f;
-    else              x = -3.0258469f * t3 + 2.1070379f * t2 + 0.2226347f * t1 + 0.240390f;
-
-    const float x2 = x * x, x3 = x2 * x;
-    float y;
-    if (T <= 2222.0f)      y = -1.1063814f * x3 - 1.34811020f * x2 + 2.18555832f * x - 0.20219683f;
-    else if (T <= 4000.0f) y = -0.9549476f * x3 - 1.37418593f * x2 + 2.09137015f * x - 0.16748867f;
-    else                   y =  3.0817580f * x3 - 5.87338670f * x2 + 3.75112997f * x - 0.37001483f;
-
-    *outX = x;
-    *outY = y;
-}
-
-// sRGB/Rec.709 primaries with a D65 white, as the matrix taking linear sRGB to
-// XYZ. Its inverse takes XYZ back.
-inline void XyzToLinearSrgb(float X, float Y, float Z, float* r, float* g, float* b) {
-    *r =  3.2404542f * X - 1.5371385f * Y - 0.4985314f * Z;
-    *g = -0.9692660f * X + 1.8760108f * Y + 0.0415560f * Z;
-    *b =  0.0556434f * X - 0.2040259f * Y + 1.0572252f * Z;
-}
-
-// The per-channel gains that render an illuminant at `kelvin` (offset along the
-// green/magenta axis by `tint`) as neutral.
-//
-// The illuminant's chromaticity becomes an sRGB triple; dividing by it is what
-// makes that colour come out grey. Normalised on green, so the control does not
-// double as an exposure slider.
-inline void KelvinGains(float kelvin, float tint, float* gr, float* gg, float* gb) {
-    float x = 0.0f, y = 0.0f;
-    PlanckianXy(kelvin, &x, &y);
-
-    // Tint moves perpendicular to the locus: +y is greener, -y magenta. The
-    // scale is chosen so the slider's -1..1 covers the useful range without
-    // leaving the region where the cubic above is meaningful.
-    y = std::clamp(y - tint * 0.05f, 0.05f, 0.95f);
-    if (y < 1e-4f) y = 1e-4f;
-
-    // xy -> XYZ at unit luminance.
-    const float X = x / y;
-    const float Y = 1.0f;
-    const float Z = (1.0f - x - y) / y;
-
-    float r, g, b;
-    XyzToLinearSrgb(X, Y, Z, &r, &g, &b);
-
-    // Below about 1900 K the Planckian locus leaves the sRGB gamut and the blue
-    // component goes NEGATIVE -- measured, b is -0.036 at 1700 K and only turns
-    // positive around 1900 K. Clamping it to a small epsilon and dividing
-    // produced a blue gain of 32x at 2000 K and broke monotonicity: the red gain
-    // stopped falling as the temperature rose, so dragging the slider one way
-    // moved the colour back the other.
-    //
-    // Floored at a value that keeps the ratio sane rather than at zero. The
-    // parameter range starts at 2000 K for the same reason, so this is the last
-    // line of defence rather than the normal path.
-    constexpr float kMinComponent = 0.02f;
-    r = std::max(r, kMinComponent);
-    g = std::max(g, kMinComponent);
-    b = std::max(b, kMinComponent);
-
-    *gr = g / r;
-    *gg = 1.0f;
-    *gb = g / b;
-}
 } // namespace
 
 class BasicAdjust : public AlgorithmBase {
@@ -412,6 +332,19 @@ void main(uint3 tid : SV_DispatchThreadID) {
         m_hasDaylightWb = d.hasDaylightWb;
     }
 
+
+    // Opens the kelvin slider at the temperature the camera chose, and tint at
+    // the green/magenta offset it applied alongside -- so the controls describe
+    // this photograph before anyone touches them.
+    //
+    // Both are defaults rather than values: a script that sets kelvin, or a
+    // slider the user has already moved, wins. Left at 0 for a source with no
+    // daylight reference, where 0 correctly means "nothing to correct against".
+    void PrepareDefaults(bool sourceIsMosaic, float asShotK, float asShotT) override {
+        if (!sourceIsMosaic || asShotK <= 0.0f) return;
+        m_kelvin.SetDefault(asShotK);
+        m_tint.SetDefault(asShotT);
+    }
     void PrepareGpu(const std::vector<ImageDesc>& inputs) override {
         m_linear = !inputs.empty() && inputs[0].linear;
         m_white  = m_linear ? kLinearShoulder : 1.0f;
@@ -419,20 +352,29 @@ void main(uint3 tid : SV_DispatchThreadID) {
     }
 
 private:
-    // The white-balance gains, from the absolute Kelvin control and the
-    // relative nudge together.
+    // The white-balance gains, from kelvin and tint.
     //
-    // The Kelvin part answers "what light was this shot under?", and needs two
-    // things from the file: the as-shot gains the camera chose (camMul) and the
-    // camera's daylight reference (preMul). The demosaic has already applied
-    // camMul, so the image arrives balanced as the camera saw it -- meaning a
-    // Kelvin setting must be applied RELATIVE to that, not from scratch. Undo
-    // the camera's choice, apply the requested illuminant, and the two ratios
-    // cancel to exactly 1.0 when the request matches the shot.
+    // Two axes, which is what white balance actually has: a colour temperature
+    // along the Planckian locus, and a green/magenta offset perpendicular to it
+    // that no temperature can express. Every raw developer uses this pair, and
+    // it is what the camera's own choice decomposes into -- measured, matching a
+    // file's temperature alone still left red and blue both off by 1.078, equal
+    // in both, which is a pure green shift by definition.
     //
-    // Without preMul there is no way to know where neutral is, so kelvin does
-    // nothing and only the relative control applies. That is the honest
-    // behaviour for a JPEG, which carries no such record.
+    // A third relative "temperature" nudge used to sit on top. It was dropped
+    // once kelvin could start at the camera's own value: a small warm/cool
+    // adjustment is just a small move in Kelvin, and having two controls for one
+    // axis meant neither said clearly what it did.
+    //
+    // The demosaic has already applied camMul, so the image arrives balanced as
+    // the camera saw it -- meaning a request is applied RELATIVE to that. Undo
+    // the camera's choice, apply the asked-for illuminant, and the two cancel
+    // exactly when the two agree. That cancellation is what makes the number
+    // mean something rather than being an arbitrary curve.
+    //
+    // Without preMul there is nothing to measure against, so this leaves the
+    // image alone. That is the honest behaviour for a JPEG, which carries no
+    // record of where neutral was.
     //
     // Gains are normalised on luminance, so changing the white balance does not
     // double as an exposure change.
@@ -443,10 +385,9 @@ private:
 
         const float k = float(m_kelvin);
         if (k > 1.0f && m_hasDaylightWb) {
-            // The illuminant the user asked for, and the one the camera assumed,
-            // both expressed as gains on this sensor. preMul is the camera's
-            // D65 reference, so scaling it by the ratio of the requested
-            // illuminant to D65 gives the requested illuminant in camera space.
+            // The requested illuminant, and D65, both as gains on this sensor.
+            // preMul is the camera's D65 reference, so the ratio between the two
+            // expresses the request in camera space.
             float wr = 1.0f, wg = 1.0f, wb = 1.0f;
             KelvinGains(k, float(m_tint), &wr, &wg, &wb);
 
@@ -454,31 +395,21 @@ private:
             KelvinGains(kD65Kelvin, 0.0f, &dr, &dg, &db);
 
             // What the camera already applied, relative to its daylight
-            // reference: this is the correction to undo.
+            // reference: the correction to undo.
             const float shotR = m_camMul[0] / std::max(m_preMul[0], 1e-6f);
             const float shotB = m_camMul[2] / std::max(m_preMul[2], 1e-6f);
 
-            // ...and what the requested illuminant asks for instead.
-            const float wantR = wr / std::max(dr, 1e-6f);
-            const float wantB = wb / std::max(db, 1e-6f);
-
-            *r = wantR / std::max(shotR, 1e-6f);
-            *b = wantB / std::max(shotB, 1e-6f);
-        }
-
-        // The relative nudge, on top of whatever the above decided. Red and
-        // blue in opposition for temperature; green against magenta for tint.
-        const float t = float(m_temperature);
-        const float n = float(m_tint);
-        *r *= 1.0f + t * 0.4f;
-        *b *= 1.0f - t * 0.4f;
-
-        // Tint is folded into the Kelvin path when that is active (it shifts the
-        // illuminant off the locus), so apply it here only when it is not.
-        if (!(k > 1.0f && m_hasDaylightWb)) {
-            *g *= 1.0f - n * 0.3f;
-            *r *= 1.0f + n * 0.15f;
-            *b *= 1.0f + n * 0.15f;
+            *r = (wr / std::max(dr, 1e-6f)) / std::max(shotR, 1e-6f);
+            *g = wg / std::max(dg, 1e-6f);
+            *b = (wb / std::max(db, 1e-6f)) / std::max(shotB, 1e-6f);
+        } else {
+            // No reference to anchor to. Tint is still meaningful on its own --
+            // it is a straightforward green/magenta push, not something that
+            // needs to know where neutral was -- so it stays available.
+            const float n = float(m_tint);
+            *g = 1.0f - n * 0.3f;
+            *r = 1.0f + n * 0.15f;
+            *b = 1.0f + n * 0.15f;
         }
 
         *r = std::max(*r, 0.0f);
@@ -592,31 +523,30 @@ private:
         *bb = std::max(b, 0.0f);
     }
 
-    // 0 means "leave the camera's own white balance alone", which is why this
-    // is not simply defaulted to 5500: a raw arrives already balanced as shot,
-    // and a control that jumped to daylight the moment the image loaded would
-    // change every picture before the user touched anything.
+    // Defaults to the temperature the camera actually used, recovered from the
+    // file when the image loads -- so the slider opens showing what this
+    // photograph IS, and moving it away is what changes the picture.
+    //
+    // It previously defaulted to 0 meaning "leave the camera's balance alone",
+    // which is a poor answer to "what temperature is this?" when the file
+    // knows. 0 remains valid and still means that, for a JPEG or a raw whose
+    // profile carries no daylight reference.
     Param<float> m_kelvin{
-        this, "kelvin", 0.0f, 0.0f, 25000.0f,
-        {.help = "Absolute colour temperature of the light the scene was under, "
-                 "in Kelvin -- 2800 tungsten, 5500 daylight, 7000 shade. Setting "
-                 "it to the ACTUAL light neutralises the cast: a photograph shot "
-                 "under tungsten needs ~2800 here, not a cooler number. 0 keeps "
-                 "the camera's own white balance. Needs a raw file; a JPEG has "
-                 "no record of where neutral was.",
+        this, "kelvin", 0.0f, 0.0f, kKelvinMax,
+        {.help = "Colour temperature of the light the scene was under, in Kelvin "
+                 "-- 2800 tungsten, 5500 daylight, 7000 shade. Setting it to the "
+                 "ACTUAL light neutralises the cast: a photograph shot under "
+                 "tungsten needs ~2800 here, not a cooler number. Starts at the "
+                 "value the camera chose. Needs a raw file; a JPEG carries no "
+                 "record of where neutral was, so this does nothing there.",
          .step = 50.0, .softMin = 2000.0, .softMax = 10000.0}};
 
-    Param<float> m_temperature{
-        this, "temperature", 0.0f, -1.0f, 1.0f,
-        {.help = "Warm/cool nudge, relative to whatever white balance is already "
-                 "in effect -- the camera's, or the one `kelvin` set. Positive "
-                 "warms (more red, less blue). Use this for a small correction "
-                 "by eye; use kelvin to name the actual illuminant.",
-         .step = 0.01, .softMin = -0.5, .softMax = 0.5}};
     Param<float> m_tint{
         this, "tint", 0.0f, -1.0f, 1.0f,
-        {.help = "Green/magenta balance, the axis perpendicular to temperature. "
-                 "Negative is greener, positive more magenta.",
+        {.help = "Green/magenta balance, the axis colour temperature cannot "
+                 "express. Negative is greener, positive more magenta. Also "
+                 "starts where the camera had it: matching a raw's white balance "
+                 "needs both axes, not just the temperature.",
          .step = 0.01, .softMin = -0.5, .softMax = 0.5}};
     Param<float> m_exposure{
         this, "exposure", 0.0f, -5.0f, 5.0f,

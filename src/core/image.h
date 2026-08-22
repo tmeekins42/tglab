@@ -234,4 +234,16 @@ private:
 // this declaration, which keeps the dependency pointing one way.
 std::shared_ptr<SharedGpuTexture> ShareGpuTexture(const Image& img);
 
+// The colour temperature and green/magenta offset the camera chose for a shot,
+// recovered from its white-balance metadata.
+//
+// In core/ rather than inside basic_adjust because two places need the same
+// answer: the algorithm, to apply a correction relative to what the camera did,
+// and the app, to open the kelvin slider at the value the camera used rather
+// than at a sentinel.
+//
+// Both are 0 when `d` carries no daylight reference (a JPEG, or a raw whose
+// profile lacks one), which correctly means "nothing to measure against".
+void AsShotWhiteBalance(const ImageDesc& d, float* kelvin, float* tint);
+
 } // namespace tglab

@@ -84,6 +84,17 @@ struct SourceImage {
     // demosaic automatically, so a script never has to mention it and works
     // unchanged whether a PNG or a CR3 is dropped on the slot.
     bool isMosaic = false;
+
+    // The colour temperature and green/magenta offset the camera chose for this
+    // shot, recovered from its white-balance metadata. Zero when the file
+    // carries no daylight reference to measure against.
+    //
+    // Here so that a control declared by params() can DEFAULT to what this
+    // photograph actually is. The alternative was a sentinel -- kelvin 0 meaning
+    // "leave it alone" -- which is a poor answer to "what temperature is this?"
+    // when the file knows, and which Tim reported as confusing on sight.
+    float asShotKelvin = 0.0f;
+    float asShotTint   = 0.0f;
 };
 
 struct InterpResult {

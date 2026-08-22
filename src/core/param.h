@@ -106,6 +106,19 @@ public:
     T Min() const { return m_lo; }
     T Max() const { return m_hi; }
     T Default() const { return m_def; }
+
+    // Replaces the declared default with one derived from the image, and moves
+    // the current value with it when the value is still the old default -- so an
+    // untouched control follows the source, while one the user or the script has
+    // set stays put.
+    //
+    // Used by basic_adjust so the kelvin slider opens at the temperature the
+    // camera actually chose. See AlgorithmBase::PrepareDefaults.
+    void SetDefault(T d) {
+        d = std::clamp(d, m_lo, m_hi);
+        if (m_v == m_def) m_v = d;
+        m_def = d;
+    }
     const ParamOpts& Opts() const { return m_opts; }
     const char* Help() const override { return m_opts.help; }
 

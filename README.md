@@ -439,7 +439,7 @@ one image once.
 
 ### Photographic adjustments
 
-`basic_adjust` is the standard raw-developer control set — kelvin, temperature, tint,
+`basic_adjust` is the standard raw-developer control set — kelvin, tint,
 exposure, contrast, highlights, shadows, whites, blacks, vibrance, saturation
 — in **one** algorithm rather than ten. [scripts/develop.tgl](scripts/develop.tgl)
 uses it.
@@ -503,40 +503,53 @@ Two things that fell out of measuring this, both counter-intuitive:
 
 #### Colour temperature
 
-Two controls, answering different questions.
+Two axes, which is what white balance actually has: a colour temperature along
+the Planckian locus, and a green/magenta offset perpendicular to it that no
+temperature can express.
 
-`kelvin` is **absolute**: it names the illuminant the scene was under, and
-setting it to the actual light neutralises the cast — a tungsten photograph
-needs ~2800 there, not a cooler number. `temperature` stays a relative warm/cool
-nudge on top, for correcting by eye.
+`kelvin` names the illuminant the scene was under, and setting it to the actual
+light neutralises the cast — a tungsten photograph needs ~2800 there, not a
+cooler number. It **opens at the temperature the camera chose**, recovered from
+the file, so the control describes this photograph before anyone touches it.
+`tint` opens at the offset the camera applied alongside.
 
-The absolute one needs two references, both from the raw file: the gains the
-camera chose for this shot (`cam_mul`) and the camera's own daylight reference
-(`pre_mul`). The demosaic has already applied the first, so a Kelvin request is
-applied *relative* to it — undo the camera's choice, apply the requested
-illuminant — and the two cancel exactly when the request matches the shot. That
-round trip is what makes the number mean something rather than being an
-arbitrary curve, and it is asserted in the tests.
+A third relative "temperature" nudge existed briefly and was removed. Once
+kelvin could start at the camera's own value, a small warm/cool adjustment was
+just a small move in Kelvin — and having two controls for one axis meant neither
+said clearly what it did.
+
+Both directions come from the same two references, both in the raw file: the
+gains the camera chose for this shot (`cam_mul`) and the camera's own daylight
+reference (`pre_mul`). The demosaic has already applied the first, so a request
+is applied *relative* to it — undo the camera's choice, apply the asked-for
+illuminant — and the two cancel exactly when they agree. That cancellation is
+what makes the number mean something rather than being an arbitrary curve, and
+it is asserted in the tests.
 
 A JPEG has no such record, so `kelvin` does nothing there rather than guessing.
+`tint` still works: a green/magenta push does not need to know where neutral was.
 
-Why the relative control was not enough: it scaled red and blue by at most
-±40%, while a tungsten frame measured here sits a factor of **0.65 in red and
-1.67 in blue** from daylight — outside its reach entirely, which is why a warm
-image could not be brought back to neutral however far the slider went.
+Why a relative control was not enough on its own: it scaled red and blue by at
+most ±40%, while a tungsten frame measured here sits a factor of **0.65 in red
+and 1.67 in blue** from daylight — outside its reach entirely, which is why a
+warm image could not be brought back to neutral however far the slider went.
 
-The chromaticity comes from Kim et al.'s cubic fit to the Planckian locus,
-converted to sRGB and inverted to give per-channel gains. Two things worth
-recording from checking it:
+Three things worth recording from building it:
 
-- It matches Illuminant A to within 0.0005 in xy. D50 and D65 sit about 0.006
+- The chromaticity comes from Kim et al.'s cubic fit to the Planckian locus. It
+  matches Illuminant A to within 0.0005 in xy. D50 and D65 sit about 0.006
   *below* the locus, which is correct rather than error — daylight illuminants
   are not black bodies.
 - Below about 1900 K the locus leaves the sRGB gamut and the blue component goes
   negative (measured: −0.036 at 1700 K). Clamping it to a small epsilon produced
   a blue gain of **32×** at 2000 K and broke monotonicity, so dragging the
-  slider one way moved the colour back the other. The range starts at 2000 K and
-  the components are floored well above zero.
+  slider one way moved the colour back the other. The range starts at 2000 K.
+- **The two axes are not independent.** Tint shifts `y`, which moves the R/B
+  ratio as well as the green level — measured, tint +0.6 changes R/B by 12% at
+  4000 K. Solving for temperature and then for tint therefore does not land on
+  the right pair; doing so left the round trip 8% off. Recovering the camera's
+  choice alternates between the two until they settle, which brings it inside
+  1.5%.
 
 The line to draw: settled operations that always run together belong fused;
 anything worth *experimenting* with stays a separate algorithm, where

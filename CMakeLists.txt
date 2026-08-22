@@ -42,6 +42,7 @@ add_library(tglab_core STATIC
     src/core/image_loader.cpp
     src/algo_util/histogram.cpp
     src/algo_util/pixel_buffer.cpp
+    src/algo_util/white_balance.cpp
     src/core/exif.cpp
     src/core/image_stats.cpp
     src/core/raw_io.cpp

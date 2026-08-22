@@ -104,6 +104,19 @@ public:
     // calls RunCPU, so without this the shader would use stale values.
     virtual void PrepareGpu(const std::vector<ImageDesc>& inputs) { (void)inputs; }
 
+    // Lets an algorithm set parameter DEFAULTS from the source it will run on,
+    // before the script declares its controls.
+    //
+    // Distinct from PrepareGpu, which happens far too late for this: by then the
+    // UI has already built its sliders. Only basic_adjust uses it, to open the
+    // kelvin control at the temperature the camera actually chose rather than at
+    // a sentinel meaning "leave it alone".
+    //
+    // A default, not a value: whatever the user or the script set wins.
+    virtual void PrepareDefaults(bool /*sourceIsMosaic*/,
+                                 float /*asShotKelvin*/,
+                                 float /*asShotTint*/) {}
+
     // Extra root constants, bit-cast to uint. Floats go through asfloat() in
     // the shader. Order must match the cbuffer declaration.
     //

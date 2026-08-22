@@ -238,15 +238,83 @@ static void TestKelvinWhiteBalance() {
         Check(false, "basic_adjust without a daylight reference: " + err);
     }
 
-    // The relative control still works alongside it, and still works on its own.
-    if (RunFilter("basic_adjust", make(false), {{"temperature", 0.5}}, &out, &err)) {
-        Check(ratioOf(out) > 1.1,
-              "the relative temperature control still warms without a daylight ref (R/B " +
-                  std::to_string(ratioOf(out)) + ")");
+    // Tint is meaningful with or without a daylight reference: it is a plain
+    // green/magenta push, not something that needs to know where neutral was.
+    // So it stays available on a JPEG, where kelvin cannot be.
+    auto greenOf = [](Image& img) {
+        ImageView v = img.MapCpuRead();
+        return double(HalfToFloat(v.At<uint16_t>(8, 8)[1]));
+    };
+    Image neutralTint, greener;
+    if (RunFilter("basic_adjust", make(false), {}, &neutralTint, &err) &&
+        RunFilter("basic_adjust", make(false), {{"tint", -0.5}}, &greener, &err)) {
+        Check(greenOf(greener) > greenOf(neutralTint),
+              "tint still works without a daylight reference");
     } else {
-        Check(false, "relative temperature: " + err);
+        Check(false, "tint without a daylight reference: " + err);
+    }
+
+    // The as-shot recovery: the file knows what temperature it was taken at, so
+    // the slider should open there rather than at a sentinel.
+    //
+    // Tim reported the old "0 means leave it alone" default as confusing on
+    // sight, and he was right: it is a poor answer to "what temperature is this
+    // photograph?" when the answer is in the metadata.
+    {
+        ImageDesc d{8, 8, Format::RGBA16F};
+        d.linear = true;
+        d.camMul[0] = 1.4541f; d.camMul[1] = 1.0f; d.camMul[2] = 2.3701f;
+        d.preMul[0] = 2.2513f; d.preMul[1] = 1.0f; d.preMul[2] = 1.4180f;
+        d.hasDaylightWb = true;
+
+        float k = 0.0f, t = 0.0f;
+        AsShotWhiteBalance(d, &k, &t);
+
+        // Measured on the real file these numbers come from: ~4027 K. A
+        // tungsten-leaning shot, which is what that cam_mul says.
+        Check(k > 3500.0f && k < 4500.0f,
+              "as-shot temperature recovered from the metadata (" +
+                  std::to_string(k) + " K, expected ~4000)");
+
+        // Feeding it back must be a no-op: that round trip is what makes the
+        // recovered number trustworthy rather than merely plausible.
+        auto make = [&]() {
+            Image img;
+            img.Alloc(d);
+            ImageView v = img.MapCpuWrite();
+            for (int y = 0; y < 8; ++y)
+                for (int x = 0; x < 8; ++x) {
+                    uint16_t* p = v.At<uint16_t>(x, y);
+                    for (int c = 0; c < 3; ++c) p[c] = FloatToHalf(0.40f);
+                    p[3] = FloatToHalf(1.0f);
+                }
+            return img;
+        };
+        Image back;
+        std::string e;
+        if (RunFilter("basic_adjust", make(),
+                      {{"kelvin", double(k)}, {"tint", double(t)}}, &back, &e)) {
+            ImageView v = back.MapCpuRead();
+            const float r = HalfToFloat(v.At<uint16_t>(4, 4)[0]);
+            const float g = HalfToFloat(v.At<uint16_t>(4, 4)[1]);
+            const float b = HalfToFloat(v.At<uint16_t>(4, 4)[2]);
+            Check(std::abs(r / b - 1.0f) < 0.02f && std::abs(g / b - 1.0f) < 0.02f,
+                  "feeding the recovered values back leaves the image neutral (R/B " +
+                      std::to_string(r / b) + ", G/B " + std::to_string(g / b) + ")");
+        } else {
+            Check(false, "round-trip through the recovered values: " + e);
+        }
+
+        // A JPEG has nothing to measure against and must say so rather than
+        // inventing a number.
+        ImageDesc plain{8, 8, Format::RGBA8};
+        float k2 = -1.0f, t2 = -1.0f;
+        AsShotWhiteBalance(plain, &k2, &t2);
+        Check(k2 == 0.0f && t2 == 0.0f,
+              "no daylight reference yields no as-shot temperature rather than a guess");
     }
 }
+
 int main() {
     std::string err;
     TestKelvinWhiteBalance();
@@ -908,24 +976,29 @@ int main() {
             Check(chroma(out, 16, 48) > chroma(base, 16, 48),
                   "positive vibrance increases chroma on a muted colour");
 
-        // Temperature must move red and blue in opposition without changing
-        // overall brightness -- the gains are luminance-normalised precisely so
-        // warming an image is not also an exposure change.
-        if (run("temperature", 0.5)) {
+        // Tint moves green against magenta without changing overall brightness
+        // -- the gains are luminance-normalised precisely so a colour shift is
+        // not also an exposure change.
+        //
+        // This fixture is RGBA8 with no daylight reference, so `kelvin` does
+        // nothing here by design and there is nothing to assert about it. The
+        // Kelvin control has its own section, on a fixture that carries the
+        // metadata it needs.
+        if (run("tint", -0.5)) {
             ImageView v = out.MapCpuRead();
             ImageView bv = base.MapCpuRead();
             const uint8_t* p = v.At<uint8_t>(32, 32);
             const uint8_t* q = bv.At<uint8_t>(32, 32);
-            Check(p[0] > q[0] && p[2] < q[2], "positive temperature warms (R up, B down)");
+            Check(p[1] > q[1], "negative tint pushes towards green");
             Check(std::abs(bandMean(out, 16, 48) - bandMean(base, 16, 48)) < 12,
                   "...without a large brightness shift");
         }
-        if (run("temperature", -0.5)) {
+        if (run("tint", 0.5)) {
             ImageView v = out.MapCpuRead();
             ImageView bv = base.MapCpuRead();
             const uint8_t* p = v.At<uint8_t>(32, 32);
             const uint8_t* q = bv.At<uint8_t>(32, 32);
-            Check(p[0] < q[0] && p[2] > q[2], "negative temperature cools (R down, B up)");
+            Check(p[1] < q[1], "positive tint pushes towards magenta");
         }
 
         if (run("blacks", -0.5))
