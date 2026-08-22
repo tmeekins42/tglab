@@ -139,17 +139,26 @@ void PipelineWorker::Run() {
                                           haveGpu ? &gpu : nullptr,
                                           m_mode.load(std::memory_order_relaxed),
                                           &job->sourceVersions, token.get());
-        m_lastMs.store(
-            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
-            std::memory_order_relaxed);
-        m_lastGpuStages.store(job->pipe.GpuStageCount(), std::memory_order_relaxed);
-        m_lastCpuStages.store(job->pipe.CpuStageCount(), std::memory_order_relaxed);
-        m_lastCachedStages.store(job->pipe.CachedStageCount(), std::memory_order_relaxed);
+        const double elapsedMs =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 
         // A cancelled run is not a failure and has nothing to show: a newer job
         // is already queued. Publishing it would flash a stale or partial image
         // and, if reported, an error the user never caused.
         const bool cancelled = !ok && err == Pipeline::kCancelled;
+
+        // Timing and stage counts describe the run the user can SEE. Recording
+        // them for a cancelled run made the status bar flicker between the real
+        // figure and a near-zero one: mid-drag, each frame's job is abandoned
+        // almost immediately by the next, so "53 ms" alternated with "0 ms" and
+        // read as though the pipeline were running twice. It was not -- only
+        // one run's output was ever displayed.
+        if (!cancelled) {
+            m_lastMs.store(elapsedMs, std::memory_order_relaxed);
+            m_lastGpuStages.store(job->pipe.GpuStageCount(), std::memory_order_relaxed);
+            m_lastCpuStages.store(job->pipe.CpuStageCount(), std::memory_order_relaxed);
+            m_lastCachedStages.store(job->pipe.CachedStageCount(), std::memory_order_relaxed);
+        }
         if (cancelled) {
             // The abandoned pipeline's stage cache is half-finished, so it
             // cannot seed the next run -- a cancelled stage is marked invalid,
