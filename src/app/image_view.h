@@ -36,7 +36,12 @@ public:
 
     // Bumped by the app whenever the pipeline produced new pixels, so the
     // texture re-uploads only then rather than every frame.
-    void SetContentVersion(uint64_t v) { m_version = v; }
+    void SetContentVersion(uint64_t v) override { m_version = v; }
+
+    // The result still resident on the GPU, when there is one. Set alongside
+    // the version each frame; drawing prefers it over the Image, because
+    // converting from it needs no readback.
+    void SetGpuSource(std::shared_ptr<SharedGpuTexture> g) override { m_gpuSrc = std::move(g); }
 
     // The 1:1 loupe, for inspecting individual pixels.
     void SetLoupe(bool on) { m_loupe = on; }
@@ -45,12 +50,16 @@ public:
 private:
     // Drawn from CPU pixels rather than the GPU texture, so the magnified view
     // is truly point-sampled. See the definition for why.
-    void DrawLoupe(Image& img, const ImVec2& mouse, const ImVec2& imgOrigin,
+    void DrawLoupe(Device& dev, Image& img, const ImVec2& mouse, const ImVec2& imgOrigin,
                    float zoom, ImDrawList* dl);
     static void SampleRgb(const ImageView& v, int x, int y, float* rgb);
 
     std::string m_name;
     GpuTexture  m_tex;
+
+    // Kept alive for as long as this view might draw from it -- the worker can
+    // free the pipeline's outputs on its own thread at any point.
+    std::shared_ptr<SharedGpuTexture> m_gpuSrc;
     ViewCamera  m_own;
     ViewCamera* m_shared  = nullptr;
     uint64_t    m_version = 0;

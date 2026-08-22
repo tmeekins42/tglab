@@ -27,6 +27,36 @@ public:
     // Converts R32F/RGBA32F to RGBA8 for display. Re-uploads only when
     // `contentVersion` differs from the last call.
     bool Update(Device& dev, Image& img, uint64_t contentVersion);
+
+    // Reads a small rectangle of a GPU-resident result back to the CPU.
+    //
+    // For the 1:1 loupe, which point-samples individual pixels and prints their
+    // values -- it genuinely needs the numbers, not a magnified picture. The
+    // rectangle is tens of pixels across, so this is a few kilobytes rather
+    // than the whole image, and it only happens while the loupe is switched on.
+    //
+    // Blocking: it waits for the copy. Acceptable for a deliberate, hovering
+    // inspection gesture; not something to put on the per-frame path.
+    //
+    // `outPixels` receives width*height*BytesPerPixel bytes in the source's own
+    // format. Returns false if the rectangle is empty or the copy fails.
+    static bool ReadRegion(Device& dev, const SharedGpuTexture& src,
+                           int x, int y, int w, int h,
+                           std::vector<uint8_t>* outPixels);
+
+    // Converts straight from a result that is still on the GPU, with no
+    // readback and no CPU conversion.
+    //
+    // The alternative -- and what this replaces -- was to map the pixels, walk
+    // them on the CPU into RGBA8, and upload the result back. At 21 MP that was
+    // ~86 ms of readback and ~47 ms of conversion per viewer per frame, sending
+    // the image across the bus twice to draw it once.
+    //
+    // The compute context and ImGui share one device and compute images carry
+    // ALLOW_SIMULTANEOUS_ACCESS, so the UI's direct queue can sample the
+    // worker's texture while the compute queue owns it.
+    bool UpdateFromGpu(Device& dev, const SharedGpuTexture& src,
+                       uint64_t contentVersion);
     void Release();
 
     bool Valid() const { return m_res != nullptr; }
@@ -52,5 +82,10 @@ private:
     UINT64          m_uploadSize[kMaxFramesInFlight] = {};
     uint64_t        m_version = UINT64_MAX;   // last uploaded content version
 };
+
+// Frees the shared display-conversion pipeline. One shader and one descriptor
+// heap serve every view, so they outlive any single GpuTexture; call this once
+// at shutdown, before the device goes away.
+void ReleaseDisplayPipeline();
 
 } // namespace tglab

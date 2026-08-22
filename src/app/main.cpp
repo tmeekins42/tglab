@@ -370,6 +370,15 @@ void App::Shutdown() {
     m_diffTex.Release();
     for (PaletteEntry& e : m_palette) e.thumb.Release();
 
+    // The viewer results hold references to the worker's GPU textures. Dropping
+    // them here, after the worker has stopped and before the device goes, keeps
+    // the last reference from outliving the device that created the resource.
+    m_viewerImages.clear();
+
+    // One shader and one descriptor heap serve every view, so they are not
+    // owned by any single GpuTexture.
+    ReleaseDisplayPipeline();
+
     ImGui_ImplDX12_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
@@ -642,6 +651,14 @@ void App::PollWorker() {
         // blank them. Views look themselves up by name, and m_views is rebuilt
         // from the script, so an entry for a removed display() is simply never
         // consulted.
+        // The histogram the worker measured on the GPU, if it did. Takes
+        // precedence over anything the stats thread produced: it is newer by
+        // construction, having been computed from this very run.
+        if (out.haveStats) {
+            m_stats = std::move(out.stats);
+            m_statsRequested = false;
+        }
+
         for (ViewerImage& in : out.viewers) {
             auto it = std::find_if(m_viewerImages.begin(), m_viewerImages.end(),
                                    [&](const ViewerImage& v) { return v.name == in.name; });
@@ -1233,7 +1250,22 @@ void App::DrawInfoPanel() {
     for (const ViewerImage& vi : m_viewerImages)
         if (vi.name == shownName) { shownVersion = vi.version; break; }
 
-    if (m_stats.source != shownName || m_stats.version != shownVersion) {
+    // Tell the pipeline worker which viewer to measure. It computes the
+    // histogram on the GPU where the pixels already are, and the result arrives
+    // with the next run -- no readback, and nothing extra for this thread to do.
+    m_worker.SetHistogramViewer(shownName);
+
+    // The stats thread is the fallback, for subjects the worker cannot measure:
+    // a palette image (never went through the pipeline) and a CPU-only stage
+    // (no GPU residency). Asking for both would compute it twice.
+    const bool workerMeasures = [&] {
+        for (const ViewerImage& vi : m_viewerImages)
+            if (vi.name == shownName) return vi.gpu != nullptr;
+        return false;
+    }();
+
+    if (!workerMeasures &&
+        (m_stats.source != shownName || m_stats.version != shownVersion)) {
         if (!m_statsRequested ||
             m_requestedSource != shownName || m_requestedVersion != shownVersion) {
             if (GetEnvironmentVariableA("TGLAB_INFODBG", nullptr, 0) > 0) {
@@ -1929,9 +1961,11 @@ void App::Frame() {
         // Per-viewer, so an unchanged viewer skips the upload entirely rather
         // than re-converting the same pixels because some other viewer moved.
         uint64_t ver = 0;
+        std::shared_ptr<SharedGpuTexture> gpuSrc;
         for (const ViewerImage& vi : m_viewerImages)
-            if (vi.name == v->Name()) { ver = vi.version; break; }
+            if (vi.name == v->Name()) { ver = vi.version; gpuSrc = vi.gpu; break; }
         v->SetContentVersion(ver);
+        v->SetGpuSource(std::move(gpuSrc));
         v->Draw(m_dev, img);
     }
 

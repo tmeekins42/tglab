@@ -31,7 +31,13 @@ void ImageViewPanel::Draw(Device& dev, Image* img) {
         return;
     }
 
-    if (!m_tex.Update(dev, *img, m_version)) {
+    // Prefer the GPU source when the result is still resident there: converting
+    // from it is a dispatch, where the CPU path is a readback plus a scalar
+    // conversion plus an upload. Falls back for a CPU-only stage, which has no
+    // shared texture -- a script can mix the two.
+    const bool ok = m_gpuSrc ? m_tex.UpdateFromGpu(dev, *m_gpuSrc, m_version)
+                             : m_tex.Update(dev, *img, m_version);
+    if (!ok) {
         ImGui::TextDisabled("could not upload image");
         ImGui::End();
         return;
@@ -134,36 +140,69 @@ void ImageViewPanel::Draw(Device& dev, Image* img) {
     }
 
     if (m_loupe && ImGui::IsItemHovered())
-        DrawLoupe(*img, ImGui::GetIO().MousePos, p0, cam.zoom, dl);
+        DrawLoupe(dev, *img, ImGui::GetIO().MousePos, p0, cam.zoom, dl);
 
     ImGui::End();
 }
 
-// A 1:1 magnifier at the cursor, drawn pixel by pixel from the CPU image.
+// A 1:1 magnifier at the cursor, drawn pixel by pixel.
 //
-// Deliberately not a scaled draw of the GPU texture: ImGui's DX12 backend
-// picks its sampler per pipeline state, with no public per-draw override, so a
-// magnified texture would come out bilinear -- which is exactly wrong for
-// pixel snooping, since it invents values between the ones you are trying to
-// read. Reading the CPU pixels directly gives true point sampling and, as a
-// bonus, the real numbers to print underneath.
-void ImageViewPanel::DrawLoupe(Image& img, const ImVec2& mouse, const ImVec2& imgOrigin,
-                               float zoom, ImDrawList* dl) {
+// Deliberately not a scaled draw of the GPU texture: ImGui's DX12 backend picks
+// its sampler per pipeline state, with no public per-draw override, so a
+// magnified texture would come out bilinear -- exactly wrong for pixel
+// snooping, since it invents values between the ones you are trying to read.
+// Drawing one filled rect per sample gives true point sampling and, as a bonus,
+// the real numbers to print underneath.
+//
+// It needs actual pixel values, which the display path no longer brings back:
+// a GPU-resident result is converted on the device and never read. So the loupe
+// fetches just its own window -- 15x15 samples, a few kilobytes -- rather than
+// the whole image, and only while it is switched on.
+void ImageViewPanel::DrawLoupe(Device& dev, Image& img, const ImVec2& mouse,
+                               const ImVec2& imgOrigin, float zoom, ImDrawList* dl) {
     if (zoom <= 1e-6f) return;
 
-    ImageView v = img.MapCpuRead();
-    if (!v.Valid()) return;
+    const ImageDesc& d = img.Desc();
+    if (!d.Valid()) return;
 
     // Which image pixel the cursor is over.
     const int cx = int((mouse.x - imgOrigin.x) / zoom);
     const int cy = int((mouse.y - imgOrigin.y) / zoom);
-    if (cx < 0 || cy < 0 || cx >= v.desc.width || cy >= v.desc.height) return;
+    if (cx < 0 || cy < 0 || cx >= d.width || cy >= d.height) return;
 
     // Odd, so there is a true centre pixel to put the crosshair on.
     constexpr int kSamples = 15;
     constexpr float kCell  = 12.0f;
     constexpr int kHalf    = kSamples / 2;
     const float side = kSamples * kCell;
+
+    // The window, clamped so it stays inside the image. `ox`/`oy` are its
+    // top-left in image space, which the sampling loop below indexes from.
+    const int ox = std::clamp(cx - kHalf, 0, std::max(0, d.width  - kSamples));
+    const int oy = std::clamp(cy - kHalf, 0, std::max(0, d.height - kSamples));
+    const int ow = std::min(kSamples, d.width  - ox);
+    const int oh = std::min(kSamples, d.height - oy);
+
+    // Either the region comes back from the GPU, or the image already has CPU
+    // pixels (a CPU-only stage). One of the two must work.
+    ImageView v{};
+    std::vector<uint8_t> region;
+    ImageDesc regionDesc = d;
+    if (m_gpuSrc) {
+        if (!GpuTexture::ReadRegion(dev, *m_gpuSrc, ox, oy, ow, oh, &region)) return;
+        regionDesc.width  = ow;
+        regionDesc.height = oh;
+        v.data = region.data();
+        v.desc = regionDesc;
+    } else {
+        v = img.MapCpuRead();
+        if (!v.Valid()) return;
+    }
+
+    // Sampling is relative to the region when one was fetched, and absolute
+    // otherwise -- this is the only difference between the two paths.
+    const int sampleOx = m_gpuSrc ? 0 : ox;
+    const int sampleOy = m_gpuSrc ? 0 : oy;
 
     // Placed away from the cursor so it does not cover what is being inspected,
     // and flipped near the panel edges so it stays on screen.
@@ -179,8 +218,8 @@ void ImageViewPanel::DrawLoupe(Image& img, const ImVec2& mouse, const ImVec2& im
 
     for (int j = 0; j < kSamples; ++j) {
         for (int i = 0; i < kSamples; ++i) {
-            const int sx = std::clamp(cx - kHalf + i, 0, v.desc.width - 1);
-            const int sy = std::clamp(cy - kHalf + j, 0, v.desc.height - 1);
+            const int sx = std::clamp(sampleOx + i, 0, v.desc.width - 1);
+            const int sy = std::clamp(sampleOy + j, 0, v.desc.height - 1);
 
             float rgb[3];
             SampleRgb(v, sx, sy, rgb);
@@ -194,13 +233,18 @@ void ImageViewPanel::DrawLoupe(Image& img, const ImVec2& mouse, const ImVec2& im
     }
 
     // Centre marker, drawn as an outline so it never hides the pixel it marks.
-    const ImVec2 c0(lx + kHalf * kCell, ly + kHalf * kCell);
+    // Where the cursor pixel actually landed in the window: near an edge the
+    // window is clamped inward, so it is no longer the middle cell.
+    const int markI = std::clamp(cx - ox, 0, kSamples - 1);
+    const int markJ = std::clamp(cy - oy, 0, kSamples - 1);
+    const ImVec2 c0(lx + markI * kCell, ly + markJ * kCell);
     dl->AddRect(c0, ImVec2(c0.x + kCell, c0.y + kCell), IM_COL32(255, 255, 0, 255), 0, 0, 2.0f);
 
     // The actual values. Float formats keep three decimals -- a raw image lives
     // in 0..1 and beyond, where "0.5" and "0.512" are meaningfully different.
     float centre[3];
-    SampleRgb(v, cx, cy, centre);
+    SampleRgb(v, std::clamp(sampleOx + markI, 0, v.desc.width - 1),
+              std::clamp(sampleOy + markJ, 0, v.desc.height - 1), centre);
     char buf[128];
     if (v.desc.format == Format::RGBA8)
         std::snprintf(buf, sizeof buf, "(%d, %d)  %d %d %d", cx, cy,

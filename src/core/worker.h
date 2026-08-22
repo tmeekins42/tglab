@@ -23,6 +23,7 @@
 
 #include "cancel.h"
 #include "compare.h"
+#include "image_stats.h"
 #include "pipeline.h"
 
 // Declared at global scope: writing `struct ID3D12Device*` inside namespace
@@ -57,6 +58,17 @@ struct ViewerImage {
     // cached stage -- display(src, ...) while a slider drives a later stage --
     // costs nothing per frame instead of a full readback and conversion.
     uint64_t    version = 0;
+
+    // Set when the result is still on the GPU and can be drawn from there.
+    // `image` is then a descriptor-only shell with no CPU pixels: no readback
+    // happened, which is the whole point.
+    //
+    // The compute context and ImGui share one device and compute images carry
+    // ALLOW_SIMULTANEOUS_ACCESS, so the UI's direct queue can sample this while
+    // the compute queue owns it. It holds its own reference, because the worker
+    // frees a stage's outputs on its own thread whenever the cache is replaced
+    // -- possibly while the UI is still drawing the previous frame from it.
+    std::shared_ptr<SharedGpuTexture> gpu;
 };
 
 struct PipelineOutcome {
@@ -68,6 +80,13 @@ struct PipelineOutcome {
     // Set when the job was a comparison rather than a normal run.
     bool                           isCompare = false;
     std::shared_ptr<CompareResult> compare;
+
+    // Histogram of the viewer named by SetHistogramViewer(), when the panel
+    // asked for one. Computed here rather than on the stats thread because the
+    // GPU context lives here and the pixels are already resident: measuring
+    // them where they are costs 4 KB of bins instead of an 84 MB readback.
+    bool        haveStats = false;
+    StatsResult stats;
 };
 
 class ComputeContext;
@@ -107,6 +126,14 @@ public:
     // Being a frame stale only means one extra clone just after a tab switch,
     // which the UI's version check then makes free.
     void SetVisibleViewers(std::vector<std::string> names);
+
+    // The viewer whose histogram the info panel wants, or "" for none.
+    //
+    // Computed on the worker because that is where the GPU context lives and
+    // where the pixels already are: BuildHistogram() reads 4 KB of bins instead
+    // of dragging the image back across the bus. Only one viewer is measured
+    // because the panel only ever shows one, and only when the panel is open.
+    void SetHistogramViewer(std::string name);
 
     // Runs the pipeline twice (CPU then GPU) and diffs the chosen stage.
     // Deliberately not coalesced with normal runs in the caller's mind: it is
@@ -154,6 +181,7 @@ private:
     // Guarded by m_mtx. Written by the UI, read by the worker when deciding
     // which viewers are worth cloning.
     std::vector<std::string>        m_visibleViewers;
+    std::string                     m_histViewer;
     uint64_t              m_nextSeq = 1;
     ID3D12Device*         m_device = nullptr;
 };

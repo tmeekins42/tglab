@@ -1,11 +1,89 @@
 #include "worker.h"
 
+#include <cmath>
 #include <chrono>
 
 #include "../gpu/compute.h"
 #include "../gpu/gpu_image.h"
 
 namespace tglab {
+namespace {
+
+// Turns GPU bins into the StatsResult the info panel draws.
+//
+// The statistics come from the bins rather than the pixels, exactly as the CPU
+// path computes them from algo_util/Histogram -- so mean, median and stddev are
+// bin-quantised in both, and the two agree.
+StatsResult StatsFromBins(const ComputeContext::HistogramResult& h,
+                          const ImageDesc& desc,
+                          std::string source, uint64_t version) {
+    constexpr int kBins = 256;
+
+    StatsResult s;
+    s.source  = std::move(source);
+    s.version = version;
+    s.valid   = true;
+
+    auto toFloat = [](const std::vector<uint32_t>& in, std::vector<float>* out) {
+        out->assign(in.size(), 0.0f);
+        for (size_t i = 0; i < in.size(); ++i) (*out)[i] = float(in[i]);
+    };
+    if (!h.r.empty()) { toFloat(h.r, &s.r); toFloat(h.g, &s.g); toFloat(h.b, &s.b); }
+    toFloat(h.luma, &s.luma);
+
+    const double span = h.rangeMax - h.rangeMin;
+    auto binValue = [&](int i) {
+        return h.rangeMin + (double(i) / double(kBins - 1)) * span;
+    };
+
+    const double n = double(h.count ? h.count : 1);
+
+    double sum = 0.0;
+    for (int i = 0; i < kBins && i < int(h.luma.size()); ++i)
+        sum += binValue(i) * double(h.luma[size_t(i)]);
+    s.mean = sum / n;
+
+    double var = 0.0;
+    for (int i = 0; i < kBins && i < int(h.luma.size()); ++i) {
+        const double d = binValue(i) - s.mean;
+        var += d * d * double(h.luma[size_t(i)]);
+    }
+    s.stddev = std::sqrt(var / n);
+
+    // Median by walking to the half-count bin, as Percentile() does.
+    {
+        const double target = n * 0.5;
+        double acc = 0.0;
+        s.median = binValue(0);
+        for (int i = 0; i < kBins && i < int(h.luma.size()); ++i) {
+            acc += double(h.luma[size_t(i)]);
+            if (acc >= target) { s.median = binValue(i); break; }
+        }
+    }
+
+    // The tallest interior bin scales the plot: the end bins collect
+    // everything clipped, so including them would flatten the curve.
+    float peak = 1.0f;
+    for (int i = 1; i + 1 < kBins && i < int(s.luma.size()); ++i)
+        peak = std::max(peak, s.luma[size_t(i)]);
+    s.peak = peak;
+
+    s.scale = (desc.format == Format::RGBA8) ? 255.0 : 1.0;
+
+    // Headroom above 1.0 exists only for a float image, and only when the
+    // capture actually had it. The bins span the observed range, so the top of
+    // that range is where to look.
+    s.maxValue    = h.rangeMax;
+    s.hasHeadroom = (s.scale == 1.0) && (h.rangeMax > 1.0001);
+
+    if (!h.luma.empty()) {
+        s.clipLow  = double(h.luma.front()) / n;
+        s.clipHigh = double(h.luma.back()) / n;
+    }
+    return s;
+}
+
+} // namespace
 
 void PipelineWorker::Start(ID3D12Device* device) {
     if (m_thread.joinable()) return;
@@ -70,6 +148,12 @@ void PipelineWorker::SetVisibleViewers(std::vector<std::string> names) {
     std::lock_guard<std::mutex> lock(m_mtx);
     m_visibleViewers = std::move(names);
 }
+
+void PipelineWorker::SetHistogramViewer(std::string name) {
+    std::lock_guard<std::mutex> lock(m_mtx);
+    m_histViewer = std::move(name);
+}
+
 bool PipelineWorker::TryFetch(PipelineOutcome* out) {
     std::lock_guard<std::mutex> lock(m_mtx);
     if (!m_result) return false;
@@ -218,8 +302,57 @@ void PipelineWorker::Run() {
                 uint64_t& ver = m_viewerVersions[vd.name];
                 if (changed || ver == 0) ++ver;
 
-                outcome->viewers.push_back(
-                    {vd.name, const_cast<Image&>(std::get<Image>(*d)).Clone(), ver});
+                const Image& result = std::get<Image>(*d);
+
+                // Still on the GPU: hand over a reference and do NOT read it
+                // back. Clone() would map the pixels, which is the 86 ms this
+                // whole path exists to avoid.
+                //
+                // A CPU-only result (a stage with no GPU kernel) has no shared
+                // texture, so it takes the clone as before -- both cases have
+                // to work, since a script can mix the two.
+                std::shared_ptr<SharedGpuTexture> shared = ShareGpuTexture(result);
+
+                ViewerImage vi;
+                vi.name    = vd.name;
+                vi.version = ver;
+                vi.gpu     = shared;
+                if (shared) {
+                    // Descriptor only. Anything that wants CPU pixels has to
+                    // ask the pipeline, not this shell.
+                    vi.image = Image(result.Desc());
+                } else {
+                    vi.image = const_cast<Image&>(result).Clone();
+                }
+                outcome->viewers.push_back(std::move(vi));
+            }
+
+            // The info panel's histogram, measured here while the pixels are
+            // still resident. Only the viewer the panel is showing, and only
+            // when it is open -- the panel draws one at a time.
+            std::string wantStats;
+            {
+                std::lock_guard<std::mutex> lock(m_mtx);
+                wantStats = m_histViewer;
+            }
+            if (haveGpu && !wantStats.empty()) {
+                for (const ViewerDecl& vd : job->pipe.Viewers()) {
+                    if (vd.name != wantStats) continue;
+                    const Data* d = job->pipe.Resolve(vd.source, &job->sources);
+                    if (!d || !std::holds_alternative<Image>(*d)) break;
+                    const Image& result = std::get<Image>(*d);
+                    const GpuResidency* g = result.RawGpu();
+                    if (!g || !g->image.Valid()) break;   // CPU-only stage
+
+                    ComputeContext::HistogramResult hr;
+                    std::string herr;
+                    if (gpu.BuildHistogram(g->image, &hr, &herr)) {
+                        outcome->stats = StatsFromBins(hr, result.Desc(), vd.name,
+                                                       m_viewerVersions[vd.name]);
+                        outcome->haveStats = true;
+                    }
+                    break;
+                }
             }
 
             prev     = std::move(job->pipe);

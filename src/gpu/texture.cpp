@@ -5,6 +5,8 @@
 #include <vector>
 
 #include "device.h"
+#include "gpu_image.h"
+#include "shader.h"
 
 namespace tglab {
 
@@ -56,7 +58,10 @@ bool GpuTexture::Create(Device& dev, const ImageDesc& d) {
     rd.Format           = DXGI_FORMAT_R8G8B8A8_UNORM;   // display format
     rd.SampleDesc.Count = 1;
     rd.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    rd.Flags            = D3D12_RESOURCE_FLAG_NONE;
+    // UNORDERED_ACCESS so the display conversion can write it from a compute
+    // shader. Without this the only way to fill it is a CPU upload, which means
+    // reading the result back first.
+    rd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
 
     if (FAILED(dev.Get()->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
                                                   D3D12_RESOURCE_STATE_COPY_DEST,
@@ -248,4 +253,356 @@ bool GpuTexture::Update(Device& dev, Image& img, uint64_t contentVersion) {
     return true;
 }
 
+
+namespace {
+
+// The format a compute SRV reads the source as. Mirrors ComputeContext's
+// mapping, but declared here so gpu/texture.cpp does not depend on the compute
+// context just for a switch.
+DXGI_FORMAT DisplaySrvFormat(Format f) {
+    switch (f) {
+        case Format::RGBA8:   return DXGI_FORMAT_R8G8B8A8_UNORM;
+        case Format::R32F:    return DXGI_FORMAT_R32_FLOAT;
+        case Format::RGBA32F: return DXGI_FORMAT_R32G32B32A32_FLOAT;
+        case Format::RGBA16F: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+        default:              return DXGI_FORMAT_UNKNOWN;
+    }
+}
+
+// The display conversion, run on the graphics queue.
+//
+// Whatever a stage produced -- half-float scene-linear, single-channel float,
+// or already-RGBA8 -- becomes the RGBA8 texture ImGui samples. Doing it here
+// rather than on the CPU is the whole point: the pixels never leave the device.
+//
+// The R32F branch normalises over a range supplied by the caller so that signed
+// data (a sobel gradient) is visible rather than clipped to black, matching
+// what the CPU path did.
+const char* kDisplayHlsl = R"(
+Texture2D<float4>   Src : register(t0);
+RWTexture2D<float4> Dst : register(u0);
+
+cbuffer Params : register(b0) {
+    uint Width;
+    uint Height;
+    uint Mode;      // 0 = pass through, 1 = single channel normalised
+    uint LoBits;
+    uint SpanBits;
+};
+
+[numthreads(8, 8, 1)]
+void main(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= Width || tid.y >= Height) return;
+    float4 c = Src[int2(tid.xy)];
+    if (Mode == 1) {
+        float lo   = asfloat(LoBits);
+        float span = asfloat(SpanBits);
+        float g = saturate((c.x - lo) / span);
+        Dst[tid.xy] = float4(g, g, g, 1.0);
+    } else {
+        Dst[tid.xy] = float4(saturate(c.rgb), 1.0);
+    }
+}
+)";
+
+// One pipeline shared by every view: they all run the same shader.
+struct DisplayPipeline {
+    ID3D12RootSignature* root = nullptr;
+    ID3D12PipelineState* pso  = nullptr;
+
+    // Non-shader-visible descriptors, so the table can be built per call
+    // without disturbing ImGui's own heap allocations.
+    ID3D12DescriptorHeap* heap = nullptr;
+    UINT stride = 0;
+    UINT cursor = 0;
+
+    bool valid = false;
+};
+
+DisplayPipeline g_display;
+
+constexpr UINT kDisplaySlots = 64;   // (SRV + UAV) per view, several views
+
+bool EnsureDisplayPipeline(Device& dev) {
+    if (g_display.valid) return true;
+
+    ShaderCompiler compiler;
+    if (!compiler.Init()) return false;
+
+    ShaderBlob blob;
+    std::string errors;
+    if (!compiler.CompileCompute(kDisplayHlsl, "main", "display_convert", &blob, &errors)) {
+        std::fprintf(stderr, "[display] shader: %s\n", errors.c_str());
+        compiler.Shutdown();
+        return false;
+    }
+
+    D3D12_DESCRIPTOR_RANGE ranges[2] = {};
+    ranges[0].RangeType          = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    ranges[0].NumDescriptors     = 1;
+    ranges[0].BaseShaderRegister = 0;
+    ranges[1].RangeType          = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    ranges[1].NumDescriptors     = 1;
+    ranges[1].BaseShaderRegister = 0;
+    ranges[1].OffsetInDescriptorsFromTableStart = 1;
+
+    D3D12_ROOT_PARAMETER params[2] = {};
+    params[0].ParameterType            = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[0].Constants.Num32BitValues = 8;
+    params[1].ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[1].DescriptorTable.NumDescriptorRanges = 2;
+    params[1].DescriptorTable.pDescriptorRanges   = ranges;
+
+    D3D12_ROOT_SIGNATURE_DESC rsd = {};
+    rsd.NumParameters = 2;
+    rsd.pParameters   = params;
+
+    ID3DBlob* sig = nullptr;
+    ID3DBlob* sigErr = nullptr;
+    if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1,
+                                           &sig, &sigErr))) {
+        if (sigErr) sigErr->Release();
+        compiler.Shutdown();
+        return false;
+    }
+    HRESULT hr = dev.Get()->CreateRootSignature(0, sig->GetBufferPointer(),
+                                                sig->GetBufferSize(),
+                                                IID_PPV_ARGS(&g_display.root));
+    sig->Release();
+    if (sigErr) sigErr->Release();
+    if (FAILED(hr)) { compiler.Shutdown(); return false; }
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature   = g_display.root;
+    pd.CS.pShaderBytecode = blob.dxil.data();
+    pd.CS.BytecodeLength  = blob.dxil.size();
+    if (FAILED(dev.Get()->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_display.pso)))) {
+        compiler.Shutdown();
+        return false;
+    }
+    compiler.Shutdown();
+
+    // Shader-visible: the table is bound for the dispatch.
+    D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+    hd.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    hd.NumDescriptors = kDisplaySlots;
+    hd.Flags          = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    if (FAILED(dev.Get()->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_display.heap))))
+        return false;
+
+    g_display.stride = dev.Get()->GetDescriptorHandleIncrementSize(
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    g_display.valid = true;
+    return true;
+}
+
+} // namespace
+
+void ReleaseDisplayPipeline() {
+    if (g_display.pso)  { g_display.pso->Release();  g_display.pso  = nullptr; }
+    if (g_display.root) { g_display.root->Release(); g_display.root = nullptr; }
+    if (g_display.heap) { g_display.heap->Release(); g_display.heap = nullptr; }
+    g_display.valid = false;
+}
+
+
+bool GpuTexture::ReadRegion(Device& dev, const SharedGpuTexture& src,
+                            int x, int y, int w, int h,
+                            std::vector<uint8_t>* outPixels) {
+    if (!src.res || w <= 0 || h <= 0) return false;
+
+    // Clamp to the image; the caller centres a window on the cursor, which
+    // runs off the edge whenever the cursor is near one.
+    x = std::clamp(x, 0, src.desc.width  - 1);
+    y = std::clamp(y, 0, src.desc.height - 1);
+    w = std::min(w, src.desc.width  - x);
+    h = std::min(h, src.desc.height - y);
+    if (w <= 0 || h <= 0) return false;
+
+    const UINT bpp      = UINT(BytesPerPixel(src.desc.format));
+    const UINT rowPitch = UINT(w) * bpp;
+    const UINT aligned  = (rowPitch + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) &
+                          ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+    const UINT64 total  = UINT64(aligned) * UINT64(h);
+
+    D3D12_HEAP_PROPERTIES hp = {};
+    hp.Type = D3D12_HEAP_TYPE_READBACK;
+
+    D3D12_RESOURCE_DESC bd = {};
+    bd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width            = total;
+    bd.Height           = 1;
+    bd.DepthOrArraySize = 1;
+    bd.MipLevels        = 1;
+    bd.Format           = DXGI_FORMAT_UNKNOWN;
+    bd.SampleDesc.Count = 1;
+    bd.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    ID3D12Resource* staging = nullptr;
+    if (FAILED(dev.Get()->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd,
+                                                  D3D12_RESOURCE_STATE_COPY_DEST,
+                                                  nullptr, IID_PPV_ARGS(&staging))))
+        return false;
+
+    // Its own command list and fence rather than the frame's: this has to
+    // complete before the pixels can be read, and the frame list is not
+    // submitted until EndFrame().
+    ID3D12CommandAllocator* alloc = nullptr;
+    ID3D12GraphicsCommandList* list = nullptr;
+    ID3D12Fence* fence = nullptr;
+    HANDLE evt = nullptr;
+    bool ok = false;
+
+    if (SUCCEEDED(dev.Get()->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                    IID_PPV_ARGS(&alloc))) &&
+        SUCCEEDED(dev.Get()->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc,
+                                               nullptr, IID_PPV_ARGS(&list))) &&
+        SUCCEEDED(dev.Get()->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) {
+        evt = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+
+        D3D12_TEXTURE_COPY_LOCATION d = {};
+        d.pResource                          = staging;
+        d.Type                               = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        d.PlacedFootprint.Footprint.Format   = DisplaySrvFormat(src.desc.format);
+        d.PlacedFootprint.Footprint.Width    = UINT(w);
+        d.PlacedFootprint.Footprint.Height   = UINT(h);
+        d.PlacedFootprint.Footprint.Depth    = 1;
+        d.PlacedFootprint.Footprint.RowPitch = aligned;
+
+        D3D12_TEXTURE_COPY_LOCATION s = {};
+        s.pResource = src.res;
+        s.Type      = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+
+        // The source carries ALLOW_SIMULTANEOUS_ACCESS, so it can be copied
+        // from on this queue without transitioning it away from the compute
+        // queue that owns it.
+        const D3D12_BOX box = {UINT(x), UINT(y), 0, UINT(x + w), UINT(y + h), 1};
+        list->CopyTextureRegion(&d, 0, 0, 0, &s, &box);
+
+        if (SUCCEEDED(list->Close())) {
+            ID3D12CommandList* lists[] = {list};
+            dev.Queue()->ExecuteCommandLists(1, lists);
+            dev.Queue()->Signal(fence, 1);
+            if (fence->GetCompletedValue() < 1 && evt) {
+                fence->SetEventOnCompletion(1, evt);
+                // Bounded: a hung copy must not park the UI thread forever.
+                WaitForSingleObject(evt, 2000);
+            }
+
+            void* mapped = nullptr;
+            D3D12_RANGE readAll = {0, SIZE_T(total)};
+            if (SUCCEEDED(staging->Map(0, &readAll, &mapped))) {
+                outPixels->resize(size_t(rowPitch) * size_t(h));
+                for (int row = 0; row < h; ++row)
+                    std::memcpy(outPixels->data() + size_t(row) * rowPitch,
+                                static_cast<const uint8_t*>(mapped) + size_t(row) * aligned,
+                                rowPitch);
+                staging->Unmap(0, nullptr);
+                ok = true;
+            }
+        }
+    }
+
+    if (evt)     CloseHandle(evt);
+    if (fence)   fence->Release();
+    if (list)    list->Release();
+    if (alloc)   alloc->Release();
+    staging->Release();
+    return ok;
+}
+bool GpuTexture::UpdateFromGpu(Device& dev, const SharedGpuTexture& src,
+                               uint64_t contentVersion) {
+    if (!src.res || !src.desc.Valid()) return false;
+
+    const bool recreated = (!m_res || m_desc.width != src.desc.width ||
+                            m_desc.height != src.desc.height);
+    if (recreated && !Create(dev, src.desc)) return false;
+
+    // Nothing changed since the last upload: the common case once the pipeline
+    // is idle, and what keeps a static frame free.
+    if (!recreated && contentVersion == m_version) return true;
+    m_version = contentVersion;
+
+    if (!EnsureDisplayPipeline(dev)) return false;
+
+    ID3D12GraphicsCommandList* cl = dev.CurrentCommandList();
+    if (!cl) return false;
+
+    // A slice per call, wrapping. Descriptors are consumed when the list
+    // executes, so two views sharing slot 0 within a frame would both sample
+    // whichever was written last -- the same trap as batched compute
+    // dispatches.
+    if (g_display.cursor + 2 > kDisplaySlots) g_display.cursor = 0;
+    const UINT slot = g_display.cursor;
+    g_display.cursor += 2;
+
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu0 =
+        g_display.heap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu0 =
+        g_display.heap->GetGPUDescriptorHandleForHeapStart();
+    D3D12_CPU_DESCRIPTOR_HANDLE srvCpu{cpu0.ptr + SIZE_T(slot) * g_display.stride};
+    D3D12_CPU_DESCRIPTOR_HANDLE uavCpu{cpu0.ptr + SIZE_T(slot + 1) * g_display.stride};
+    D3D12_GPU_DESCRIPTOR_HANDLE tableGpu{gpu0.ptr + SIZE_T(slot) * g_display.stride};
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+    sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sd.Format                  = DisplaySrvFormat(src.desc.format);
+    sd.ViewDimension           = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sd.Texture2D.MipLevels     = 1;
+    if (sd.Format == DXGI_FORMAT_UNKNOWN) return false;
+    dev.Get()->CreateShaderResourceView(src.res, &sd, srvCpu);
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC ud = {};
+    ud.Format        = DXGI_FORMAT_R8G8B8A8_UNORM;
+    ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    dev.Get()->CreateUnorderedAccessView(m_res, nullptr, &ud, uavCpu);
+
+    // The display texture sits in PIXEL_SHADER_RESOURCE for ImGui between
+    // frames (or COPY_DEST when freshly created), and has to become a UAV to be
+    // written.
+    D3D12_RESOURCE_BARRIER b = {};
+    b.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource   = m_res;
+    b.Transition.StateBefore = m_freshlyCreated
+                                   ? D3D12_RESOURCE_STATE_COPY_DEST
+                                   : D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    b.Transition.StateAfter  = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    cl->ResourceBarrier(1, &b);
+    m_freshlyCreated = false;
+
+    ID3D12DescriptorHeap* heaps[] = {g_display.heap};
+    cl->SetDescriptorHeaps(1, heaps);
+    cl->SetComputeRootSignature(g_display.root);
+    cl->SetPipelineState(g_display.pso);
+
+    auto bits = [](float f) { uint32_t u; std::memcpy(&u, &f, sizeof(u)); return u; };
+    uint32_t roots[8] = {};
+    roots[0] = uint32_t(src.desc.width);
+    roots[1] = uint32_t(src.desc.height);
+    roots[2] = (src.desc.format == Format::R32F) ? 1u : 0u;
+    // A single-channel result is normalised over 0..1 here rather than over its
+    // own min/max: finding the true range would need a reduction pass, and the
+    // CPU path only had one because it already held every pixel.
+    roots[3] = bits(0.0f);
+    roots[4] = bits(1.0f);
+    cl->SetComputeRoot32BitConstants(0, 8, roots, 0);
+    cl->SetComputeRootDescriptorTable(1, tableGpu);
+
+    cl->Dispatch(UINT((src.desc.width + 7) / 8), UINT((src.desc.height + 7) / 8), 1);
+
+    // Back to a shader resource for ImGui to sample this frame.
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    b.Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    cl->ResourceBarrier(1, &b);
+
+    // Restore ImGui's heap. Binding is command-list state, not per-dispatch, so
+    // leaving mine set makes every later ImGui draw reference handles from a
+    // heap that is no longer bound -- which the debug layer reports as
+    // "descriptor heap ... is different from currently set descriptor heap",
+    // and which crashes the app outright.
+    ID3D12DescriptorHeap* uiHeap = dev.Srv().Heap();
+    cl->SetDescriptorHeaps(1, &uiHeap);
+    return true;
+}
 } // namespace tglab

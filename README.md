@@ -411,6 +411,32 @@ being algorithms themselves. Currently:
   `ValueScale()` reports 255 or 1 so a parameter expressed as a fraction of the
   intensity range means the same thing whatever the source format.
 
+`ComputeContext::BuildHistogram()` is the same thing on the GPU, used by the
+info panel. Two dispatches — an order-preserving float-to-uint min/max, then
+atomic binning — and only the bins come back: 4 KB rather than the whole image.
+It is checked bin-for-bin against `Histogram` for all three formats.
+
+**A follow-up worth taking:** `threshold_otsu`, `threshold_triangle` and
+`threshold_isodata` have no GPU path today, and the histogram is precisely why.
+Plain `threshold` has a kernel because its level is a parameter passed as a
+constant; the automatic variants must *derive* the level from a histogram
+first, which pins the whole algorithm to the CPU and drags a full-resolution
+image back across the bus to pick a single number.
+
+With `BuildHistogram()` they become: build on the GPU, read back 4 KB, run
+Otsu on those 256 bins (microseconds), then dispatch the *existing* threshold
+kernel with the level as a constant. Two things to settle first, which is why
+it is not done here: the display histogram subsamples to ~262k pixels, and
+whether Otsu on a sample picks the same level as Otsu on every pixel needs
+measuring rather than assuming (the stride is already a shader constant, so
+forcing it to 1 is a one-line change with a cost). And the level has to reach
+the CPU between the two dispatches, so such a stage cannot batch with its
+neighbours the way a pure kernel does.
+
+`median_blur` also uses a histogram but gains nothing here: it maintains a
+sliding window histogram per pixel, which is a different algorithm from binning
+one image once.
+
 ### Photographic adjustments
 
 `basic_adjust` is the standard raw-developer control set — temperature, tint,
@@ -515,9 +541,43 @@ this" is not something that side can know — and once an image is CPU-resident
 the clone is a memcpy, since the expensive parts were the readback and the
 conversion, both of which the version check skips.
 
-Still on the table: displaying straight from the GPU texture. The compute
-context and ImGui share a device, so the readback is avoidable — it is just a
-larger change than the two above.
+The readback is now gone too, which removes the last of it. The compute context
+and ImGui share one `ID3D12Device`, and compute images already carried
+`ALLOW_SIMULTANEOUS_ACCESS`, so the UI's direct queue can sample the worker's
+texture while the compute queue owns it — no copy and no cross-queue
+transition. The header said this was the plan in M3; it was simply never wired
+through to the viewers.
+
+So a result that is still on the device is handed to the UI as a reference
+rather than a copy, and the display conversion becomes a compute dispatch that
+writes the RGBA8 texture ImGui samples. Per viewer, per frame, at 5634×3752:
+
+| | originally | after the table | now |
+|---|---|---|---|
+| readback | 86 ms | 86 ms | **0** |
+| RGBA8 conversion | 323 ms | 47 ms | **0** (a dispatch) |
+| histogram | (rode on the readback) | | ~1 ms |
+
+Lifetime is the part that needs care. The worker frees a stage's outputs on its
+own thread whenever the cache is replaced, possibly while the UI is still
+drawing the previous frame from one — so the shared texture holds its own
+reference rather than relying on the device's deferred-release list, which is a
+UI-thread facility.
+
+Two things still need real CPU pixels, and both are handled rather than
+regressed. The **histogram** is measured on the GPU (above) and only its bins
+come back. The **1:1 loupe** genuinely needs the numbers — it point-samples
+individual pixels and prints their values — so it reads back just its own 15×15
+window, a few kilobytes, and only while it is switched on. A CPU-only stage has
+no shared texture at all and takes the original path, so a script mixing the two
+works.
+
+**A trap worth recording:** the conversion binds its own descriptor heap, and
+descriptor-heap binding is command-list state rather than per-dispatch. Leaving
+it bound made every later ImGui draw reference handles from a heap that was no
+longer set — the debug layer says "descriptor heap … is different from currently
+set descriptor heap", and the app crashes. Restoring ImGui's heap afterwards is
+the whole fix. It only reproduced in Debug; the Release build ran happily.
 
 ### Filters
 
