@@ -57,10 +57,49 @@ inline float LinearToSrgb(float c) {
                              : 1.055f * std::pow(c, 1.0f / 2.4f) - 0.055f;
 }
 
+// Scene-linear input (a demosaiced raw) is ALREADY linear, so the transfer
+// functions must not be applied to it -- and its values must not be clamped on
+// write. Both of those were being done unconditionally, which decoded linear
+// data as though it were gamma-encoded and then threw away every value above
+// 1.0. On a bright frame that is most of a stop of highlight detail: measured
+// 1.77 coming out of the demosaic, clamped to 0.9995 on the way out.
+//
+// The linear path stays linear end to end. Whatever displays or writes the
+// image applies a transfer function at that point, which is where it belongs.
+inline float DecodeIn(float c, bool linear) {
+    return linear ? c : SrgbToLinear(c);
+}
+
+inline float EncodeOut(float c, bool linear) {
+    // No clamp on the linear path -- the headroom is the point.
+    return linear ? std::max(c, 0.0f) : LinearToSrgb(c);
+}
+
 // Rec. 709 luminance, matching the primaries the image is already in.
 inline float Luma(float r, float g, float b) {
     return 0.2126f * r + 0.7152f * g + 0.0722f * b;
 }
+
+// Where the highlight band tops out for scene-linear input.
+//
+// NOT the image's peak, and not 1.0. Measured across six raws from two bodies,
+// peak *luminance* after demosaic ran 0.25 to 0.75 -- every one of them below
+// the 1.0 the band previously assumed, so their highlights sat in the band's
+// dead zone and the slider did nothing. That is the "ranges are too small"
+// symptom: the control was fine, the band it drove was pitched for
+// gamma-encoded data.
+//
+// Deliberately a constant rather than per-image: a peak-relative band would
+// mean something different on every frame, so the same slider position would
+// give different results shot to shot. Pitched here, a highlight at 0.35 gets
+// partial correction and anything at or above 0.7 gets the full amount, which
+// covers the observed range with room above it.
+//
+// Note that a single saturated *channel* is not a bright pixel: one frame here
+// peaks at 1.82 in blue while its luminance never exceeds 0.25. That is a
+// colour clip, not a blown highlight, and a luminance-driven band correctly
+// leaves it alone.
+constexpr float kLinearShoulder = 0.70f;
 
 // A smooth 0..1 window used to target a tonal band without a hard edge, which
 // would show as banding on a gradient.
@@ -90,6 +129,23 @@ public:
 
         const int w = m_in.Width(), h = m_in.Height(), ch = m_in.Channels();
         const float scale = m_in.ValueScale();
+        const bool  linear = src.desc.linear;
+
+        // Where the highlight band tops out.
+        //
+        // For gamma-encoded input this is 1.0, the definitional maximum. For
+        // scene-linear input it is NOT the image's peak: three frames from the
+        // same camera measured peaks of 0.39, 0.86 and 1.06, so a
+        // peak-relative band would mean something different on every shot and
+        // the slider would behave differently frame to frame.
+        //
+        // kLinearShoulder instead marks where highlights *begin* in linear
+        // light -- above middle grey, around a stop under diffuse white. The
+        // band saturates there and stays saturated for everything brighter, so
+        // detail at 1.8 gets the full correction rather than being lumped in
+        // with detail at 1.0. That is what makes highlight recovery reach the
+        // headroom a raw actually carries.
+        const float white = linear ? kLinearShoulder : 1.0f;
 
         // White balance gains, derived once rather than per pixel.
         float wbR = 1.0f, wbG = 1.0f, wbB = 1.0f;
@@ -105,21 +161,21 @@ public:
                 // grey so the tonal controls still work.
                 float r, g, b;
                 if (ch == 1) {
-                    r = g = b = SrgbToLinear(p[0] / scale);
+                    r = g = b = DecodeIn(p[0] / scale, linear);
                 } else {
-                    r = SrgbToLinear(p[0] / scale);
-                    g = SrgbToLinear(p[1] / scale);
-                    b = SrgbToLinear(p[2] / scale);
+                    r = DecodeIn(p[0] / scale, linear);
+                    g = DecodeIn(p[1] / scale, linear);
+                    b = DecodeIn(p[2] / scale, linear);
                 }
 
-                Apply(&r, &g, &b, wbR, wbG, wbB, expGain);
+                Apply(&r, &g, &b, wbR, wbG, wbB, expGain, white);
 
                 if (ch == 1) {
-                    m_out.Set(x, y, 0, LinearToSrgb(Luma(r, g, b)) * scale);
+                    m_out.Set(x, y, 0, EncodeOut(Luma(r, g, b), linear) * scale);
                 } else {
-                    m_out.Set(x, y, 0, LinearToSrgb(r) * scale);
-                    m_out.Set(x, y, 1, LinearToSrgb(g) * scale);
-                    m_out.Set(x, y, 2, LinearToSrgb(b) * scale);
+                    m_out.Set(x, y, 0, EncodeOut(r, linear) * scale);
+                    m_out.Set(x, y, 1, EncodeOut(g, linear) * scale);
+                    m_out.Set(x, y, 2, EncodeOut(b, linear) * scale);
                     if (ch == 4) m_out.Set(x, y, 3, p[3]);
                 }
             }
@@ -147,6 +203,8 @@ cbuffer Params : register(b0) {
     uint  Highlights, Shadows;
     uint  Whites, Blacks;
     uint  Vibrance, Saturation;
+    uint  Linear;               // 1 = scene-linear input: no transfer, no clamp
+    uint  HighlightTop;         // top of the highlight band (1.0 unless linear)
 };
 
 static const float3 kLumaW = float3(0.2126, 0.7152, 0.0722);
@@ -169,7 +227,9 @@ void main(uint3 tid : SV_DispatchThreadID) {
     if (tid.x >= Width || tid.y >= Height) return;
 
     float4 texel = Src[int2(tid.xy)];
-    float3 c = SrgbToLinear(texel.rgb);
+
+    // Scene-linear input is already linear -- decoding it again would be wrong.
+    float3 c = (Linear != 0) ? texel.rgb : SrgbToLinear(texel.rgb);
 
     // --- white balance ---
     c *= float3(asfloat(WbR), asfloat(WbG), asfloat(WbB));
@@ -184,8 +244,11 @@ void main(uint3 tid : SV_DispatchThreadID) {
 
     float hi = asfloat(Highlights);
     if (abs(hi) > 1e-4) {
-        float w = SmoothBand(lum, 0.35, 1.0);
-        c *= (1.0 + hi * w);
+        float wp = asfloat(HighlightTop);
+        float w = SmoothBand(lum, 0.35, wp);
+        // Floored: see the CPU path -- at full weight this reaches exactly 0
+        // for hi = -1 and erases the highlights instead of recovering them.
+        c *= max(1.0 + hi * w, 0.15);
     }
     float sh = asfloat(Shadows);
     if (abs(sh) > 1e-4) {
@@ -219,7 +282,10 @@ void main(uint3 tid : SV_DispatchThreadID) {
     }
     if (abs(sat) > 1e-4) c = lerp(lum.xxx, c, 1.0 + sat);
 
-    Dst[tid.xy] = float4(LinearToSrgb(max(c, 0.0)), texel.a);
+    // On the linear path the values stay linear AND unclamped: the headroom
+    // above 1.0 is exactly what the highlight controls need to recover.
+    c = max(c, 0.0);
+    Dst[tid.xy] = float4((Linear != 0) ? c : LinearToSrgb(c), texel.a);
 }
 )";
     }
@@ -238,7 +304,15 @@ void main(uint3 tid : SV_DispatchThreadID) {
                 bits(float(m_contrast)),
                 bits(float(m_highlights)), bits(float(m_shadows)),
                 bits(float(m_whites)),     bits(float(m_blacks)),
-                bits(float(m_vibrance)),   bits(float(m_saturation))};
+                bits(float(m_vibrance)),   bits(float(m_saturation)),
+                uint32_t(m_linear ? 1 : 0), bits(m_white)};
+    }
+
+    // HasGPU() is consulted before PrepareGpu(), so this is where the input
+    // descriptor first becomes available -- the GPU path never calls RunCPU().
+    void PrepareGpu(const std::vector<ImageDesc>& inputs) override {
+        m_linear = !inputs.empty() && inputs[0].linear;
+        m_white  = m_linear ? kLinearShoulder : 1.0f;
     }
 
 private:
@@ -275,11 +349,14 @@ private:
             *b /= lum;
         }
     }
-
     // The CPU path, matching the shader step for step. Kept in sync because
     // compare mode checks one against the other.
+    //
+    // `white` is where the highlight band tops out; see kLinearShoulder and
+    // the caller for why it is not 1.0 on scene-linear input.
+    // symptom: not the slider, the band it drives.
     void Apply(float* rr, float* gg, float* bb,
-               float wbR, float wbG, float wbB, float expGain) const {
+               float wbR, float wbG, float wbB, float expGain, float white) const {
         float r = *rr * wbR * expGain;
         float g = *gg * wbG * expGain;
         float b = *bb * wbB * expGain;
@@ -288,8 +365,13 @@ private:
 
         const float hi = float(m_highlights);
         if (std::abs(hi) > 1e-4f) {
-            const float w = SmoothBand(lum, 0.35f, 1.0f);
-            const float k = 1.0f + hi * w;
+            const float w = SmoothBand(lum, 0.35f, white);
+            // Floored well above zero: at full weight, k = 1 + hi*w reaches
+            // exactly 0 for hi = -1, wiping highlights to black rather than
+            // recovering them. Harmless on 8-bit input, where the band seldom
+            // reached full weight, but reachable on scene-linear data, where
+            // it now does. -1 means "pull hard", not "erase".
+            const float k = std::max(1.0f + hi * w, 0.15f);
             r *= k; g *= k; b *= k;
         }
         const float sh = float(m_shadows);
@@ -396,6 +478,9 @@ private:
         this, "saturation", 0.0f, -1.0f, 1.0f,
         {.help = "Colour intensity, applied evenly. -1 is fully greyscale.",
          .step = 0.01, .softMin = -1.0, .softMax = 1.0}};
+
+    bool  m_linear = false;   // set by PrepareGpu from the input descriptor
+    float m_white  = 1.0f;
 
     PixelBuffer m_in, m_out;
 };

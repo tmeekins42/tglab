@@ -94,6 +94,21 @@ struct ImageDesc {
                        0.0f, 1.0f, 0.0f,
                        0.0f, 0.0f, 1.0f};
 
+    // True when the pixels are scene-linear with real headroom above 1.0,
+    // rather than gamma-encoded and bounded to 0..1.
+    //
+    // This is the difference between a demosaiced raw and a JPEG, and it
+    // decides two things: whether a tonal algorithm should apply the sRGB
+    // transfer functions at all (applying them to linear data is simply wrong),
+    // and whether it may clamp on write (clamping a raw discards the highlight
+    // headroom that made shooting raw worthwhile).
+    //
+    // A flag rather than inferring from `format`: RGBA16F happens to mean
+    // linear today because only the demosaicers produce it, but the first
+    // algorithm that emits half-float gamma-encoded data would break that
+    // inference silently.
+    bool linear = false;
+
     bool operator==(const ImageDesc&) const = default;
     size_t SizeInBytes() const;
     bool   Valid() const { return width > 0 && height > 0 && format != Format::Unknown; }

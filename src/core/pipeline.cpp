@@ -176,8 +176,17 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
             // demosaicing -- and leaving the CFA metadata set would make a
             // finished image claim to still need it, so a second demosaic in
             // the chain would happily mangle it.
-            if (base.IsMosaic() && d.format != Format::R32F)
+            if (base.IsMosaic() && d.format != Format::R32F) {
                 d.cfa = CfaPattern::None;
+
+                // ...and what comes out is scene-linear. A demosaic converts
+                // sensor counts to linear RGB; it never applies a transfer
+                // function, so the result carries headroom above 1.0 wherever
+                // the white-balance gains pushed a channel past saturation.
+                // Tonal algorithms downstream need to know not to gamma-decode
+                // it and not to clamp it.
+                d.linear = true;
+            }
             if (!d.Valid()) {
                 *err = "line " + std::to_string(s.line) + ": '" + s.algoName +
                        "' could not determine output size";

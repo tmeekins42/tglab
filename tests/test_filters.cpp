@@ -430,6 +430,143 @@ int main() {
         }
     }
 
+
+    // --- basic_adjust on scene-linear input ---------------------------------
+    //
+    // A demosaiced raw is scene-linear with real headroom above 1.0, which is
+    // a different kind of image from the RGBA8 the controls were written
+    // against. Two things went wrong and neither is visible on 8-bit input:
+    //
+    //   1. The sRGB transfer functions were applied unconditionally, decoding
+    //      already-linear data as though it were gamma-encoded, and the encode
+    //      on the way out clamped to 1.0 -- discarding every value above it.
+    //      Measured on a real CR2, a peak of 1.77 came out as 0.9995.
+    //
+    //   2. The highlight band ran to a hardcoded 1.0. Measured across six raws
+    //      from two bodies, peak luminance after demosaic ran 0.25 to 0.75, so
+    //      on every one of them the band never engaged and the highlights
+    //      slider did nothing. This is the "ranges are too small" report: the
+    //      control was fine, the band was pitched for gamma-encoded data.
+    {
+        // Scene-linear, flagged as such, with a highlight above 1.0 that only
+        // survives if nothing clamps -- the case that matters and that an
+        // RGBA8 fixture structurally cannot express.
+        auto makeLinear = []() {
+            ImageDesc d{32, 32, Format::RGBA16F};
+            d.linear = true;
+            Image img;
+            img.Alloc(d);
+            ImageView v = img.MapCpuWrite();
+            for (int y = 0; y < 32; ++y)
+                for (int x = 0; x < 32; ++x) {
+                    // Top third genuinely blown (1.4), middle a highlight
+                    // inside the band (0.6), bottom a midtone (0.2).
+                    const float lum = (y < 11) ? 1.4f : (y < 22 ? 0.6f : 0.2f);
+                    uint16_t* p = v.At<uint16_t>(x, y);
+                    for (int c = 0; c < 3; ++c) p[c] = FloatToHalf(lum);
+                    p[3] = FloatToHalf(1.0f);
+                }
+            return img;
+        };
+
+        auto bandMax = [](Image& img, int y0, int y1) {
+            ImageView v = img.MapCpuRead();
+            float hi = 0.0f;
+            for (int y = y0; y < y1; ++y)
+                for (int x = 0; x < 32; ++x)
+                    hi = std::max(hi, HalfToFloat(v.At<uint16_t>(x, y)[0]));
+            return double(hi);
+        };
+
+        Image out;
+        std::string err;
+
+        // Defaults must be identity on a linear image, headroom included. This
+        // is the check that fails when the transfer functions are applied to
+        // linear data: 1.4 came back as 0.9995.
+        if (RunFilter("basic_adjust", makeLinear(), {}, &out, &err)) {
+            Check(std::abs(bandMax(out, 0, 11) - 1.4) < 0.01,
+                  "linear input: defaults preserve headroom above 1.0 (got " +
+                      std::to_string(bandMax(out, 0, 11)) + ", want 1.4)");
+            Check(std::abs(bandMax(out, 22, 32) - 0.2) < 0.01,
+                  "linear input: defaults leave midtones alone");
+        } else {
+            Check(false, "basic_adjust runs on linear input: " + err);
+        }
+
+        // Pulling highlights down must actually reach the blown region. This
+        // is the check that fails when the band tops out at 1.0.
+        if (RunFilter("basic_adjust", makeLinear(), {{"highlights", -1.0}}, &out, &err)) {
+            const double blown = bandMax(out, 0, 11);
+            // Bounded on BOTH sides: it must come down, but a control that
+            // drives the region to black is not recovering anything. The first
+            // version of this check only tested blown < 1.0, and passed while
+            // the value was exactly 0.
+            Check(blown < 1.0 && blown > 0.1,
+                  "linear input: highlights -1 recovers detail rather than erasing it"
+                  " (1.4 -> " + std::to_string(blown) + ")");
+            Check(std::abs(bandMax(out, 22, 32) - 0.2) < 0.02,
+                  "linear input: highlights -1 leaves midtones alone (got " +
+                      std::to_string(bandMax(out, 22, 32)) + ")");
+        } else {
+            Check(false, "basic_adjust highlights on linear input: " + err);
+        }
+
+        // The band pitch, isolated. Real raws mostly do NOT peak above 1.0 --
+        // measured across six files, peak luminance ran 0.25 to 0.75 -- so the
+        // case that matters is a highlight *below* 1.0 that the old band, which
+        // ran from 0.35 to a hardcoded 1.0, barely engaged with. A fixture that
+        // peaks above 1.0 cannot tell the two bands apart, because it clears
+        // the old shoulder as well.
+        auto makeDim = []() {
+            ImageDesc d{32, 32, Format::RGBA16F};
+            d.linear = true;
+            Image img;
+            img.Alloc(d);
+            ImageView v = img.MapCpuWrite();
+            for (int y = 0; y < 32; ++y)
+                for (int x = 0; x < 32; ++x) {
+                    // 0.7 is a highlight in a scene-linear raw, and is exactly
+                    // where the old band's weight was still only ~0.4.
+                    const float lum = (y < 16) ? 0.7f : 0.2f;
+                    uint16_t* p = v.At<uint16_t>(x, y);
+                    for (int c = 0; c < 3; ++c) p[c] = FloatToHalf(lum);
+                    p[3] = FloatToHalf(1.0f);
+                }
+            return img;
+        };
+
+        if (RunFilter("basic_adjust", makeDim(), {{"highlights", -1.0}}, &out, &err)) {
+            const double hl = bandMax(out, 0, 16);
+            // Computed, not guessed. At lum 0.7 with the band toe at 0.35:
+            // the old 1.0 shoulder gives weight 0.558, so k = 0.442 and the
+            // result is 0.310. The 0.70 shoulder gives weight 1.0, k floors at
+            // 0.15, and the result is 0.105. 0.20 separates them cleanly.
+            Check(hl < 0.20,
+                  "linear input: highlights reach a sub-1.0 highlight (0.7 -> " +
+                      std::to_string(hl) + ")");
+            Check(std::abs(bandMax(out, 16, 32) - 0.2) < 0.02,
+                  "linear input: a sub-1.0 pull still leaves midtones alone");
+        } else {
+            Check(false, "basic_adjust on a dim linear image: " + err);
+        }
+
+        // Gamma-encoded input must be unaffected by all of the above: the sRGB
+        // path still applies and the band still tops out at 1.0.
+        Image srgb;
+        if (RunFilter("basic_adjust", MakeEdgeImage(false), {}, &srgb, &err)) {
+            Image again;
+            if (RunFilter("basic_adjust", MakeEdgeImage(false), {}, &again, &err)) {
+                ImageView a = srgb.MapCpuRead(), b = again.MapCpuRead();
+                double worst = 0.0;
+                for (int y = 0; y < a.desc.height; ++y)
+                    for (int x = 0; x < a.desc.width; ++x)
+                        worst = std::max(worst, std::abs(double(a.At<uint8_t>(x, y)[0]) -
+                                                         double(b.At<uint8_t>(x, y)[0])));
+                Check(worst < 1.0, "gamma-encoded input still takes the sRGB path unchanged");
+            }
+        }
+    }
     // --- basic_adjust: each control does what its help text claims -----------
     //
     // Ten controls fused into one kernel means a mistake in any of them is

@@ -644,6 +644,86 @@ static void TestGpuAgreement(ID3D12Device* dev) {
     }
 }
 
+
+// basic_adjust on SCENE-LINEAR input, CPU against GPU.
+//
+// The table-driven agreement test above cannot reach this: its fixture is
+// RGBA8, so it only ever exercises the gamma-encoded branch. The linear branch
+// skips the sRGB transfer functions, skips the output clamp, and pitches the
+// highlight band differently -- three divergences between the two paths that
+// nothing else checks, and the GPU path never calls RunCPU() to fall back on.
+static void TestLinearAdjustAgreement(ID3D12Device* dev) {
+    Section("basic_adjust on linear input: CPU vs GPU");
+
+    ComputeContext gpu;
+    if (!gpu.Init(dev) || !gpu.Ready()) { Check(false, "compute context initialises"); return; }
+
+    auto make = []() {
+        ImageDesc d{64, 64, Format::RGBA16F};
+        d.linear = true;
+        Image img;
+        img.Alloc(d);
+        ImageView v = img.MapCpuWrite();
+        for (int y = 0; y < 64; ++y)
+            for (int x = 0; x < 64; ++x) {
+                // Blown, highlight, and midtone bands, slightly tinted so the
+                // colour controls have something to act on.
+                const float lum = (y < 21) ? 1.4f : (y < 42 ? 0.7f : 0.2f);
+                uint16_t* p = v.At<uint16_t>(x, y);
+                p[0] = FloatToHalf(lum * 1.1f);
+                p[1] = FloatToHalf(lum);
+                p[2] = FloatToHalf(lum * 0.9f);
+                p[3] = FloatToHalf(1.0f);
+            }
+        return img;
+    };
+
+    auto run = [&](ExecMode mode, Image* out, std::string* err) {
+        auto algo = Registry::Get().Create("basic_adjust");
+        if (!algo) { *err = "no basic_adjust"; return false; }
+        for (ParamBase* p : algo->Params()) {
+            const std::string n = p->Name();
+            if (n == "exposure")   p->SetFromScript(Value(0.5),  err);
+            if (n == "shadows")    p->SetFromScript(Value(0.4),  err);
+            if (n == "saturation") p->SetFromScript(Value(0.3),  err);
+        }
+        Pipeline pipe;
+        std::vector<Data> src;
+        src.push_back(Data{make()});
+        pipe.AddStage(std::move(algo), "basic_adjust", {{-1, 0}}, 1, 1);
+        if (!pipe.Execute(&src, nullptr, err, &gpu, mode)) return false;
+        *out = const_cast<Image&>(std::get<Image>(*pipe.Resolve({0, 0}, &src))).Clone();
+        return true;
+    };
+
+    Image cpuImg, gpuImg;
+    std::string err;
+    if (!run(ExecMode::ForceCPU, &cpuImg, &err)) { Check(false, "ForceCPU runs: " + err); return; }
+    if (!run(ExecMode::ForceGPU, &gpuImg, &err)) { Check(false, "ForceGPU runs: " + err); return; }
+
+    ImageView a = cpuImg.MapCpuRead();
+    ImageView b = gpuImg.MapCpuRead();
+    double worst = 0.0, cpuPeak = 0.0;
+    for (int y = 0; y < 64; ++y)
+        for (int x = 0; x < 64; ++x)
+            for (int c = 0; c < 3; ++c) {
+                const double av = HalfToFloat(a.At<uint16_t>(x, y)[c]);
+                const double bv = HalfToFloat(b.At<uint16_t>(x, y)[c]);
+                worst = std::max(worst, std::abs(av - bv));
+                cpuPeak = std::max(cpuPeak, av);
+            }
+
+    Check(worst < 0.005,
+          "linear basic_adjust: GPU matches CPU (worst " + std::to_string(worst) + ")");
+
+    // Guards against both paths being wrong together. Highlights is left at its
+    // default here on purpose: pulling it would legitimately bring the peak
+    // below 1.0, and then the check could not distinguish "recovered" from
+    // "clamped". With only exposure lifting, 1.4 must come back higher still.
+    Check(cpuPeak > 1.0,
+          "linear basic_adjust: neither path clamped the result (peak " +
+              std::to_string(cpuPeak) + ")");
+}
 static void TestCompare(ID3D12Device* dev) {
     Section("compare mode");
 
@@ -761,6 +841,7 @@ int main() {
         TestGpuPipeline(dev);
         TestBatchedBindings(dev);
         TestResidency(dev);
+        TestLinearAdjustAgreement(dev);
         TestCompare(dev);
         TestGpuAgreement(dev);
         dev->Release();

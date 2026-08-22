@@ -445,10 +445,35 @@ through an SRV, and a UAV barrier does not order that. They flush between
 passes. (A state-transition barrier was tried instead and does not work —
 transitioning out and back gives the driver nothing to synchronise against.)
 
-Everything is computed in **linear light**: the shader decodes sRGB on read and
-re-encodes on write. Exposure is a multiply, and multiplying gamma-encoded
-values gives the wrong answer — highlights roll off incorrectly and colours
-shift as they brighten.
+Everything is computed in **linear light**. A gamma-encoded image (a JPEG) is
+decoded on read and re-encoded on write; a demosaiced raw is *already* linear
+and is passed through untouched. Exposure is a multiply, and multiplying
+gamma-encoded values gives the wrong answer — highlights roll off incorrectly
+and colours shift as they brighten.
+
+The distinction matters more than it sounds. Applying the sRGB decode to
+already-linear data is simply wrong, and the encode on the way out clamps to
+1.0 — which discards exactly the highlight headroom that made shooting raw
+worthwhile. Measured on a CR2, a peak of 1.77 came back as 0.9995. Images
+carry a `linear` flag, set by the pipeline when a demosaic widens a mosaic to
+RGB, and tonal algorithms branch on it.
+
+The tonal *bands* have to move with it too. `highlights` targets a band that
+ran to a hardcoded 1.0, which is the definitional maximum for gamma-encoded
+data but not for a raw: measured across six files from two bodies, peak
+luminance after demosaic ran 0.25 to 0.75, so on every one of them the band
+never engaged and the slider did nothing. The band now tops out at 0.70 for
+linear input.
+
+Two things that fell out of measuring this, both counter-intuitive:
+
+- A single saturated *channel* is not a bright pixel. One frame peaks at 1.82
+  in blue while its luminance never exceeds 0.25 — a colour clip, not a blown
+  highlight, and a luminance-driven band correctly leaves it alone.
+- The band edge cannot be derived from the camera. Three frames sharing
+  identical white balance and colour matrix peaked at 0.39, 0.86 and 1.06: the
+  peak is a property of the scene. Nor can it be the image's own peak, which
+  would make the same slider position mean something different on every shot.
 
 The line to draw: settled operations that always run together belong fused;
 anything worth *experimenting* with stays a separate algorithm, where
