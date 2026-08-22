@@ -81,6 +81,28 @@ public:
 
     ShaderCompiler& Compiler() { return m_compiler; }
 
+    // --- histogram ----------------------------------------------------------
+    //
+    // The info panel's histogram, computed where the pixels already are.
+    //
+    // The point is not that binning is slow on the CPU; it is that getting the
+    // pixels there is. The stats worker subsamples to 512x512, but Subsample()
+    // begins by mapping the *whole* image, so a 21 MP result paid a 66 ms
+    // readback of 84 MB in order to keep 262k pixels -- 0.3% of what it
+    // fetched. Here only the bins come back: 4 KB.
+    //
+    // Bins are 256 per channel over [rangeMin, rangeMax], matching
+    // algo_util/Histogram so the panel's statistics are the same either way.
+    // For an RGBA8 image the range is fixed at 0..255; for a float one it is
+    // the observed luma range, because a float image has no natural bounds.
+    struct HistogramResult {
+        std::vector<uint32_t> r, g, b, luma;   // 256 each; rgb empty for R32F
+        double   rangeMin = 0.0;
+        double   rangeMax = 255.0;
+        uint64_t count    = 0;
+    };
+    bool BuildHistogram(const GpuImage& src, HistogramResult* out, std::string* err);
+
     // Submits any recorded work and waits for it.
     //
     // Dispatch() only *records*; consecutive dispatches accumulate into one
@@ -98,6 +120,23 @@ private:
     // Opens the command list, reusing an in-progress batch rather than
     // discarding it. See the definition for why this matters.
     bool BeginRecording();
+
+    // Histogram scratch, created on first use and reused. The bins live in a
+    // 256x4 R32_UINT texture (rows R, G, B, luma) and the luma range in a 2x1
+    // one; integer textures because HLSL atomics need them, and textures rather
+    // than buffers because the fixed root signature binds texture UAVs.
+    bool CreateHistogramResources(std::string* err);
+    ComputeKernel   m_histRangeKernel{};
+    ComputeKernel   m_histBinKernel{};
+    ID3D12Resource* m_histBins  = nullptr;
+    ID3D12Resource* m_histRange = nullptr;
+    ID3D12Resource* m_histRead  = nullptr;   // readback staging for both
+
+    // ClearUnorderedAccessViewUint wants two handles for the same UAV: a
+    // shader-visible one and a CPU-readable one. The main heap is shader
+    // visible, which makes it CPU write-only, so the clear needs its own
+    // non-shader-visible heap. Two slots: bins and range.
+    ID3D12DescriptorHeap* m_histClearHeap = nullptr;
 
 
     // True when work is recorded but not yet submitted, so BeginRecording()

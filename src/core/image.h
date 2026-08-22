@@ -140,6 +140,15 @@ struct GpuResidencyDeleter {
     void operator()(GpuResidency*) const noexcept;
 };
 
+// The GPU texture a viewer can be displayed from directly, with no readback.
+// Defined in gpu/, so core/ only holds a pointer -- the same arrangement as
+// GpuResidency, and for the same reason.
+struct SharedGpuTexture;
+
+// Frees a SharedGpuTexture without core/ needing its definition.
+struct SharedGpuTextureDeleter {
+    void operator()(SharedGpuTexture*) const noexcept;
+};
 class Image {
 public:
     Image();
@@ -198,5 +207,10 @@ private:
     Residency            m_res = Residency::None;
     std::unique_ptr<GpuResidency, GpuResidencyDeleter> m_gpu;
 };
+
+// Makes a shareable GPU texture from an Image that is GPU-resident, or returns
+// null when it is not. Defined in gpu/gpu_image.cpp; core/ calls it through
+// this declaration, which keeps the dependency pointing one way.
+std::shared_ptr<SharedGpuTexture> ShareGpuTexture(const Image& img);
 
 } // namespace tglab

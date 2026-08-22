@@ -14,6 +14,7 @@
 #include <d3d12.h>
 
 #include "../src/core/algorithm.h"
+#include "../src/algo_util/histogram.h"
 #include "../src/core/compare.h"
 #include "../src/core/pipeline.h"
 #include "../src/core/worker.h"
@@ -586,6 +587,125 @@ static void TestResidency(ID3D12Device* dev) {
 // merely runs and produces a plausible image is not verified: the whole point
 // of having both is that they compute the same thing, and compare mode is
 // only trustworthy if that holds.
+
+// The GPU histogram agrees with the CPU one, bin for bin.
+//
+// The info panel's histogram is computed where the pixels already live, so
+// that a result never has to come back to the CPU just to be measured. The
+// CPU path had to map the whole image first -- 86 ms of readback at 21 MP --
+// and then kept 0.3% of what it fetched.
+//
+// Agreement has to be exact, not approximate: this is not an optimisation of
+// the same code but a reimplementation in HLSL, including an order-preserving
+// float-to-uint key (HLSL has no float atomics) and a two-pass min/max before
+// binning. Any of that being subtly wrong would show as a plausible but
+// incorrect histogram, which is far worse than a slow one.
+static void TestGpuHistogram(ID3D12Device* dev) {
+    Section("GPU histogram");
+
+    ComputeContext gpu;
+    if (!gpu.Init(dev) || !gpu.Ready()) { Check(false, "compute context initialises"); return; }
+
+    // Three formats, because they take different paths: RGBA8 has a fixed
+    // 0..255 range, the float ones are binned over their observed range, and
+    // R32F has no colour channels at all.
+    struct Case { const char* name; Format fmt; };
+    const Case cases[] = {
+        {"RGBA8",    Format::RGBA8},
+        {"RGBA16F",  Format::RGBA16F},
+        {"R32F",     Format::R32F},
+    };
+
+    for (const Case& c : cases) {
+        const int w = 200, h = 150;
+        Image img;
+        img.Alloc({w, h, c.fmt});
+        {
+            ImageView v = img.MapCpuWrite();
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x) {
+                    // A gradient with a bright corner, so the range is not
+                    // 0..1 and the bins are not uniform.
+                    const float t = float(x) / float(w - 1);
+                    const float u = float(y) / float(h - 1);
+                    const float lum = (x > w - 12 && y < 12) ? 1.8f : (0.15f + 0.6f * t * u);
+                    if (c.fmt == Format::RGBA8) {
+                        uint8_t* p = v.At<uint8_t>(x, y);
+                        p[0] = uint8_t(std::clamp(lum, 0.0f, 1.0f) * 200.0f);
+                        p[1] = uint8_t(std::clamp(lum, 0.0f, 1.0f) * 255.0f);
+                        p[2] = uint8_t(std::clamp(lum, 0.0f, 1.0f) * 120.0f);
+                        p[3] = 255;
+                    } else if (c.fmt == Format::RGBA16F) {
+                        uint16_t* p = v.At<uint16_t>(x, y);
+                        p[0] = FloatToHalf(lum * 0.8f);
+                        p[1] = FloatToHalf(lum);
+                        p[2] = FloatToHalf(lum * 0.5f);
+                        p[3] = FloatToHalf(1.0f);
+                    } else {
+                        *v.At<float>(x, y) = lum;
+                    }
+                }
+        }
+
+        // Upload, then measure on the GPU.
+        GpuImage gi;
+        if (!gpu.CreateImage(img.Desc(), &gi)) { Check(false, std::string(c.name) + ": create"); continue; }
+        {
+            ImageView v = img.MapCpuRead();
+            if (!gpu.Upload(v, &gi)) { Check(false, std::string(c.name) + ": upload"); gi.Release(); continue; }
+        }
+
+        ComputeContext::HistogramResult g;
+        std::string err;
+        if (!gpu.BuildHistogram(gi, &g, &err)) {
+            Check(false, std::string(c.name) + ": BuildHistogram: " + err);
+            gi.Release();
+            continue;
+        }
+        gi.Release();
+
+        // The reference. Small enough that the shader samples every pixel
+        // (step stays 1), so the two see exactly the same set and the bins
+        // must match exactly rather than approximately.
+        Histogram ref;
+        ImageView v = img.MapCpuRead();
+        ref.Build(v, -1);
+
+        Check(g.count == ref.Count(),
+              std::string(c.name) + ": same pixel count (gpu " + std::to_string(g.count) +
+                  ", cpu " + std::to_string(ref.Count()) + ")");
+
+        Check(std::abs(g.rangeMin - ref.RangeMin()) < 1e-4 &&
+                  std::abs(g.rangeMax - ref.RangeMax()) < 1e-4,
+              std::string(c.name) + ": same range (gpu [" + std::to_string(g.rangeMin) +
+                  ", " + std::to_string(g.rangeMax) + "], cpu [" +
+                  std::to_string(ref.RangeMin()) + ", " + std::to_string(ref.RangeMax()) + "])");
+
+        // Bin-for-bin on luma. A near-miss in the float key or the bin index
+        // would show here as a one-bin shift, which a shape comparison would
+        // forgive and a histogram reader would not.
+        uint64_t worstDiff = 0;
+        int worstBin = -1;
+        for (int i = 0; i < 256; ++i) {
+            const uint64_t a = g.luma.empty() ? 0 : g.luma[size_t(i)];
+            const uint64_t b = ref.Bin(i);
+            const uint64_t d = (a > b) ? a - b : b - a;
+            if (d > worstDiff) { worstDiff = d; worstBin = i; }
+        }
+        Check(worstDiff == 0,
+              std::string(c.name) + ": luma bins match exactly (worst " +
+                  std::to_string(worstDiff) + " at bin " + std::to_string(worstBin) + ")");
+
+        // R32F has no colour channels to report; anything else must have three.
+        if (c.fmt == Format::R32F) {
+            Check(g.r.empty() && g.g.empty() && g.b.empty(),
+                  "R32F: no colour channels reported");
+        } else {
+            Check(g.r.size() == 256 && g.g.size() == 256 && g.b.size() == 256,
+                  std::string(c.name) + ": three colour channels reported");
+        }
+    }
+}
 static void TestGpuAgreement(ID3D12Device* dev) {
     Section("CPU/GPU agreement");
 
@@ -920,6 +1040,7 @@ int main() {
         TestResidency(dev);
         TestLinearAdjustAgreement(dev);
         TestCompare(dev);
+        TestGpuHistogram(dev);
         TestGpuAgreement(dev);
         dev->Release();
     } else {

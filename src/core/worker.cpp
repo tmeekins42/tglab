@@ -65,6 +65,11 @@ uint64_t PipelineWorker::SubmitCompare(Pipeline pipe, std::vector<Data> sources,
     return seq;
 }
 
+
+void PipelineWorker::SetVisibleViewers(std::vector<std::string> names) {
+    std::lock_guard<std::mutex> lock(m_mtx);
+    m_visibleViewers = std::move(names);
+}
 bool PipelineWorker::TryFetch(PipelineOutcome* out) {
     std::lock_guard<std::mutex> lock(m_mtx);
     if (!m_result) return false;

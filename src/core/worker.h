@@ -98,6 +98,16 @@ public:
     uint64_t Submit(Pipeline pipe, std::vector<Data> sources,
                     std::vector<uint64_t> sourceVersions = {});
 
+    // Names of the viewers currently on screen. A docked tab that is hidden
+    // behind another still has a declared viewer, and cloning its result costs
+    // a full readback -- ~86 ms at 21 MP -- for pixels nobody can see.
+    //
+    // Advisory, and deliberately so: it is read on the worker without a lock
+    // beyond the one guarding the swap, and it describes the previous frame.
+    // Being a frame stale only means one extra clone just after a tab switch,
+    // which the UI's version check then makes free.
+    void SetVisibleViewers(std::vector<std::string> names);
+
     // Runs the pipeline twice (CPU then GPU) and diffs the chosen stage.
     // Deliberately not coalesced with normal runs in the caller's mind: it is
     // an explicit, one-off request, not something a slider triggers.
@@ -140,6 +150,10 @@ private:
     // Worker-thread only, so unguarded.
     std::map<std::string, uint64_t> m_viewerVersions;
     std::vector<uint64_t>           m_lastSourceVersions;
+
+    // Guarded by m_mtx. Written by the UI, read by the worker when deciding
+    // which viewers are worth cloning.
+    std::vector<std::string>        m_visibleViewers;
     uint64_t              m_nextSeq = 1;
     ID3D12Device*         m_device = nullptr;
 };

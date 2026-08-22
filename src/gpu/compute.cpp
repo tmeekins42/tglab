@@ -79,6 +79,15 @@ void ComputeContext::Shutdown() {
     for (ID3D12Resource* r : m_staging) if (r) r->Release();
     m_staging.clear();
 
+    // Histogram scratch. The kernels hold PSOs created by this context, so they
+    // go before the device reference is dropped.
+    m_histRangeKernel.Release();
+    m_histBinKernel.Release();
+    if (m_histBins)      { m_histBins->Release();      m_histBins = nullptr; }
+    if (m_histRange)     { m_histRange->Release();     m_histRange = nullptr; }
+    if (m_histRead)      { m_histRead->Release();      m_histRead = nullptr; }
+    if (m_histClearHeap) { m_histClearHeap->Release(); m_histClearHeap = nullptr; }
+
     m_compiler.Shutdown();
     if (m_srvHeap) { m_srvHeap->Release(); m_srvHeap = nullptr; }
     if (m_event)   { CloseHandle(m_event); m_event = nullptr; }
@@ -477,4 +486,180 @@ bool ComputeContext::Flush(std::string* err) {
     return true;
 }
 
+
+// --- histogram --------------------------------------------------------------
+
+namespace {
+
+// Pass 1: the luma range.
+//
+// HLSL has no float atomics, so values map to an order-preserving uint first.
+// For a non-negative float the raw bits already sort correctly; for a negative
+// one they sort backwards, so they are inverted. The standard radix-sort float
+// key -- exact, no quantisation.
+const char* kHistRangeHlsl = R"(
+Texture2D<float4>  Src   : register(t0);
+RWTexture2D<uint>  Range : register(u0);   // (0,0) min key, (1,0) max key
+
+cbuffer Params : register(b0) {
+    uint Width;
+    uint Height;
+    uint Step;        // subsample stride
+    uint IsSingle;    // 1 = R32F: luma is just .x
+};
+
+uint FloatKey(float f) {
+    uint u = asuint(f);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+[numthreads(8, 8, 1)]
+void main(uint3 tid : SV_DispatchThreadID) {
+    uint x = tid.x * Step, y = tid.y * Step;
+    if (x >= Width || y >= Height) return;
+    float4 t = Src[int2(x, y)];
+    float  l = (IsSingle != 0) ? t.x : dot(t.rgb, float3(0.299, 0.587, 0.114));
+    uint k = FloatKey(l), prev;
+    InterlockedMin(Range[int2(0, 0)], k, prev);
+    InterlockedMax(Range[int2(1, 0)], k, prev);
+}
+)";
+
+// Pass 2: scatter into bins. One atomic per component per sampled pixel.
+const char* kHistBinHlsl = R"(
+Texture2D<float4>  Src  : register(t0);
+Texture2D<uint>    Rng  : register(t1);
+RWTexture2D<uint>  Bins : register(u0);   // 256 x 4: rows R, G, B, luma
+
+cbuffer Params : register(b0) {
+    uint Width;
+    uint Height;
+    uint Step;
+    uint IsSingle;
+    uint FixedRange;   // 1 = bin over 0..1 regardless of content (RGBA8)
+};
+
+float KeyFloat(uint k) {
+    uint u = (k & 0x80000000u) ? (k & 0x7FFFFFFFu) : ~k;
+    return asfloat(u);
+}
+
+[numthreads(8, 8, 1)]
+void main(uint3 tid : SV_DispatchThreadID) {
+    uint x = tid.x * Step, y = tid.y * Step;
+    if (x >= Width || y >= Height) return;
+
+    // An 8-bit image has a natural 0..255 range, which a UNORM SRV presents as
+    // 0..1. Binning it over the *observed* range instead would rescale every
+    // image to fill the histogram, so a low-contrast photograph would look like
+    // a full-range one -- and it would disagree with the CPU path, which uses
+    // the fixed range. Float formats have no natural bounds and keep the
+    // observed range, which is what stops a gradient in [-2, 2] from collapsing
+    // into a single bin.
+    float lo = (FixedRange != 0) ? 0.0 : KeyFloat(Rng[int2(0, 0)]);
+    float hi = (FixedRange != 0) ? 1.0 : KeyFloat(Rng[int2(1, 0)]);
+    float span = max(hi - lo, 1e-12);
+
+    float4 t = Src[int2(x, y)];
+    float  l = (IsSingle != 0) ? t.x : dot(t.rgb, float3(0.299, 0.587, 0.114));
+
+    uint prev;
+    if (IsSingle == 0) {
+        int br = clamp(int(((t.r - lo) / span) * 255.0 + 0.5), 0, 255);
+        int bg = clamp(int(((t.g - lo) / span) * 255.0 + 0.5), 0, 255);
+        int bb = clamp(int(((t.b - lo) / span) * 255.0 + 0.5), 0, 255);
+        InterlockedAdd(Bins[int2(br, 0)], 1, prev);
+        InterlockedAdd(Bins[int2(bg, 1)], 1, prev);
+        InterlockedAdd(Bins[int2(bb, 2)], 1, prev);
+    }
+    int bl = clamp(int(((l - lo) / span) * 255.0 + 0.5), 0, 255);
+    InterlockedAdd(Bins[int2(bl, 3)], 1, prev);
+}
+)";
+
+// The shader's FloatKey, inverted, for decoding the range on the CPU.
+float KeyToFloat(uint32_t k) {
+    const uint32_t u = (k & 0x80000000u) ? (k & 0x7FFFFFFFu) : ~k;
+    float f;
+    std::memcpy(&f, &u, sizeof(f));
+    return f;
+}
+
+// Matches the CPU path's budget, so the two produce the same picture. A
+// 256-bin histogram of a quarter-million evenly spaced pixels is
+// indistinguishable from an exhaustive one, and it bounds the atomic traffic
+// on a 45 MP image.
+constexpr int64_t kHistMaxSamples = 512 * 512;
+
+constexpr int kHistBins = 256;
+
+// 256 R32_UINT texels is 1024 bytes, which is already a multiple of the 256-byte
+// copy alignment. Spelled out rather than reusing the alignment constant: those
+// are different quantities that happen to relate, and conflating them made the
+// first version specify a 256-byte pitch for a 1024-byte row.
+constexpr UINT kHistRowPitch = UINT(kHistBins) * 4;
+constexpr int kHistRows = 4;      // R, G, B, luma
+
+} // namespace
+
+bool ComputeContext::CreateHistogramResources(std::string* err) {
+    if (m_histBins) return true;
+
+    D3D12_HEAP_PROPERTIES hp = {};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    auto makeTex = [&](UINT w, UINT h, ID3D12Resource** out) {
+        D3D12_RESOURCE_DESC rd = {};
+        rd.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rd.Width            = w;
+        rd.Height           = h;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels        = 1;
+        rd.Format           = DXGI_FORMAT_R32_UINT;
+        rd.SampleDesc.Count = 1;
+        rd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        return SUCCEEDED(m_device->CreateCommittedResource(
+            &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON,
+            nullptr, IID_PPV_ARGS(out)));
+    };
+
+    if (!makeTex(kHistBins, kHistRows, &m_histBins) || !makeTex(2, 1, &m_histRange)) {
+        *err = "could not create histogram textures";
+        return false;
+    }
+
+    // The clear heap: non-shader-visible, because ClearUnorderedAccessViewUint
+    // READS the CPU handle it is given, and a shader-visible heap is CPU
+    // write-only. Passing a handle from the main heap is what the debug layer
+    // rejects with "points to a descriptor heap type that is CPU write only".
+    D3D12_DESCRIPTOR_HEAP_DESC chd = {};
+    chd.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    chd.NumDescriptors = 2;
+    chd.Flags          = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+    if (FAILED(m_device->CreateDescriptorHeap(&chd, IID_PPV_ARGS(&m_histClearHeap)))) {
+        *err = "could not create the histogram clear heap";
+        return false;
+    }
+
+    // One readback buffer: four bin rows, then one more for the 2-texel range.
+    D3D12_HEAP_PROPERTIES rhp = {};
+    rhp.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC bd = {};
+    bd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width            = UINT64(kHistRowPitch) * (kHistRows + 1);
+    bd.Height           = 1;
+    bd.DepthOrArraySize = 1;
+    bd.MipLevels        = 1;
+    bd.SampleDesc.Count = 1;
+    bd.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (FAILED(m_device->CreateCommittedResource(&rhp, D3D12_HEAP_FLAG_NONE, &bd,
+                                                 D3D12_RESOURCE_STATE_COPY_DEST,
+                                                 nullptr, IID_PPV_ARGS(&m_histRead)))) {
+        *err = "could not create the histogram readback buffer";
+        return false;
+    }
+    return true;
+}
+
+#include "histogram_gpu.inc"
 } // namespace tglab

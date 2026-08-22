@@ -61,6 +61,16 @@ GpuResidency* Image::AcquireGpuRead(ComputeContext& ctx) {
     return m_gpu.get();
 }
 
+
+void SharedGpuTextureDeleter::operator()(SharedGpuTexture* p) const noexcept {
+    delete p;
+}
+
+std::shared_ptr<SharedGpuTexture> ShareGpuTexture(const Image& img) {
+    const GpuResidency* g = img.RawGpu();
+    if (!g || !g->image.Valid()) return nullptr;
+    return std::make_shared<SharedGpuTexture>(g->image.res, g->image.desc);
+}
 void InstallGpuResidencyHooks() {
     g_readbackFromGpu = [](Image& img) -> bool {
         GpuResidency* g = img.RawGpu();
