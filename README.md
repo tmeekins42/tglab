@@ -808,16 +808,34 @@ under `third_party/`.
 - **`Image` owns its residency.** Writing on one side invalidates the other,
   and a read transfers only when stale — which is what keeps a chain of GPU
   stages free of intermediate transfers.
+- **A GPU result is never read back to be displayed.** The worker hands the UI a
+  refcounted reference to the compute texture and the display conversion is a
+  dispatch, so the pixels stay on the device from demosaic to screen. The
+  histogram is measured there too. The only thing that still pulls pixels across
+  is the 1:1 loupe, which needs the actual numbers and fetches just its own
+  15×15 window.
 - **Views render to offscreen targets** behind a `View` interface, so a 3D
   viewport (SfM, gaussian splats) can dock alongside 2D panels later.
 
 ### Known limitations
 
-- **Display still round-trips through the CPU.** A viewer calls `MapCpuRead()`
-  and re-uploads as a display texture; rendering straight from the compute
-  output's SRV would remove that. The residency API already supports it.
-- **One dispatch per stage**, so genuinely multi-pass GPU algorithms either
-  fuse into one pass or stay on the CPU.
+- **Intermediates are never freed until the pipeline is replaced.** A 12-stage
+  45 MP RGBA16F chain holds roughly 8 GB of them, and nothing collects one that
+  no later stage or viewer reads. The stage cache is what makes dragging a
+  slider cheap, so collecting eagerly would trade one problem for another; the
+  likely shape is a setting that engages when VRAM is tight, which the status
+  bar already reports.
+- **A GPU stage binds one input.** The root signature has four SRV slots, but no
+  multi-input algorithm has a kernel yet — `non_max_suppression` (gx, gy, mag)
+  and `kuwahara_generalized` (image plus precomputed sector weights) are the two
+  that want one.
+- **The automatic thresholds have no GPU path**, because deriving a level from a
+  histogram pins the whole algorithm to the CPU. `BuildHistogram()` now makes
+  this tractable; see *Shared utilities* for what still needs settling.
+- **Tonal control ranges do not follow the pixel format.** `threshold`'s level
+  is fixed at 0..255, so on a float image everything falls below it and the
+  result is black. Correct for that level, but the level should track the
+  format.
 
 ## Licence
 
