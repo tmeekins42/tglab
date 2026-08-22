@@ -165,9 +165,19 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
                 case FormatSpec::RGBA8:       d.format = Format::RGBA8;   break;
                 case FormatSpec::R32F:        d.format = Format::R32F;    break;
                 case FormatSpec::RGBA32F:     d.format = Format::RGBA32F; break;
+                case FormatSpec::RGBA16F:     d.format = Format::RGBA16F; break;
                 case FormatSpec::SameAsInput: /* keep base.format */      break;
                 case FormatSpec::Any:         /* keep base.format */      break;
             }
+
+            // The output of a multi-channel stage is no longer a mosaic, even
+            // though it inherited the input's descriptor. Anything that widens
+            // a single sample per pixel into RGB has, by definition, done the
+            // demosaicing -- and leaving the CFA metadata set would make a
+            // finished image claim to still need it, so a second demosaic in
+            // the chain would happily mangle it.
+            if (base.IsMosaic() && d.format != Format::R32F)
+                d.cfa = CfaPattern::None;
             if (!d.Valid()) {
                 *err = "line " + std::to_string(s.line) + ": '" + s.algoName +
                        "' could not determine output size";
@@ -237,6 +247,18 @@ bool Pipeline::RunStageGpu(Stage& s, const std::vector<const Data*>& in,
         if (!d || !std::holds_alternative<Image>(*d)) { *err = "non-image input"; return false; }
     for (const Data& d : s.outputs)
         if (!std::holds_alternative<Image>(d)) { *err = "non-image output"; return false; }
+
+    // Hand the algorithm its input descriptors before anything is bound. A
+    // demosaic needs the CFA pattern and sensor levels, which live on the
+    // image rather than on a parameter, and RunCPU -- the usual place to read
+    // them -- never runs on this path.
+    {
+        std::vector<ImageDesc> inDescs;
+        inDescs.reserve(in.size());
+        for (const Data* d : in)
+            inDescs.push_back(std::get<Image>(*d).Desc());
+        s.algo->PrepareGpu(inDescs);
+    }
 
     // Kernels are compiled once per stage and cached on the stage, so dragging
     // a slider does not recompile HLSL every frame.

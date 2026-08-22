@@ -19,6 +19,7 @@ double ReadChannel(const ImageView& v, int x, int y, int c) {
         case Format::RGBA8:   return double(v.At<uint8_t>(x, y)[c]);
         case Format::R32F:    return c == 0 ? double(*v.At<float>(x, y)) : 0.0;
         case Format::RGBA32F: return double(v.At<float>(x, y)[c]);
+        case Format::RGBA16F: return double(HalfToFloat(v.At<uint16_t>(x, y)[c]));
         default:              return 0.0;
     }
 }
@@ -28,6 +29,7 @@ int ChannelCount(Format f) {
         case Format::RGBA8:   return 4;
         case Format::R32F:    return 1;
         case Format::RGBA32F: return 4;
+        case Format::RGBA16F: return 4;
         default:              return 0;
     }
 }

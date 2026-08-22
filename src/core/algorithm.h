@@ -94,6 +94,16 @@ public:
     //   b0      uint Width, uint Height, then GpuConstants() below
     virtual const char* GpuSource() const { return nullptr; }
 
+    // Called before the GPU path runs, with the input descriptors.
+    //
+    // Most algorithms need nothing here: their constants come from parameters.
+    // A demosaic does -- the CFA pattern and the sensor's black and white
+    // levels ride on the *image*, not on any parameter, and GpuConstants() is
+    // otherwise the only place to read them, by which point the descriptors are
+    // out of reach. RunCPU() gets them from RunCtx, but the GPU path never
+    // calls RunCPU, so without this the shader would use stale values.
+    virtual void PrepareGpu(const std::vector<ImageDesc>& inputs) { (void)inputs; }
+
     // Extra root constants, bit-cast to uint. Floats go through asfloat() in
     // the shader. Order must match the cbuffer declaration.
     //

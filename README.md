@@ -93,14 +93,23 @@ rather than failing silently.
 like any other image, decoded by LibRaw. Dispatch is by extension, so nothing
 else in the app knows raw exists.
 
-LibRaw does the whole conversion here — black level, white balance, demosaic,
-colour matrix, gamma — and hands back RGB. That means **you are working on
-someone else's demosaic**, which is the right default for "just show me the
-picture" and the wrong one for researching demosaicing itself. The plan is for
-the sensor's Bayer mosaic to become a data type in its own right, with a
-`"demosaic"` category alongside `"filter"` and `"threshold"`, so the
-interpolation becomes an algorithm to compare rather than something that
-already happened.
+**The palette holds the sensor mosaic**, not a finished image. That is where
+the dynamic range lives: a Canon CR2 measures ~13,400 distinct levels and a
+Sony ARW ~15,600, against the 256 an 8-bit conversion leaves. Adjusting exposure
+on the 8-bit version recovers nothing, because the highlight information is
+already gone.
+
+`image("name")` demosaics automatically using the default method, so **a script
+never has to mention demosaicing** — the same script works whether a PNG or a
+CR3 is dropped on the slot. `mosaic("name")` returns the undemosaiced sensor
+data, which is what [scripts/demosaic.tgl](scripts/demosaic.tgl) uses to compare
+two methods side by side.
+
+`demosaic_passthrough` shows the mosaic as it actually is: zoom in and the
+colour filter array is visible, one colour per pixel, before any interpolation.
+
+`TGLAB_RAW_RGB=1` falls back to LibRaw's own conversion, as an escape hatch if a
+camera's mosaic cannot be read.
 
 Two things worth knowing:
 
@@ -176,7 +185,8 @@ kernel = [[-1,0,1],[-2,0,2],[-1,0,1]]   # matrix literal
 
 | Builtin | Meaning |
 |---|---|
-| `image("name")` | An image from the palette. |
+| `image("name")` | An image from the palette. A raw file is demosaiced automatically. |
+| `mosaic("name")` | The undemosaiced sensor mosaic. Errors on a non-raw image. |
 | `slider("label", min, max, default)` | Declares a slider; returns its current value. |
 | `check("label", default)` | Declares a checkbox; returns 0 or 1. |
 | `choose("label", [a, b, c])` | Dropdown of algorithms; returns the selected one. |

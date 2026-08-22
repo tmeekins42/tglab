@@ -35,6 +35,15 @@ void PixelBuffer::Unpack(const ImageView& v) {
                 }
             break;
 
+        case Format::RGBA16F:
+            for (int y = 0; y < m_h; ++y)
+                for (int x = 0; x < m_w; ++x) {
+                    const uint16_t* p = v.At<uint16_t>(x, y);
+                    for (int c = 0; c < 4; ++c)
+                        m_data[Index(x, y) + size_t(c)] = HalfToFloat(p[c]);
+                }
+            break;
+
         default:   // RGBA8
             for (int y = 0; y < m_h; ++y)
                 for (int x = 0; x < m_w; ++x) {
@@ -66,6 +75,21 @@ void PixelBuffer::PackInto(ImageView& dst) const {
                     for (int c = 0; c < 4; ++c)
                         p[c] = m_ch == 1 ? m_data[Index(x, y)]
                                          : m_data[Index(x, y) + size_t(c)];
+                }
+            break;
+
+        case Format::RGBA16F:
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x) {
+                    uint16_t* p = dst.At<uint16_t>(x, y);
+                    for (int c = 0; c < 4; ++c) {
+                        const float s = m_ch == 1 ? m_data[Index(x, y)]
+                                                  : m_data[Index(x, y) + size_t(c)];
+                        p[c] = FloatToHalf(s);
+                    }
+                    // A 1-channel buffer carries no alpha; 1.0 keeps the image
+                    // opaque rather than fully transparent.
+                    if (m_ch == 1) p[3] = FloatToHalf(1.0f);
                 }
             break;
 

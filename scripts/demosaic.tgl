@@ -1,0 +1,24 @@
+# Comparing demosaic methods on the same sensor data.
+#
+# mosaic("test") is the undemosaiced sensor readout -- one sample per pixel,
+# linear, at the sensor's full bit depth. image("test") would instead give the
+# demosaiced result using the app's default method, which is what every other
+# script gets without having to ask.
+#
+# Drop a raw file (.CR3, .CR2, .ARW, .NEF, ...) onto the "test" row.
+# On a PNG or JPEG this script errors, deliberately: there is no mosaic to show.
+
+raw = mosaic("test")
+
+a = choose("method A", "demosaic")
+b = choose("method B", "demosaic")
+
+outA = params(a, "A")(raw)
+outB = params(b, "B")(raw)
+
+display(outA, "1 method A")
+display(outB, "2 method B")
+
+# Pick demosaic_passthrough in either dropdown to see the raw Bayer pattern
+# itself -- zoom in and the colour filter array is visible, one colour per
+# pixel, before any interpolation.

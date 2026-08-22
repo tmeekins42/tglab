@@ -103,6 +103,154 @@ bool ReadRawMetadata(const std::string& path, ExifData* out) {
     return out->present;
 }
 
+namespace {
+
+// LibRaw reports the CFA layout through filters(), a packed 32-bit code. Rather
+// than decode that bit layout, ask it which colour sits at each of the four
+// positions in the 2x2 tile -- COLOR() handles every vendor quirk internally.
+CfaPattern CfaFromLibRaw(LibRaw& raw) {
+    if (raw.imgdata.idata.filters == 9) return CfaPattern::XTrans;
+    if (raw.imgdata.idata.filters == 0) return CfaPattern::None;   // already RGB
+
+    // LibRaw's colour indices are 0=R, 1=G, 2=B, 3=G2. Fold the second green
+    // onto the first, since the two are interchangeable for our purposes.
+    auto at = [&](int r, int c) {
+        const int v = raw.COLOR(r, c);
+        return v == 3 ? 1 : v;
+    };
+
+    const int tl = at(0, 0), tr = at(0, 1), bl = at(1, 0), br = at(1, 1);
+    if (tl == 0 && tr == 1 && bl == 1 && br == 2) return CfaPattern::RGGB;
+    if (tl == 2 && tr == 1 && bl == 1 && br == 0) return CfaPattern::BGGR;
+    if (tl == 1 && tr == 0 && bl == 2 && br == 1) return CfaPattern::GRBG;
+    if (tl == 1 && tr == 2 && bl == 0 && br == 1) return CfaPattern::GBRG;
+    return CfaPattern::None;
+}
+
+} // namespace
+
+bool LoadRawMosaic(const std::string& path, Image* out, std::string* err) {
+    LibRaw raw;
+
+    if (const int rc = raw.open_file(path.c_str()); rc != LIBRAW_SUCCESS) {
+        *err = "could not open raw '" + path + "': " + libraw_strerror(rc);
+        return false;
+    }
+    if (const int rc = raw.unpack(); rc != LIBRAW_SUCCESS) {
+        *err = "could not unpack raw '" + path + "': " + libraw_strerror(rc);
+        return false;
+    }
+
+    const ushort* raw_image = raw.imgdata.rawdata.raw_image;
+    if (!raw_image) {
+        // Foveon and some medium-format backs have no Bayer mosaic at all.
+        *err = "'" + path + "' has no Bayer mosaic (a three-colour sensor?)";
+        return false;
+    }
+
+    const CfaPattern cfa = CfaFromLibRaw(raw);
+    if (cfa == CfaPattern::None) {
+        *err = "'" + path + "' has an unrecognised colour filter array";
+        return false;
+    }
+
+    const auto& s = raw.imgdata.sizes;
+
+    // The visible frame, not the full sensor readout. The margins are masked
+    // pixels used for black-level calibration; including them would put a black
+    // band down two edges of every image.
+    const int w = s.width;
+    const int h = s.height;
+    if (w <= 0 || h <= 0) {
+        *err = "'" + path + "' reports no visible image area";
+        return false;
+    }
+
+    // Cropping shifts the CFA phase. A left or top margin with an odd offset
+    // means the visible frame starts on a different colour than the sensor
+    // does, and getting this wrong swaps red and blue across the whole image.
+    const int xoff = s.left_margin;
+    const int yoff = s.top_margin;
+    CfaPattern visibleCfa = cfa;
+    if ((xoff & 1) || (yoff & 1)) {
+        // Re-derive from the CFA colour at the visible frame's own origin.
+        auto at = [&](int r, int c) {
+            const int v = raw.COLOR(r + yoff, c + xoff);
+            return v == 3 ? 1 : v;
+        };
+        const int tl = at(0, 0), tr = at(0, 1), bl = at(1, 0), br = at(1, 1);
+        if      (tl == 0 && tr == 1 && bl == 1 && br == 2) visibleCfa = CfaPattern::RGGB;
+        else if (tl == 2 && tr == 1 && bl == 1 && br == 0) visibleCfa = CfaPattern::BGGR;
+        else if (tl == 1 && tr == 0 && bl == 2 && br == 1) visibleCfa = CfaPattern::GRBG;
+        else if (tl == 1 && tr == 2 && bl == 0 && br == 1) visibleCfa = CfaPattern::GBRG;
+    }
+
+    ImageDesc d;
+    d.width      = w;
+    d.height     = h;
+    d.format     = Format::R32F;
+    d.cfa        = visibleCfa;
+    // cblack[] holds per-channel offsets on top of the global black level; the
+    // first four cover the 2x2 tile. Averaging them is an approximation, but
+    // the per-channel spread is small on every sensor this has been tried on,
+    // and a single scalar keeps the descriptor simple.
+    {
+        double black = raw.imgdata.color.black;
+        double sum = 0;
+        for (int i = 0; i < 4; ++i) sum += raw.imgdata.color.cblack[i];
+        black += sum / 4.0;
+        d.blackLevel = float(black);
+    }
+    d.whiteLevel = float(raw.imgdata.color.maximum);
+    if (d.whiteLevel <= d.blackLevel) d.whiteLevel = d.blackLevel + 1.0f;
+
+    // As-shot white balance, normalised to green.
+    //
+    // Without this the image is overwhelmingly green: a sensor's green
+    // photosites are far more sensitive than its red and blue ones, and the
+    // camera's own multipliers are what correct for that. Measured on real
+    // files: a Canon 5D3 needs R x1.45 / B x2.37, a Sony RX100M5 R x2.26 /
+    // B x1.79 -- large enough that omitting them is immediately visible.
+    {
+        const float* m = raw.imgdata.color.cam_mul;
+        const float g = (m[1] > 0.0f) ? m[1] : 1.0f;
+        d.camMul[0] = (m[0] > 0.0f) ? m[0] / g : 1.0f;
+        d.camMul[1] = 1.0f;
+        d.camMul[2] = (m[2] > 0.0f) ? m[2] / g : 1.0f;
+    }
+
+    // Camera primaries -> sRGB. Sensor filters are not sRGB primaries, so even
+    // perfectly balanced data has the wrong hues without this -- greens too
+    // yellow, blues too purple. LibRaw derives it from the embedded profile.
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c)
+            d.rgbCam[r * 3 + c] = raw.imgdata.color.rgb_cam[r][c];
+
+    // A file with no embedded matrix leaves rgb_cam zeroed, which would map
+    // every pixel to black. Identity is wrong but visible; black is not.
+    {
+        float sum = 0.0f;
+        for (int i = 0; i < 9; ++i) sum += std::abs(d.rgbCam[i]);
+        if (sum < 1e-6f) {
+            for (int i = 0; i < 9; ++i) d.rgbCam[i] = (i % 4 == 0) ? 1.0f : 0.0f;
+        }
+    }
+
+    out->Alloc(d);
+    ImageView v = out->MapCpuWrite();
+
+    // Stored as raw sensor counts rather than normalised here: the demosaic
+    // applies the black/white levels, so every algorithm sees the same
+    // convention and the levels stay inspectable on the descriptor.
+    const int stride = s.raw_width;
+    for (int y = 0; y < h; ++y) {
+        const ushort* row = raw_image + size_t(y + yoff) * size_t(stride) + size_t(xoff);
+        for (int x = 0; x < w; ++x) *v.At<float>(x, y) = float(row[x]);
+    }
+
+    return true;
+}
+
 bool LoadRawFile(const std::string& path, Image* out, std::string* err) {
     LibRaw raw;
 

@@ -123,6 +123,13 @@ bool GpuTexture::Update(Device& dev, Image& img, uint64_t contentVersion) {
         for (int i = 0; i < w * h * 4; ++i)
             rgba[size_t(i)] = uint8_t(std::clamp(p[i], 0.0f, 1.0f) * 255.0f);
         srcBytes = rgba.data();
+    } else if (d.format == Format::RGBA16F) {
+        const uint16_t* p = reinterpret_cast<const uint16_t*>(v.data);
+        rgba.resize(size_t(w) * size_t(h) * 4);
+        for (int i = 0; i < w * h * 4; ++i)
+            rgba[size_t(i)] =
+                uint8_t(std::clamp(HalfToFloat(p[i]), 0.0f, 1.0f) * 255.0f);
+        srcBytes = rgba.data();
     } else {
         return false;
     }

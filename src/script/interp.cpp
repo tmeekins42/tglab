@@ -88,8 +88,10 @@ namespace {
 
 class Interp {
 public:
-    Interp(const std::vector<SourceImage>& sources, UiState* ui, Pipeline* out)
-        : m_sources(sources), m_ui(ui), m_pipe(out) {}
+    Interp(const std::vector<SourceImage>& sources, UiState* ui, Pipeline* out,
+           std::string defaultDemosaic)
+        : m_sources(sources), m_ui(ui), m_pipe(out),
+          m_defaultDemosaic(std::move(defaultDemosaic)) {}
 
     bool Run(const Program& prog) {
         for (const Stmt& s : prog.stmts) {
@@ -312,6 +314,7 @@ private:
         }
 
         if (calleeName == "image")   return CallImage(e, out);
+        if (calleeName == "mosaic")  return CallMosaic(e, out);
         if (calleeName == "slider")  return CallSlider(e, out);
         if (calleeName == "check")   return CallCheck(e, out);
         if (calleeName == "choose")  return CallChoose(e, out);
@@ -344,10 +347,59 @@ private:
             return Fail(e.line, "image() takes one string: image(\"name\")");
         const std::string& want = a.pos[0].AsString();
         for (const SourceImage& s : m_sources) {
-            if (s.name == want) {
+            if (s.name != want) continue;
+
+            // An ordinary image is handed straight through.
+            if (!s.isMosaic) {
                 out->push_back(Value(PortHandle{-1, s.index}));
                 return true;
             }
+
+            // A mosaic needs demosaicing before anything else can use it, and
+            // the script must not have to say so. Insert the default method as
+            // an ordinary stage, so it caches, runs on the GPU, and shows up in
+            // the stage list like everything else.
+            //
+            // Recorded once per source: two image("x") calls in one script
+            // should share a stage rather than demosaicing twice.
+            if (auto it = m_demosaicStage.find(s.index); it != m_demosaicStage.end()) {
+                out->push_back(Value(PortHandle{it->second, 0}));
+                return true;
+            }
+
+            auto algo = Registry::Get().Create(m_defaultDemosaic);
+            if (!algo)
+                return Fail(e.line, "unknown default demosaic '" + m_defaultDemosaic + "'");
+
+            const int stage = m_pipe->AddStage(std::move(algo), m_defaultDemosaic,
+                                               {PortRef{-1, s.index}}, 1, e.line);
+            m_demosaicStage[s.index] = stage;
+            out->push_back(Value(PortHandle{stage, 0}));
+            return true;
+        }
+        return Fail(e.line, "no image named '" + want + "' in the palette");
+    }
+
+    // mosaic("name") -- the undemosaiced sensor data.
+    //
+    // The counterpart to image()'s automatic demosaic: this is what a script
+    // uses to demosaic explicitly, which is the only way to compare two methods
+    // side by side. Errors on a non-raw source rather than returning something
+    // that merely looks like a mosaic.
+    bool CallMosaic(const Expr& e, std::vector<Value>* out) {
+        EvaledArgs a;
+        if (!EvalArgs(e, &a)) return false;
+        if (a.pos.size() != 1 || !a.pos[0].IsString())
+            return Fail(e.line, "mosaic() takes one string: mosaic(\"name\")");
+
+        const std::string& want = a.pos[0].AsString();
+        for (const SourceImage& s : m_sources) {
+            if (s.name != want) continue;
+            if (!s.isMosaic)
+                return Fail(e.line, "'" + want + "' is not a raw image, so it has "
+                                    "no sensor mosaic; use image(\"" + want + "\")");
+            out->push_back(Value(PortHandle{-1, s.index}));
+            return true;
         }
         return Fail(e.line, "no image named '" + want + "' in the palette");
     }
@@ -593,6 +645,13 @@ private:
     // Keyed by algorithm name.
     struct ParamValues { std::vector<std::pair<std::string, double>> values; };
     std::unordered_map<std::string, ParamValues> m_pendingParams;
+
+    // The demosaic image() inserts for a mosaic source, and the stage already
+    // recorded for each one -- two image("x") calls should share a stage rather
+    // than demosaicing the same sensor data twice.
+    std::string                    m_defaultDemosaic;
+    std::unordered_map<int, int>   m_demosaicStage;   // palette index -> stage
+
     std::string                            m_err;
 };
 
@@ -601,11 +660,12 @@ private:
 InterpResult Interpret(const Program& prog,
                        const std::vector<SourceImage>& sources,
                        UiState* ui,
-                       Pipeline* out) {
+                       Pipeline* out,
+                       const std::string& defaultDemosaic) {
     out->Clear();
     ui->BeginRun();
 
-    Interp in(sources, ui, out);
+    Interp in(sources, ui, out, defaultDemosaic);
     InterpResult r;
     r.ok = in.Run(prog);
     if (!r.ok) r.error = in.Error();

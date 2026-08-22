@@ -72,6 +72,15 @@ private:
 struct SourceImage {
     std::string name;
     int         index = 0;   // index into the palette Data vector
+
+    // True when this palette entry holds an undemosaiced sensor mosaic.
+    //
+    // The palette stores the mosaic rather than a demosaiced copy, because that
+    // is where the dynamic range lives -- a 14-bit sensor's ~15,000 levels
+    // against the 256 an 8-bit conversion leaves. image() then inserts the
+    // demosaic automatically, so a script never has to mention it and works
+    // unchanged whether a PNG or a CR3 is dropped on the slot.
+    bool isMosaic = false;
 };
 
 struct InterpResult {
@@ -79,9 +88,15 @@ struct InterpResult {
     std::string error;
 };
 
+// `defaultDemosaic` names the algorithm image() inserts for a mosaic source.
+// It is an app setting rather than something the script states, so that a
+// script never has to mention demosaicing on the chance a raw file is dropped
+// on it. A script that wants a specific method calls mosaic() and demosaics
+// explicitly, which is what makes side-by-side comparison possible.
 InterpResult Interpret(const Program& prog,
                        const std::vector<SourceImage>& sources,
                        UiState* ui,
-                       Pipeline* out);
+                       Pipeline* out,
+                       const std::string& defaultDemosaic = "demosaic_bilinear");
 
 } // namespace tglab

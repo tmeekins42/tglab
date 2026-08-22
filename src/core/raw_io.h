@@ -41,4 +41,18 @@ bool LoadRawFile(const std::string& path, Image* out, std::string* err);
 // `out` untouched.
 bool ReadRawMetadata(const std::string& path, ExifData* out);
 
+// Loads the sensor's undemosaiced Bayer mosaic: one sample per pixel, linear,
+// as R32F with the CFA pattern and black/white levels on the descriptor.
+//
+// This is the path that actually buys dynamic range. LoadRawFile() asks LibRaw
+// for finished 8-bit sRGB, which crushes a 14-bit sensor's 16384 levels to 256
+// before any adjustment sees them -- pulling exposure down then recovers
+// nothing, because the highlight information is already gone. The mosaic keeps
+// all of it, and demosaicing becomes an algorithm the lab can compare rather
+// than something that already happened.
+//
+// The visible frame only: LibRaw's raw buffer includes masked border pixels
+// used for black-level calibration, which are not part of the picture.
+bool LoadRawMosaic(const std::string& path, Image* out, std::string* err);
+
 } // namespace tglab

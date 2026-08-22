@@ -19,6 +19,7 @@ int BytesPerPixel(Format f) {
         case Format::RGBA8:   return 4;
         case Format::R32F:    return 4;
         case Format::RGBA32F: return 16;
+        case Format::RGBA16F: return 8;
         case Format::Unknown: return 0;
     }
     return 0;
@@ -29,9 +30,83 @@ const char* FormatName(Format f) {
         case Format::RGBA8:   return "RGBA8";
         case Format::R32F:    return "R32F";
         case Format::RGBA32F: return "RGBA32F";
+        case Format::RGBA16F: return "RGBA16F";
         case Format::Unknown: return "Unknown";
     }
     return "Unknown";
+}
+
+// Half conversion via bit manipulation rather than a lookup table: this runs
+// once per pixel at the pipeline's edges, not in an inner loop, and the table
+// would cost 128 KB to save a handful of instructions.
+uint16_t FloatToHalf(float f) {
+    uint32_t x;
+    std::memcpy(&x, &f, sizeof(x));
+
+    const uint32_t sign = (x >> 16) & 0x8000u;
+    int32_t  exp  = int32_t((x >> 23) & 0xFF) - 127 + 15;
+    uint32_t mant = x & 0x7FFFFFu;
+
+    if (exp >= 0x1F) {
+        // Overflow, inf or NaN. Saturate rather than producing inf: a pixel
+        // value of infinity poisons every later average.
+        return uint16_t(sign | 0x7BFFu);
+    }
+    if (exp <= 0) {
+        // Subnormal or underflow. Flushing to zero is fine for image data,
+        // where these values are far below one part in 65535.
+        return uint16_t(sign);
+    }
+    return uint16_t(sign | (uint32_t(exp) << 10) | (mant >> 13));
+}
+
+float HalfToFloat(uint16_t h) {
+    const uint32_t sign = uint32_t(h & 0x8000u) << 16;
+    const uint32_t exp  = (h >> 10) & 0x1Fu;
+    const uint32_t mant = h & 0x3FFu;
+
+    uint32_t out;
+    if (exp == 0) {
+        out = sign;                                   // zero (subnormals flushed)
+    } else if (exp == 0x1F) {
+        out = sign | 0x7F800000u | (mant << 13);      // inf / NaN
+    } else {
+        out = sign | ((exp - 15 + 127) << 23) | (mant << 13);
+    }
+
+    float f;
+    std::memcpy(&f, &out, sizeof(f));
+    return f;
+}
+
+const char* CfaPatternName(CfaPattern p) {
+    switch (p) {
+        case CfaPattern::RGGB:   return "RGGB";
+        case CfaPattern::BGGR:   return "BGGR";
+        case CfaPattern::GRBG:   return "GRBG";
+        case CfaPattern::GBRG:   return "GBRG";
+        case CfaPattern::XTrans: return "X-Trans";
+        case CfaPattern::None:   return "none";
+    }
+    return "none";
+}
+
+int CfaColorAt(CfaPattern p, int x, int y) {
+    // Which colour a sample carries, from its position in the 2x2 tile.
+    // Returned as an RGB index so callers can write straight into a channel.
+    const int q = (y & 1) * 2 + (x & 1);   // 0=TL, 1=TR, 2=BL, 3=BR
+    switch (p) {
+        //                     TL  TR  BL  BR
+        case CfaPattern::RGGB: { static const int c[] = {0, 1, 1, 2}; return c[q]; }
+        case CfaPattern::BGGR: { static const int c[] = {2, 1, 1, 0}; return c[q]; }
+        case CfaPattern::GRBG: { static const int c[] = {1, 0, 2, 1}; return c[q]; }
+        case CfaPattern::GBRG: { static const int c[] = {1, 2, 0, 1}; return c[q]; }
+        // X-Trans is a 6x6 pattern, not 2x2, and needs its own algorithms.
+        // Reporting green keeps callers from indexing out of range.
+        case CfaPattern::XTrans: return 1;
+        case CfaPattern::None:   return 1;
+    }
+    return 1;
 }
 
 size_t ImageDesc::SizeInBytes() const {

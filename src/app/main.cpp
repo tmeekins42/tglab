@@ -96,13 +96,25 @@ void MakeThumbnail(Image& src, int maxSide, Image* out) {
             for (int sy = y * step; sy < std::min((y + 1) * step, sh); ++sy) {
                 for (int sx = x * step; sx < std::min((x + 1) * step, sw); ++sx) {
                     if (v.desc.format == Format::R32F) {
-                        const float f = *v.At<float>(sx, sy);
+                        // A mosaic holds raw sensor counts (2047..15488 on a
+                        // Canon CR2), not 0..1. Clamping those to 1.0 made
+                        // every raw thumbnail pure white, so scale by the
+                        // sensor's own levels first. An ordinary R32F image
+                        // has blackLevel 0 and whiteLevel 1, so this is a
+                        // no-op for it.
+                        const float black = v.desc.blackLevel;
+                        const float range = std::max(v.desc.whiteLevel - black, 1e-6f);
+                        const float f = (*v.At<float>(sx, sy) - black) / range;
                         const int g = int(std::clamp(f, 0.0f, 1.0f) * 255.0f);
                         acc[0] += g; acc[1] += g; acc[2] += g; acc[3] += 255;
                     } else if (v.desc.format == Format::RGBA32F) {
                         const float* p = v.At<float>(sx, sy);
                         for (int c = 0; c < 4; ++c)
                             acc[c] += int(std::clamp(p[c], 0.0f, 1.0f) * 255.0f);
+                    } else if (v.desc.format == Format::RGBA16F) {
+                        const uint16_t* p = v.At<uint16_t>(sx, sy);
+                        for (int c = 0; c < 4; ++c)
+                            acc[c] += int(std::clamp(HalfToFloat(p[c]), 0.0f, 1.0f) * 255.0f);
                     } else {
                         const uint8_t* p = v.At<uint8_t>(sx, sy);
                         for (int c = 0; c < 4; ++c) acc[c] += p[c];
@@ -245,7 +257,7 @@ private:
 
     // Info panel: dimensions, per-channel histogram, and capture settings for
     // whichever image is being looked at.
-    bool       m_infoOpen          = false;
+    bool       m_infoOpen          = true;    // shown by default; it is where the histogram lives
     // Histograms are computed on their own thread: four 256-bin passes over an
     // 8 MP image is far too much to spend in a frame for a panel that is purely
     // informational, and it was noticeably slowing the app when done inline.
@@ -510,7 +522,16 @@ void App::RunScript() {
             sources.push_back(Data{std::get<Image>(m_palette[i].data).Clone()});
         else
             sources.push_back(Data{});
-        names.push_back({m_palette[i].name, int(i)});
+        {
+            SourceImage si;
+            si.name  = m_palette[i].name;
+            si.index = int(i);
+            // Tells the interpreter to insert a demosaic for this source, so a
+            // script never has to mention one.
+            if (std::holds_alternative<Image>(m_palette[i].data))
+                si.isMosaic = std::get<Image>(m_palette[i].data).Desc().IsMosaic();
+            names.push_back(si);
+        }
         // Bumped when a drop replaces the file behind this slot, which is what
         // lets the stage cache notice the pixels changed.
         versions.push_back(m_palette[i].version);
@@ -563,7 +584,16 @@ void App::RequestCompare() {
             sources.push_back(Data{std::get<Image>(m_palette[i].data).Clone()});
         else
             sources.push_back(Data{});
-        names.push_back({m_palette[i].name, int(i)});
+        {
+            SourceImage si;
+            si.name  = m_palette[i].name;
+            si.index = int(i);
+            // Tells the interpreter to insert a demosaic for this source, so a
+            // script never has to mention one.
+            if (std::holds_alternative<Image>(m_palette[i].data))
+                si.isMosaic = std::get<Image>(m_palette[i].data).Desc().IsMosaic();
+            names.push_back(si);
+        }
         // Bumped when a drop replaces the file behind this slot, which is what
         // lets the stage cache notice the pixels changed.
         versions.push_back(m_palette[i].version);
@@ -1160,6 +1190,7 @@ void App::DrawInfoPanel() {
         case Format::RGBA8:   fmt = "RGBA8";   break;
         case Format::R32F:    fmt = "R32F";    break;
         case Format::RGBA32F: fmt = "RGBA32F"; break;
+        case Format::RGBA16F: fmt = "RGBA16F"; break;
         default: break;
     }
     ImGui::Text("%d x %d  (%.1f MP)", d.width, d.height,
@@ -1240,6 +1271,15 @@ void App::DrawInfoPanel() {
     if (!m_stats.valid) {
         ImGui::TextDisabled("computing...");
     } else {
+        // Float images live in 0..1, so "%.1f" showed 0.0 for everything. Three
+        // decimals there, one for the 0..255 case where they would be noise.
+        if (m_stats.scale <= 1.5) {
+            ImGui::Text("mean %.3f   median %.3f   stddev %.3f",
+                        m_stats.mean, m_stats.median, m_stats.stddev);
+            if (m_stats.hasHeadroom)
+                ImGui::TextDisabled("headroom to %.2f (%.1f stops above white)",
+                                    m_stats.maxValue, std::log2(m_stats.maxValue));
+        } else
         ImGui::Text("mean %.1f   median %.1f   stddev %.1f",
                     m_stats.mean, m_stats.median, m_stats.stddev);
         // Clipping is the thing worth flagging: it is unrecoverable, and it

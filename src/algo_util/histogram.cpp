@@ -17,6 +17,12 @@ double SampleValue(const ImageView& v, int x, int y, int channel) {
             if (channel >= 0) return double(p[channel]);
             return 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2];
         }
+        case Format::RGBA16F: {
+            const uint16_t* p = v.At<uint16_t>(x, y);
+            const double r = HalfToFloat(p[0]), g = HalfToFloat(p[1]), b = HalfToFloat(p[2]);
+            if (channel >= 0) return HalfToFloat(p[channel]);
+            return 0.299 * r + 0.587 * g + 0.114 * b;
+        }
         case Format::RGBA8: {
             const uint8_t* p = v.At<uint8_t>(x, y);
             if (channel >= 0) return double(p[channel]);

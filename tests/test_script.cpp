@@ -999,6 +999,150 @@ int main() {
         Check(err2 == err, "the same error is reported on every run, not just the first");
     }
 
+    // --- image() demosaics a mosaic automatically ---------------------------
+    //
+    // The requirement: a script must not have to mention demosaicing on the
+    // chance a raw file is dropped on it. image() inserts the default method
+    // for a mosaic source and does nothing for an ordinary one, so the same
+    // script works either way.
+    {
+        ImageDesc d{4, 4, Format::R32F};
+        d.cfa = CfaPattern::RGGB;
+        Image mos;
+        mos.Alloc(d);
+
+        std::vector<Data> src;
+        src.push_back(Data{std::move(mos)});
+        std::vector<SourceImage> names;
+        { SourceImage s; s.name = "test"; s.index = 0; s.isMosaic = true; names.push_back(s); }
+
+        Program prog;
+        std::string err;
+        Check(Parse("src = image(\"test\")\ndisplay(src)\n", &prog, &err),
+              "a plain script parses");
+        UiState ui; Pipeline p;
+        const auto r = Interpret(prog, names, &ui, &p);
+        Check(r.ok, "it interprets against a mosaic source" + (r.ok ? "" : ": " + r.error));
+        Check(p.Stages().size() == 1 && p.Stages()[0].algoName == "demosaic_bilinear",
+              "image() inserted the default demosaic without the script asking");
+
+        // Two image() calls on one source must share the stage rather than
+        // demosaicing the same sensor data twice.
+        Program prog2;
+        Parse("a = image(\"test\")\nb = image(\"test\")\ndisplay(a)\ndisplay(b)\n",
+              &prog2, &err);
+        UiState ui2; Pipeline p2;
+        Interpret(prog2, names, &ui2, &p2);
+        Check(p2.Stages().size() == 1,
+              "two image() calls share one demosaic stage, not two");
+    }
+    {
+        // An ordinary image gets no demosaic stage at all.
+        std::vector<Data> src;
+        Image plain;
+        plain.Alloc({4, 4, Format::RGBA8});
+        src.push_back(Data{std::move(plain)});
+        std::vector<SourceImage> names{{"test", 0, false}};
+
+        Program prog;
+        std::string err;
+        Parse("src = image(\"test\")\ndisplay(src)\n", &prog, &err);
+        UiState ui; Pipeline p;
+        Interpret(prog, names, &ui, &p);
+        Check(p.Stages().empty(), "an ordinary image gets no demosaic stage");
+    }
+    {
+        // mosaic() is the explicit counterpart, and must refuse a non-raw
+        // source rather than hand back something that merely looks like one.
+        std::vector<Data> src;
+        Image plain;
+        plain.Alloc({4, 4, Format::RGBA8});
+        src.push_back(Data{std::move(plain)});
+        std::vector<SourceImage> names{{"test", 0, false}};
+
+        Program prog;
+        std::string err;
+        Parse("m = mosaic(\"test\")\ndisplay(m)\n", &prog, &err);
+        UiState ui; Pipeline p;
+        const auto r = Interpret(prog, names, &ui, &p);
+        Check(!r.ok && r.error.find("not a raw image") != std::string::npos,
+              "mosaic() on a non-raw image explains itself: \"" + r.error + "\"");
+    }
+
+    // --- half float ---------------------------------------------------------
+    //
+    // RGBA16F is the working format for raw, so a rounding error here would
+    // quietly cost precision everywhere rather than failing visibly.
+    {
+        Check(HalfToFloat(FloatToHalf(0.0f)) == 0.0f, "half round-trips zero");
+        Check(HalfToFloat(FloatToHalf(1.0f)) == 1.0f, "half round-trips one");
+        Check(std::abs(HalfToFloat(FloatToHalf(-1.0f)) + 1.0f) < 1e-6f,
+              "half round-trips a negative");
+
+        // Within half's precision across the range image data actually uses.
+        double worst = 0.0;
+        for (int i = 0; i <= 1000; ++i) {
+            const float f = float(i) / 1000.0f;
+            worst = std::max(worst, std::abs(double(HalfToFloat(FloatToHalf(f))) - f));
+        }
+        // Half has ~11 bits of mantissa, so 1e-3 is generous; a real bug here
+        // (a shifted exponent, say) would be off by orders of magnitude.
+        Check(worst < 1e-3, "half round-trips 0..1 within precision (worst " +
+                                std::to_string(worst) + ")");
+
+        // A 14-bit sensor's smallest step must survive, since that is the whole
+        // reason for choosing half over 8-bit.
+        const float step = 1.0f / 16384.0f;
+        Check(HalfToFloat(FloatToHalf(step)) > 0.0f,
+              "a 14-bit sensor's smallest step does not flush to zero");
+
+        // Overflow saturates rather than producing inf, which would poison
+        // every later average.
+        Check(HalfToFloat(FloatToHalf(1e30f)) > 60000.0f &&
+              std::isfinite(HalfToFloat(FloatToHalf(1e30f))),
+              "overflow saturates rather than becoming infinity");
+    }
+
+    // --- CFA pattern --------------------------------------------------------
+    {
+        // RGGB: R G / G B, as an RGB channel index.
+        Check(CfaColorAt(CfaPattern::RGGB, 0, 0) == 0, "RGGB top-left is red");
+        Check(CfaColorAt(CfaPattern::RGGB, 1, 0) == 1, "RGGB top-right is green");
+        Check(CfaColorAt(CfaPattern::RGGB, 0, 1) == 1, "RGGB bottom-left is green");
+        Check(CfaColorAt(CfaPattern::RGGB, 1, 1) == 2, "RGGB bottom-right is blue");
+        // BGGR is RGGB with red and blue exchanged.
+        Check(CfaColorAt(CfaPattern::BGGR, 0, 0) == 2, "BGGR top-left is blue");
+        Check(CfaColorAt(CfaPattern::BGGR, 1, 1) == 0, "BGGR bottom-right is red");
+        // The pattern tiles, so (2,2) must match (0,0).
+        Check(CfaColorAt(CfaPattern::GRBG, 2, 2) == CfaColorAt(CfaPattern::GRBG, 0, 0),
+              "the pattern tiles every 2 pixels");
+        // Half the samples are green in every Bayer layout.
+        for (CfaPattern p : {CfaPattern::RGGB, CfaPattern::BGGR,
+                             CfaPattern::GRBG, CfaPattern::GBRG}) {
+            int greens = 0;
+            for (int y = 0; y < 2; ++y)
+                for (int x = 0; x < 2; ++x)
+                    if (CfaColorAt(p, x, y) == 1) ++greens;
+            Check(greens == 2, std::string(CfaPatternName(p)) + " has two greens per tile");
+        }
+    }
+
+    // --- mosaic metadata rides on ImageDesc ---------------------------------
+    {
+        ImageDesc plain{4, 4, Format::RGBA8};
+        Check(!plain.IsMosaic(), "an ordinary image is not a mosaic");
+
+        ImageDesc mosaic{4, 4, Format::R32F};
+        mosaic.cfa = CfaPattern::RGGB;
+        Check(mosaic.IsMosaic(), "a CFA pattern makes it a mosaic");
+
+        // The stage cache compares descriptors, so a mosaic and an ordinary
+        // image of the same size must not look interchangeable.
+        ImageDesc sameSize{4, 4, Format::R32F};
+        Check(!(mosaic == sameSize),
+              "a mosaic and a plain image of the same size compare unequal");
+    }
+
     // --- camera raw ---------------------------------------------------------
     //
     // Only the dispatch is tested here: decoding needs a real camera file,

@@ -126,6 +126,13 @@ void ImageStats::Run() {
             out->mean   = h.Mean();
             out->median = h.Median();
             out->stddev = h.StdDev();
+            out->scale  = (v.desc.format == Format::RGBA8) ? 255.0 : 1.0;
+
+            // Headroom above 1.0 only exists for a float image, and only when
+            // the capture actually had it. The histogram bins over the observed
+            // range, so its top bin is where to look.
+            out->maxValue = h.RangeMax();
+            out->hasHeadroom = (out->scale == 1.0) && (out->maxValue > 1.0001);
 
             const double n = double(h.Count() ? h.Count() : 1);
             out->clipLow  = double(h.Bin(0)) / n;

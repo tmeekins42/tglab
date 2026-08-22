@@ -163,7 +163,20 @@ if(MSVC)
     target_compile_definitions(tglab_filter_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
 
+# Demosaic behaviour: reconstruction against a known scene, CFA phase, and
+# the metadata rules that keep a demosaiced image from being demosaiced twice.
+add_executable(tglab_demosaic_tests
+    tests/test_demosaic.cpp
+    $<TARGET_OBJECTS:tglab_algorithms>
+)
+target_link_libraries(tglab_demosaic_tests PRIVATE tglab_core imgui d3d12 dxgi)
+if(MSVC)
+    target_compile_definitions(tglab_demosaic_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+tglab_copy_dxc(tglab_demosaic_tests)
+
 enable_testing()
 add_test(NAME script_spine COMMAND tglab_tests)
 add_test(NAME filters      COMMAND tglab_filter_tests)
+add_test(NAME demosaic     COMMAND tglab_demosaic_tests)
 add_test(NAME runtime      COMMAND tglab_runtime_tests)

@@ -14,9 +14,42 @@ namespace tglab {
 enum class Format : uint8_t {
     Unknown = 0,
     RGBA8,      // 4 x uint8  — loading, display
-    R32F,       // 1 x float  — intermediates, signed gradients
+    R32F,       // 1 x float  — intermediates, signed gradients, Bayer mosaics
     RGBA32F,    // 4 x float  — high-precision intermediates
+    RGBA16F,    // 4 x half   — the working format for raw
 };
+
+// Colour filter array layout, naming the 2x2 tile's top-left quad.
+//
+// A Bayer mosaic is deliberately NOT a new Data type: it is a single-channel
+// 2D array of samples, which R32F already describes. What it needs beyond that
+// is metadata saying which colour each pixel carries -- a property of the
+// image, not a new kind of data. Keeping it an Image means PixelBuffer, the
+// stage cache, FormatSpec and the GPU path all handle it unchanged, and a
+// "passthrough" demosaic is simply the identity function.
+enum class CfaPattern : uint8_t {
+    None = 0,   // an ordinary image; every existing algorithm sees this
+    RGGB,
+    BGGR,
+    GRBG,
+    GBRG,
+    XTrans,     // Fuji's 6x6; the slot is reserved, the algorithms are not written
+};
+
+const char* CfaPatternName(CfaPattern p);
+
+// IEEE 754 half conversion.
+//
+// RGBA16F is the working format for raw: it halves the bandwidth of RGBA32F,
+// which matters because chained GPU stages are bandwidth-bound, and its 11 bits
+// of mantissa still comfortably exceed a 14-bit sensor's usable range. There is
+// no native half type in C++, so pixels are stored as uint16_t and converted at
+// the edges.
+uint16_t FloatToHalf(float f);
+float    HalfToFloat(uint16_t h);
+
+// The colour of one mosaic sample. Index 0=R, 1=G, 2=B, matching RGB order.
+int CfaColorAt(CfaPattern p, int x, int y);
 
 int BytesPerPixel(Format f);
 const char* FormatName(Format f);
@@ -28,6 +61,7 @@ enum class FormatSpec : uint8_t {
     RGBA8,
     R32F,
     RGBA32F,
+    RGBA16F,
 };
 
 struct ImageDesc {
@@ -35,9 +69,37 @@ struct ImageDesc {
     int    height = 0;
     Format format = Format::Unknown;
 
+    // Sensor metadata, meaningful only for an undemosaiced mosaic. Declared
+    // after `format` so the twenty-odd existing {w, h, Format::X} brace
+    // initialisations keep working and simply take the defaults.
+    //
+    // These participate in operator==, which drives the stage cache. That is
+    // correct: a mosaic and an RGB image of the same size are genuinely
+    // different, and a cached result for one must not be reused for the other.
+    CfaPattern cfa        = CfaPattern::None;
+    float      blackLevel = 0.0f;   // sensor value that means black
+    float      whiteLevel = 1.0f;   // ... and saturation
+
+    // As-shot white balance, as per-channel gains normalised so green is 1.
+    //
+    // A sensor's green photosites are roughly twice as sensitive as its red and
+    // blue ones, so raw data is heavily green without these -- which is exactly
+    // what an undemosaiced image looks like if you forget them.
+    float camMul[3] = {1.0f, 1.0f, 1.0f};
+
+    // Camera colour space -> sRGB, row-major. Sensor primaries are not sRGB
+    // primaries, so without this even correctly balanced data has the wrong
+    // hues. Identity for a non-raw image.
+    float rgbCam[9] = {1.0f, 0.0f, 0.0f,
+                       0.0f, 1.0f, 0.0f,
+                       0.0f, 0.0f, 1.0f};
+
     bool operator==(const ImageDesc&) const = default;
     size_t SizeInBytes() const;
     bool   Valid() const { return width > 0 && height > 0 && format != Format::Unknown; }
+
+    // True when this image still carries an undemosaiced sensor pattern.
+    bool IsMosaic() const { return cfa != CfaPattern::None; }
 };
 
 // Non-owning view of CPU pixels. Algorithms operate through this.

@@ -38,6 +38,18 @@ struct StatsResult {
     double mean   = 0.0;
     double median = 0.0;
     double stddev = 0.0;
+
+    // The units mean/median/stddev are in: 255 for an 8-bit image, 1 for a
+    // float one. Without this the panel formatted a linear float image's 0..1
+    // values with one decimal place and showed "mean 0.0 median 0.0 stddev
+    // 0.0" for a perfectly good photograph.
+    double scale = 255.0;
+
+    // True when the image carries values above 1.0 -- real highlight headroom
+    // that an 8-bit conversion would have clipped. Worth saying explicitly,
+    // since it is the whole reason for the raw path.
+    bool   hasHeadroom = false;
+    double maxValue    = 0.0;
     double clipLow  = 0.0;   // fraction of pixels at pure black
     double clipHigh = 0.0;   // ... and at pure white
 
