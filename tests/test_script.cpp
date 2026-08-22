@@ -1303,6 +1303,57 @@ int main() {
                                      (undocumented ? ":" + missing : ""));
     }
 
+
+    // --- a control follows a changed default, unless the user moved it -------
+    //
+    // Almost every parameter's default is fixed, so FindOrAdd could simply
+    // preserve the current value across re-runs. kelvin's is not: it comes from
+    // the image, and on startup the control is created before the raw finishes
+    // loading. It was therefore built at 0 and preserved forever -- the slider
+    // read 0 K on a file whose metadata says 5381.
+    //
+    // Reported twice: once as "the kelvin slider defaulted to 0, which was
+    // confusing", and again after I fixed the recovery but not this.
+    {
+        UiState ui;
+
+        UiControl proto;
+        proto.kind  = UiControl::Kind::Slider;
+        proto.label = "basic_adjust.kelvin";
+        proto.lo    = 0.0;
+        proto.hi    = 25000.0;
+        proto.def   = 0.0;      // as declared, before any image is known
+        proto.value = 0.0;
+
+        ui.BeginRun();
+        UiControl& first = ui.FindOrAdd(proto);
+        Check(first.value == 0.0, "a fresh control takes the declared default");
+
+        // The image arrives and the default becomes the camera's temperature.
+        UiControl updated = proto;
+        updated.def   = 5381.0;
+        updated.value = 5381.0;
+
+        ui.BeginRun();
+        UiControl& second = ui.FindOrAdd(updated);
+        Check(second.value == 5381.0,
+              "an untouched control follows the new default (got " +
+                  std::to_string(second.value) + ", want 5381)");
+        Check(second.def == 5381.0, "...and reports it as the default");
+
+        // But a value the user set is theirs. Move it, then change the default
+        // again: the control must not jump.
+        second.value = 3200.0;
+        UiControl moved = updated;
+        moved.def   = 6504.0;
+        moved.value = 6504.0;
+
+        ui.BeginRun();
+        UiControl& third = ui.FindOrAdd(moved);
+        Check(third.value == 3200.0,
+              "a control the user moved keeps its value when the default changes "
+              "(got " + std::to_string(third.value) + ", want 3200)");
+    }
     // --- parameter step / soft range ---------------------------------------
     //
     // Snapping lives in Param::set(), so it must apply to script and typed

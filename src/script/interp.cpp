@@ -34,6 +34,19 @@ UiControl& UiState::FindOrAdd(const UiControl& proto) {
         existing->kind    = proto.kind;
         existing->lo      = proto.lo;
         existing->hi      = proto.hi;
+        // A control still sitting on its old default follows a changed one.
+        //
+        // Defaults are fixed for almost every parameter, but kelvin's comes
+        // from the image -- and on startup the control is created before the
+        // raw finishes loading, so it is built at 0 and then preserved here
+        // forever. The slider showed 0 K on a file whose metadata says 5381.
+        //
+        // Only when untouched: a value the user moved, or the script set, is
+        // still theirs to keep.
+        if (existing->kind == UiControl::Kind::Slider &&
+            existing->value == existing->def && existing->def != proto.def) {
+            existing->value = proto.def;
+        }
         existing->def     = proto.def;
         existing->display = proto.display;
         existing->group   = proto.group;
