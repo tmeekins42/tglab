@@ -98,6 +98,11 @@ public:
     int CpuStageCount()    const { return m_cpuStages; }
     int CachedStageCount() const { return m_cachedStages; }
 
+    // Index of the first stage that actually re-ran. Everything below it kept
+    // its cached output, so a viewer reading from there shows the same pixels
+    // it showed last run -- which is what lets the UI skip re-uploading it.
+    size_t FirstDirtyStage() const { return m_firstDirty; }
+
     const Data* Resolve(PortRef r, const std::vector<Data>* sources) const;
 
     std::vector<Stage>&       Stages()       { return m_stages; }
@@ -118,6 +123,7 @@ private:
     int                     m_gpuStages = 0;
     int                     m_cpuStages = 0;
     int                     m_cachedStages = 0;
+    size_t                  m_firstDirty = 0;
 };
 
 } // namespace tglab

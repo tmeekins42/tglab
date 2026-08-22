@@ -235,7 +235,6 @@ private:
     std::string m_error;        // last script/run error, empty when fine
     std::string m_loadError;    // script file could not be read (survives a re-run)
     bool        m_dirty = true; // re-run requested
-    uint64_t    m_contentVersion = 1;
     bool        m_rebuildLayout = false;   // explicit "Reset layout" request
     int         m_layoutCountdown = 0;     // frames until the default layout is built
     int         m_switchCountdown = 0;     // self-test: frames until TGLAB_SWITCH fires
@@ -636,8 +635,21 @@ void App::PollWorker() {
         m_error = out.error;          // keep the previous images on screen
     } else {
         m_error.clear();
-        m_viewerImages = std::move(out.viewers);
-        ++m_contentVersion;           // tells the views their pixels are new
+
+        // Merge by name rather than replace. The worker omits viewers whose
+        // pixels did not change -- displaying a source while a slider drives a
+        // later stage is the common case -- so a wholesale assignment would
+        // blank them. Views look themselves up by name, and m_views is rebuilt
+        // from the script, so an entry for a removed display() is simply never
+        // consulted.
+        for (ViewerImage& in : out.viewers) {
+            auto it = std::find_if(m_viewerImages.begin(), m_viewerImages.end(),
+                                   [&](const ViewerImage& v) { return v.name == in.name; });
+            if (it == m_viewerImages.end())
+                m_viewerImages.push_back(std::move(in));
+            else
+                *it = std::move(in);
+        }
     }
     ReportError(prevError);
     UpdateWindowTitle();
@@ -1213,18 +1225,26 @@ void App::DrawInfoPanel() {
     // is tens of milliseconds -- far too much to spend in a frame for a panel
     // that is purely informational. A request goes out when the subject or the
     // content changes; until it returns, the previous bins stay on screen.
-    if (m_stats.source != shownName || m_stats.version != m_contentVersion) {
+    // The version of the viewer this panel is showing, not a global one: with
+    // per-viewer versions a global counter would either never change (and the
+    // histogram would freeze) or change for every viewer (and it would
+    // recompute needlessly).
+    uint64_t shownVersion = 0;
+    for (const ViewerImage& vi : m_viewerImages)
+        if (vi.name == shownName) { shownVersion = vi.version; break; }
+
+    if (m_stats.source != shownName || m_stats.version != shownVersion) {
         if (!m_statsRequested ||
-            m_requestedSource != shownName || m_requestedVersion != m_contentVersion) {
+            m_requestedSource != shownName || m_requestedVersion != shownVersion) {
             if (GetEnvironmentVariableA("TGLAB_INFODBG", nullptr, 0) > 0) {
                 std::fprintf(stderr, "[info] subject=%s version=%llu\n",
-                             shownName.c_str(), (unsigned long long)m_contentVersion);
+                             shownName.c_str(), (unsigned long long)shownVersion);
                 std::fflush(stderr);
             }
-            m_statsWorker.Request(*shown, shownName, m_contentVersion);
+            m_statsWorker.Request(*shown, shownName, shownVersion);
             m_statsRequested   = true;
             m_requestedSource  = shownName;
-            m_requestedVersion = m_contentVersion;
+            m_requestedVersion = shownVersion;
         }
     }
 
@@ -1293,7 +1313,7 @@ void App::DrawInfoPanel() {
                                 m_stats.clipLow * 100.0, m_stats.clipHigh * 100.0);
         // Says plainly that what is on screen is one image behind, rather than
         // letting a stale curve look current.
-        if (m_stats.source != shownName || m_stats.version != m_contentVersion)
+        if (m_stats.source != shownName || m_stats.version != shownVersion)
             ImGui::TextDisabled("(updating...)");
     }
 
@@ -1906,7 +1926,12 @@ void App::Frame() {
         for (ViewerImage& vi : m_viewerImages)
             if (vi.name == v->Name()) { img = &vi.image; break; }
 
-        v->SetContentVersion(m_contentVersion);
+        // Per-viewer, so an unchanged viewer skips the upload entirely rather
+        // than re-converting the same pixels because some other viewer moved.
+        uint64_t ver = 0;
+        for (const ViewerImage& vi : m_viewerImages)
+            if (vi.name == v->Name()) { ver = vi.version; break; }
+        v->SetContentVersion(ver);
         v->Draw(m_dev, img);
     }
 

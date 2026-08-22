@@ -479,6 +479,46 @@ The line to draw: settled operations that always run together belong fused;
 anything worth *experimenting* with stays a separate algorithm, where
 `choose()` and the compare panel can reach it.
 
+### Getting pixels onto the screen
+
+Optimising the pipeline is only half the latency. Dragging a slider on a 21 MP
+raw felt like about half a second while the status bar reported 53 ms, and the
+gap was entirely in the display path — which the status bar does not time.
+
+Measured per viewer, at 5634×3752:
+
+| | before | after |
+|---|---|---|
+| readback (`Clone()` on a GPU-resident image) | 86 ms | 86 ms |
+| RGBA16F → RGBA8 conversion | 323 ms | 47 ms |
+| **per viewer, per frame** | **409 ms** | **133 ms** |
+
+`develop.tgl` shows two viewers, so all of it doubled.
+
+The conversion was the surprise — larger than running the pipeline. It is 85
+million components per frame, and `HalfToFloat` is an out-of-line call in
+another translation unit, so none of it inlined. A half has only 65536 possible
+values, so the whole operation — decode, clamp, scale — collapses into a 64 KB
+lookup table and one indexed load. That is the 9× above.
+
+The second half is not making the work faster but *not doing it*. Viewers now
+carry a per-viewer content version, bumped only when that viewer's own pixels
+changed, which the stage cache already knows from `FirstDirtyStage()`. In
+`display(src, ...)` next to a slider-driven stage, the source is unchanged, so
+its texture upload is skipped entirely rather than re-converting identical
+pixels every frame. A single global version cannot express this: it either
+never changes, or changes for everything at once.
+
+The worker still *sends* unchanged viewers rather than omitting them. It holds
+one outcome and a newer run overwrites an unfetched one, so "the UI already has
+this" is not something that side can know — and once an image is CPU-resident
+the clone is a memcpy, since the expensive parts were the readback and the
+conversion, both of which the version check skips.
+
+Still on the table: displaying straight from the GPU texture. The compute
+context and ImGui share a device, so the readback is avoidable — it is just a
+larger change than the two above.
+
 ### Filters
 
 Everything in `Category()=="filter"` is interchangeable, so

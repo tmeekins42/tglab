@@ -133,6 +133,12 @@ void PipelineWorker::Run() {
             continue;
         }
 
+        // Did any palette image change since the last run? A viewer that
+        // displays a source directly has no stage whose cache could tell us, so
+        // the versions are compared here.
+        bool sourcesChanged = (job->sourceVersions != m_lastSourceVersions);
+        m_lastSourceVersions = job->sourceVersions;
+
         const auto t0 = std::chrono::steady_clock::now();
         std::string err;
         const bool ok = job->pipe.Execute(&job->sources, havePrev ? &prev : nullptr, &err,
@@ -182,11 +188,33 @@ void PipelineWorker::Run() {
             // cache) stays here, so the next job can still skip unchanged
             // stages — that cache is exactly what makes dragging a slider on a
             // late stage cheap.
+            //
+            // Each viewer carries a version that changes only when its own
+            // pixels do. The UI uploads on a version change, so displaying a
+            // source next to a slider-driven stage no longer re-converts the
+            // source every frame.
+            //
+            // The worker cannot skip *sending* an unchanged viewer: m_result
+            // holds one outcome and a newer run overwrites an unfetched one, so
+            // "already sent" is not something this side can know. Cloning an
+            // unchanged image is cheap anyway once it is CPU-resident -- the
+            // expensive parts were the readback and the RGBA8 conversion, and
+            // the version check skips both.
+            const size_t firstDirty = job->pipe.FirstDirtyStage();
             for (const ViewerDecl& vd : job->pipe.Viewers()) {
                 const Data* d = job->pipe.Resolve(vd.source, &job->sources);
                 if (!d || !std::holds_alternative<Image>(*d)) continue;
+
+                // A palette source (stage < 0) changes only when the file
+                // behind it is replaced, which arrives as a new source version.
+                const bool changed = (vd.source.stage < 0)
+                                         ? sourcesChanged
+                                         : size_t(vd.source.stage) >= firstDirty;
+                uint64_t& ver = m_viewerVersions[vd.name];
+                if (changed || ver == 0) ++ver;
+
                 outcome->viewers.push_back(
-                    {vd.name, const_cast<Image&>(std::get<Image>(*d)).Clone()});
+                    {vd.name, const_cast<Image&>(std::get<Image>(*d)).Clone(), ver});
             }
 
             prev     = std::move(job->pipe);

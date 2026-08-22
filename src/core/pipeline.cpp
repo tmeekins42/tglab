@@ -104,6 +104,8 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
         }
     }
 
+    m_firstDirty = firstDirty;
+
     // Dirty stages still reuse their compiled kernel when they are the same
     // algorithm as last run — a parameter change does not alter the HLSL, and
     // recompiling on every slider tick would defeat the point of the GPU path.

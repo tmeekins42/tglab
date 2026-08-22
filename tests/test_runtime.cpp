@@ -132,6 +132,82 @@ static void TestWorker() {
 // Coalescing already drops *queued* jobs, but a job that had started ran to
 // completion -- so nudging a slider during a minute-long filter meant waiting
 // for the old value before the new one even began.
+
+// Per-viewer content versions.
+//
+// display(src, ...) next to a slider-driven stage is the common shape -- it is
+// what develop.tgl does -- and the source's pixels do not change when the
+// slider moves. The UI uploads a viewer's display texture only when its version
+// changes, and that upload is expensive: Clone() on a GPU-resident image forces
+// a readback and the texture then converts to RGBA8. Measured at 21 MP, ~85 ms
+// and ~50 ms per viewer per frame, none of it visible to the status bar.
+//
+// A single global version cannot express this: it either never changes (and
+// nothing ever refreshes) or changes whenever any viewer does (and everything
+// refreshes).
+static void TestViewerVersions() {
+    Section("per-viewer content versions");
+
+    PipelineWorker worker;
+    worker.Start(nullptr);
+    worker.SetExecMode(ExecMode::ForceCPU);
+
+    // Viewer "a" reads the source; viewer "b" reads a blur the slider drives.
+    auto build = [](double sigma, UiState* ui, Pipeline* pipe,
+                    std::vector<Data>* src, std::string* err) {
+        const std::string s =
+            "src = image(\"test\")\n"
+            "b = gaussian_blur(src, sigma = " + std::to_string(sigma) + ")\n"
+            "display(src, \"a\")\n"
+            "display(b, \"b\")\n";
+        return BuildPipeline(s.c_str(), 128, ui, pipe, src, err);
+    };
+
+    auto fetch = [&](uint64_t seq, PipelineOutcome* out) {
+        const auto deadline = clockt::now() + std::chrono::seconds(30);
+        while (clockt::now() < deadline) {
+            if (worker.TryFetch(out) && out->seq == seq) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        return false;
+    };
+
+    auto versionOf = [](const PipelineOutcome& o, const char* name) -> uint64_t {
+        for (const ViewerImage& v : o.viewers)
+            if (v.name == name) return v.version;
+        return 0;
+    };
+
+    UiState ui1; Pipeline p1; std::vector<Data> s1; std::string err;
+    if (!build(2.0, &ui1, &p1, &s1, &err)) { Check(false, "build: " + err); worker.Stop(); return; }
+    PipelineOutcome o1;
+    if (!fetch(worker.Submit(std::move(p1), std::move(s1)), &o1)) {
+        Check(false, "first run delivered"); worker.Stop(); return; }
+
+    Check(o1.viewers.size() == 2, "both viewers delivered on the first run");
+    Check(versionOf(o1, "a") > 0 && versionOf(o1, "b") > 0,
+          "both viewers start at a non-zero version");
+
+    // Same script, different slider value: only "b" is downstream of it.
+    UiState ui2; Pipeline p2; std::vector<Data> s2;
+    if (!build(6.0, &ui2, &p2, &s2, &err)) { Check(false, "build: " + err); worker.Stop(); return; }
+    PipelineOutcome o2;
+    if (!fetch(worker.Submit(std::move(p2), std::move(s2)), &o2)) {
+        Check(false, "second run delivered"); worker.Stop(); return; }
+
+    Check(o2.viewers.size() == 2,
+          "both viewers are still delivered (the UI must not be left holding a gap)");
+    Check(versionOf(o2, "a") == versionOf(o1, "a"),
+          "the source viewer keeps its version when a later stage changes (was " +
+              std::to_string(versionOf(o1, "a")) + ", now " +
+              std::to_string(versionOf(o2, "a")) + ")");
+    Check(versionOf(o2, "b") != versionOf(o1, "b"),
+          "the slider-driven viewer gets a new version (was " +
+              std::to_string(versionOf(o1, "b")) + ", now " +
+              std::to_string(versionOf(o2, "b")) + ")");
+
+    worker.Stop();
+}
 static void TestCancellation() {
     Section("cancellation");
 
@@ -833,6 +909,7 @@ static void TestCompare(ID3D12Device* dev) {
 
 int main() {
     TestWorker();
+    TestViewerVersions();
     TestCancellation();
     TestShaderCompiler();
 

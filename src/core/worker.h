@@ -16,6 +16,7 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <map>
 #include <string>
 #include <thread>
 #include <vector>
@@ -50,6 +51,12 @@ struct PipelineJob {
 struct ViewerImage {
     std::string name;
     Image       image;
+
+    // Bumped only when THIS viewer's pixels actually changed. The UI uploads
+    // to its display texture on a version change, so a viewer reading from a
+    // cached stage -- display(src, ...) while a slider drives a later stage --
+    // costs nothing per frame instead of a full readback and conversion.
+    uint64_t    version = 0;
 };
 
 struct PipelineOutcome {
@@ -128,6 +135,11 @@ private:
     std::atomic<int>      m_lastCpuStages{0};
     std::atomic<int>      m_lastCachedStages{0};
     std::atomic<double>   m_lastMs{0.0};
+
+    // Per-viewer bookkeeping for skipping unchanged viewers (see Run()).
+    // Worker-thread only, so unguarded.
+    std::map<std::string, uint64_t> m_viewerVersions;
+    std::vector<uint64_t>           m_lastSourceVersions;
     uint64_t              m_nextSeq = 1;
     ID3D12Device*         m_device = nullptr;
 };
