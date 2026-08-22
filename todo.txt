@@ -1,0 +1,59 @@
+BUGS / SMALL FEATURES
+- many algorithms use the switch-default and if-else to have RGB8 as the default format. please change this to the default case is an error message so we can find unimplemented formats.
+- the brightness algorithm only implements two formats, see above.
+- brightness algorithm sliders should be named brightness and gain.
+- would a tty / stdio backend make the app easier to debug?
+- add GPU implementation for local_threshold and use the new GPU histogram
+- add faint gridlines around the pixels in the loupe
+- at some point we might need a vram garbage collector if we're doing a LOT of gpu operations and collecting a lot of temporary textures.
+- new algorithm: auto-develop. It's an extension of develop, but it auto finds the best settings to "develop" the image. Most important are auto white-balance and auto-exposure
+
+FEATURES
+- add support for additional image channels, such as alpha channels and depth channels
+- channel merging. Astronomy images are captured single channel with colored filters. How to merge them?
+- image export
+- batch processing
+- an option to visualize clipping regions in the image
+- the image palette is a collection of images. I would like the option to make a palette entry into a image group.
+  + in a group, dropping an image adds it to the list instead of replacing
+  + we'll need a remove image option (right-click)
+  + an image group/list is a new data type. Some algorithms take an image list as input (focus stacking, panorama merging, SfM...)
+  + a group has a hidden frame number and a play button can make us cycle the frame number. this does nothing for algorithms that take an image list
+  + algorithms that take a single image will use the image at the image index in the group. when the index changes if play is pressed, updates the dirty flag to re-process
+  + a video file can be dropped into a group as well
+  + for videos, we might need a way to set start/end frames as we probably don't need the entire video.
+- Exposure stacking -> HDR
+- Focus stacking
+- feature tracking support, numerous algorithms
+- photo alignment from features
+- fine photo alignment from optimizing solver?
+- panorama photo merging, multiple projections
+- Job system: future algorithms could become much slower and broken into multiple stages, some with dependencies on other stages, some that can run in parallel. A job system can make this faster
+- progress bar for job system
+- are there any public lens correction databases we could take advantage of?
+- denoising algorithms
+- can we run a script (develop?) on every image in a group, then run an algorithm, like panorama that works on the entire group?
+
+FROM CLAUDE (raised in conversation, not yet in the list above)
+- basic_adjust ranges scaling with bit depth. Different raws have different bit
+  depths and the controls do not currently know.
+- exposure does not visibly stretch the histogram. Suspected to be the SDR
+  display window rather than the data: values pushed above 1.0 leave the visible
+  range instead of stretching it. Related: showing where the SDR window sits
+  within the full range, which Tim suggested as a way to make headroom legible.
+- blue-channel clipping at high exposure, seen on a warm image before Kelvin
+  white balance existed. Worth re-checking now the cast can be corrected first.
+- proxy resolution for interactive edits: work at view resolution while a slider
+  moves, full resolution when idle. Benched deliberately -- local-neighbourhood
+  algorithms give different results at lower resolution, so a proxy is only
+  honest for the preview.
+- threshold_otsu / _triangle / _isodata have no GPU path, and deriving a level
+  from a histogram is why. With BuildHistogram they become build-on-GPU, read
+  4 KB, compute the level, dispatch the existing threshold kernel. Two things to
+  settle first: whether Otsu on the subsampled histogram picks the same level as
+  Otsu on every pixel, and that such a stage cannot batch with its neighbours.
+  (This is the same ground as "add GPU implementation for local_threshold".)
+
+ANSWERED, NO ACTION
+- mosaic() erroring on a non-raw image: recommended keeping the error, since a
+  script asking for sensor data on a JPEG has made a mistake worth reporting.
