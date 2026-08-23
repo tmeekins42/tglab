@@ -774,6 +774,49 @@ The remaining three resist a straightforward kernel: `median_blur` and
 `kuwahara_generalized` needs its precomputed sector weight maps as a second
 input, which the one-input dispatch shape does not yet express.
 
+### Denoise
+
+Several filters above already denoise — `bilateral`, `nonlocal_means`,
+`anisotropic_diffusion` and `median_blur` are all reasonable choices. What
+`Category()=="denoise"` adds is the multi-scale approach, which is a different
+idea rather than another neighbourhood shape.
+
+| Algorithm | CPU | Notes |
+|---|---|---|
+| `wavelet_denoise` | ~170 ms/MP | À-trous wavelet shrinkage. Separate luma and chroma thresholds. |
+
+**Why multi-scale.** A spatial filter has one neighbourhood and must trade
+grain against texture inside it. A wavelet decomposition splits the image into
+bands first, so fine grain is removed at the scale it occupies while edges —
+which carry energy at every scale — survive. The transform is *à trous* ("with
+holes"): undecimated, so every level stays full resolution. That costs memory
+against a decimated transform, but avoids the shift-dependence that makes
+decimated wavelets ring around edges — the artefact that makes naive wavelet
+denoising look worse than the noise it removed.
+
+Two details that matter more than the transform:
+
+- **Soft thresholding, not hard.** Zeroing coefficients below a threshold
+  leaves a discontinuity, and a coefficient sitting either side of it from one
+  pixel to the next flips between kept and discarded. That is the mottled
+  "wavelet blotch" that gives the method its bad reputation.
+- **Luma and chroma are shrunk separately,** with chroma defaulting four times
+  harder. Sensor noise is far worse in chroma, and chroma carries little fine
+  detail, so it tolerates much heavier smoothing before anything shows. That
+  asymmetry is most of what makes ISO denoising work, and it is invisible in an
+  RGB basis where all three channels get the same treatment.
+
+Measured on an ISO 1000 CR2 to confirm this is the right tool for that noise:
+sigma is ~53 sensor levels at ISO 1000 and ~33 at ISO 400, the tails stop
+around 4.5 sigma (broad-band, no impulse component — impulse noise would want
+a median instead), and sigma tracks √signal, meaning it is shot-noise dominated
+rather than a constant read-noise floor. Both point at coefficient shrinkage.
+
+[scripts/denoise.tgl](scripts/denoise.tgl) puts the original and the denoised
+result side by side. There is no GPU kernel yet: it needs 2×levels passes and a
+two-channel scratch, and `GpuScratchFormat` currently allows a custom scratch
+format only for exactly two passes.
+
 A GPU path is used only within the radius each kernel declares safe. Beyond
 that the stage falls back to the CPU, because a single dispatch doing millions
 of fetches per pixel trips the GPU watchdog and takes the whole device down.

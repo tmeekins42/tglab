@@ -195,6 +195,7 @@ add_test(NAME script_spine COMMAND tglab_tests)
 add_test(NAME filters      COMMAND tglab_filter_tests)
 add_test(NAME demosaic     COMMAND tglab_demosaic_tests)
 add_test(NAME runtime      COMMAND tglab_runtime_tests)
+add_test(NAME denoise      COMMAND tglab_denoise_tests)
 
 add_executable(dbg_hang
     tests/dbg_hang.cpp
@@ -245,3 +246,10 @@ if(MSVC)
 endif()
 tglab_copy_dxc(dxc_smoke)
 add_test(NAME dxc_smoke COMMAND dxc_smoke)
+
+add_executable(tglab_denoise_tests tests/test_denoise.cpp $<TARGET_OBJECTS:tglab_algorithms>)
+target_link_libraries(tglab_denoise_tests PRIVATE tglab_core)
+if(MSVC)
+    target_compile_definitions(tglab_denoise_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+

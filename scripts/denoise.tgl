@@ -1,0 +1,15 @@
+# Denoising a raw photograph.
+#
+# image() already inserted hot_pixel_repair and the demosaic, so `src` here is
+# a finished RGB image and the noise left in it is the broad-band sensor kind.
+
+src = image("test")
+
+luma   = slider("luma", 0.0, 0.08, 0.02)
+chroma = slider("chroma", 0.0, 0.25, 0.08)
+levels = slider("levels", 1, 6, 4)
+
+clean = wavelet_denoise(src, luma = luma, chroma = chroma, levels = levels)
+
+display(src,   "original")
+display(clean, "denoised")
