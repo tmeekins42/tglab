@@ -1317,6 +1317,11 @@ static void TestCompare(ID3D12Device* dev) {
 }
 
 int main() {
+    // Line-buffer stdout: when ctest or CI redirects it to a file the
+    // default is block buffering, so a crash discards everything not yet
+    // flushed and the log ends before the failure rather than at it.
+    setvbuf(stdout, nullptr, _IONBF, 0);
+
     TestWorker();
     TestGpuOnlyShell();
     TestViewerVersions();
