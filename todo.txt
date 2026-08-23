@@ -127,3 +127,14 @@ DONE (recent, pruned periodically)
   local stddev 3-11 across it against 127 in the patch, so every local method
   correctly returned nearly uniform white with all its black pixels confined to
   the corner. Correct output, useless demonstration.
+- the info-panel histogram now follows a tab switch. It is measured during a
+  pipeline RUN, and switching tabs is not one, so a viewer never shown during a
+  run had no histogram and the panel kept displaying the previous tab's. Asking
+  for a new subject now requests a run; the stage cache makes it nearly free
+  since nothing recomputes.
+- gaussian_blur and box_blur are separable on the GPU now, in two passes, so
+  their sigma/radius ceilings are gone. They used to fall back to the CPU above
+  sigma 4 / radius 24 -- exactly where a blur costs most. At sigma 12 the GPU
+  time barely moves (22 -> 25 ms) while the CPU goes 111 -> 701 ms.
+  The remaining ceilings (bilateral, kuwahara, symmetric_nearest) are real:
+  those weights do not separate.

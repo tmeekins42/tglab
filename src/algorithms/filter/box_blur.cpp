@@ -45,13 +45,16 @@ public:
     }
 
     // --- GPU implementation -------------------------------------------------
-    // Single-pass O(r^2) rather than the CPU's separable running sum: a
-    // two-pass version needs an intermediate target, and at these radii the
-    // brute-force gather is still far quicker than the CPU path. Capped for the
-    // same reason as the Gaussian -- a huge radius in one dispatch trips the
-    // GPU watchdog and takes the device down.
-    static constexpr int kMaxGpuRadius = 24;
-    bool HasGPU() const override { return int(m_radius) <= kMaxGpuRadius; }
+    // Separable, in two passes, like the CPU path.
+    //
+    // It was a single O(r^2) gather, on the reasoning that a two-pass version
+    // "needs an intermediate target" -- true when that was written, but the
+    // iterative dispatch path now supplies a ping-pong buffer. The cap that
+    // followed from it is gone: at radius 24 one pass is 2,401 fetches per pixel
+    // against 98 for two separable ones, and above the cap the stage fell back
+    // to the CPU exactly where a blur costs most.
+    bool HasGPU() const override { return true; }
+    int  GpuIterations() const override { return 2; }
 
     const char* GpuSource() const override {
         return R"(
@@ -62,6 +65,7 @@ cbuffer Params : register(b0) {
     uint Width;
     uint Height;
     uint Radius;
+    uint Pass;        // 0 = horizontal, 1 = vertical
 };
 
 [numthreads(8, 8, 1)]
@@ -72,21 +76,20 @@ void main(uint3 tid : SV_DispatchThreadID) {
     float4 sum = 0.0;
     float  n   = 0.0;
 
-    for (int dy = -r; dy <= r; ++dy) {
-        for (int dx = -r; dx <= r; ++dx) {
-            int2 p = int2(tid.xy) + int2(dx, dy);
-            p = clamp(p, int2(0, 0), int2(Width - 1, Height - 1));   // clamp-to-edge
-            sum += Src[p];
-            n   += 1.0;
-        }
+    for (int i = -r; i <= r; ++i) {
+        int2 p = (Pass == 0) ? int2(int(tid.x) + i, int(tid.y))
+                             : int2(int(tid.x), int(tid.y) + i);
+        p = clamp(p, int2(0, 0), int2(Width - 1, Height - 1));   // clamp-to-edge
+        sum += Src[p];
+        n   += 1.0;
     }
     Dst[tid.xy] = sum / max(n, 1.0);
 }
 )";
     }
 
-    std::vector<uint32_t> GpuConstants(int) const override {
-        return {uint32_t(std::max(1, int(m_radius)))};
+    std::vector<uint32_t> GpuConstants(int iteration) const override {
+        return {uint32_t(std::max(1, int(m_radius))), uint32_t(iteration)};
     }
 
 private:

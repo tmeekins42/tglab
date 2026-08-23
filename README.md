@@ -677,7 +677,7 @@ where a compute kernel exists.
 | Filter | CPU | GPU | Preserves edges | Notes |
 |---|---|---|---|---|
 | `box_blur` | ~75 ms | 3x | no | Running sum, O(1) in radius. The baseline. |
-| `gaussian_blur` | ~140 ms | 5x | no | Separable on the CPU, single-pass on the GPU. |
+| `gaussian_blur` | ~140 ms | 5x | no | Separable on both, so a large sigma stays on the GPU. |
 | `guided_filter` | ~230 ms | — | yes | O(1) in radius, no gradient reversal. Usually the best default. |
 | `median_blur` | ~680 ms | — | yes | Sliding 256-bin histogram for 8-bit. The impulse-noise filter. |
 | `symmetric_nearest` | ~590 ms | 13x | yes | Cheap, no preferred orientation. |
@@ -695,6 +695,14 @@ input, which the one-input dispatch shape does not yet express.
 A GPU path is used only within the radius each kernel declares safe. Beyond
 that the stage falls back to the CPU, because a single dispatch doing millions
 of fetches per pixel trips the GPU watchdog and takes the whole device down.
+
+That applies to the O(r²) kernels — `bilateral`, `kuwahara`, `symmetric_nearest`
+— whose weights genuinely do not separate. The two blurs have **no ceiling**:
+they run as two separable passes, so radius 60 costs 120 fetches per pixel
+rather than 14,600. They previously did have one, at sigma 4, and it meant the
+fast path gave up exactly where a blur is most expensive: dragging the sigma
+slider past 4 dropped GPU usage to zero and pinned a core. Measured at sigma 12,
+the GPU time barely moves (22 → 25 ms) while the CPU goes 111 → 701 ms.
 
 Two behaviours worth knowing before tuning, both asserted in the tests:
 

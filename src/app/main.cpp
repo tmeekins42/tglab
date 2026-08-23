@@ -285,6 +285,11 @@ private:
     ImageStats  m_statsWorker;
     StatsResult m_stats;                     // newest result, drawn as-is
     bool        m_statsRequested   = false;  // a request is outstanding
+
+    // Which viewer the info panel last asked the worker to measure. A change
+    // means the panel is showing a different tab and needs a run to get its
+    // histogram; see where it is set.
+    std::string m_histViewer;
     std::string m_requestedSource;           // what that request was for
     uint64_t    m_requestedVersion = 0;
 
@@ -1318,9 +1323,21 @@ void App::DrawInfoPanel() {
         if (vi.name == shownName) { shownVersion = vi.version; break; }
 
     // Tell the pipeline worker which viewer to measure. It computes the
-    // histogram on the GPU where the pixels already are, and the result arrives
-    // with the next run -- no readback, and nothing extra for this thread to do.
-    m_worker.SetHistogramViewer(shownName);
+    // histogram on the GPU where the pixels already are, so there is no readback
+    // and nothing extra for this thread to do.
+    //
+    // The measurement rides on a pipeline run, though, and switching tabs is not
+    // one -- so a viewer the panel has never asked about while a run happened
+    // has no histogram, and the panel kept showing the previous tab's. Asking
+    // for a new subject therefore has to request a run.
+    //
+    // Cheap, because nothing recomputes: every stage hits the cache and the run
+    // exists only to reach the BuildHistogram call at the end of it.
+    if (shownName != m_histViewer) {
+        m_histViewer = shownName;
+        m_worker.SetHistogramViewer(shownName);
+        if (subjectIsGpuOnly) m_dirty = true;
+    }
 
     // The stats thread is the fallback, for subjects the worker cannot measure:
     // a palette image (never went through the pipeline) and a CPU-only stage

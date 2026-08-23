@@ -959,6 +959,16 @@ static void TestGpuAgreement(ID3D12Device* dev) {
          "o = gaussian_blur(src, sigma = 2.0)\n"
          "display(o)\n", 2.0, 1.0},
 
+        // A large sigma, which is the case that used to fall back to the CPU.
+        // The old kernel was a single O(r^2) pass, so sigma above 4 was refused;
+        // separable passes make radius 60 cost 120 fetches rather than 14,600.
+        // Worth testing at both ends: the two paths compute the same radius from
+        // the same sigma, so a mismatch here would mean they had drifted apart.
+        {"gaussian_blur",
+         "src = image(\"test\")\n"
+         "o = gaussian_blur(src, sigma = 12.0)\n"
+         "display(o)\n", 2.0, 1.0},
+
         {"bilateral",
          "src = image(\"test\")\n"
          "o = bilateral(src, sigma_space = 3.0, sigma_range = 0.15)\n"

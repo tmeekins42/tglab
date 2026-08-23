@@ -109,22 +109,31 @@ public:
     // intermediate target, which the current one-dispatch-per-algorithm model
     // does not express. Still far faster than the CPU path, and it makes the
     // CPU/GPU comparison in M4 an honest one (same maths, different hardware).
-    // Only when the radius stays small enough for a single O(r^2) dispatch.
-    // Beyond that the pipeline falls back to the separable CPU path, which is
-    // both correct and (at those radii) not much slower -- and crucially does
-    // not trip the GPU watchdog, which takes the whole device down.
-    static constexpr float kMaxGpuSigma = 4.0f;
-    bool HasGPU() const override { return float(m_sigma) <= kMaxGpuSigma; }
+    // Separable on the GPU too, in two passes.
+    //
+    // It used to be a single O(r^2) dispatch, which forced a sigma ceiling of 4:
+    // at sigma 20 the radius is 60, so one pass is ~14,600 fetches per pixel and
+    // trips the GPU watchdog. Above the ceiling the stage fell back to the CPU,
+    // which is exactly where a blur is most expensive -- the fast path gave up
+    // precisely when it was most needed.
+    //
+    // Two separable passes make it O(2r) like the CPU path: 120 fetches at
+    // sigma 20 rather than 14,600, a 120x reduction that removes the reason for
+    // any ceiling at all. The Gaussian is separable exactly, so this is the same
+    // maths and not an approximation.
+    bool HasGPU() const override { return true; }
+    int  GpuIterations() const override { return 2; }
 
     const char* GpuSource() const override {
         return R"(
-Texture2D<float4>   Src : register(t0);
+Texture2D<float4>   Src : register(t0);   // ping-pong: source, then h-blurred
 RWTexture2D<float4> Dst : register(u0);
 
 cbuffer Params : register(b0) {
     uint Width;
     uint Height;
     uint SigmaBits;
+    uint Pass;        // 0 = horizontal, 1 = vertical
 };
 
 [numthreads(8, 8, 1)]
@@ -132,34 +141,33 @@ void main(uint3 tid : SV_DispatchThreadID) {
     if (tid.x >= Width || tid.y >= Height) return;
 
     float sigma  = max(asfloat(SigmaBits), 0.01);
-    // Matches HasGPU()'s ceiling. A single O(r^2) pass at radius 60 would be
-    // ~14,600 fetches per pixel -- billions per dispatch on a 512x512 image --
-    // which trips the GPU watchdog (TDR) and removes the device.
-    int   radius = min(int(ceil(sigma * 3.0)), 12);
+    // Matches the CPU path's radius, so the two agree rather than merely
+    // resembling each other. 64 is the CPU's own clamp, and at O(2r) a 129-tap
+    // pass is unremarkable.
+    int   radius = clamp(int(ceil(sigma * 3.0)), 1, 64);
     float twoSS  = 2.0 * sigma * sigma;
 
     float4 sum    = 0.0;
     float  weight = 0.0;
 
-    for (int dy = -radius; dy <= radius; ++dy) {
-        for (int dx = -radius; dx <= radius; ++dx) {
-            int2 p = int2(tid.xy) + int2(dx, dy);
-            p = clamp(p, int2(0, 0), int2(Width - 1, Height - 1));   // clamp-to-edge
-            float w = exp(-float(dx * dx + dy * dy) / twoSS);
-            sum    += Src[p] * w;
-            weight += w;
-        }
+    for (int i = -radius; i <= radius; ++i) {
+        int2 p = (Pass == 0) ? int2(int(tid.x) + i, int(tid.y))
+                             : int2(int(tid.x), int(tid.y) + i);
+        p = clamp(p, int2(0, 0), int2(Width - 1, Height - 1));   // clamp-to-edge
+        float w = exp(-float(i * i) / twoSS);
+        sum    += Src[p] * w;
+        weight += w;
     }
     Dst[tid.xy] = sum / max(weight, 1e-6);
 }
 )";
     }
 
-    std::vector<uint32_t> GpuConstants(int) const override {
+    std::vector<uint32_t> GpuConstants(int iteration) const override {
         const float sigma = m_sigma;
         uint32_t bits;
         std::memcpy(&bits, &sigma, sizeof(bits));
-        return {bits};
+        return {bits, uint32_t(iteration)};
     }
 
 private:
