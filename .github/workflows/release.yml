@@ -40,6 +40,12 @@ jobs:
         run: ctest --test-dir build -C Release --output-on-failure
         continue-on-error: true
 
+      # ctest reports a crashed test as SEGFAULT with no output, so run the
+      # binary directly to see how far it got. Diagnostic only.
+      - name: Runtime test output
+        run: ./build/Release/tglab_runtime_tests.exe
+        continue-on-error: true
+
       - name: Package
         run: cmake --build build --config Release --target package_release
 
