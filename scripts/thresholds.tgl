@@ -3,8 +3,19 @@
 #
 # Adding a new algorithm with Category()=="threshold" makes it show up here
 # with its controls, without editing this script at all.
+#
+# Run this on assets/page.png rather than test.png:
+#
+#   ./build/Release/tglab.exe scripts/thresholds.tgl assets/page.png
+#
+# page.png is a synthetic scan -- text under uneven lighting, bright at the top
+# left and dim at the bottom right. That gradient is the whole point: a single
+# global threshold cannot serve both ends of it, which is what the local methods
+# exist to fix. test.png is a smooth gradient with a checkerboard patch, and has
+# so little local structure that every local method correctly returns almost
+# uniform white on it -- which looks broken but is not.
 
-src = image("test")
+src = image("page")
 
 op = choose("method", "threshold")
 

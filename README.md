@@ -45,7 +45,7 @@ Arguments are a `.tgl` script plus any images to preload. Paths are relative to
 the repository root, which is where the app expects to run from.
 
 ```sh
-./build/Release/tglab.exe scripts/thresholds.tgl assets/test.png
+./build/Release/tglab.exe scripts/thresholds.tgl assets/page.png
 ```
 
 Images can also be **dragged in from Explorer** at any time.

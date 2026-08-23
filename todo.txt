@@ -121,3 +121,9 @@ DONE (recent, pruned periodically)
   Three tests had used grayscale/sobel as their "CPU-only algorithm" example and
   broke once those gained kernels; they now use guided_filter, which is
   genuinely CPU-only rather than merely not-ported-yet.
+- thresholds.tgl now ships with assets/page.png -- a synthetic scan, text under
+  a lighting gradient -- rather than pointing at test.png. The algorithms were
+  correct all along: test.png is a smooth gradient with a checkerboard patch,
+  local stddev 3-11 across it against 127 in the patch, so every local method
+  correctly returned nearly uniform white with all its black pixels confined to
+  the corner. Correct output, useless demonstration.

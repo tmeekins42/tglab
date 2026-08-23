@@ -527,6 +527,74 @@ int main() {
           "no algorithm leaves its output untouched on any format" +
               (offenders.empty() ? std::string() : " (" + offenders + ")"));
 }
+
+    // --- local thresholds recover text under uneven lighting -----------------
+    //
+    // The point of a local method, and the one thing no global threshold can
+    // do: a page lit brightly at one end and dimly at the other has no single
+    // level that works across it.
+    //
+    // Worth having because the failure mode is confusing rather than obvious.
+    // Run on a smooth gradient with no local structure, every local method
+    // correctly returns nearly uniform white -- which looks broken. Tim reported
+    // exactly that from thresholds.tgl on test.png, and the algorithms were
+    // fine; the fixture had nothing for them to find.
+    {
+        const int W = 192, H = 192;
+        auto strokeAt = [](int x, int y) { return ((y / 4) % 3 == 0) && (x % 16 < 11); };
+
+        Image page;
+        page.Alloc({W, H, Format::RGBA8});
+        {
+            ImageView v = page.MapCpuWrite();
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    // Paper falling from 220 to 90 across the frame. Text sits a
+                    // constant 60 below the LOCAL paper level, so it stays
+                    // equally legible at both ends -- and no global threshold
+                    // can separate them, because dark paper on the right is
+                    // darker than bright text on the left.
+                    const double paper = 220.0 - 130.0 * (double(x) / (W - 1));
+                    const double val = strokeAt(x, y) ? paper - 60.0 : paper;
+                    uint8_t* p = v.At<uint8_t>(x, y);
+                    p[0] = p[1] = p[2] = uint8_t(std::clamp(val, 0.0, 255.0));
+                    p[3] = 255;
+                }
+        }
+
+        auto agreement = [&](const char* name) -> double {
+            Image out;
+            std::string e;
+            if (!RunFilter(name, page.Clone(), {}, &out, &e)) return -1.0;
+            ImageView v = out.MapCpuRead();
+            int correct = 0, total = 0;
+            for (int y = 2; y < H - 2; ++y)
+                for (int x = 2; x < W - 2; ++x) {
+                    const bool isText  = strokeAt(x, y);
+                    const bool sawText = *v.At<float>(x, y) < 0.5f;
+                    if (isText == sawText) ++correct;
+                    ++total;
+                }
+            return total ? 100.0 * double(correct) / double(total) : -1.0;
+        };
+
+        for (const char* name : {"threshold_niblack", "threshold_sauvola",
+                                 "threshold_bernsen", "threshold_adaptive_mean",
+                                 "threshold_adaptive_gaussian"}) {
+            const double pct = agreement(name);
+            Check(pct > 90.0,
+                  std::string(name) + " recovers text under a lighting gradient (" +
+                      std::to_string(pct) + "%)");
+        }
+
+        // And the contrast that justifies them existing: a global threshold
+        // cannot do this, so if one ever scores as well the fixture has stopped
+        // testing what it claims to.
+        const double otsu = agreement("threshold_otsu");
+        Check(otsu < 80.0,
+              "a global threshold cannot (" + std::to_string(otsu) +
+                  "%), which is why the local ones exist");
+    }
     // --- the shared plumbing ------------------------------------------------
     {
         Image img = MakeEdgeImage(false);
