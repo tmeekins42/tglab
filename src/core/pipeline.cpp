@@ -109,11 +109,21 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
     // Dirty stages still reuse their compiled kernel when they are the same
     // algorithm as last run — a parameter change does not alter the HLSL, and
     // recompiling on every slider tick would defeat the point of the GPU path.
+    //
+    // The iterative scratch carries over for the same reason. It is a
+    // full-size texture -- 16 MB for an RGBA32F scratch at 1024x1024 -- and
+    // reallocating one per slider tick is churn the driver has to absorb even
+    // now that it is correctly freed. ExecuteGpuStage re-checks the descriptor
+    // and reallocates if the size or format actually changed, so carrying a
+    // stale one is safe.
     if (prev) {
         for (size_t i = firstDirty; i < m_stages.size(); ++i) {
             if (i >= prev->m_stages.size()) break;
-            if (m_stages[i].algoName == prev->m_stages[i].algoName)
-                m_stages[i].kernel = prev->m_stages[i].kernel;
+            if (m_stages[i].algoName == prev->m_stages[i].algoName) {
+                m_stages[i].kernel      = prev->m_stages[i].kernel;
+                m_stages[i].gpuScratch  = prev->m_stages[i].gpuScratch;
+                m_stages[i].scratchDesc = prev->m_stages[i].scratchDesc;
+            }
         }
     }
 

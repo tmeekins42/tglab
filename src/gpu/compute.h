@@ -34,6 +34,35 @@ struct GpuImage {
     // "Incompatible texture barrier layout" on all 14 GPU algorithms.
     D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
 
+    // Frees the resource when the last owner goes away.
+    //
+    // Without this, holding a GpuImage in a shared_ptr leaked the texture: the
+    // wrapper was freed and the ID3D12Resource was not. The iterative scratch
+    // is held exactly that way and is reallocated whenever a parameter changes,
+    // so dragging a slider leaked one full-size texture per tick -- 16 MB a
+    // move for an RGBA32F scratch at 1024x1024, until the card ran out.
+    //
+    // Copying is deleted rather than refcounted: a GpuImage is an owner, and a
+    // copy would double-free. Move transfers ownership and leaves the source
+    // empty.
+    ~GpuImage() { Release(); }
+
+    GpuImage() = default;
+    GpuImage(const GpuImage&)            = delete;
+    GpuImage& operator=(const GpuImage&) = delete;
+
+    GpuImage(GpuImage&& o) noexcept
+        : res(o.res), desc(o.desc), state(o.state) { o.res = nullptr; }
+
+    GpuImage& operator=(GpuImage&& o) noexcept {
+        if (this != &o) {
+            Release();
+            res = o.res; desc = o.desc; state = o.state;
+            o.res = nullptr;
+        }
+        return *this;
+    }
+
     bool Valid() const { return res != nullptr; }
     void Release() { if (res) { res->Release(); res = nullptr; } }
 };

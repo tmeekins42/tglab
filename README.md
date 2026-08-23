@@ -173,14 +173,15 @@ names are the filename without extension and are **case-sensitive**, so
 
 ### GPU validation
 
-Two tools, both Debug-only, for the class of GPU bug that is invisible to
-ordinary testing — a binding that is wrong when the command list *executes*
-rather than when it records.
+Tools for the classes of GPU bug that ordinary testing does not see: a binding
+that is wrong when the command list *executes* rather than when it records, and
+a resource allocated per run and never freed.
 
 ```sh
 ./build/Debug/gpu_audit.exe            # every GPU algorithm under full validation
 ./build/Debug/gpu_audit.exe --verbose  # print the text of each distinct message
 ./build/Debug/gpu_audit.exe --strict   # include warnings inherent to the design
+./build/Release/gpu_leak.exe           # VRAM growth across repeated runs
 ```
 
 `gpu_audit` runs every registered GPU-capable algorithm through the real script
@@ -189,6 +190,25 @@ enabled, then attributes each validation message to the algorithm that provoked
 it. GBV patches shaders to check descriptors and resource state on the GPU, so
 it catches faults the CPU-side layer cannot see. It is 10–100× slower, which is
 why this is a separate tool rather than part of `ctest`.
+
+`gpu_leak` re-runs one algorithm's pipeline many times, varying a parameter
+each run exactly as a slider drag does, and reports whether video memory is
+still climbing after warm-up:
+
+```sh
+./build/Release/gpu_leak.exe                       # threshold_sauvola, 40 runs
+./build/Release/gpu_leak.exe gaussian_blur 60      # any GPU algorithm
+```
+
+It compares the two halves of the run rather than first-to-last, because the
+first few runs legitimately allocate — kernels compile, outputs and scratch are
+created — and a two-point comparison reads that warm-up as a leak.
+
+This caught a real one: `GpuImage` had a manual `Release()` and no destructor,
+so a `shared_ptr<GpuImage>` freed the wrapper and leaked the texture. The
+iterative scratch is held exactly that way, so every slider tick leaked a
+full-size texture — 16 MB a move for an RGBA32F scratch at 1024×1024, climbing
+until the card ran out.
 
 The app itself takes `TGLAB_GBV=1` to enable the same validation, and dumps DRED
 auto-breadcrumbs (naming the command list and the exact op that stalled) on any

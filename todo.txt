@@ -50,8 +50,6 @@ FROM CLAUDE (raised in conversation, not yet in the list above)
   range instead of stretching it. Related: showing where the SDR window sits
   within the full range, which Tim suggested as a way to make headroom legible.
   if the histogram shows the entire image, and what is displayed, can we show a window around the displayed area?
-- blue-channel clipping at high exposure, seen on a warm image before Kelvin
-  white balance existed. Worth re-checking now the cast can be corrected first.
 - proxy resolution for interactive edits: work at view resolution while a slider
   moves, full resolution when idle. Benched deliberately -- local-neighbourhood
   algorithms give different results at lower resolution, so a proxy is only

@@ -205,3 +205,15 @@ target_link_libraries(gpu_audit PRIVATE tglab_core d3d12 dxgi)
 if(MSVC)
     target_compile_definitions(gpu_audit PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
+
+# VRAM leak check: re-runs a pipeline many times and reports whether video
+# memory is still climbing after warm-up. Not an add_test() -- it measures a
+# shared adapter, so another process allocating during the run can skew it.
+add_executable(gpu_leak
+    tests/gpu_leak.cpp
+    $<TARGET_OBJECTS:tglab_algorithms>
+)
+target_link_libraries(gpu_leak PRIVATE tglab_core d3d12 dxgi)
+if(MSVC)
+    target_compile_definitions(gpu_leak PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
