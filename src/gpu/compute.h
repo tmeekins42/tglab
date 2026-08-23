@@ -94,7 +94,15 @@ public:
 
     // False once a dispatch has hung or the device was removed; the pipeline
     // then stops offering the GPU path for the rest of the session.
-    bool Ready() const { return m_device != nullptr && !m_deviceLost; }
+    // True only when Init() ran to completion.
+    //
+    // Deliberately NOT "m_device != nullptr": Init() assigns the device
+    // first and can fail at any of six later steps, so that test reported
+    // ready for a context with no queue, no command list, or -- as on a
+    // GPU-less CI runner -- no shader compiler. Every guard written as
+    // `if (!Ready()) return;` was then a no-op, and the first dispatch
+    // dereferenced a null kernel.
+    bool Ready() const { return m_ready && !m_deviceLost; }
     bool DeviceLost() const { return m_deviceLost; }
 
     // Builds a kernel from HLSL source. Root signature is fixed by convention:
@@ -203,6 +211,7 @@ private:
     std::vector<ID3D12Resource*> m_staging;   // upload/readback buffers, freed on flush
     ShaderCompiler               m_compiler;
     bool                         m_deviceLost = false;
+    bool                 m_ready      = false;
 };
 
 } // namespace tglab

@@ -67,10 +67,18 @@ bool ComputeContext::Init(ID3D12Device* device) {
     // MapCpuRead() would silently hand back stale pixels instead of failing.
     InstallGpuResidencyHooks();
 
-    return m_compiler.Init();
+    // Set last, and only on full success: everything above can fail, and a
+    // half-built context that claims to be ready is worse than one that admits
+    // it is not.
+    if (!m_compiler.Init()) return false;
+    m_ready = true;
+    return true;
 }
 
 void ComputeContext::Shutdown() {
+    // A shut-down context is not ready, whatever else survives below.
+    m_ready = false;
+
     if (m_queue && m_fence) {
         const UINT64 v = ++m_fenceVal;
         m_queue->Signal(m_fence, v);
