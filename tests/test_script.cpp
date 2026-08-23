@@ -1069,20 +1069,30 @@ int main() {
         // Asserts a demosaic was inserted, not *which* one: the default is an
         // app setting, and pinning the name here would make changing it a test
         // failure rather than a decision.
-        Check(p.Stages().size() == 1 &&
-                  p.Stages()[0].algoName.rfind("demosaic_", 0) == 0,
-              "image() inserted the default demosaic without the script asking"
-              + (p.Stages().empty() ? std::string() : " (" + p.Stages()[0].algoName + ")"));
+        // A mosaic gets TWO automatic stages: hot_pixel_repair, then the
+        // demosaic. Repair runs first because a demosaic smears a stuck sensel
+        // across a neighbourhood, after which it is no longer a single-sample
+        // outlier. Both are ordinary stages, so either can be inspected,
+        // retuned, or switched off -- which matters for astrophotography, where
+        // a star is a genuine one-pixel highlight.
+        Check(p.Stages().size() == 2 &&
+                  p.Stages()[0].algoName == "hot_pixel_repair" &&
+                  p.Stages()[1].algoName.rfind("demosaic_", 0) == 0,
+              "image() inserted hot_pixel_repair then the default demosaic"
+              + (p.Stages().size() < 2
+                     ? std::string()
+                     : " (" + p.Stages()[0].algoName + ", " +
+                           p.Stages()[1].algoName + ")"));
 
-        // Two image() calls on one source must share the stage rather than
-        // demosaicing the same sensor data twice.
+        // Two image() calls on one source must share the stages rather than
+        // repairing and demosaicing the same sensor data twice.
         Program prog2;
         Parse("a = image(\"test\")\nb = image(\"test\")\ndisplay(a)\ndisplay(b)\n",
               &prog2, &err);
         UiState ui2; Pipeline p2;
         Interpret(prog2, names, &ui2, &p2);
-        Check(p2.Stages().size() == 1,
-              "two image() calls share one demosaic stage, not two");
+        Check(p2.Stages().size() == 2,
+              "two image() calls share one repair+demosaic pair, not two");
     }
     {
         // An ordinary image gets no demosaic stage at all.

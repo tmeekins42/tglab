@@ -33,8 +33,11 @@ FEATURES
 - progress bar for job system
 - are there any public lens correction databases we could take advantage of?
 - denoising algorithms
-- can we run a script (develop?) on every image in a group, then run an algorithm, like panorama that works on the entire group?
-- can we detect dead/stuck pixels from the raw capure? test: d:\lrwork\little\_MG_96732.CR2 has a stuck solid red pixel on the right eye. (this is a common issue on cameras)
+- can we run a script (develop?) on every image in a group, then run an algorithm, like panorama that works on the entire group? 
+  Maybe we can have image/image group in the palette that is the output from another script?
+  Or is it better to expand our scripting?
+  Example: merge 3 photos into 1 HDR photo. I have a dozen of the group of 3 HDRs that are then stitched into an HDR panorama.
+- can we detect dead/stuck pixels from the raw capure? test: d:\lrwork\little\_MG_9673.CR2 has a stuck solid red pixel on the right eye. (this is a common issue on cameras)
 - can algorithms be toggled on/off?
 
 NOTES

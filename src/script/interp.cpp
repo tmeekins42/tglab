@@ -381,12 +381,32 @@ private:
                 return true;
             }
 
+            // Repair stuck sensels before demosaicing.
+            //
+            // Before, because a demosaic smears one bad sample across a
+            // neighbourhood: afterwards it is no longer a single-pixel outlier
+            // and the repair would have to guess at a blob whose shape depends
+            // on which demosaic ran. Tim's 5D has seven such sensels, at the
+            // same coordinates in every frame.
+            //
+            // Inserted automatically for the same reason the demosaic is: a
+            // script should not have to know the sensor has defects. It is an
+            // ordinary registered stage, so it appears in the stage list, has
+            // its own sliders, and can be turned off -- which matters for
+            // astrophotography, where a star IS a genuine one-pixel highlight.
+            PortRef demosaicInput{-1, s.index};
+            if (auto repair = Registry::Get().Create("hot_pixel_repair")) {
+                const int rs = m_pipe->AddStage(std::move(repair), "hot_pixel_repair",
+                                                {PortRef{-1, s.index}}, 1, e.line);
+                demosaicInput = PortRef{rs, 0};
+            }
+
             auto algo = Registry::Get().Create(m_defaultDemosaic);
             if (!algo)
                 return Fail(e.line, "unknown default demosaic '" + m_defaultDemosaic + "'");
 
             const int stage = m_pipe->AddStage(std::move(algo), m_defaultDemosaic,
-                                               {PortRef{-1, s.index}}, 1, e.line);
+                                               {demosaicInput}, 1, e.line);
             m_demosaicStage[s.index] = stage;
             out->push_back(Value(PortHandle{stage, 0}));
             return true;
