@@ -171,6 +171,35 @@ names are the filename without extension and are **case-sensitive**, so
 ./build/Release/tglab_runtime_tests.exe  # worker thread, shaders, GPU (needs a device)
 ```
 
+### GPU validation
+
+Two tools, both Debug-only, for the class of GPU bug that is invisible to
+ordinary testing — a binding that is wrong when the command list *executes*
+rather than when it records.
+
+```sh
+./build/Debug/gpu_audit.exe            # every GPU algorithm under full validation
+./build/Debug/gpu_audit.exe --verbose  # print the text of each distinct message
+./build/Debug/gpu_audit.exe --strict   # include warnings inherent to the design
+```
+
+`gpu_audit` runs every registered GPU-capable algorithm through the real script
+and pipeline layers with the D3D12 debug layer and **GPU-based validation**
+enabled, then attributes each validation message to the algorithm that provoked
+it. GBV patches shaders to check descriptors and resource state on the GPU, so
+it catches faults the CPU-side layer cannot see. It is 10–100× slower, which is
+why this is a separate tool rather than part of `ctest`.
+
+The app itself takes `TGLAB_GBV=1` to enable the same validation, and dumps DRED
+auto-breadcrumbs (naming the command list and the exact op that stalled) on any
+device removal.
+
+`--strict` also reports "Incompatible texture barrier layout" on UAV bindings.
+That one is inherent: a resource created with `ALLOW_SIMULTANEOUS_ACCESS` is
+permanently in `LAYOUT_COMMON`, so every UAV binding reads as a layout mismatch.
+That flag is what lets the UI sample a compute result with no cross-queue
+transition, so the warning is the price of the zero-readback display path.
+
 ---
 
 ## Script reference

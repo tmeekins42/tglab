@@ -266,6 +266,24 @@ bool ComputeContext::Upload(const ImageView& src, GpuImage* dst) {
     s.PlacedFootprint.Footprint.Depth    = 1;
     s.PlacedFootprint.Footprint.RowPitch = aligned;
 
+    // CopyTextureRegion needs the destination in COPY_DEST.
+    //
+    // This used to rely on state promotion: a resource sitting in COMMON is
+    // promoted implicitly for a copy. That works, but it leaves the tracked
+    // state and the real state disagreeing, so the next dispatch's transition
+    // barrier declares a StateBefore the runtime rejects. Being explicit here
+    // keeps GpuImage::state honest.
+    if (dst->state != D3D12_RESOURCE_STATE_COPY_DEST) {
+        D3D12_RESOURCE_BARRIER b = {};
+        b.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource   = dst->res;
+        b.Transition.StateBefore = dst->state;
+        b.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        m_list->ResourceBarrier(1, &b);
+        dst->state = D3D12_RESOURCE_STATE_COPY_DEST;
+    }
+
     m_list->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr);
 
     m_staging.push_back(staging);
@@ -315,6 +333,24 @@ bool ComputeContext::Readback(const GpuImage& src, ImageView* dst) {
     D3D12_TEXTURE_COPY_LOCATION s = {};
     s.pResource = src.res;
     s.Type      = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+
+    // The source has to be in COPY_SOURCE for the copy below. Same reasoning as
+    // Upload: relying on promotion desynchronises GpuImage::state from reality.
+    // const_cast because the state is a property of the resource, not of this
+    // handle -- Readback does not otherwise modify the image.
+    {
+        GpuImage& m = const_cast<GpuImage&>(src);
+        if (m.state != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+            D3D12_RESOURCE_BARRIER b = {};
+            b.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b.Transition.pResource   = m.res;
+            b.Transition.StateBefore = m.state;
+            b.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            m_list->ResourceBarrier(1, &b);
+            m.state = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        }
+    }
 
     m_list->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr);
 
@@ -401,6 +437,41 @@ bool ComputeContext::Dispatch(const ComputeKernel& k,
             ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
             m_device->CreateUnorderedAccessView(nullptr, nullptr, &ud, h);
         }
+    }
+
+    // Put every bound resource into the state its binding requires.
+    //
+    // Textures are created in COMMON and stay there until something moves them.
+    // A dispatch that writes a UAV still in COMMON is undefined: GPU-based
+    // validation flagged it on every dispatch of all 14 GPU algorithms. Batched
+    // into one ResourceBarrier call because the driver can then handle them
+    // together rather than serialising once per resource.
+    {
+        D3D12_RESOURCE_BARRIER pre[kMaxSrv + kMaxUav] = {};
+        UINT n = 0;
+
+        auto want = [&](GpuImage* img, D3D12_RESOURCE_STATES to) {
+            if (!img || !img->Valid() || img->state == to) return;
+            // An image bound as BOTH an input and an output of the same
+            // dispatch (an in-place pass) cannot be in two states at once;
+            // UAV wins, since the write is what must be correct.
+            for (UINT i = 0; i < n; ++i)
+                if (pre[i].Transition.pResource == img->res) return;
+            D3D12_RESOURCE_BARRIER& b = pre[n++];
+            b.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b.Transition.pResource   = img->res;
+            b.Transition.StateBefore = img->state;
+            b.Transition.StateAfter  = to;
+            b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            img->state               = to;
+        };
+
+        for (GpuImage* o : outputs) want(o, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        for (const GpuImage* i : inputs)
+            want(const_cast<GpuImage*>(i),
+                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+        if (n) m_list->ResourceBarrier(n, pre);
     }
 
     ID3D12DescriptorHeap* heaps[] = {m_srvHeap};

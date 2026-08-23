@@ -192,3 +192,16 @@ target_link_libraries(dbg_hang PRIVATE tglab_core imgui d3d12 dxgi dbghelp)
 if(MSVC)
     target_compile_definitions(dbg_hang PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
+
+# GPU shader audit: runs every GPU-capable algorithm under the debug layer and
+# GPU-based validation. Not an add_test() -- GBV is 10-100x slower and the run
+# takes minutes, so it is a tool you invoke deliberately rather than part of
+# the normal suite.
+add_executable(gpu_audit
+    tests/gpu_audit.cpp
+    $<TARGET_OBJECTS:tglab_algorithms>
+)
+target_link_libraries(gpu_audit PRIVATE tglab_core d3d12 dxgi)
+if(MSVC)
+    target_compile_definitions(gpu_audit PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()

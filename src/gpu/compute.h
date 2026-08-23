@@ -25,6 +25,15 @@ struct GpuImage {
     ID3D12Resource* res = nullptr;
     ImageDesc       desc{};
 
+    // What state the resource is currently in, so Dispatch transitions it only
+    // when it actually needs to change.
+    //
+    // Tracked rather than assumed, because the same texture is bound as a UAV
+    // by one stage and an SRV by the next. Without it every dispatch wrote a
+    // resource still sitting in COMMON, which GPU-based validation reported as
+    // "Incompatible texture barrier layout" on all 14 GPU algorithms.
+    D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
+
     bool Valid() const { return res != nullptr; }
     void Release() { if (res) { res->Release(); res = nullptr; } }
 };
