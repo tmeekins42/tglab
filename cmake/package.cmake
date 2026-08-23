@@ -40,6 +40,19 @@ set(TGLAB_DIST_DIR  "${CMAKE_BINARY_DIR}/dist/${TGLAB_DIST_NAME}")
 add_custom_target(package_release
     COMMENT "Packaging ${TGLAB_DIST_NAME}.zip"
 
+    # Prove the DXC we are about to ship actually compiles, before zipping it.
+    #
+    # Checking that the DLLs exist is not enough: the first published release
+    # shipped a dxcompiler.dll from an older SDK whose DxcCreateInstance fails,
+    # so the app started, fell back to the CPU for every algorithm, and looked
+    # merely slow. dxc_smoke runs against the same DLLs that go into the
+    # archive, so a compiler that cannot do the job fails the build.
+    COMMAND ${CMAKE_COMMAND} -E copy "${DXC_COMPILER_DLL}"
+            "$<TARGET_FILE_DIR:dxc_smoke>/"
+    COMMAND ${CMAKE_COMMAND} -E copy "${DXC_DXIL_DLL}"
+            "$<TARGET_FILE_DIR:dxc_smoke>/"
+    COMMAND "$<TARGET_FILE:dxc_smoke>"
+
     # Start clean: a stale file from a previous version would otherwise ship
     # silently, and a release archive is the worst place to find one.
     COMMAND ${CMAKE_COMMAND} -E rm -rf "${TGLAB_DIST_DIR}"
@@ -94,4 +107,4 @@ add_custom_target(package_release
 
 # Depends on the app, so `--target package_release` builds it first rather than
 # quietly zipping a stale exe.
-add_dependencies(package_release tglab)
+add_dependencies(package_release tglab dxc_smoke)

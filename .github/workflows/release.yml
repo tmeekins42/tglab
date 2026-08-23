@@ -27,8 +27,30 @@ jobs:
         with:
           submodules: recursive
 
+      # A pinned DXC, rather than whatever the runner's SDK happens to carry.
+      #
+      # The first published release shipped the runner's SDK copy, whose
+      # DxcCreateInstance fails outright: the app started, fell back to the CPU
+      # for every algorithm, and looked merely slow. Pinning means the DLLs that
+      # ship are a known version rather than a property of the image, and the
+      # dxc_smoke test below proves they work before anything is zipped.
+      - name: Fetch DXC
+        shell: pwsh
+        run: |
+          $ver = 'v1.8.2502'
+          $url = "https://github.com/microsoft/DirectXShaderCompiler/releases/download/$ver/dxc_2025_02_20.zip"
+          Invoke-WebRequest -Uri $url -OutFile dxc.zip
+          Expand-Archive dxc.zip -DestinationPath dxc
+          $dir = "$PWD/dxc/bin/x64"
+          if (-not (Test-Path "$dir/dxcompiler.dll")) { throw "dxcompiler.dll not in $dir" }
+          if (-not (Test-Path "$dir/dxil.dll"))       { throw "dxil.dll not in $dir" }
+          "DXC_BIN=$dir" | Out-File -FilePath $env:GITHUB_ENV -Append
+
       - name: Configure
-        run: cmake -S . -B build -A x64
+        run: >
+          cmake -S . -B build -A x64
+          -DDXC_COMPILER_DLL="$env:DXC_BIN/dxcompiler.dll"
+          -DDXC_DXIL_DLL="$env:DXC_BIN/dxil.dll"
 
       - name: Build
         run: cmake --build build --config Release

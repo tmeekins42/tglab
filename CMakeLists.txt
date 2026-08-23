@@ -236,3 +236,12 @@ endif()
 
 # Binary release packaging (see cmake/package.cmake).
 include(${CMAKE_SOURCE_DIR}/cmake/package.cmake)
+
+# Proves the packaged DXC actually compiles, not merely that the DLLs exist.
+add_executable(dxc_smoke tests/dxc_smoke.cpp)
+target_link_libraries(dxc_smoke PRIVATE tglab_core)
+if(MSVC)
+    target_compile_definitions(dxc_smoke PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+tglab_copy_dxc(dxc_smoke)
+add_test(NAME dxc_smoke COMMAND dxc_smoke)
