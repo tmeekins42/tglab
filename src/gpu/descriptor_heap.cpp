@@ -1,5 +1,6 @@
 #include "descriptor_heap.h"
 
+#include <algorithm>
 #include <cassert>
 
 namespace tglab {
@@ -32,6 +33,45 @@ void SrvHeap::Shutdown() {
     m_stride   = 0;
 }
 
+
+bool SrvHeap::Reserve(uint32_t count, D3D12_CPU_DESCRIPTOR_HANDLE* outCpu,
+                      D3D12_GPU_DESCRIPTOR_HANDLE* outGpu) {
+    if (count == 0 || count > m_capacity) return false;
+    if (m_free.size() < count) return false;
+
+    // Find a run of `count` consecutive free indices.
+    //
+    // Deliberately NOT "the block must start at 0": ImGui allocates its font
+    // atlas descriptor during init, so index 0 is already gone by the time the
+    // display pipeline asks. An earlier version required [0, count) and simply
+    // returned false, which made EnsureDisplayPipeline fail and the viewer fall
+    // back to the CPU path -- silently, since the fallback is a legitimate
+    // route for CPU-only stages. Fail loudly or not at all.
+    std::vector<uint32_t> sorted(m_free.begin(), m_free.end());
+    std::sort(sorted.begin(), sorted.end());
+
+    uint32_t runStart = 0, runLen = 0;
+    for (size_t i = 0; i < sorted.size(); ++i) {
+        if (runLen && sorted[i] == runStart + runLen) {
+            ++runLen;
+        } else {
+            runStart = sorted[i];
+            runLen   = 1;
+        }
+        if (runLen == count) break;
+    }
+    if (runLen < count) return false;
+
+    // Remove the reserved indices from the free list.
+    const uint32_t lo = runStart, hi = runStart + count;
+    m_free.erase(std::remove_if(m_free.begin(), m_free.end(),
+                                [lo, hi](uint32_t v) { return v >= lo && v < hi; }),
+                 m_free.end());
+
+    outCpu->ptr = m_cpuStart.ptr + SIZE_T(runStart) * m_stride;
+    outGpu->ptr = m_gpuStart.ptr + UINT64(runStart) * m_stride;
+    return true;
+}
 void SrvHeap::Alloc(D3D12_CPU_DESCRIPTOR_HANDLE* outCpu, D3D12_GPU_DESCRIPTOR_HANDLE* outGpu) {
     assert(!m_free.empty() && "SRV heap exhausted — raise the capacity");
     const uint32_t idx = m_free.back();

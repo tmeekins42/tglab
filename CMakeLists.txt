@@ -181,3 +181,14 @@ add_test(NAME script_spine COMMAND tglab_tests)
 add_test(NAME filters      COMMAND tglab_filter_tests)
 add_test(NAME demosaic     COMMAND tglab_demosaic_tests)
 add_test(NAME runtime      COMMAND tglab_runtime_tests)
+
+add_executable(dbg_hang
+    tests/dbg_hang.cpp
+    src/app/image_view.cpp
+    src/app/file_watch.cpp
+    $<TARGET_OBJECTS:tglab_algorithms>
+)
+target_link_libraries(dbg_hang PRIVATE tglab_core imgui d3d12 dxgi dbghelp)
+if(MSVC)
+    target_compile_definitions(dbg_hang PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()

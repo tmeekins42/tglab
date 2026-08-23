@@ -1333,10 +1333,23 @@ void App::DrawInfoPanel() {
     //
     // Cheap, because nothing recomputes: every stage hits the cache and the run
     // exists only to reach the BuildHistogram call at the end of it.
-    if (shownName != m_histViewer) {
-        m_histViewer = shownName;
-        m_worker.SetHistogramViewer(shownName);
-        if (subjectIsGpuOnly) m_dirty = true;
+    // Keyed on the VIEWER the panel is following, not on `shownName`.
+    //
+    // shownName falls back to a palette entry whenever the viewer's image is
+    // briefly absent, which it is each time the worker replaces the list
+    // mid-run. Keying on it let the name alternate between viewer and palette,
+    // so a frame could look like a new subject and ask for another run.
+    //
+    // Measured: 40 slider moves produced 40 submits either way, so this was NOT
+    // the cause of the lock-up Tim reported -- that was the GPU display path
+    // (see image_view.cpp). Kept because m_infoViewer is the honest key: it is
+    // stable across that flicker and changes only when the user switches tab.
+    if (m_infoViewer != m_histViewer) {
+        m_histViewer = m_infoViewer;
+        m_worker.SetHistogramViewer(m_infoViewer);
+        // One run to fetch it. Not repeated, because m_histViewer now matches
+        // and this branch will not fire again until the tab changes.
+        m_dirty = true;
     }
 
     // The stats thread is the fallback, for subjects the worker cannot measure:

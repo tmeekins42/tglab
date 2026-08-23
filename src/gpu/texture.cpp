@@ -311,15 +311,19 @@ struct DisplayPipeline {
     ID3D12RootSignature* root = nullptr;
     ID3D12PipelineState* pso  = nullptr;
 
-    // Non-shader-visible descriptors, so the table can be built per call
-    // without disturbing ImGui's own heap allocations.
-    ID3D12DescriptorHeap* heap = nullptr;
+    // Base of the block reserved inside ImGui's shader-visible heap. Sharing
+    // that one heap is what keeps the table valid at execute time.
+    D3D12_CPU_DESCRIPTOR_HANDLE cpuBase{};
+    D3D12_GPU_DESCRIPTOR_HANDLE gpuBase{};
     UINT stride = 0;
 
     // Where the next conversion takes its two descriptors, and which frame slot
     // that cursor belongs to. See kDisplaySlots for why both are needed.
     UINT cursor    = 0;
     UINT frameSlot = UINT(-1);
+
+    // Source textures this frame sampled, held until the slot recycles.
+    std::vector<ID3D12Resource*> retained[kMaxFramesInFlight];
 
     bool valid = false;
 };
@@ -406,16 +410,23 @@ bool EnsureDisplayPipeline(Device& dev) {
         return false;
     }
 
-    // Shader-visible: the table is bound for the dispatch.
-    D3D12_DESCRIPTOR_HEAP_DESC hd = {};
-    hd.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = kDisplaySlots;
-    hd.Flags          = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    if (FAILED(dev.Get()->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_display.heap))))
+    // Reserve the conversion's descriptors inside ImGui's heap.
+    //
+    // This used to be a second shader-visible heap, on the reasoning that it
+    // would not disturb ImGui's allocations. That was the bug: only ONE
+    // shader-visible CBV/SRV/UAV heap can be bound at a time, and the code
+    // rebinds ImGui's heap at the end of the frame's recording. Descriptor
+    // heaps are resolved when the list EXECUTES, not when it records, so by
+    // the time the GPU ran the dispatch the display heap was no longer bound
+    // and the table pointed into ImGui's heap instead -- reported by GPU-based
+    // validation as "Invalid resource pointed to by descriptor", and by DRED
+    // as both queues stalled on a dispatch.
+    //
+    // Sharing one heap makes the binding correct by construction.
+    if (!dev.Srv().Reserve(kDisplaySlots, &g_display.cpuBase, &g_display.gpuBase))
         return false;
 
-    g_display.stride = dev.Get()->GetDescriptorHandleIncrementSize(
-        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    g_display.stride = dev.Srv().Stride();
     g_display.valid = true;
     return true;
 }
@@ -425,7 +436,11 @@ bool EnsureDisplayPipeline(Device& dev) {
 void ReleaseDisplayPipeline() {
     if (g_display.pso)  { g_display.pso->Release();  g_display.pso  = nullptr; }
     if (g_display.root) { g_display.root->Release(); g_display.root = nullptr; }
-    if (g_display.heap) { g_display.heap->Release(); g_display.heap = nullptr; }
+    // No heap to free: the descriptors live in ImGui's heap, which the device owns.
+    for (auto& list : g_display.retained) {
+        for (ID3D12Resource* r : list) r->Release();
+        list.clear();
+    }
     g_display.valid = false;
 }
 
@@ -483,6 +498,7 @@ bool GpuTexture::ReadRegion(Device& dev, const SharedGpuTexture& src,
                                                nullptr, IID_PPV_ARGS(&list))) &&
         SUCCEEDED(dev.Get()->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) {
         evt = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+        list->SetName(L"loupe.readback.list");
 
         D3D12_TEXTURE_COPY_LOCATION d = {};
         d.pResource                          = staging;
@@ -547,7 +563,24 @@ bool GpuTexture::UpdateFromGpu(Device& dev, const SharedGpuTexture& src,
     if (!recreated && contentVersion == m_version) return true;
     m_version = contentVersion;
 
-    if (!EnsureDisplayPipeline(dev)) return false;
+    // Say so, once, if the conversion pipeline cannot be built.
+    //
+    // Returning false here sends the viewer down the CPU readback path, which
+    // is a legitimate route for a CPU-only stage -- so a failure is otherwise
+    // indistinguishable from normal operation and simply looks slow. That is
+    // exactly what happened when Reserve() demanded descriptors starting at
+    // index 0: every conversion silently fell back, and a test suite measuring
+    // only "does it hang" reported the GPU path as fixed while never running it.
+    if (!EnsureDisplayPipeline(dev)) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            std::fprintf(stderr, "[gpu] display conversion unavailable; "
+                                 "viewers fall back to CPU readback\n");
+            std::fflush(stderr);
+        }
+        return false;
+    }
 
     ID3D12GraphicsCommandList* cl = dev.CurrentCommandList();
     if (!cl) return false;
@@ -563,7 +596,29 @@ bool GpuTexture::UpdateFromGpu(Device& dev, const SharedGpuTexture& src,
     if (g_display.frameSlot != frameSlot) {
         g_display.frameSlot = frameSlot;
         g_display.cursor    = blockBase;
+        // This slot has come round again, so BeginFrame() has waited on its
+        // fence: whatever it was holding is finished with on the GPU.
+        for (ID3D12Resource* r : g_display.retained[frameSlot]) r->Release();
+        g_display.retained[frameSlot].clear();
     }
+    // Keep the source resource alive until this frame's fence has passed.
+    //
+    // The viewer holds its shared texture in a single slot that is overwritten
+    // every frame from the worker's latest result. When the worker publishes a
+    // new one, the last reference to the PREVIOUS texture can drop on the UI
+    // thread -- and ~SharedGpuTexture calls Release() immediately, freeing a
+    // resource that frames still in flight are about to sample. GPU-based
+    // validation reports exactly that: "Invalid resource pointed to by
+    // descriptor. One possibility is that the resource has been destroyed."
+    //
+    // Refcounting alone cannot cover it: the count is correct for the CPU
+    // timeline and says nothing about work the GPU has not executed yet. So
+    // this takes its own reference, parked in the frame's slot and released
+    // when that slot comes round -- by which point BeginFrame() has waited on
+    // the slot's fence, so the GPU is provably done with it.
+    src.res->AddRef();
+    g_display.retained[frameSlot].push_back(src.res);
+
 
     // More conversions in one frame than the block holds -- 32 viewers all
     // changing at once, which nothing does today. Reusing a slot within a frame
@@ -579,10 +634,8 @@ bool GpuTexture::UpdateFromGpu(Device& dev, const SharedGpuTexture& src,
     const UINT slot = g_display.cursor;
     g_display.cursor += 2;
 
-    D3D12_CPU_DESCRIPTOR_HANDLE cpu0 =
-        g_display.heap->GetCPUDescriptorHandleForHeapStart();
-    D3D12_GPU_DESCRIPTOR_HANDLE gpu0 =
-        g_display.heap->GetGPUDescriptorHandleForHeapStart();
+    const D3D12_CPU_DESCRIPTOR_HANDLE cpu0 = g_display.cpuBase;
+    const D3D12_GPU_DESCRIPTOR_HANDLE gpu0 = g_display.gpuBase;
     D3D12_CPU_DESCRIPTOR_HANDLE srvCpu{cpu0.ptr + SIZE_T(slot) * g_display.stride};
     D3D12_CPU_DESCRIPTOR_HANDLE uavCpu{cpu0.ptr + SIZE_T(slot + 1) * g_display.stride};
     D3D12_GPU_DESCRIPTOR_HANDLE tableGpu{gpu0.ptr + SIZE_T(slot) * g_display.stride};
@@ -614,7 +667,9 @@ bool GpuTexture::UpdateFromGpu(Device& dev, const SharedGpuTexture& src,
     cl->ResourceBarrier(1, &b);
     m_freshlyCreated = false;
 
-    ID3D12DescriptorHeap* heaps[] = {g_display.heap};
+    // ImGui's heap holds the reserved block, so this is the same heap that
+    // stays bound afterwards -- no rebind can invalidate the table.
+    ID3D12DescriptorHeap* heaps[] = {dev.Srv().Heap()};
     cl->SetDescriptorHeaps(1, heaps);
     cl->SetComputeRootSignature(g_display.root);
     cl->SetPipelineState(g_display.pso);
@@ -639,11 +694,10 @@ bool GpuTexture::UpdateFromGpu(Device& dev, const SharedGpuTexture& src,
     b.Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     cl->ResourceBarrier(1, &b);
 
-    // Restore ImGui's heap. Binding is command-list state, not per-dispatch, so
-    // leaving mine set makes every later ImGui draw reference handles from a
-    // heap that is no longer bound -- which the debug layer reports as
-    // "descriptor heap ... is different from currently set descriptor heap",
-    // and which crashes the app outright.
+    // Re-assert ImGui's heap. Now that the conversion draws its descriptors
+    // from that same heap this is a no-op, but it is kept so the list.s heap
+    // binding is stated explicitly at the end of the block rather than being
+    // an inherited assumption.
     ID3D12DescriptorHeap* uiHeap = dev.Srv().Heap();
     cl->SetDescriptorHeaps(1, &uiHeap);
     return true;

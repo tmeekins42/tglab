@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 namespace tglab {
@@ -21,6 +22,139 @@ static void Trace(const char* stage, HRESULT hr = S_OK) {
     fflush(stderr);
 }
 
+// Breadcrumb op -> short name. Generated from the SDK enum; a switch means
+// an unknown value prints its number instead of indexing off a table.
+static const char* BreadcrumbOpName(D3D12_AUTO_BREADCRUMB_OP op) {
+    switch (op) {
+        case D3D12_AUTO_BREADCRUMB_OP_SETMARKER: return "SETMARKER";
+        case D3D12_AUTO_BREADCRUMB_OP_BEGINEVENT: return "BEGINEVENT";
+        case D3D12_AUTO_BREADCRUMB_OP_ENDEVENT: return "ENDEVENT";
+        case D3D12_AUTO_BREADCRUMB_OP_DRAWINSTANCED: return "DRAWINSTANCED";
+        case D3D12_AUTO_BREADCRUMB_OP_DRAWINDEXEDINSTANCED: return "DRAWINDEXEDINSTANCED";
+        case D3D12_AUTO_BREADCRUMB_OP_EXECUTEINDIRECT: return "EXECUTEINDIRECT";
+        case D3D12_AUTO_BREADCRUMB_OP_DISPATCH: return "DISPATCH";
+        case D3D12_AUTO_BREADCRUMB_OP_COPYBUFFERREGION: return "COPYBUFFERREGION";
+        case D3D12_AUTO_BREADCRUMB_OP_COPYTEXTUREREGION: return "COPYTEXTUREREGION";
+        case D3D12_AUTO_BREADCRUMB_OP_COPYRESOURCE: return "COPYRESOURCE";
+        case D3D12_AUTO_BREADCRUMB_OP_COPYTILES: return "COPYTILES";
+        case D3D12_AUTO_BREADCRUMB_OP_RESOLVESUBRESOURCE: return "RESOLVESUBRESOURCE";
+        case D3D12_AUTO_BREADCRUMB_OP_CLEARRENDERTARGETVIEW: return "CLEARRENDERTARGETVIEW";
+        case D3D12_AUTO_BREADCRUMB_OP_CLEARUNORDEREDACCESSVIEW: return "CLEARUNORDEREDACCESSVIEW";
+        case D3D12_AUTO_BREADCRUMB_OP_CLEARDEPTHSTENCILVIEW: return "CLEARDEPTHSTENCILVIEW";
+        case D3D12_AUTO_BREADCRUMB_OP_RESOURCEBARRIER: return "RESOURCEBARRIER";
+        case D3D12_AUTO_BREADCRUMB_OP_EXECUTEBUNDLE: return "EXECUTEBUNDLE";
+        case D3D12_AUTO_BREADCRUMB_OP_PRESENT: return "PRESENT";
+        case D3D12_AUTO_BREADCRUMB_OP_RESOLVEQUERYDATA: return "RESOLVEQUERYDATA";
+        case D3D12_AUTO_BREADCRUMB_OP_BEGINSUBMISSION: return "BEGINSUBMISSION";
+        case D3D12_AUTO_BREADCRUMB_OP_ENDSUBMISSION: return "ENDSUBMISSION";
+        case D3D12_AUTO_BREADCRUMB_OP_DECODEFRAME: return "DECODEFRAME";
+        case D3D12_AUTO_BREADCRUMB_OP_PROCESSFRAMES: return "PROCESSFRAMES";
+        case D3D12_AUTO_BREADCRUMB_OP_ATOMICCOPYBUFFERUINT: return "ATOMICCOPYBUFFERUINT";
+        case D3D12_AUTO_BREADCRUMB_OP_ATOMICCOPYBUFFERUINT64: return "ATOMICCOPYBUFFERUINT64";
+        case D3D12_AUTO_BREADCRUMB_OP_RESOLVESUBRESOURCEREGION: return "RESOLVESUBRESOURCEREGION";
+        case D3D12_AUTO_BREADCRUMB_OP_WRITEBUFFERIMMEDIATE: return "WRITEBUFFERIMMEDIATE";
+        case D3D12_AUTO_BREADCRUMB_OP_DECODEFRAME1: return "DECODEFRAME1";
+        case D3D12_AUTO_BREADCRUMB_OP_SETPROTECTEDRESOURCESESSION: return "SETPROTECTEDRESOURCESESSION";
+        case D3D12_AUTO_BREADCRUMB_OP_DECODEFRAME2: return "DECODEFRAME2";
+        case D3D12_AUTO_BREADCRUMB_OP_PROCESSFRAMES1: return "PROCESSFRAMES1";
+        case D3D12_AUTO_BREADCRUMB_OP_BUILDRAYTRACINGACCELERATIONSTRUCTURE: return "BUILDRAYTRACINGACCELERATIONSTRUCTURE";
+        case D3D12_AUTO_BREADCRUMB_OP_EMITRAYTRACINGACCELERATIONSTRUCTUREPOSTBUILDINFO: return "EMITRAYTRACINGACCELERATIONSTRUCTUREPOSTBUILDINFO";
+        case D3D12_AUTO_BREADCRUMB_OP_COPYRAYTRACINGACCELERATIONSTRUCTURE: return "COPYRAYTRACINGACCELERATIONSTRUCTURE";
+        case D3D12_AUTO_BREADCRUMB_OP_DISPATCHRAYS: return "DISPATCHRAYS";
+        case D3D12_AUTO_BREADCRUMB_OP_INITIALIZEMETACOMMAND: return "INITIALIZEMETACOMMAND";
+        case D3D12_AUTO_BREADCRUMB_OP_EXECUTEMETACOMMAND: return "EXECUTEMETACOMMAND";
+        case D3D12_AUTO_BREADCRUMB_OP_ESTIMATEMOTION: return "ESTIMATEMOTION";
+        case D3D12_AUTO_BREADCRUMB_OP_RESOLVEMOTIONVECTORHEAP: return "RESOLVEMOTIONVECTORHEAP";
+        case D3D12_AUTO_BREADCRUMB_OP_SETPIPELINESTATE1: return "SETPIPELINESTATE1";
+        case D3D12_AUTO_BREADCRUMB_OP_INITIALIZEEXTENSIONCOMMAND: return "INITIALIZEEXTENSIONCOMMAND";
+        case D3D12_AUTO_BREADCRUMB_OP_EXECUTEEXTENSIONCOMMAND: return "EXECUTEEXTENSIONCOMMAND";
+        case D3D12_AUTO_BREADCRUMB_OP_DISPATCHMESH: return "DISPATCHMESH";
+        case D3D12_AUTO_BREADCRUMB_OP_ENCODEFRAME: return "ENCODEFRAME";
+        case D3D12_AUTO_BREADCRUMB_OP_RESOLVEENCODEROUTPUTMETADATA: return "RESOLVEENCODEROUTPUTMETADATA";
+        case D3D12_AUTO_BREADCRUMB_OP_BARRIER: return "BARRIER";
+        case D3D12_AUTO_BREADCRUMB_OP_BEGIN_COMMAND_LIST: return "BEGIN_COMMAND_LIST";
+        case D3D12_AUTO_BREADCRUMB_OP_DISPATCHGRAPH: return "DISPATCHGRAPH";
+        case D3D12_AUTO_BREADCRUMB_OP_SETPROGRAM: return "SETPROGRAM";
+        case D3D12_AUTO_BREADCRUMB_OP_PROCESSFRAMES2: return "PROCESSFRAMES2";
+    }
+    return "<unknown op>";
+}
+
+// Dumps DRED breadcrumbs and page-fault data after a device removal.
+//
+// The point of this is the ordering: for each command list DRED reports how
+// many ops COMPLETED. Op N completed and op N+1 did not, so N+1 is where the
+// GPU stopped -- which is the single fact DXGI_ERROR_DEVICE_HUNG withholds.
+// Ops after the stall are printed too, marked, because the hang is usually
+// caused by the op that never finished rather than the last one that did.
+//
+// Safe to call on a dead device: DRED data is retained by the runtime
+// precisely so it can be read after removal.
+void ReportDeviceRemoval(ID3D12Device* device, const char* where) {
+    if (!device) return;
+
+    const HRESULT reason = device->GetDeviceRemovedReason();
+    std::fprintf(stderr, "\n=== DEVICE REMOVED (%s) reason=0x%08lX ===\n",
+                 where, static_cast<unsigned long>(reason));
+
+    ID3D12DeviceRemovedExtendedData1* dred = nullptr;
+    if (FAILED(device->QueryInterface(IID_PPV_ARGS(&dred))) || !dred) {
+        std::fprintf(stderr, "  (no DRED interface; run a Debug build)\n");
+        std::fflush(stderr);
+        return;
+    }
+
+    D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT1 crumbs = {};
+    if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput1(&crumbs))) {
+        int listIndex = 0;
+        for (const D3D12_AUTO_BREADCRUMB_NODE1* n = crumbs.pHeadAutoBreadcrumbNode;
+             n; n = n->pNext, ++listIndex) {
+            const UINT done = n->pLastBreadcrumbValue ? *n->pLastBreadcrumbValue : 0;
+            // A list that finished everything did not stall; skip the noise.
+            if (n->BreadcrumbCount == 0 || done == n->BreadcrumbCount) continue;
+
+            // Prefer the wide name: SetName() sets W, so the A fields are null
+            // for anything this app named. %ls handles the wide string.
+            std::fprintf(stderr, "  [list %d] %ls (%p) on queue %ls (%p) -- completed %u of %u\n",
+                         listIndex,
+                         n->pCommandListDebugNameW ? n->pCommandListDebugNameW : L"<unnamed>",
+                         static_cast<void*>(n->pCommandList),
+                         n->pCommandQueueDebugNameW ? n->pCommandQueueDebugNameW : L"<unnamed>",
+                         static_cast<void*>(n->pCommandQueue),
+                         done, n->BreadcrumbCount);
+
+            // A window around the stall: enough for context, not the whole list.
+            const UINT lo = done > 4 ? done - 4 : 0;
+            const UINT hi = (done + 4 < n->BreadcrumbCount) ? done + 4 : n->BreadcrumbCount;
+            for (UINT i = lo; i < hi; ++i) {
+                std::fprintf(stderr, "      %s op[%u] = %s\n",
+                             i == done ? "-->" : "   ", i,
+                             BreadcrumbOpName(n->pCommandHistory[i]));
+            }
+        }
+    }
+
+    D3D12_DRED_PAGE_FAULT_OUTPUT1 pf = {};
+    if (SUCCEEDED(dred->GetPageFaultAllocationOutput1(&pf)) && pf.PageFaultVA) {
+        std::fprintf(stderr, "  page fault VA = 0x%llx\n",
+                     static_cast<unsigned long long>(pf.PageFaultVA));
+        for (const D3D12_DRED_ALLOCATION_NODE1* a = pf.pHeadExistingAllocationNode;
+             a; a = a->pNext) {
+            std::fprintf(stderr, "    live alloc: %s\n",
+                         a->ObjectNameA ? a->ObjectNameA : "<unnamed>");
+        }
+        // Freed-but-faulting is the signature of a use-after-free.
+        for (const D3D12_DRED_ALLOCATION_NODE1* a = pf.pHeadRecentFreedAllocationNode;
+             a; a = a->pNext) {
+            std::fprintf(stderr, "    RECENTLY FREED: %s\n",
+                         a->ObjectNameA ? a->ObjectNameA : "<unnamed>");
+        }
+    }
+
+    dred->Release();
+    std::fprintf(stderr, "=== end DRED ===\n\n");
+    std::fflush(stderr);
+}
 bool Device::Init(HWND hwnd, bool enableDebugLayer) {
     Trace("Init begin");
     // The debug layer must be enabled before device creation. It is what
@@ -30,6 +164,55 @@ bool Device::Init(HWND hwnd, bool enableDebugLayer) {
         if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dbg)))) {
             dbg->EnableDebugLayer();
             dbg->Release();
+        }
+    }
+
+    // Device Removed Extended Data. Must be turned on BEFORE device creation,
+    // like the debug layer, because it changes how the runtime records work.
+    //
+    // This is what a GPU hang leaves behind. DXGI_ERROR_DEVICE_HUNG on its own
+    // names nothing: the device is gone and the debug layer has no faulting
+    // call to report. Auto-breadcrumbs record the ops each command list
+    // actually completed, so the last one before the gap is where the GPU
+    // stopped. Page-fault data adds the offending VA and the resource that
+    // owned it, which also catches use-after-free.
+    //
+    // Costs per-op overhead, so it rides with the debug layer rather than
+    // shipping in release builds.
+    if (enableDebugLayer) {
+        ID3D12DeviceRemovedExtendedDataSettings1* dred = nullptr;
+        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dred)))) {
+            dred->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            dred->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            dred->Release();
+            Trace("DRED enabled");
+        }
+    }
+
+    // GPU-based validation, opt-in via TGLAB_GBV=1.
+    //
+    // Off by default because it instruments every shader and costs 10-100x --
+    // far too slow for interactive use. But it validates resource STATE at
+    // dispatch time on the GPU, which is precisely the class of mistake the
+    // ordinary debug layer cannot see: it checks descriptors as executed
+    // rather than as recorded.
+    //
+    // SynchronizedCommandQueueValidation serialises queue execution so that
+    // cross-queue hazards are reported against the call that caused them.
+    // That is the check that matters for a texture the worker writes while
+    // the UI samples it.
+    if (enableDebugLayer) {
+        size_t gbvLen = 0;
+        const bool wantGbv =
+            getenv_s(&gbvLen, nullptr, 0, "TGLAB_GBV") == 0 && gbvLen > 0;
+        if (wantGbv) {
+            ID3D12Debug1* dbg1 = nullptr;
+            if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dbg1)))) {
+                dbg1->SetEnableGPUBasedValidation(TRUE);
+                dbg1->SetEnableSynchronizedCommandQueueValidation(TRUE);
+                dbg1->Release();
+                Trace("GPU-based validation ON (slow)");
+            }
         }
     }
 
@@ -45,6 +228,11 @@ bool Device::Init(HWND hwnd, bool enableDebugLayer) {
         if (SUCCEEDED(m_device->QueryInterface(IID_PPV_ARGS(&iq)))) {
             iq->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_CORRUPTION, FALSE);
             iq->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR, FALSE);
+            // WARNING too: an object destroyed while still referenced raises
+            // 0x087D at teardown, and breaking there loses the message that
+            // says WHICH object -- the one useful part.
+            iq->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_WARNING, FALSE);
+            iq->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_INFO, FALSE);
             iq->Release();
         }
     }
@@ -53,6 +241,8 @@ bool Device::Init(HWND hwnd, bool enableDebugLayer) {
     qd.Type  = D3D12_COMMAND_LIST_TYPE_DIRECT;
     qd.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
     if (FAILED(m_device->CreateCommandQueue(&qd, IID_PPV_ARGS(&m_queue)))) return false;
+    // Named so DRED breadcrumbs say WHICH queue stalled rather than <unnamed>.
+    m_queue->SetName(L"ui.direct.queue");
 
     D3D12_DESCRIPTOR_HEAP_DESC rtvDesc = {};
     rtvDesc.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
@@ -81,6 +271,7 @@ bool Device::Init(HWND hwnd, bool enableDebugLayer) {
                                            m_frames[0].allocator, nullptr,
                                            IID_PPV_ARGS(&m_cmdList))))
         return false;
+    m_cmdList->SetName(L"ui.direct.list");
     m_cmdList->Close();
 
     if (FAILED(m_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_fence)))) return false;
@@ -214,12 +405,9 @@ ID3D12GraphicsCommandList* Device::BeginFrame() {
     if (f.fenceValue != 0 && m_fence->GetCompletedValue() < f.fenceValue) {
         m_fence->SetEventOnCompletion(f.fenceValue, m_fenceEvent);
         if (WaitForSingleObject(m_fenceEvent, 5000) != WAIT_OBJECT_0) {
-            const HRESULT reason = m_device ? m_device->GetDeviceRemovedReason() : S_OK;
-            std::fprintf(stderr,
-                         "[gpu] frame fence did not signal within 5s; "
-                         "device removed reason 0x%08lX\n",
-                         static_cast<unsigned long>(reason));
+            std::fprintf(stderr, "[gpu] frame fence did not signal within 5s\n");
             std::fflush(stderr);
+            ReportDeviceRemoval(m_device, "frame fence timeout");
         }
     }
 

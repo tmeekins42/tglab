@@ -1,6 +1,7 @@
 #include "image_view.h"
 
 #include <algorithm>
+#include <cstdlib>
 
 #include "../gpu/device.h"
 #include "imgui.h"
@@ -44,8 +45,24 @@ void ImageViewPanel::Draw(Device& dev, Image* img) {
     // from it is a dispatch, where the CPU path is a readback plus a scalar
     // conversion plus an upload. Falls back for a CPU-only stage, which has no
     // shared texture -- a script can mix the two.
-    const bool ok = m_gpuSrc ? m_tex.UpdateFromGpu(dev, *m_gpuSrc, m_version)
-                             : m_tex.Update(dev, *img, m_version);
+    // Draw straight from the GPU result unless TGLAB_CPUDISPLAY=1 forces the
+    // readback path (kept as an escape hatch for comparison and debugging).
+    //
+    // This path previously hung the device. The cause was a second
+    // shader-visible descriptor heap: only one can be bound at a time, and
+    // descriptor heaps resolve when the command list EXECUTES rather than when
+    // it records, so rebinding ImGui's heap at the end of the frame left the
+    // conversion's table pointing into the wrong heap. GPU-based validation
+    // named it ("Invalid resource pointed to by descriptor") and DRED showed
+    // both queues stalled on a dispatch. The conversion's descriptors now live
+    // in ImGui's heap, so one heap stays bound throughout. See texture.cpp.
+    static const bool kCpuDisplay = [] {
+        size_t len = 0;
+        return getenv_s(&len, nullptr, 0, "TGLAB_CPUDISPLAY") == 0 && len > 0;
+    }();
+    const bool useGpu = m_gpuSrc && !kCpuDisplay;
+    const bool ok = useGpu ? m_tex.UpdateFromGpu(dev, *m_gpuSrc, m_version)
+                           : m_tex.Update(dev, *img, m_version);
     if (!ok) {
         ImGui::TextDisabled("could not upload image");
         ImGui::End();

@@ -101,4 +101,9 @@ private:
     SrvHeap m_srv;
 };
 
+// Dumps DRED breadcrumbs + page-fault data after a device removal. Prints the
+// op each stalled command list stopped at, which DXGI_ERROR_DEVICE_HUNG alone
+// does not tell you. No-op unless the Debug build enabled DRED.
+void ReportDeviceRemoval(ID3D12Device* device, const char* where);
+
 } // namespace tglab

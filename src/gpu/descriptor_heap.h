@@ -19,6 +19,20 @@ public:
     void Alloc(D3D12_CPU_DESCRIPTOR_HANDLE* outCpu, D3D12_GPU_DESCRIPTOR_HANDLE* outGpu);
     void Free(D3D12_CPU_DESCRIPTOR_HANDLE cpu, D3D12_GPU_DESCRIPTOR_HANDLE gpu);
 
+    // Reserves `count` CONTIGUOUS descriptors and returns the base handles.
+    //
+    // For the display-conversion table, which needs its two descriptors
+    // adjacent and must live in THIS heap: only one shader-visible heap can
+    // be bound at a time, so a dispatch reading a table from a second heap
+    // reads whatever the bound heap happens to hold. Reserving here keeps
+    // one heap bound for both ImGui and the conversion.
+    //
+    // Call before any Alloc(); returns false if the capacity cannot cover it.
+    bool Reserve(uint32_t count, D3D12_CPU_DESCRIPTOR_HANDLE* outCpu,
+                 D3D12_GPU_DESCRIPTOR_HANDLE* outGpu);
+
+    UINT Stride() const { return m_stride; }
+
     ID3D12DescriptorHeap* Heap() const { return m_heap; }
 
 private:

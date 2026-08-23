@@ -39,6 +39,8 @@ bool ComputeContext::Init(ID3D12Device* device) {
     D3D12_COMMAND_QUEUE_DESC qd = {};
     qd.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
     if (FAILED(device->CreateCommandQueue(&qd, IID_PPV_ARGS(&m_queue)))) return false;
+    // Named for DRED breadcrumbs (see ReportDeviceRemoval).
+    m_queue->SetName(L"worker.compute.queue");
 
     if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE,
                                               IID_PPV_ARGS(&m_alloc))))
@@ -46,6 +48,7 @@ bool ComputeContext::Init(ID3D12Device* device) {
     if (FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE,
                                          m_alloc, nullptr, IID_PPV_ARGS(&m_list))))
         return false;
+    m_list->SetName(L"worker.compute.list");
     m_list->Close();
 
     if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_fence)))) return false;
@@ -475,6 +478,7 @@ bool ComputeContext::Flush(std::string* err) {
     // A hang shows up here even when the wait succeeds.
     if (m_device->GetDeviceRemovedReason() != S_OK) {
         m_deviceLost = true;
+        ReportDeviceRemoval(m_device, "compute flush");
         *err = "GPU device was removed (a kernel most likely ran too long); "
                "falling back to the CPU";
         return false;
