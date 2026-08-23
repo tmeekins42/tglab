@@ -108,13 +108,23 @@ set_target_properties(tglab PROPERTIES VS_DEBUGGER_WORKING_DIRECTORY ${CMAKE_SOU
 # step D3D12 refuses to load the resulting DXIL, with an error that does not
 # mention the missing DLL. Copy both next to every executable that compiles
 # shaders.
+#
+# Redist/D3D is searched FIRST and matters for shipping: those are the copies
+# Microsoft designates as redistributable, and they are not byte-identical to
+# the ones under bin/. Developing against bin/ and shipping Redist/ would mean
+# releasing something never actually run, so prefer Redist everywhere and let
+# bin/ be the fallback for an SDK install that lacks it.
 find_file(DXC_COMPILER_DLL dxcompiler.dll
-    PATHS "$ENV{WindowsSdkDir}bin/${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}/x64"
+    PATHS "$ENV{WindowsSdkDir}Redist/D3D/x64"
+          "C:/Program Files (x86)/Windows Kits/10/Redist/D3D/x64"
+          "$ENV{WindowsSdkDir}bin/${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}/x64"
           "C:/Program Files (x86)/Windows Kits/10/bin/${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}/x64"
           "C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64"
     NO_DEFAULT_PATH)
 find_file(DXC_DXIL_DLL dxil.dll
-    PATHS "$ENV{WindowsSdkDir}bin/${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}/x64"
+    PATHS "$ENV{WindowsSdkDir}Redist/D3D/x64"
+          "C:/Program Files (x86)/Windows Kits/10/Redist/D3D/x64"
+          "$ENV{WindowsSdkDir}bin/${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}/x64"
           "C:/Program Files (x86)/Windows Kits/10/bin/${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}/x64"
           "C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64"
     NO_DEFAULT_PATH)
@@ -223,3 +233,6 @@ target_link_libraries(gpu_leak PRIVATE tglab_core d3d12 dxgi)
 if(MSVC)
     target_compile_definitions(gpu_leak PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
+
+# Binary release packaging (see cmake/package.cmake).
+include(${CMAKE_SOURCE_DIR}/cmake/package.cmake)

@@ -9,9 +9,6 @@ BUGS / SMALL FEATURES
 - can we add a gpu watchdog that catches and breaks out of gpu hangs?
 
 FEATURES
-- Can we release pre-compiled executables on github? Do we need to start tracking version numbers / or release number? maybe release number.. not sure this app with ever be "finished".
-  (partly started: CMake now sets a project VERSION, currently 0.4.0, and the
-  About dialog reports it. Bumping it there is the single place to change.)
 - add support for additional image channels, such as alpha channels and depth channels
 - channel merging. Astronomy images are captured single channel with colored filters. How to merge them?
 - image export

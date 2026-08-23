@@ -39,6 +39,39 @@ cmake --build build --config Debug
 built from source and adds about a minute to a clean build; it is only
 recompiled when the submodule moves.)
 
+### Binary releases
+
+Prebuilt Windows archives are on the [releases
+page](https://github.com/tmeekins42/tglab/releases) — unzip anywhere and run
+`tglab.exe`. Needs 64-bit Windows 10/11, a Direct3D 12 GPU, and the [Visual C++
+Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe) if the app
+reports a missing `VCRUNTIME140.dll`.
+
+To build one:
+
+```sh
+cmake --build build --config Release --target package_release
+```
+
+That produces `build/dist/tglab-<version>-win64.zip` with the exe, both DXC
+DLLs, the scripts and assets folders, and every licence. The DLLs are taken
+from the SDK's `Redist/D3D` directory — the copies Microsoft designates as
+redistributable, which are *not* byte-identical to the ones under `bin/`, so
+the same files are used for development and for shipping rather than releasing
+something never actually run. Packaging fails outright if they are missing,
+because an archive without them starts and then silently falls back to the CPU
+for every algorithm.
+
+Pushing a `v*` tag runs [.github/workflows/release.yml](.github/workflows/release.yml),
+which builds on a clean runner, checks the archive contains everything, and
+publishes it. Building somewhere with nothing else installed is the point: a
+package that only runs on the machine that built it is exactly what this
+catches.
+
+The version lives in one place — `project(tglab VERSION ...)` in
+[CMakeLists.txt](CMakeLists.txt) — and reaches both the About dialog and the
+archive name from there.
+
 ## Run
 
 Arguments are a `.tgl` script plus any images to preload. Paths are relative to

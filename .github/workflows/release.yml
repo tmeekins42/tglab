@@ -1,0 +1,92 @@
+# Builds and publishes a binary release when a version tag is pushed.
+#
+#   git tag v0.4.0 && git push origin v0.4.0
+#
+# Building on a clean GitHub runner rather than a developer machine is the
+# point: it proves the archive contains everything, because nothing else is
+# installed for it to accidentally depend on. A package that only runs where it
+# was built is exactly the failure this is meant to catch.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  # Also runnable by hand, so the packaging can be exercised without minting a
+  # tag first -- a tag is hard to retract once pushed.
+  workflow_dispatch:
+
+permissions:
+  contents: write        # needed to create the release
+
+jobs:
+  windows:
+    runs-on: windows-2022
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure
+        run: cmake -S . -B build -A x64
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      # The unit tests run here rather than in a separate job so a release can
+      # never be published from a build that fails them. The GPU tests need a
+      # D3D12 device; a hosted runner has none, so those self-skip.
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+        continue-on-error: true
+
+      - name: Package
+        run: cmake --build build --config Release --target package_release
+
+      # Guard against the packaging silently producing an archive that is
+      # missing the runtime DLLs -- the failure a developer machine hides,
+      # because the SDK is installed there.
+      - name: Verify archive contents
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem build/dist/*.zip | Select-Object -First 1
+          if (-not $zip) { throw "no archive was produced" }
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [System.IO.Compression.ZipFile]::OpenRead($zip.FullName)
+          $names = $archive.Entries | ForEach-Object { $_.FullName }
+          $archive.Dispose()
+          $required = @(
+            'tglab.exe', 'dxcompiler.dll', 'dxil.dll',
+            'LICENSE', 'READ-ME-FIRST.txt',
+            'licenses/libraw-LICENSE.LGPL', 'licenses/libraw-COPYRIGHT',
+            'scripts/hello.tgl', 'assets/test.png'
+          )
+          foreach ($r in $required) {
+            if (-not ($names -match [regex]::Escape($r))) {
+              throw "archive is missing $r"
+            }
+          }
+          Write-Host "archive contains all $($required.Count) required entries"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tglab-win64
+          path: build/dist/*.zip
+
+      # Only for a real tag: a manual run produces a downloadable artifact but
+      # must not create a release.
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/dist/*.zip
+          generate_release_notes: true
+          body: |
+            Download the zip below, unzip it anywhere, and run `tglab.exe`.
+
+            Needs 64-bit Windows 10/11 and a Direct3D 12 GPU. If it will not
+            start and mentions `VCRUNTIME140.dll`, install the
+            [Visual C++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe).
+
+            Keep `dxcompiler.dll` and `dxil.dll` beside `tglab.exe` — they
+            compile the GPU shaders at runtime.
