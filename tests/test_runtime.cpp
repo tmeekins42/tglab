@@ -1018,6 +1018,46 @@ static void TestGpuAgreement(ID3D12Device* dev) {
         // In practice the two agree exactly on this fixture, so the tolerance is
         // held tight enough to notice if that stops being true. Loosening it
         // "because thresholds are brittle" would have hidden a real divergence.
+
+        // Bernsen, the case that motivated GpuScratchFormat. Its first pass
+        // carries a window MINIMUM and MAXIMUM, so it needs a 2-channel
+        // intermediate; sized from the R32F output the maximum was silently
+        // dropped and half the pixels came out wrong. The mean tolerance below
+        // is what detects that -- a max-difference check cannot, because a
+        // threshold that flips is always wrong by the full range.
+
+        // The Niblack family: mean and stddev over a clipped rectangular
+        // window. The CPU takes these from an integral image (a sequential 2D
+        // prefix sum); the GPU separates the rectangle into a horizontal then
+        // vertical box sum, carrying sum/sum-of-squares/count through an
+        // RGBA32F scratch. Border pixels average FEWER samples in both paths --
+        // clipped, not clamp-sampled -- and getting that wrong shows up here as
+        // an edge-only difference the mean check would otherwise dilute.
+        {"threshold_niblack",
+         "src = image(\"test\")\n"
+         "o = threshold_niblack(src, window = 15, k = -0.2)\n"
+         "display(o)\n", 255.0, 0.5},
+
+        // Sauvola's R is a stddev in the source's units, so it must scale to
+        // 0..1 for the shader while k, which multiplies a ratio, must not.
+        // Scaling both or neither is the obvious mistake and this is what
+        // catches it.
+        {"threshold_sauvola",
+         "src = image(\"test\")\n"
+         "o = threshold_sauvola(src, window = 15, k = 0.2, r = 128)\n"
+         "display(o)\n", 255.0, 0.5},
+
+        {"threshold_adaptive_mean",
+         "src = image(\"test\")\n"
+         "o = threshold_adaptive_mean(src, window = 15, c = 5)\n"
+         "display(o)\n", 255.0, 0.5},
+
+        {"threshold_bernsen",
+         "src = image(\"test\")\n"
+         "o = threshold_bernsen(src, window = 15, contrast_min = 15, "
+         "uniform_level = 128)\n"
+         "display(o)\n", 255.0, 0.5},
+
         {"threshold_adaptive_gaussian",
          "src = image(\"test\")\n"
          "o = threshold_adaptive_gaussian(src, window = 15, sigma = 3, c = 5)\n"

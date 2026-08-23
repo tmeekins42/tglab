@@ -339,7 +339,29 @@ bool Pipeline::RunStageGpu(Stage& s, const std::vector<const Data*>& in,
         return false;
     }
 
-    const ImageDesc desc = std::get<Image>(s.outputs[0]).Desc();
+    // The scratch may deliberately differ from the output: see
+    // AlgorithmBase::GpuScratchFormat. Only the format changes -- dimensions
+    // always match, since every pass covers the same pixel grid.
+    ImageDesc desc = std::get<Image>(s.outputs[0]).Desc();
+    switch (s.algo->GpuScratchFormat()) {
+        case FormatSpec::RGBA8:   desc.format = Format::RGBA8;   break;
+        case FormatSpec::R32F:    desc.format = Format::R32F;    break;
+        case FormatSpec::RGBA32F: desc.format = Format::RGBA32F; break;
+        case FormatSpec::RGBA16F: desc.format = Format::RGBA16F; break;
+        case FormatSpec::Any:
+        case FormatSpec::SameAsInput:
+            break;   // keep the output's format
+    }
+    // A scratch that differs from the output is only coherent when the passes
+    // alternate exactly once: intermediate in scratch, result in output. With
+    // three or more passes the ping-pong would write the rich intermediate into
+    // the single-channel output and lose it -- the same silent truncation this
+    // hook exists to prevent, just moved. Refuse rather than corrupt.
+    if (desc.format != std::get<Image>(s.outputs[0]).Desc().format && iterations != 2) {
+        *err = "a GPU stage with its own scratch format must use exactly 2 passes";
+        return false;
+    }
+
     if (!s.gpuScratch) {
         s.gpuScratch = std::make_shared<GpuImage>();
         if (!gpu->CreateImage(desc, s.gpuScratch.get())) {

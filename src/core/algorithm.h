@@ -139,6 +139,21 @@ public:
     // holds the final result, so the algorithm only writes one pass.
     virtual int GpuIterations() const { return 1; }
 
+    // Format for the ping-pong scratch image of an iterative GPU stage.
+    //
+    // FormatSpec::SameAsInput (the default) means "match the output", which is
+    // what a filter wants: its intermediate is the same kind of thing as its
+    // result.
+    //
+    // A threshold is where that breaks down. Its output is a single-channel
+    // R32F mask, but the intermediate it needs is richer -- Bernsen carries a
+    // window minimum AND maximum, the Niblack family carries a running sum and
+    // sum-of-squares. Sized from the output those extra channels are silently
+    // dropped: the first version of the Bernsen kernel lost its maximum and got
+    // 50% of pixels wrong, with nothing reported. Declaring the scratch format
+    // separately is what makes those algorithms expressible.
+    virtual FormatSpec GpuScratchFormat() const { return FormatSpec::SameAsInput; }
+
     std::span<ParamBase* const> Params() const { return m_params; }
     ParamBase* FindParam(std::string_view name) const;
 

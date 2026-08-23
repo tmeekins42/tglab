@@ -87,6 +87,130 @@ public:
         }
     }
 
+
+public:
+    // --- GPU implementation -------------------------------------------------
+    //
+    // Two passes of a separable box sum: horizontal into scratch, then vertical
+    // while thresholding.
+    //
+    // The CPU gets its windowed moments from an integral image, which is a 2D
+    // prefix sum and therefore inherently sequential -- that is what made this
+    // look like it needed a multi-dispatch GPU scan. But the window is a
+    // RECTANGLE, and a rectangular sum separates: sum over x, then over y. Two
+    // passes, no scan, no extra scratch buffer.
+    //
+    // The intermediate carries a sum AND a sum-of-squares (stddev needs the
+    // second moment), plus the count. That is what GpuScratchFormat::RGBA32F
+    // provides; sized from the R32F output only the first would survive.
+    //
+    // Border handling matches the CPU exactly and deliberately: the window is
+    // CLIPPED to the image and divided by however many pixels actually fell
+    // inside, rather than clamp-sampling the edge pixel repeatedly. The two
+    // give different answers along the border, and the agreement test is what
+    // holds them together.
+    bool HasGPU() const override { return int(m_window) <= kMaxGpuWindow; }
+    int  GpuIterations() const override { return 2; }
+    FormatSpec GpuScratchFormat() const override { return FormatSpec::RGBA32F; }
+
+    const char* GpuSource() const override {
+        return R"(
+Texture2D<float4>   Src  : register(t0);   // ping-pong: source, then h-moments
+Texture2D<float4>   Orig : register(t1);   // the untouched input, every pass
+RWTexture2D<float4> Dst  : register(u0);
+
+cbuffer Params : register(b0) {
+    uint Width;
+    uint Height;
+    uint Radius;
+    uint Mode;      // 0 = niblack, 1 = sauvola, 2 = adaptive mean
+    uint ABits;     // niblack k / sauvola k / mean c   (c in 0..1 units)
+    uint BBits;     // sauvola R, in 0..1 units
+    uint Invert;
+    uint Pass;      // 0 = horizontal, 1 = vertical + threshold
+};
+
+float Luma(float4 c) { return dot(c.rgb, float3(0.299, 0.587, 0.114)); }
+
+[numthreads(8, 8, 1)]
+void main(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= Width || tid.y >= Height) return;
+
+    int r = int(Radius);
+
+    if (Pass == 0) {
+        // Horizontal: sum, sum of squares, and the number of pixels actually
+        // inside the image -- clipped, not clamped, to match the CPU.
+        int x0 = max(int(tid.x) - r, 0);
+        int x1 = min(int(tid.x) + r, int(Width) - 1);
+        float s = 0.0, s2 = 0.0;
+        for (int x = x0; x <= x1; ++x) {
+            float v = Luma(Src[int2(x, int(tid.y))]);
+            s  += v;
+            s2 += v * v;
+        }
+        Dst[tid.xy] = float4(s, s2, float(x1 - x0 + 1), 1.0);
+        return;
+    }
+
+    // Vertical: accumulate the horizontal partials over the clipped row span.
+    int y0 = max(int(tid.y) - r, 0);
+    int y1 = min(int(tid.y) + r, int(Height) - 1);
+    float s = 0.0, s2 = 0.0, n = 0.0;
+    for (int y = y0; y <= y1; ++y) {
+        float3 p = Src[int2(int(tid.x), y)].rgb;
+        s  += p.r;
+        s2 += p.g;
+        n  += p.b;
+    }
+    if (n <= 0.0) { Dst[tid.xy] = 0.0; return; }
+
+    float mean   = s / n;
+    float var    = max(0.0, s2 / n - mean * mean);
+    float stddev = sqrt(var);
+
+    float a = asfloat(ABits);
+    float t;
+    if (Mode == 0) {
+        t = mean + a * stddev;                       // niblack
+    } else if (Mode == 1) {
+        float R = max(1e-6, asfloat(BBits));         // sauvola
+        t = mean * (1.0 + a * (stddev / R - 1.0));
+    } else {
+        t = mean - a;                                // adaptive mean
+    }
+
+    float v = Luma(Orig[int2(tid.xy)]);
+    bool above = v > t;
+    if (Invert != 0) above = !above;
+    Dst[tid.xy] = above ? 1.0 : 0.0;
+}
+)";
+    }
+
+    std::vector<uint32_t> GpuConstants(int iteration) const override {
+        auto bits = [](float f) {
+            uint32_t u;
+            std::memcpy(&u, &f, sizeof(u));
+            return u;
+        };
+        return {uint32_t(RadiusFromWindow(int(m_window))),
+                uint32_t(GpuMode()),
+                bits(GpuParamA()),
+                bits(GpuParamB()),
+                uint32_t(bool(m_invert) ? 1 : 0),
+                uint32_t(iteration)};
+    }
+
+protected:
+    // Which branch of the shared kernel this thresholder wants, and its
+    // coefficients. One kernel rather than three near-identical ones: the
+    // moment passes are the whole cost and are byte-for-byte the same, so
+    // splitting them would triple the shader compiles to no benefit.
+    virtual int   GpuMode()   const = 0;
+    virtual float GpuParamA() const = 0;
+    virtual float GpuParamB() const { return 0.0f; }
+
 protected:
     virtual double Threshold(const LocalStats& s) const = 0;
     virtual bool   UsesIntegralImage() const { return true; }
@@ -107,6 +231,12 @@ private:
 class NiblackThreshold : public LocalThresholdBase {
 public:
     const char* Name() const override { return "threshold_niblack"; }
+
+    // Niblack: t = mean + k*stddev. k multiplies a stddev, so it is
+    // scale-free -- no 0..255 conversion, unlike sauvola's R.
+    int   GpuMode()   const override { return 0; }
+    float GpuParamA() const override { return float(m_k); }
+
 
 protected:
     double Threshold(const LocalStats& s) const override {
@@ -130,6 +260,13 @@ REGISTER_ALGORITHM(NiblackThreshold);
 class SauvolaThreshold : public LocalThresholdBase {
 public:
     const char* Name() const override { return "threshold_sauvola"; }
+
+    // Sauvola: t = mean * (1 + k*(stddev/R - 1)). k is scale-free; R is a
+    // stddev in the source's units, so it scales to 0..1 for the shader.
+    int   GpuMode()   const override { return 1; }
+    float GpuParamA() const override { return float(m_k); }
+    float GpuParamB() const override { return float(m_r) / 255.0f; }
+
 
 protected:
     double Threshold(const LocalStats& s) const override {
@@ -175,6 +312,108 @@ protected:
         return 0.5 * (s.minV + s.maxV);
     }
 
+public:
+    // --- GPU implementation -------------------------------------------------
+    //
+    // Two passes of a separable min/max, the same decomposition the CPU uses:
+    // horizontal into scratch, then vertical while thresholding. Separable
+    // because a direct window scan is O(r^2) -- at 8 MP with a 15x15 window
+    // that is ~1.8 billion samples.
+    //
+    // The scratch is RGBA32F rather than the R32F output, because this pass has
+    // TWO values to carry: the window minimum and maximum. An earlier version
+    // wrote both into a single-channel scratch, silently kept only the min, and
+    // got 50% of pixels wrong -- which is what GpuScratchFormat exists to fix.
+    bool HasGPU() const override { return int(m_window) <= kMaxGpuWindow; }
+    int  GpuIterations() const override { return 2; }
+    FormatSpec GpuScratchFormat() const override { return FormatSpec::RGBA32F; }
+
+    // Bernsen replaces the shared moments kernel entirely (it needs window
+    // min/max, not mean/stddev), so these exist only to satisfy the base.
+    // GpuMode is never read: GpuConstants below is overridden too.
+    int   GpuMode()   const override { return -1; }
+    float GpuParamA() const override { return 0.0f; }
+
+    const char* GpuSource() const override {
+        return R"(
+Texture2D<float4>   Src  : register(t0);   // ping-pong: source, then h-min/max
+Texture2D<float4>   Orig : register(t1);   // the untouched input, every pass
+RWTexture2D<float4> Dst  : register(u0);
+
+cbuffer Params : register(b0) {
+    uint Width;
+    uint Height;
+    uint Radius;
+    uint ContrastMinBits;   // in 0..1 units
+    uint GlobalLevelBits;   // in 0..1 units
+    uint Invert;
+    uint Pass;              // 0 = horizontal min/max, 1 = vertical + threshold
+};
+
+float Luma(float4 c) { return dot(c.rgb, float3(0.299, 0.587, 0.114)); }
+
+[numthreads(8, 8, 1)]
+void main(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= Width || tid.y >= Height) return;
+
+    int  r  = int(Radius);
+    int2 hi = int2(Width - 1, Height - 1);
+
+    float lo = 1e30, hiV = -1e30;
+    for (int i = -r; i <= r; ++i) {
+        int2 p = (Pass == 0) ? int2(int(tid.x) + i, int(tid.y))
+                             : int2(int(tid.x), int(tid.y) + i);
+        p = clamp(p, int2(0, 0), hi);
+        if (Pass == 0) {
+            // Colour in, luma out.
+            float v = Luma(Src[p]);
+            lo  = min(lo,  v);
+            hiV = max(hiV, v);
+        } else {
+            // Pass 0 packed min into .r and max into .g -- the two channels the
+            // RGBA32F scratch exists to provide.
+            lo  = min(lo,  Src[p].r);
+            hiV = max(hiV, Src[p].g);
+        }
+    }
+
+    if (Pass == 0) {
+        Dst[tid.xy] = float4(lo, hiV, 0.0, 1.0);
+        return;
+    }
+
+    float contrast = hiV - lo;
+    float v = Luma(Orig[int2(tid.xy)]);
+
+    bool above;
+    if (contrast < asfloat(ContrastMinBits)) {
+        // Uniform window: resolve the whole thing to one side, exactly as the
+        // CPU's +/-1e30 sentinel threshold does.
+        above = (0.5 * (lo + hiV)) >= asfloat(GlobalLevelBits);
+    } else {
+        above = v > (0.5 * (lo + hiV));
+    }
+    if (Invert != 0) above = !above;
+    Dst[tid.xy] = above ? 1.0 : 0.0;
+}
+)";
+    }
+
+    std::vector<uint32_t> GpuConstants(int iteration) const override {
+        auto bits = [](float f) {
+            uint32_t u;
+            std::memcpy(&u, &f, sizeof(u));
+            return u;
+        };
+        // Both thresholds are declared in 0..255 but a UNORM SRV hands the
+        // shader 0..1, so they are scaled here -- the same units trap as
+        // brightness's offset.
+        return {uint32_t(RadiusFromWindow(int(m_window))),
+                bits(float(m_contrastMin) / 255.0f),
+                bits(float(m_globalLevel) / 255.0f),
+                uint32_t(bool(m_invert) ? 1 : 0),
+                uint32_t(iteration)};
+    }
 private:
     Param<float> m_contrastMin{this, "contrast_min", 15.0f, 0.0f, 128.0f,
         {.help = "Below this local contrast (max minus min) the window is treated as "
@@ -195,6 +434,11 @@ REGISTER_ALGORITHM(BernsenThreshold);
 class AdaptiveMeanThreshold : public LocalThresholdBase {
 public:
     const char* Name() const override { return "threshold_adaptive_mean"; }
+
+    // Adaptive mean: t = mean - c. c is an intensity offset, so it scales.
+    int   GpuMode()   const override { return 2; }
+    float GpuParamA() const override { return float(m_c) / 255.0f; }
+
 
 protected:
     double Threshold(const LocalStats& s) const override {

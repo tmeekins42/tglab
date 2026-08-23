@@ -795,6 +795,39 @@ buffer so the last pass lands in the real output, allocates the scratch image
 once, and caches it across runs. This is what makes Perona-Malik interactive:
 its ~17x speedup is on top of running every iteration.
 
+**A richer intermediate than the output.** The scratch defaults to the output's
+format, which suits a filter whose intermediate is the same kind of thing as
+its result. A threshold is where that breaks: its output is a single-channel
+`R32F` mask, but the value it must carry between passes is wider — Bernsen
+needs a window minimum *and* maximum, the Niblack family a running sum, a sum
+of squares, and a count. `GpuScratchFormat()` declares that independently:
+
+```cpp
+FormatSpec GpuScratchFormat() const override { return FormatSpec::RGBA32F; }
+```
+
+Without it those extra channels are silently dropped. The first Bernsen kernel
+lost its maximum that way and got 50% of pixels wrong with nothing reported,
+which is why the CPU/GPU agreement test checks the *mean* difference: a
+threshold that flips is wrong by the full range, so a max-difference check
+cannot distinguish one bad pixel from half the image.
+
+This is also what made the local thresholds tractable on the GPU at all. Their
+windowed mean and stddev come from an integral image on the CPU — a 2D prefix
+sum, inherently sequential, and the reason they looked like they needed a
+multi-dispatch scan. But the window is a *rectangle*, and a rectangular sum
+separates: horizontal pass, then vertical, carrying the moments through the
+scratch. Measured at 9.4 MP with a 51-pixel window: `threshold_bernsen` 16.3x,
+`threshold_adaptive_mean` 5.3x, `threshold_sauvola` 1.9x, `threshold_niblack`
+1.5x. The two smaller numbers are honest — an integral image is O(1) per pixel
+whatever the window, so the CPU is genuinely hard to beat there, and at the
+1024px test size `niblack` is slightly *slower* on the GPU.
+
+A scratch format that differs from the output is only coherent with exactly two
+passes: intermediate in scratch, result in output. More would ping-pong the
+rich intermediate back into the narrow output and lose it, so the framework
+refuses rather than silently truncating.
+
 Only single-input, single-output stages may iterate — anything else has no
 obvious pair of buffers to alternate between.
 
