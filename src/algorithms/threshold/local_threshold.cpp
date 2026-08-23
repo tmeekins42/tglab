@@ -10,6 +10,7 @@
 // to look like the app had hung.
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 
 #include "../../algo_util/histogram.h"
 #include "../../core/algorithm.h"
@@ -28,6 +29,15 @@ inline int RadiusFromWindow(int window) {
 
 // Shared plumbing. Subclasses supply the per-pixel threshold given the local
 // statistics, which is the only thing that actually differs between them.
+// Largest window a GPU kernel takes. A pass fetches (2r+1) texels, so at
+// window 51 that is 51 per pixel per pass -- comfortable. Beyond it the CPU
+// path is separable and O(2r) and so is not the bottleneck anyway, while a
+// single dispatch doing far more would risk the watchdog.
+//
+// At file scope because it is a property of the dispatch shape rather than of
+// any one class: AdaptiveGaussianThreshold does not derive from the base below.
+constexpr int kMaxGpuWindow = 51;
+
 class LocalThresholdBase : public AlgorithmBase {
 public:
     const char* Category() const override { return "threshold"; }
@@ -174,6 +184,7 @@ private:
     Param<float> m_globalLevel{this, "uniform_level", 128.0f, 0.0f, 255.0f,
         {.help = "Threshold used where local contrast falls below contrast_min. "
                  "Set above the paper brightness so blank areas come out as background."}};
+public:
 };
 
 REGISTER_ALGORITHM(BernsenThreshold);
@@ -272,6 +283,87 @@ public:
         }
     }
 
+
+    // --- GPU implementation -------------------------------------------------
+    //
+    // Two passes, the same separable split the CPU uses: horizontal into the
+    // ping-pong buffer, then vertical while thresholding. The second pass reads
+    // the blurred neighbourhood from t0 AND the original pixel from t1, which is
+    // why the iterative path binds the source on every pass.
+    bool HasGPU() const override { return int(m_window) <= kMaxGpuWindow; }
+    int  GpuIterations() const override { return 2; }
+
+    const char* GpuSource() const override {
+        return R"(
+Texture2D<float4>   Src  : register(t0);   // ping-pong: source, then h-blurred
+Texture2D<float4>   Orig : register(t1);   // the untouched input, every pass
+RWTexture2D<float4> Dst  : register(u0);
+
+cbuffer Params : register(b0) {
+    uint Width;
+    uint Height;
+    uint Radius;
+    uint SigmaBits;
+    uint CBits;        // offset, in 0..1 units
+    uint Invert;
+    uint Pass;         // 0 = horizontal, 1 = vertical + threshold
+};
+
+float Luma(float4 c) { return dot(c.rgb, float3(0.299, 0.587, 0.114)); }
+
+[numthreads(8, 8, 1)]
+void main(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= Width || tid.y >= Height) return;
+
+    int   r     = int(Radius);
+    float sigma = max(0.1, asfloat(SigmaBits));
+    int2  hi    = int2(Width - 1, Height - 1);
+
+    // Weights recomputed per pixel rather than shared: at r <= 25 that is at
+    // most 51 exp() calls against 51 texture fetches, and it keeps the kernel
+    // free of groupshared setup and its barriers.
+    float acc = 0.0, wsum = 0.0;
+    for (int i = -r; i <= r; ++i) {
+        float wgt = exp(-float(i * i) / (2.0 * sigma * sigma));
+        int2  p   = (Pass == 0) ? int2(int(tid.x) + i, int(tid.y))
+                                : int2(int(tid.x), int(tid.y) + i);
+        p = clamp(p, int2(0, 0), hi);
+        // Pass 0 reads colour and takes luma; pass 1 reads the pass-0 result,
+        // which is already a scalar in .r.
+        acc  += ((Pass == 0) ? Luma(Src[p]) : Src[p].r) * wgt;
+        wsum += wgt;
+    }
+    acc /= max(wsum, 1e-6);
+
+    if (Pass == 0) {
+        Dst[tid.xy] = float4(acc, acc, acc, 1.0);
+        return;
+    }
+
+    // The original pixel, which the ping-pong buffer no longer holds.
+    float v = Luma(Orig[int2(tid.xy)]);
+    bool above = v > (acc - asfloat(CBits));
+    if (Invert != 0) above = !above;
+    Dst[tid.xy] = above ? 1.0 : 0.0;
+}
+)";
+    }
+
+    std::vector<uint32_t> GpuConstants(int iteration) const override {
+        auto bits = [](float f) {
+            uint32_t u;
+            std::memcpy(&u, &f, sizeof(u));
+            return u;
+        };
+        // `c` is declared in 0..255 but a UNORM SRV hands the shader 0..1, so it
+        // is scaled here -- the same units trap as brightness's offset, and the
+        // CPU/GPU agreement test is what catches getting it wrong.
+        return {uint32_t(RadiusFromWindow(int(m_window))),
+                bits(float(m_sigma)),
+                bits(float(m_c) / 255.0f),
+                uint32_t(bool(m_invert) ? 1 : 0),
+                uint32_t(iteration)};
+    }
 private:
     Param<int>   m_window{this, "window", 15, 3, 201, {.help = "Side length of the neighbourhood each pixel's threshold is computed from, in pixels. Should be larger than the strokes you want to keep but smaller than the illumination changes you want to correct. Odd values only.", .step = 2, .softMin = 3, .softMax = 51}};
     Param<float> m_sigma {this, "sigma", 3.0f, 0.1f, 32.0f,

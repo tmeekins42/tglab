@@ -368,7 +368,17 @@ bool Pipeline::RunStageGpu(Stage& s, const std::vector<const Data*>& in,
     GpuImage*       writeTo  = (iterations % 2 == 1) ? gout[0] : s.gpuScratch.get();
 
     for (int i = 0; i < iterations; ++i) {
-        const std::vector<const GpuImage*> passIn{readFrom};
+        // t0 is the ping-pong buffer; t1 is the ORIGINAL input, bound on every
+        // pass.
+        //
+        // A separable filter's last pass usually needs both: the accumulated
+        // result AND the untouched source. A local threshold compares each pixel
+        // against a blurred neighbourhood, so with only t0 the final pass has
+        // the neighbourhood but no longer the pixel. Binding the source costs
+        // one SRV slot of the four and nothing at all to a kernel that ignores
+        // it -- anisotropic_diffusion, the only other iterative algorithm, reads
+        // t0 alone and is unaffected.
+        const std::vector<const GpuImage*> passIn{readFrom, gin[0]};
         const std::vector<GpuImage*>       passOut{writeTo};
         if (!gpu->Dispatch(*s.kernel, passIn, passOut, s.algo->GpuConstants(i), err))
             return false;

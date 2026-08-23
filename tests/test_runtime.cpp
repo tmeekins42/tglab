@@ -999,6 +999,19 @@ static void TestGpuAgreement(ID3D12Device* dev) {
          "src = image(\"test\")\n"
          "o = anisotropic_diffusion(src, iterations = 8, lambda = 0.2, k = 0.1)\n"
          "display(o)\n", 6.0, 1.0},
+
+        // A local threshold is a hard comparison, so a pixel within rounding
+        // distance of its own threshold could in principle land on either side
+        // -- and flipping one changes it by the full 0..1 range, which would
+        // make a max-difference check meaningless.
+        //
+        // In practice the two agree exactly on this fixture, so the tolerance is
+        // held tight enough to notice if that stops being true. Loosening it
+        // "because thresholds are brittle" would have hidden a real divergence.
+        {"threshold_adaptive_gaussian",
+         "src = image(\"test\")\n"
+         "o = threshold_adaptive_gaussian(src, window = 15, sigma = 3, c = 5)\n"
+         "display(o)\n", 255.0, 0.5},
     };
 
     for (const Case& c : cases) {
