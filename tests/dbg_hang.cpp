@@ -68,6 +68,17 @@ int main(int argc, char** argv) {
         }
     }
 
+
+    // The About dialog: open it and draw real frames.
+    //
+    // ImGui reports a mismatched Begin/End or a bad style push as an assert at
+    // draw time, so a dialog that is never drawn is never checked. Closing it
+    // again confirms the modal releases properly rather than wedging the UI.
+    app.OpenAboutForTest();
+    settle(30, "about opened");
+    if (!app.AboutOpenForTest()) { std::printf("  FAIL: about closed itself\n"); return 1; }
+    std::printf("  ok: about dialog drew 30 frames\n");
+
     // Then drag the slider.
     for (int i = 0; i < 40; ++i) {
         app.NudgeControlForTest(std::sin(double(i) * 0.3) * 0.6);

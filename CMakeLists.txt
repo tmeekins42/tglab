@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(tglab CXX)
+project(tglab VERSION 0.4.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -80,11 +80,15 @@ target_link_libraries(tglab_algorithms PUBLIC tglab_core)
 # ---------------------------------------------------------------------------
 add_executable(tglab
     src/app/main.cpp
+    src/app/about.cpp
     src/app/image_view.cpp
     src/app/file_watch.cpp
     $<TARGET_OBJECTS:tglab_algorithms>
 )
 target_link_libraries(tglab PRIVATE tglab_core imgui d3d12 dxgi dbghelp)
+
+# The About dialog reports this; a hardcoded string in the source would drift.
+target_compile_definitions(tglab PRIVATE TGLAB_VERSION="${PROJECT_VERSION}")
 
 if(MSVC)
     target_compile_options(tglab PRIVATE /W4 /permissive-)
@@ -184,11 +188,13 @@ add_test(NAME runtime      COMMAND tglab_runtime_tests)
 
 add_executable(dbg_hang
     tests/dbg_hang.cpp
+    src/app/about.cpp
     src/app/image_view.cpp
     src/app/file_watch.cpp
     $<TARGET_OBJECTS:tglab_algorithms>
 )
 target_link_libraries(dbg_hang PRIVATE tglab_core imgui d3d12 dxgi dbghelp)
+target_compile_definitions(dbg_hang PRIVATE TGLAB_VERSION="${PROJECT_VERSION}")
 if(MSVC)
     target_compile_definitions(dbg_hang PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()

@@ -24,6 +24,7 @@
 #include "../core/image_loader.h"
 #include "../core/image_stats.h"
 #include "../core/worker.h"
+#include "about.h"
 #include "../script/interp.h"
 #include "../script/parser.h"
 #include "../gpu/device.h"
@@ -169,6 +170,11 @@ public:
     // Moves the first slider and re-runs, as dragging one does. Exists for the
     // drag test: sustained dragging is what exhausts the display descriptor
     // heap, and that cannot be reached without driving real frames.
+    // Opens the About modal, so a test can drive it through real frames --
+    // an ImGui layout error only asserts when the widget actually draws.
+    void OpenAboutForTest() { m_aboutOpen = true; }
+    bool AboutOpenForTest() const { return m_aboutOpen; }
+
     void NudgeControlForTest(double value) {
         for (UiControl& c : m_ui.Controls()) {
             if (c.kind != UiControl::Kind::Slider) continue;
@@ -271,6 +277,7 @@ private:
     std::shared_ptr<CompareResult> m_compare;
     GpuTexture m_diffTex;
     bool       m_compareOpen       = false;
+    bool       m_aboutOpen         = false;
 
     // Info panel: dimensions, per-channel histogram, and capture settings for
     // whichever image is being looked at.
@@ -978,6 +985,10 @@ void App::DrawMenuBar() {
             m_compareOpen = !m_compareOpen;
             if (m_compareOpen && !m_compare) RequestCompare();
         }
+        ImGui::EndMenu();
+    }
+    if (ImGui::BeginMenu("Help")) {
+        if (ImGui::MenuItem("About tglab...")) m_aboutOpen = true;
         ImGui::EndMenu();
     }
     ImGui::EndMainMenuBar();
@@ -2074,6 +2085,9 @@ void App::Frame() {
     DrawPalettePanel();
     DrawComparePanel();
     DrawInfoPanel();
+
+    // Last, so the modal draws over everything else.
+    DrawAboutDialog(&m_aboutOpen);
 
     // Compare and Image Info are drawn here, *after* the DockLooseViewers()
     // call earlier in the frame, so on the frame one of them first appears

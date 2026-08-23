@@ -930,3 +930,16 @@ under `third_party/`.
 ## Licence
 
 MIT — see [LICENSE](LICENSE). Dear ImGui is MIT; `stb` is public domain / MIT.
+
+**LibRaw is LGPL-2.1 or CDDL-1.0** and is linked statically, so it carries
+obligations the permissive licences do not: the notice must be reproduced, and
+recipients must be able to relink against a modified LibRaw. Its complete
+source is vendored under [third_party/libraw/](third_party/libraw/) with both
+licence texts alongside it, and building tglab rebuilds it from that source —
+which satisfies both. Anyone distributing a compiled tglab needs to carry the
+same source and notice.
+
+`Help → About tglab` shows the version, every dependency with its licence and
+copyright, and the LibRaw notice. Adding a dependency means adding an entry to
+`kLibraries` in [src/app/about.cpp](src/app/about.cpp) — the versions there are
+read from each library's own headers rather than typed in, so they cannot drift.
