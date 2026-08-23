@@ -40,11 +40,26 @@ jobs:
         run: ctest --test-dir build -C Release --output-on-failure
         continue-on-error: true
 
-      # ctest reports a crashed test as SEGFAULT with no output, so run the
-      # binary directly to see how far it got. Diagnostic only.
+      # ctest reports a crashed test as SEGFAULT and swallows its output even
+      # with --output-on-failure, so run the binary directly and capture both
+      # streams. A process that dies before main() prints nothing at all, which
+      # is itself the diagnosis: the loader could not resolve something.
       - name: Runtime test output
-        run: ./build/Release/tglab_runtime_tests.exe
+        shell: pwsh
         continue-on-error: true
+        run: |
+          Write-Host "--- DLLs beside the test exe ---"
+          Get-ChildItem build/Release/*.dll | ForEach-Object { Write-Host $_.Name }
+          Write-Host "--- running ---"
+          $p = Start-Process -FilePath "build/Release/tglab_runtime_tests.exe" `
+                             -NoNewWindow -Wait -PassThru `
+                             -RedirectStandardOutput rt-out.txt `
+                             -RedirectStandardError  rt-err.txt
+          Write-Host "exit code: $($p.ExitCode)"
+          Write-Host "--- stdout ---"
+          Get-Content rt-out.txt -ErrorAction SilentlyContinue
+          Write-Host "--- stderr ---"
+          Get-Content rt-err.txt -ErrorAction SilentlyContinue
 
       - name: Package
         run: cmake --build build --config Release --target package_release
