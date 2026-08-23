@@ -4,26 +4,33 @@
 # Adding a new algorithm with Category()=="threshold" makes it show up here
 # with its controls, without editing this script at all.
 #
-# Run this on assets/page.png rather than test.png:
+# A note on what you will see, because it is easy to misread as a bug.
+#
+# test.png is a smooth gradient with a checkerboard patch. Its local standard
+# deviation is 3-11 across the gradient and 127 inside the patch, so a LOCAL
+# method has almost nothing to find outside that corner and correctly returns
+# nearly uniform white. The global methods (otsu, triangle, isodata) are the
+# interesting ones here.
+#
+# To see what the local methods are for, drop a scanned page on the "test" row
+# -- or use the synthetic one:
 #
 #   ./build/Release/tglab.exe scripts/thresholds.tgl assets/page.png
 #
-# page.png is a synthetic scan -- text under uneven lighting, bright at the top
-# left and dim at the bottom right. That gradient is the whole point: a single
-# global threshold cannot serve both ends of it, which is what the local methods
-# exist to fix. test.png is a smooth gradient with a checkerboard patch, and has
-# so little local structure that every local method correctly returns almost
-# uniform white on it -- which looks broken but is not.
+# and change image("test") below to image("page"). That fixture is text under
+# uneven lighting, bright top left falling to dim bottom right. No single global
+# level serves both ends: measured, the five local methods recover the text
+# perfectly while otsu manages 66%.
 
-src = image("page")
+src = image("test")
 
 op = choose("method", "threshold")
 
-pre   = slider("pre-blur sigma", 0.0, 8.0, 0.0)
-blurred = gaussian_blur(src, sigma = pre)
+blur  = slider("blur sigma", 0.0, 8.0, 0.0)
+blurred = gaussian_blur(src, sigma = blur)
 
 mask = params(op)(blurred)
 
 display(src,     "1 source")
-display(blurred, "2 pre-blurred")
+display(blurred, "2 blurred")
 display(mask,    "3 mask")

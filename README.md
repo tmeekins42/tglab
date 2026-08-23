@@ -45,7 +45,7 @@ Arguments are a `.tgl` script plus any images to preload. Paths are relative to
 the repository root, which is where the app expects to run from.
 
 ```sh
-./build/Release/tglab.exe scripts/thresholds.tgl assets/page.png
+./build/Release/tglab.exe scripts/thresholds.tgl assets/test.png
 ```
 
 Images can also be **dragged in from Explorer** at any time.
@@ -285,7 +285,7 @@ default.
 src = image("test")
 
 op    = choose("method", "threshold")
-sigma = slider("pre-blur", 0.0, 8.0, 1.0)
+sigma = slider("blur sigma", 0.0, 8.0, 1.0)
 
 blurred = gaussian_blur(src, sigma = sigma)
 mask    = params(op)(blurred)
