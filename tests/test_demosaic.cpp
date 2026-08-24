@@ -13,6 +13,7 @@
 
 #include "../src/core/algorithm.h"
 #include "../src/core/pipeline.h"
+#include "../src/core/raw_io.h"
 #include "../src/gpu/compute.h"
 #include "../src/script/value.h"
 
@@ -125,6 +126,50 @@ double MeanError(Image& img, int channel) {
 } // namespace
 
 int main() {
+    // (orientation checks run first: they need no fixture)
+
+    // --- orientation ---------------------------------------------------------
+    //
+    // A raw carries the camera's orientation tag, and LibRaw reports it in
+    // dcraw's encoding: 0 none, 3 = 180, 5 = 90 CCW, 6 = 90 CW. Tim's
+    // _dsc0139.arw declares 6 and was displayed on its side.
+    //
+    // Rotating a mosaic is not a transpose -- the colour filter rotates with
+    // the pixels -- so this checks the CFA transform, not the geometry. A wrong
+    // pattern swaps red and blue across the whole image, which reads as a
+    // demosaic bug rather than an orientation one and is exactly the mistake
+    // worth pinning down.
+    //
+    // The expectations are derived by hand from the RGGB tile, independently of
+    // the implementation's coordinate map:
+    //
+    //   RGGB = R G   90 CW: R->(1,0) G->(1,1)   giving  G R  = GRBG
+    //          G B          G->(0,0) B->(0,1)           B G
+    {
+        struct Case { int flip; CfaPattern from; CfaPattern to; const char* what; };
+        const Case cases[] = {
+            {0, CfaPattern::RGGB, CfaPattern::RGGB, "no flip leaves the pattern alone"},
+            {6, CfaPattern::RGGB, CfaPattern::GRBG, "RGGB rotated 90 CW is GRBG"},
+            {3, CfaPattern::RGGB, CfaPattern::BGGR, "RGGB rotated 180 is BGGR"},
+            {5, CfaPattern::RGGB, CfaPattern::GBRG, "RGGB rotated 90 CCW is GBRG"},
+            {6, CfaPattern::BGGR, CfaPattern::GBRG, "BGGR rotated 90 CW is GBRG"},
+            {3, CfaPattern::GRBG, CfaPattern::GBRG, "GRBG rotated 180 is GBRG"},
+        };
+        for (const Case& c : cases) {
+            // Even dimensions, which is what every sensor here reports; the
+            // implementation handles odd ones by construction rather than by
+            // assuming, since an odd size shifts the CFA phase.
+            const CfaPattern got = RotateCfa(c.from, c.flip, 8, 6);
+            Check(got == c.to, std::string(c.what) + " (got " +
+                                   std::to_string(int(got)) + ")");
+        }
+
+        // Rotating four times must return to where it started, whichever way
+        // round. That catches a transform that is self-consistent but wrong.
+        CfaPattern p = CfaPattern::RGGB;
+        for (int i = 0; i < 4; ++i) p = RotateCfa(p, 6, 8, 6);
+        Check(p == CfaPattern::RGGB, "four 90 CW rotations return to RGGB");
+    }
     std::string err;
 
     // --- the fixture is a real mosaic ---------------------------------------

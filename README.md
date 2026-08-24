@@ -168,6 +168,21 @@ correction term something you can test rather than take on trust.
 `TGLAB_RAW_RGB=1` falls back to LibRaw's own conversion, as an escape hatch if a
 camera's mosaic cannot be read.
 
+**The camera's orientation tag is honoured**, at load, on the mosaic. Rotating
+after the demosaic would turn the picture the right way up but leave the
+thumbnail, the loupe and every measurement working in sensor space — a worse
+kind of wrong than not rotating at all.
+
+Rotating a mosaic is not a transpose: the colour filter rotates with the
+pixels, so an RGGB sensor turned 90° clockwise reads GRBG, and getting that
+wrong swaps red and blue across the whole image — which looks like a demosaic
+bug rather than an orientation one. `RotateCfa()` derives the new pattern from
+the same coordinate map the copy loop uses, so the two cannot disagree, and it
+handles an odd width or height shifting the CFA phase rather than assuming
+even dimensions. [tests/test_demosaic.cpp](tests/test_demosaic.cpp) checks the
+transform against expectations derived by hand, plus that four 90° rotations
+return to the original.
+
 Two things worth knowing:
 
 - **Decoding is slow** — about 6 s for a 45 MP CR3, most of it demosaicing. It

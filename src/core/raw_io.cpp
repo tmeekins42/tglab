@@ -105,6 +105,44 @@ bool ReadRawMetadata(const std::string& path, ExifData* out) {
 
 namespace {
 
+} // namespace
+
+// Declared in the header; see there for why this is worth exposing.
+//
+// Derived from the same coordinate map the copy loop uses rather than from a
+// hand-written table, so the two cannot disagree. That also handles the case a
+// table would get wrong: with an ODD width or height the rotation shifts the
+// CFA phase, because the tile no longer lands on an even boundary.
+CfaPattern RotateCfa(CfaPattern src, int flip, int w, int h) {
+    if (src == CfaPattern::None || src == CfaPattern::XTrans) return src;
+    if (flip != 3 && flip != 5 && flip != 6) return src;
+
+    // Where each of the source tile's four sensels ends up, and what colour it
+    // carries. Reading the destination tile back gives the rotated pattern.
+    int dest[2][2] = {{-1, -1}, {-1, -1}};
+    for (int sy = 0; sy < 2; ++sy) {
+        for (int sx = 0; sx < 2; ++sx) {
+            int dx = sx, dy = sy;
+            switch (flip) {
+                case 3: dx = w - 1 - sx; dy = h - 1 - sy; break;
+                case 5: dx = sy;         dy = w - 1 - sx; break;
+                case 6: dx = h - 1 - sy; dy = sx;         break;
+            }
+            dest[dy & 1][dx & 1] = CfaColorAt(src, sx, sy);
+        }
+    }
+
+    const int tl = dest[0][0], tr = dest[0][1];
+    const int bl = dest[1][0], br = dest[1][1];
+    if (tl == 0 && tr == 1 && bl == 1 && br == 2) return CfaPattern::RGGB;
+    if (tl == 2 && tr == 1 && bl == 1 && br == 0) return CfaPattern::BGGR;
+    if (tl == 1 && tr == 0 && bl == 2 && br == 1) return CfaPattern::GRBG;
+    if (tl == 1 && tr == 2 && bl == 0 && br == 1) return CfaPattern::GBRG;
+    return src;   // should not happen; leaving it alone beats guessing
+}
+
+namespace {
+
 // LibRaw reports the CFA layout through filters(), a packed 32-bit code. Rather
 // than decode that bit layout, ask it which colour sits at each of the four
 // positions in the 2x2 tile -- COLOR() handles every vendor quirk internally.
@@ -185,11 +223,28 @@ bool LoadRawMosaic(const std::string& path, Image* out, std::string* err) {
         else if (tl == 1 && tr == 2 && bl == 0 && br == 1) visibleCfa = CfaPattern::GBRG;
     }
 
+    // The camera's orientation tag, applied here rather than left to the
+    // viewer.
+    //
+    // LibRaw reports this in dcraw's encoding, which is NOT the EXIF
+    // orientation number: 0 none, 3 = 180, 5 = 90 CCW, 6 = 90 CW. Tim's
+    // _dsc0139.arw declares 6 and was displayed on its side; his other files
+    // declare 0, which is why this went unnoticed.
+    //
+    // Rotating the MOSAIC rather than the demosaiced result, because the
+    // palette holds the mosaic: leaving it to a later stage would rotate the
+    // picture but leave the thumbnail, the loupe and every measurement working
+    // in sensor space, which is a worse kind of wrong than not rotating at all.
+    const int flip = s.flip;
+    const bool swapAxes = (flip == 5 || flip == 6);
+    const int outW = swapAxes ? h : w;
+    const int outH = swapAxes ? w : h;
+
     ImageDesc d;
-    d.width      = w;
-    d.height     = h;
+    d.width      = outW;
+    d.height     = outH;
     d.format     = Format::R32F;
-    d.cfa        = visibleCfa;
+    d.cfa        = RotateCfa(visibleCfa, flip, w, h);
     // cblack[] holds per-channel offsets on top of the global black level; the
     // first four cover the 2x2 tile. Averaging them is an approximation, but
     // the per-channel spread is small on every sensor this has been tried on,
@@ -265,10 +320,22 @@ bool LoadRawMosaic(const std::string& path, Image* out, std::string* err) {
     // Stored as raw sensor counts rather than normalised here: the demosaic
     // applies the black/white levels, so every algorithm sees the same
     // convention and the levels stay inspectable on the descriptor.
+    // Rotation happens here rather than as a second pass: the destination
+    // index is a function of the source one, so this costs an addressing
+    // change rather than another full-size buffer. At 21 MP that matters.
     const int stride = s.raw_width;
     for (int y = 0; y < h; ++y) {
         const ushort* row = raw_image + size_t(y + yoff) * size_t(stride) + size_t(xoff);
-        for (int x = 0; x < w; ++x) *v.At<float>(x, y) = float(row[x]);
+        for (int x = 0; x < w; ++x) {
+            int dx = x, dy = y;
+            switch (flip) {
+                case 3: dx = w - 1 - x; dy = h - 1 - y; break;   // 180
+                case 5: dx = y;         dy = w - 1 - x; break;   // 90 CCW
+                case 6: dx = h - 1 - y; dy = x;         break;   // 90 CW
+                default: break;                                  // 0, or unknown
+            }
+            *v.At<float>(dx, dy) = float(row[x]);
+        }
     }
 
     return true;

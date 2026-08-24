@@ -55,4 +55,17 @@ bool ReadRawMetadata(const std::string& path, ExifData* out);
 // used for black-level calibration, which are not part of the picture.
 bool LoadRawMosaic(const std::string& path, Image* out, std::string* err);
 
+// The CFA pattern a mosaic has after being rotated by `flip`, in LibRaw's
+// (dcraw's) encoding: 0 none, 3 = 180, 5 = 90 CCW, 6 = 90 CW.
+//
+// Exposed because it is the subtle half of honouring an orientation tag and
+// deserves testing on its own. Rotating a mosaic is not a transpose: the colour
+// filter rotates with the pixels, so an RGGB sensor turned 90 degrees clockwise
+// reads GRBG, and getting that wrong swaps red and blue across the whole image
+// -- which looks like a demosaic bug rather than an orientation one.
+//
+// `w` and `h` are the pre-rotation dimensions; they matter because an odd size
+// shifts the CFA phase.
+CfaPattern RotateCfa(CfaPattern src, int flip, int w, int h);
+
 } // namespace tglab
