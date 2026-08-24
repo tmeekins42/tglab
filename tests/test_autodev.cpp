@@ -29,14 +29,16 @@ int main(int argc, char** argv) {
     Image m; std::string err;
     if (!LoadRawMosaic(argv[1], &m, &err)) { std::printf("load: %s\n", err.c_str()); return 1; }
     const AutoDevelopSuggestion s = SuggestExposure(m);
-    std::printf("measurement: exposure %+.2f shadows %+.2f blacks %+.2f\n\n",
-                s.exposure, s.shadows, s.blacks);
+    std::printf("measurement: exposure %+.2f highlights %+.2f shadows %+.2f "
+                "blacks %+.2f\n\n",
+                s.exposure, s.highlights, s.shadows, s.blacks);
 
     auto run = [&](const char* script, UiState* ui) {
         std::vector<Data> sources; sources.push_back(Data{m.Clone()});
         SourceImage si;
         si.name = "test"; si.index = 0; si.isMosaic = true;
         si.hasAutoExposure = s.valid;
+        si.autoHighlights = s.highlights;
         si.autoExposure = s.exposure;
         si.autoShadows  = s.shadows;
         si.autoBlacks   = s.blacks;
@@ -97,6 +99,37 @@ int main(int argc, char** argv) {
         ControlValue(ui, "basic_adjust.exposure", &v);
         std::printf("       after dragging to 0.25 and re-running: %+.2f\n", v);
         Check(std::abs(v - 0.25) < 1e-6, "a dragged slider survives the re-run");
+    }
+
+    // Highlights and shadows follow the same path, and are only suggested when
+    // the measurement says there is something to recover -- which is what makes
+    // them safe to apply unasked. A frame with no clipping must get zero, or
+    // the "auto" would be flattening pictures that were fine.
+    {
+        UiState ui;
+        if (!run("src = image(\"test\")\n"
+                 "o = params(basic_adjust, auto_exposure = 1)(src)\ndisplay(o)\n", &ui)) return 1;
+
+        double hi = 0, sh = 0;
+        ControlValue(ui, "basic_adjust.highlights", &hi);
+        ControlValue(ui, "basic_adjust.shadows", &sh);
+        std::printf("       highlights %+.2f (clipped %.2f%% -> %.2f%% after push)\n",
+                    hi, 100.0 * s.clippedFrac, 100.0 * s.clippedAfter);
+        std::printf("       shadows    %+.2f (crushed %.2f%%)\n", sh, 100.0 * s.crushedFrac);
+
+        Check(std::abs(hi - s.highlights) < 0.01, "highlights opens at the suggestion");
+        Check(std::abs(sh - s.shadows) < 0.01, "shadows opens at the suggestion");
+
+        // Direction, not just magnitude: a positive highlights value would
+        // push blown areas further rather than recovering them.
+        Check(hi <= 0.0, "highlight suggestion recovers rather than pushes");
+        Check(sh >= 0.0, "shadow suggestion opens rather than deepens");
+
+        // And the rule that keeps this from touching a clean frame.
+        if (s.clippedAfter <= 0.01)
+            Check(hi == 0.0, "no highlight recovery when nothing is clipped");
+        if (s.crushedFrac <= 0.02)
+            Check(sh == 0.0, "no shadow lift when nothing is crushed");
     }
 
     std::printf("\n%s\n", g_fail ? "FAILURES" : "auto-exposure wiring ok");

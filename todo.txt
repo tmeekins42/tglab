@@ -31,7 +31,7 @@ FEATURES
 - channel merging. Astronomy images are captured single channel with colored filters. How to merge them?
 - image export
 - batch processing
-- an option to visualize clipping regions in the image
+- an option to visualize clipping regions in the image. can we visual crush as well?
 - the image palette is a collection of images. I would like the option to make a palette entry into a image group.
   + in a group, dropping an image adds it to the list instead of replacing
   + we'll need a remove image option (right-click)

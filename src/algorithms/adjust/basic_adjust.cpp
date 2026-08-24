@@ -358,6 +358,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
         // measurement, double-click and it returns to it.
         if (f.hasExposure && bool(m_autoExposure)) {
             m_exposure.SetDefault(f.autoExposure);
+            m_highlights.SetDefault(f.autoHighlights);
             m_shadows.SetDefault(f.autoShadows);
             m_blacks.SetDefault(f.autoBlacks);
         }

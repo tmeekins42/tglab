@@ -582,6 +582,7 @@ SourceImage DescribeSource(PaletteEntry& pe, int index) {
         }
         si.hasAutoExposure = pe.autoDev.valid;
         si.autoExposure    = pe.autoDev.exposure;
+        si.autoHighlights  = pe.autoDev.highlights;
         si.autoShadows     = pe.autoDev.shadows;
         si.autoBlacks      = pe.autoDev.blacks;
     }

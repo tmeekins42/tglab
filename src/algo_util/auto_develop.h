@@ -24,16 +24,27 @@ namespace tglab {
 struct AutoDevelopSuggestion {
     bool  valid    = false;   // false when the image could not be measured
 
-    float exposure = 0.0f;    // stops
-    float blacks   = 0.0f;    // -1..1, basic_adjust's own scale
-    float shadows  = 0.0f;
+    float exposure   = 0.0f;    // stops
+    float blacks     = 0.0f;    // -1..1, basic_adjust's own scale
+    float shadows    = 0.0f;
+    float highlights = 0.0f;    // negative recovers
 
     // What the measurement actually saw, so the suggestion can be explained
     // rather than just obeyed. Reported in 0..1 of the sensor's range.
     float blackPoint  = 0.0f;   // 1st percentile
     float midtone     = 0.0f;   // median
-    float highlight   = 0.0f;   // 99.5th percentile
-    float clippedFrac = 0.0f;   // fraction at or above the white level
+    float highlight   = 0.0f;   // brightest unclipped detail
+
+    // Clipping at each end, as a fraction of the frame.
+    //
+    // `clippedFrac` is measured as captured; `clippedAfter` is what the
+    // suggested exposure push would produce, which is the figure the highlight
+    // recovery actually has to answer for. On an under-exposed frame those are
+    // very different numbers -- measured 0.67% before a +1.82 stop push and
+    // 4.32% after.
+    float clippedFrac  = 0.0f;   // at or above the white level, as captured
+    float clippedAfter = 0.0f;   // ... after the suggested exposure
+    float crushedFrac  = 0.0f;   // at or below black
 };
 
 // Measures a Bayer mosaic and suggests exposure adjustments.

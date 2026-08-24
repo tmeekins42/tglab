@@ -102,6 +102,7 @@ struct SourceImage {
     // pixels do.
     bool  hasAutoExposure = false;
     float autoExposure    = 0.0f;   // stops
+    float autoHighlights  = 0.0f;   // negative recovers
     float autoShadows     = 0.0f;
     float autoBlacks      = 0.0f;
 };

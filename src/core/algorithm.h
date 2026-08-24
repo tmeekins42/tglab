@@ -79,6 +79,7 @@ struct SourceFacts {
     // `hasExposure` is false for a non-raw source or one too small to judge.
     bool  hasExposure = false;
     float autoExposure = 0.0f;   // stops
+    float autoHighlights = 0.0f;   // negative recovers
     float autoShadows  = 0.0f;
     float autoBlacks   = 0.0f;
 };

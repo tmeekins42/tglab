@@ -199,6 +199,30 @@ Two decisions that came out of measurement rather than theory:
   +1.85, accepting blown highlights for a usable picture. Beyond the headroom
   the remaining push is applied at 85%, which lands at +1.82.
 
+**Highlights and shadows are suggested from measured clipping,** not inferred
+from the exposure. A frame with nothing blown and nothing crushed gets zero for
+both — which is what makes them safe to apply unasked, since either control
+costs contrast in the range it reshapes.
+
+The highlight figure answers for clipping *after* the push, not as captured.
+Those are very different numbers on an under-exposed frame: measured 0.67%
+blown before a +1.82 stop push and 4.32% after, and it is the second that the
+recovery has to deal with. Below 1% of the frame nothing is suggested — every
+photograph has a few saturated pixels, and reshaping the whole upper range to
+chase a specular glint is a poor trade.
+
+Shadows works the same way from the crushed fraction, with a 2% threshold so a
+genuinely black background is not treated as a fault. This replaced an earlier
+version that scaled the shadow lift by the number of stops, which is only a
+proxy: one frame here needed +1.08 stops with just 0.01% of it crushed, and got
+a shadow lift it did not need.
+
+| file | ISO | clipped (before → after) | crushed | suggested |
+|---|---|---|---|---|
+| `_dsc0037` | 6400 | 0.67% → 4.32% | 7.29% | exp +1.82, hi −0.17, sh +0.21 |
+| `_MG_9543` | 400 | 0.00% → 0.00% | 0.00% | exp +1.27 only |
+| `_DSC0162` | 125 | 0.00% → 0.00% | 0.00% | exp +0.26 only |
+
 Auto **white balance** is not implemented. The kelvin and tint controls already
 open at what the camera chose, which is a good answer, so an estimator has to
 beat that to be worth having.

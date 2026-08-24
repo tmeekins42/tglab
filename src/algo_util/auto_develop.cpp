@@ -28,6 +28,32 @@ constexpr double kMaxStops = 4.0;
 // midtones wanted and accepted the clipping. This lands at +1.82.
 constexpr double kOverdrive = 0.85;
 
+// Clipping below this is not worth answering for.
+//
+// Every photograph has a few saturated pixels -- a specular glint on water, a
+// filament, a sun through leaves -- and reshaping the whole upper range to
+// chase them costs contrast where the picture is brightest. 1% of the frame is
+// where blown area stops reading as sparkle and starts reading as loss.
+constexpr double kClipNotice = 0.01;
+
+// ... and the same at the black end. A frame with a genuinely black background
+// is not a fault to be corrected.
+constexpr double kCrushNotice = 0.02;
+
+// How hard to answer, per unit of clipped area beyond the threshold.
+//
+// Both deliberately gentle. These land on sliders the user can see and move, so
+// the suggestion should be visibly helping rather than making a decision they
+// have to undo -- and both controls cost contrast in the range they reshape.
+//
+// Calibrated on the ISO 6400 rescue: 4.3% blown after its push gives -0.17
+// highlights, and 7.3% crushed gives +0.21 shadows. Both are a nudge rather
+// than a rescue, which is the right weight for something applied unasked.
+constexpr double kHighlightGain = 5.0;
+constexpr double kShadowGain    = 4.0;
+constexpr double kMaxHighlights = 0.45;
+constexpr double kMaxShadows    = 0.50;
+
 // Highlights are allowed to reach this before the push is held back.
 //
 // Not 1.0: a suggestion that puts the brightest real detail exactly at
@@ -78,9 +104,13 @@ AutoDevelopSuggestion SuggestExposure(const Image& mosaic) {
     out.blackPoint = float(pct(0.01));
     out.midtone    = float(pct(0.50));
 
-    size_t clipped = 0;
-    for (float s : g) if (s >= 0.99f) ++clipped;
+    size_t clipped = 0, crushed = 0;
+    for (float s : g) {
+        if (s >= 0.99f)  ++clipped;
+        if (s <= 0.002f) ++crushed;
+    }
     out.clippedFrac = float(double(clipped) / double(g.size()));
+    out.crushedFrac = float(double(crushed) / double(g.size()));
 
     // The brightest UNCLIPPED detail, not a fixed percentile.
     //
@@ -133,12 +163,49 @@ AutoDevelopSuggestion SuggestExposure(const Image& mosaic) {
     stops = std::clamp(stops, 0.0, kMaxStops);
     out.exposure = float(stops);
 
-    // Lift shadows when the frame needed a big push: the same push that brings
-    // the midtones up leaves the darkest quarter compressed against black.
-    // Scaled by the push rather than fixed, so a frame that needed nothing gets
-    // nothing.
-    if (stops > 0.5) {
-        out.shadows = float(std::clamp((stops - 0.5) * 0.25, 0.0, 0.6));
+    // How much of the frame the push will drive into saturation.
+    //
+    // Measured rather than inferred, and measured AFTER the push, because that
+    // is what the highlight recovery has to answer for. On the ISO 6400 frame
+    // the two differ by more than six times: 0.67% clipped as captured, 4.32%
+    // once +1.82 stops is applied.
+    {
+        const double gain = std::pow(2.0, stops);
+        size_t after = 0;
+        for (float s : g) if (double(s) * gain >= 1.0) ++after;
+        out.clippedAfter = float(double(after) / double(g.size()));
+    }
+
+    // Highlight recovery, proportional to what the push actually blows out.
+    //
+    // Negative, because that is the recovering direction. Nothing is suggested
+    // below a threshold: a frame with a few specular glints does not want its
+    // upper tones reshaped, and a recovery applied to an image with nothing to
+    // recover only flattens it.
+    //
+    // Capped well short of the slider's own range. This is a starting point on
+    // a control the user can see, so it should be visibly helping rather than
+    // making a decision they then have to undo -- and the deeper the recovery,
+    // the more it costs in contrast up there.
+    if (out.clippedAfter > kClipNotice) {
+        const double over = double(out.clippedAfter) - kClipNotice;
+        out.highlights = float(-std::clamp(over * kHighlightGain, 0.0, kMaxHighlights));
+    }
+
+    // Shadow lift, from measured crushing rather than from the push.
+    //
+    // The earlier version derived this from the number of stops, which is a
+    // proxy: a frame can need a big push and still have no shadow detail
+    // against the floor, and another can be crushed without needing any push at
+    // all. Measuring how much of the frame actually sits at black answers the
+    // question directly.
+    //
+    // The push itself is still accounted for, because lifting the midtones
+    // lifts the shadows with them -- so what matters is what remains crushed
+    // afterwards, which the push has already reduced.
+    if (out.crushedFrac > kCrushNotice) {
+        const double over = double(out.crushedFrac) - kCrushNotice;
+        out.shadows = float(std::clamp(over * kShadowGain, 0.0, kMaxShadows));
     }
 
     // Set the black point where the data actually starts, so a raw with a

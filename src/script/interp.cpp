@@ -602,6 +602,7 @@ private:
             facts.asShotTint   = s.asShotTint;
             facts.hasExposure  = s.hasAutoExposure;
             facts.autoExposure = s.autoExposure;
+            facts.autoHighlights = s.autoHighlights;
             facts.autoShadows  = s.autoShadows;
             facts.autoBlacks   = s.autoBlacks;
             probe->PrepareDefaults(facts);
