@@ -197,6 +197,18 @@ add_test(NAME demosaic     COMMAND tglab_demosaic_tests)
 add_test(NAME runtime      COMMAND tglab_runtime_tests)
 add_test(NAME denoise      COMMAND tglab_denoise_tests)
 
+# Manual reproduction harness, not an add_test().
+#
+# It drives the real App through real frames, which is the only way to reach
+# faults that need genuine present/worker interleaving. Deliberately NOT a
+# gating test: the palette-reallocation crash it reproduces
+# (TGLAB_PALETTE_TEST=1) fires about one run in four, because it depends on a
+# freed descriptor being reused before the next draw. A test that passes 75% of
+# the time on broken code is worse than none -- it reads as a guarantee and is
+# not one.
+#
+#   build/Debug/dbg_hang.exe scripts/hello.tgl assets/test.png
+#   TGLAB_PALETTE_TEST=1 build/Debug/dbg_hang.exe scripts/hello.tgl assets/test.png
 add_executable(dbg_hang
     tests/dbg_hang.cpp
     src/app/about.cpp
@@ -252,6 +264,7 @@ target_link_libraries(tglab_denoise_tests PRIVATE tglab_core)
 if(MSVC)
     target_compile_definitions(tglab_denoise_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
+
 
 
 

@@ -21,7 +21,32 @@ inline constexpr int kMaxFramesInFlight = kNumFramesInFlight;
 
 class GpuTexture {
 public:
+    GpuTexture() = default;
     ~GpuTexture() { Release(); }
+
+    // Owns an ID3D12Resource and an SRV descriptor slot, so copying it is
+    // always a bug: both objects would release the same resource and free the
+    // same descriptor.
+    //
+    // It was implicitly copyable, and PaletteEntry holds one BY VALUE inside a
+    // std::vector. Adding an entry reallocated that vector, which copied every
+    // existing texture to new storage and then destroyed the originals --
+    // releasing resources the copies still pointed at. The freed descriptor
+    // slot was immediately handed to the new entry's thumbnail, so two palette
+    // rows drew the same SRV (Tim saw "test" showing a newly dropped photo's
+    // thumbnail), and the next Update() on the stale one dereferenced a
+    // released resource and took the app down.
+    //
+    // Deleted rather than defined: there is no sane copy of a GPU resource
+    // handle, and a vector only needs the move.
+    GpuTexture(const GpuTexture&)            = delete;
+    GpuTexture& operator=(const GpuTexture&) = delete;
+
+    GpuTexture(GpuTexture&& o) noexcept { MoveFrom(o); }
+    GpuTexture& operator=(GpuTexture&& o) noexcept {
+        if (this != &o) { Release(); MoveFrom(o); }
+        return *this;
+    }
 
     // Uploads CPU pixels, recreating the resource if the size/format changed.
     // Converts R32F/RGBA32F to RGBA8 for display. Re-uploads only when
@@ -67,6 +92,32 @@ public:
 
 private:
     bool Create(Device& dev, const ImageDesc& d);
+
+    // Transfers every owning handle and leaves `o` empty, so its destructor
+    // releases nothing. Every raw pointer here is an owner -- the resource, the
+    // descriptor slot, and each per-frame staging buffer -- so missing one
+    // would leak rather than crash, which is harder to notice.
+    void MoveFrom(GpuTexture& o) noexcept {
+        m_dev            = o.m_dev;
+        m_res            = o.m_res;
+        m_cpu            = o.m_cpu;
+        m_gpu            = o.m_gpu;
+        m_desc           = o.m_desc;
+        m_freshlyCreated = o.m_freshlyCreated;
+        m_version        = o.m_version;
+        for (int i = 0; i < kMaxFramesInFlight; ++i) {
+            m_upload[i]     = o.m_upload[i];
+            m_uploadSize[i] = o.m_uploadSize[i];
+            o.m_upload[i]     = nullptr;
+            o.m_uploadSize[i] = 0;
+        }
+        o.m_dev = nullptr;
+        o.m_res = nullptr;
+        o.m_cpu = {};
+        o.m_gpu = {};
+        o.m_desc = {};
+        o.m_version = UINT64_MAX;
+    }
 
     Device*                     m_dev = nullptr;
     ID3D12Resource*             m_res = nullptr;
