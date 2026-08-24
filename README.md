@@ -165,6 +165,44 @@ Two things worth knowing:
   to the same level. `TGLAB_RAW_NOBRIGHT=1` selects the fixed white point for
   anyone who wants it.
 
+### Auto-exposure
+
+`basic_adjust` can open its exposure controls where a measurement of the sensor
+data suggests, instead of at zero — [scripts/autodevelop.tgl](scripts/autodevelop.tgl):
+
+```
+developed = params(basic_adjust, auto_exposure = 1)(src)
+```
+
+**It sets defaults, not values,** which is what keeps it a starting point rather
+than a mode. A slider you have not touched follows the suggestion; one you drag
+stays exactly where you put it through every re-run; double-clicking returns it
+to the suggestion. There is no second set of controls and nothing to switch off.
+
+The measurement runs on the **mosaic**, before demosaic, and only on green
+sensels. Green is half of all sites so it is the best-sampled channel, and using
+all three would fold the white-balance imbalance into the estimate — a warm
+image would read as brighter than it is. It is computed once per loaded image
+and cached, since the script is re-interpreted on every slider tick.
+
+Two decisions that came out of measurement rather than theory:
+
+- **The highlight percentile steps below the clipped fraction.** A fixed 99.5th
+  percentile lands *inside* the clipped region as soon as more than 0.5% of the
+  frame is saturated, and then "protect the highlights" is protecting
+  saturation. On an ISO 6400 frame with 0.67% clipped it read 0.9993 and
+  suppressed a needed +2 stops to zero.
+- **Highlight protection is a brake, not a veto.** Clamping hard to the
+  available headroom is what a light meter would do and it is wrong for a
+  rescue: on that same frame the midtones wanted +2.05 stops while the
+  highlights allowed only +0.53, and the right answer — settled on by eye — was
+  +1.85, accepting blown highlights for a usable picture. Beyond the headroom
+  the remaining push is applied at 85%, which lands at +1.82.
+
+Auto **white balance** is not implemented. The kelvin and tint controls already
+open at what the camera chose, which is a good answer, so an estimator has to
+beat that to be worth having.
+
 ### Performance note
 
 Algorithms run on the worker thread, so the UI stays responsive no matter how

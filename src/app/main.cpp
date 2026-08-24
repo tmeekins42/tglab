@@ -19,6 +19,7 @@
 #include "../core/compare.h"
 #include "../core/pipeline.h"
 #include "../algo_util/histogram.h"
+#include "../algo_util/auto_develop.h"
 #include "../algo_util/white_balance.h"
 #include "../core/exif.h"
 #include "../core/image_loader.h"
@@ -147,6 +148,15 @@ struct PaletteEntry {
     // Screen rect of this row, recorded while drawing so a WM_DROPFILES at a
     // given point can find which slot it landed on.
     ImVec2      rowMin{}, rowMax{};
+
+    // Auto-exposure measurement, cached.
+    //
+    // Measuring costs a pass over the mosaic, and the script is re-interpreted
+    // on every slider tick -- so doing it per run would put a full-image scan
+    // in the drag path. The answer cannot change until the pixels do, which is
+    // exactly what `version` tracks.
+    AutoDevelopSuggestion autoDev;
+    uint64_t              autoDevVersion = 0;   // version autoDev was measured at
 };
 
 class App {
@@ -538,6 +548,46 @@ void App::PollStats() {
 // Phase 1 only: parse and interpret (microseconds), then hand the recorded
 // pipeline to the worker. Interpret() is what declares sliders into m_ui, so
 // keeping it here means UiState is never shared across threads.
+// Describes one palette slot to the interpreter.
+//
+// Shared by the normal run and by compare mode, which build the same source
+// list from the same palette -- and drifted apart once already, since one of
+// them is easy to forget when adding a fact.
+//
+// Takes the entry by reference because measuring caches into it: the auto
+// exposure costs a pass over the mosaic and this is called on every
+// re-interpret, which is every slider tick.
+SourceImage DescribeSource(PaletteEntry& pe, int index) {
+    SourceImage si;
+    si.name  = pe.name;
+    si.index = index;
+    if (!std::holds_alternative<Image>(pe.data)) return si;
+
+    const Image&     img = std::get<Image>(pe.data);
+    const ImageDesc& sd  = img.Desc();
+
+    // Tells the interpreter to insert a demosaic for this source, so a script
+    // never has to mention one.
+    si.isMosaic = sd.IsMosaic();
+
+    // So the kelvin control can open at what the camera chose.
+    AsShotWhiteBalance(sd, &si.asShotKelvin, &si.asShotTint);
+
+    // And so the exposure controls can open where a measurement of the sensor
+    // data suggests, rather than at zero.
+    if (si.isMosaic) {
+        if (pe.autoDevVersion != pe.version) {
+            pe.autoDev        = SuggestExposure(img);
+            pe.autoDevVersion = pe.version;
+        }
+        si.hasAutoExposure = pe.autoDev.valid;
+        si.autoExposure    = pe.autoDev.exposure;
+        si.autoShadows     = pe.autoDev.shadows;
+        si.autoBlacks      = pe.autoDev.blacks;
+    }
+    return si;
+}
+
 void App::RunScript() {
     const std::string prevError = m_error;
     m_error.clear();
@@ -561,20 +611,7 @@ void App::RunScript() {
             sources.push_back(Data{std::get<Image>(m_palette[i].data).Clone()});
         else
             sources.push_back(Data{});
-        {
-            SourceImage si;
-            si.name  = m_palette[i].name;
-            si.index = int(i);
-            // Tells the interpreter to insert a demosaic for this source, so a
-            // script never has to mention one.
-            if (std::holds_alternative<Image>(m_palette[i].data)) {
-                const ImageDesc& sd = std::get<Image>(m_palette[i].data).Desc();
-                si.isMosaic = sd.IsMosaic();
-                // So the kelvin control can open at what the camera chose.
-                AsShotWhiteBalance(sd, &si.asShotKelvin, &si.asShotTint);
-            }
-            names.push_back(si);
-        }
+        names.push_back(DescribeSource(m_palette[i], int(i)));
         // Bumped when a drop replaces the file behind this slot, which is what
         // lets the stage cache notice the pixels changed.
         versions.push_back(m_palette[i].version);
@@ -627,20 +664,7 @@ void App::RequestCompare() {
             sources.push_back(Data{std::get<Image>(m_palette[i].data).Clone()});
         else
             sources.push_back(Data{});
-        {
-            SourceImage si;
-            si.name  = m_palette[i].name;
-            si.index = int(i);
-            // Tells the interpreter to insert a demosaic for this source, so a
-            // script never has to mention one.
-            if (std::holds_alternative<Image>(m_palette[i].data)) {
-                const ImageDesc& sd = std::get<Image>(m_palette[i].data).Desc();
-                si.isMosaic = sd.IsMosaic();
-                // So the kelvin control can open at what the camera chose.
-                AsShotWhiteBalance(sd, &si.asShotKelvin, &si.asShotTint);
-            }
-            names.push_back(si);
-        }
+        names.push_back(DescribeSource(m_palette[i], int(i)));
         // Bumped when a drop replaces the file behind this slot, which is what
         // lets the stage cache notice the pixels changed.
         versions.push_back(m_palette[i].version);

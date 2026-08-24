@@ -571,6 +571,21 @@ private:
         auto probe = Registry::Get().Create(name);
         if (!probe) return Fail(e.line, "unknown algorithm '" + name + "'");
 
+        // Named arguments to params() are applied to the probe BEFORE it
+        // derives defaults, because some of them decide what the defaults are.
+        //
+        // basic_adjust's auto_exposure is the case: it asks the algorithm to
+        // open its exposure controls where a measurement suggests, so it has to
+        // be set before PrepareDefaults runs rather than after. Applied to the
+        // real algorithm too, further down, so the setting also takes effect --
+        // this copy only steers the defaults.
+        for (const auto& [pname, pval] : a.named) {
+            ParamBase* p = probe->FindParam(pname);
+            if (!p) return Fail(e.line, "'" + name + "' has no parameter '" + pname + "'");
+            std::string perr;
+            if (!p->SetFromScript(pval, &perr)) return Fail(e.line, perr);
+        }
+
         // Let the algorithm derive defaults from the source before its controls
         // are described -- basic_adjust opens its kelvin slider at whatever
         // temperature the camera chose, rather than at a sentinel.
@@ -581,7 +596,15 @@ private:
         // than a claim about a specific image.
         for (const SourceImage& s : m_sources) {
             if (!s.isMosaic) continue;
-            probe->PrepareDefaults(true, s.asShotKelvin, s.asShotTint);
+            SourceFacts facts;
+            facts.isMosaic     = true;
+            facts.asShotKelvin = s.asShotKelvin;
+            facts.asShotTint   = s.asShotTint;
+            facts.hasExposure  = s.hasAutoExposure;
+            facts.autoExposure = s.autoExposure;
+            facts.autoShadows  = s.autoShadows;
+            facts.autoBlacks   = s.autoBlacks;
+            probe->PrepareDefaults(facts);
             break;
         }
 

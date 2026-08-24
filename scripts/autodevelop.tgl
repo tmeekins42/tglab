@@ -1,0 +1,22 @@
+# Auto-develop: let the image choose the starting adjustments.
+#
+# Same controls as develop.tgl, but the exposure, shadows and blacks sliders
+# open where a measurement of the sensor data suggests instead of at zero.
+#
+# There is no second set of controls and no "auto mode" to leave. The
+# measurement sets DEFAULTS, so:
+#
+#   - a slider you have not touched follows the suggestion
+#   - a slider you drag stays exactly where you put it, through every re-run
+#   - double-clicking one returns it to the suggestion
+#
+# Drop a raw file onto the "test" row. On a JPEG the measurement is skipped:
+# a finished image has already had a tone curve applied, so its midtone says
+# nothing about how the sensor was exposed.
+
+src = image("test")
+
+developed = params(basic_adjust, auto_exposure = 1)(src)
+
+display(src,       "1 original")
+display(developed, "2 auto-developed")

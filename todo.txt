@@ -2,9 +2,17 @@ BUGS / SMALL FEATURES
 - would a tty / stdio backend make the app easier to debug? Support Windows UIA?
 - add faint gridlines around the pixels in the loupe
 - at some point we might need a vram garbage collector if we're doing a LOT of gpu operations and collecting a lot of temporary textures.
-- new algorithm: auto-develop. It's an extension of develop, but it auto finds the best settings to "develop" the image. Most important are auto white-balance and auto-exposure
-  auto-develop should also have a copy of the sliders so the user can adjust them after they've been auto-fixed... 
-  this might be tricky if the whole pipeline is re-run... might need to think about this.
+- auto-develop: AUTO WHITE BALANCE still to do. Auto-exposure is in
+  (basic_adjust's auto_exposure parameter, scripts/autodevelop.tgl); the same
+  mechanism should carry white balance, but it needs an estimator rather than
+  just a measurement. Grey-world is the usual starting point and is often
+  wrong on a scene with a dominant colour; white-patch is better when
+  something in the frame really is neutral. The camera's own as-shot value is
+  already the kelvin/tint default, and it is a decent answer, so an estimator
+  has to beat that to be worth switching on.
+  Note the "copy of the sliders" worry turned out not to exist: the suggestion
+  sets DEFAULTS, so an untouched slider follows it and a dragged one survives
+  every re-run. Verified in tests/test_autodev.cpp.
 - thumbnail in the image palette for raw images is really dark because raw images need to be "developed". Can we get an auto-developed thumbnail, or an embedded thumbnail directly from disk?
 - can we add a gpu watchdog that catches and breaks out of gpu hangs?
 

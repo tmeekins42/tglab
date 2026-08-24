@@ -95,6 +95,15 @@ struct SourceImage {
     // when the file knows, and which Tim reported as confusing on sight.
     float asShotKelvin = 0.0f;
     float asShotTint   = 0.0f;
+
+    // What a measurement of the sensor data suggests, for basic_adjust's
+    // auto-exposure. Computed once when the file loads rather than per run: it
+    // costs a pass over the mosaic, and the answer cannot change until the
+    // pixels do.
+    bool  hasAutoExposure = false;
+    float autoExposure    = 0.0f;   // stops
+    float autoShadows     = 0.0f;
+    float autoBlacks      = 0.0f;
 };
 
 struct InterpResult {

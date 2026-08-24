@@ -59,6 +59,30 @@ private:
     const CancelToken*           m_cancel = nullptr;
 };
 
+
+// What is known about the image an algorithm is about to run on, for deriving
+// parameter defaults.
+//
+// Two kinds of fact, and the distinction matters. The white balance is what the
+// CAMERA recorded -- metadata, free to read. The exposure figures are MEASURED
+// from the pixels, which costs a pass over the image and so is computed once
+// when the file loads rather than per run.
+struct SourceFacts {
+    bool isMosaic = false;
+
+    // The camera's own white balance, decomposed. Zero when the file carries no
+    // daylight reference to measure against.
+    float asShotKelvin = 0.0f;
+    float asShotTint   = 0.0f;
+
+    // Measured suggestions, in the units of basic_adjust's own controls.
+    // `hasExposure` is false for a non-raw source or one too small to judge.
+    bool  hasExposure = false;
+    float autoExposure = 0.0f;   // stops
+    float autoShadows  = 0.0f;
+    float autoBlacks   = 0.0f;
+};
+
 class AlgorithmBase {
 public:
     AlgorithmBase()          = default;
@@ -112,10 +136,14 @@ public:
     // kelvin control at the temperature the camera actually chose rather than at
     // a sentinel meaning "leave it alone".
     //
-    // A default, not a value: whatever the user or the script set wins.
-    virtual void PrepareDefaults(bool /*sourceIsMosaic*/,
-                                 float /*asShotKelvin*/,
-                                 float /*asShotTint*/) {}
+    // A default, not a value: whatever the user or the script set wins. That is
+    // what makes "auto" a starting point rather than a mode -- an untouched
+    // slider moves to the suggestion, a touched one is left alone, and a re-run
+    // changes nothing because the same image measures the same way.
+    //
+    // A struct rather than a parameter list: this started as three floats and
+    // grew, and every addition would otherwise touch every override.
+    virtual void PrepareDefaults(const SourceFacts& /*facts*/) {}
 
     // Extra root constants, bit-cast to uint. Floats go through asfloat() in
     // the shader. Order must match the cbuffer declaration.

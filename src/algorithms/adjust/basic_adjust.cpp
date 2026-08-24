@@ -340,10 +340,27 @@ void main(uint3 tid : SV_DispatchThreadID) {
     // Both are defaults rather than values: a script that sets kelvin, or a
     // slider the user has already moved, wins. Left at 0 for a source with no
     // daylight reference, where 0 correctly means "nothing to correct against".
-    void PrepareDefaults(bool sourceIsMosaic, float asShotK, float asShotT) override {
-        if (!sourceIsMosaic || asShotK <= 0.0f) return;
-        m_kelvin.SetDefault(asShotK);
-        m_tint.SetDefault(asShotT);
+    void PrepareDefaults(const SourceFacts& f) override {
+        if (!f.isMosaic) return;
+
+        // White balance from what the camera recorded.
+        if (f.asShotKelvin > 0.0f) {
+            m_kelvin.SetDefault(f.asShotKelvin);
+            m_tint.SetDefault(f.asShotTint);
+        }
+
+        // Exposure from what the sensor actually captured.
+        //
+        // Only when auto is on, and off by default: opening a raw with the
+        // exposure already moved would be startling, and the whole point of a
+        // lab is that nothing happens to the data unasked. With it on, these
+        // are defaults like any other -- drag one and it stops following the
+        // measurement, double-click and it returns to it.
+        if (f.hasExposure && bool(m_autoExposure)) {
+            m_exposure.SetDefault(f.autoExposure);
+            m_shadows.SetDefault(f.autoShadows);
+            m_blacks.SetDefault(f.autoBlacks);
+        }
     }
     void PrepareGpu(const std::vector<ImageDesc>& inputs) override {
         m_linear = !inputs.empty() && inputs[0].linear;
@@ -548,6 +565,25 @@ private:
                  "starts where the camera had it: matching a raw's white balance "
                  "needs both axes, not just the temperature.",
          .step = 0.01, .softMin = -0.5, .softMax = 0.5}};
+    // Auto-exposure, off by default.
+    //
+    // It sets DEFAULTS rather than values, so it is a starting point rather
+    // than a mode: with it on, an untouched exposure/shadows/blacks slider
+    // opens where the measurement suggests, a slider you have dragged is left
+    // exactly where you put it, and double-clicking one returns it to the
+    // suggestion. That is what Tim's note asked for -- "a copy of the sliders
+    // so the user can adjust them after they've been auto-fixed" -- without
+    // there being a second copy of anything.
+    //
+    // Off by default because a lab should not silently alter what it loaded.
+    // The measurement is only meaningful for a raw mosaic; a JPEG has already
+    // had a tone curve applied and its midtone says nothing about exposure.
+    Param<bool> m_autoExposure{
+        this, "auto_exposure", false,
+        "Open exposure, shadows and blacks where a measurement of the raw "
+        "suggests, instead of at zero. Only affects sliders you have not "
+        "touched; drag one and it stays where you put it."};
+
     Param<float> m_exposure{
         this, "exposure", 0.0f, -5.0f, 5.0f,
         {.help = "Overall brightness in stops: +1 doubles the light, -1 halves "

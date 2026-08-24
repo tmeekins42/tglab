@@ -40,6 +40,7 @@ add_library(tglab_core STATIC
     src/core/worker.cpp
     src/core/compare.cpp
     src/core/image_loader.cpp
+    src/algo_util/auto_develop.cpp
     src/algo_util/histogram.cpp
     src/algo_util/pixel_buffer.cpp
     src/algo_util/white_balance.cpp
@@ -270,3 +271,19 @@ endif()
 
 
 
+
+
+# Auto-develop: the measurement itself, and that its suggestions reach the
+# declared controls as DEFAULTS rather than as values.
+#
+# Needs a raw file, which the repository does not carry, so it is not an
+# add_test() -- point it at one:
+#   build/Release/tglab_autodev_tests.exe <some.arw>
+add_executable(tglab_autodev_tests
+    tests/test_autodev.cpp
+    $<TARGET_OBJECTS:tglab_algorithms>
+)
+target_link_libraries(tglab_autodev_tests PRIVATE tglab_core)
+if(MSVC)
+    target_compile_definitions(tglab_autodev_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
