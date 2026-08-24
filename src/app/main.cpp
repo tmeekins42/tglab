@@ -184,6 +184,7 @@ public:
         }
     }
 
+
 private:
     void RunScript();
     void BuildDefaultLayout(ImGuiID dockspace);
@@ -1112,8 +1113,22 @@ void App::DrawControl(UiControl& c) {
                         const double n = std::round((double(v) - c.lo) / c.step);
                         v = float(c.lo + n * c.step);
                     }
-                    c.value = std::clamp(double(v), c.lo, c.hi);
-                    m_dirty = true;
+                    const double snapped = std::clamp(double(v), c.lo, c.hi);
+
+                    // Only re-run if the value ACTUALLY moved.
+                    //
+                    // ImGui reports a slider as changed on every frame the
+                    // mouse is held down, whether or not the value differs --
+                    // and after snapping to a step it very often does not.
+                    // Marking dirty regardless submitted a fresh run each
+                    // frame, and since a new run cancels the one in flight,
+                    // a pipeline slower than the frame interval could never
+                    // finish: holding the mouse still on an unchanged slider
+                    // cancelled forever and the viewer never updated.
+                    if (snapped != c.value) {
+                        c.value = snapped;
+                        m_dirty = true;
+                    }
                 }
                 break;
             }
