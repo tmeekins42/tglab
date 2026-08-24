@@ -348,12 +348,25 @@ private:
                  "the cost of time. 4 covers grain through to mottling.",
          .step = 1}};
 
-    Param<float> m_lumaStrength{this, "luma", 0.02f, 0.0f, 0.25f,
+    // 0.005, from measurement rather than taste.
+    //
+    // This defaulted to 0.02, taken from a synthetic fixture whose noise sigma
+    // was 0.05 -- far noisier than a developed photograph. On a real one
+    // (_DSC0162.ARW, pushed 1.85 stops) the entire luma detail measures 0.021,
+    // so a 0.02 threshold is the SIZE of the signal and soft shrinkage removed
+    // 62% of it. That is what "denoise destroyed the image" looked like.
+    //
+    // Luma also needs far less help than chroma on a Bayer sensor: green is
+    // sampled at half of all sites while red and blue get a quarter each, so
+    // the visible speckle is overwhelmingly chroma. Defaulting luma low and
+    // chroma high matches where the noise actually is.
+    Param<float> m_lumaStrength{this, "luma", 0.005f, 0.0f, 0.25f,
         {.help = "Shrinkage threshold for the luminance detail bands, as a "
                  "fraction of the intensity range. Raise it to remove more "
-                 "grain; too high and fine texture goes with it. 0 leaves "
-                 "luminance untouched.",
-         .step = 0.002, .softMin = 0.0, .softMax = 0.08}};
+                 "grain; too high and fine texture goes with it -- on a "
+                 "developed photo the whole luma detail is around 0.02, so "
+                 "thresholds near that erase it. 0 leaves luminance untouched.",
+         .step = 0.001, .softMin = 0.0, .softMax = 0.03}};
 
     Param<float> m_chromaStrength{this, "chroma", 0.08f, 0.0f, 0.5f,
         {.help = "Shrinkage threshold for the colour detail bands. Defaults "

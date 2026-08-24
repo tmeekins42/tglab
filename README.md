@@ -835,6 +835,24 @@ The general rule: a shrinkage threshold is a fixed distance in the value
 domain, so it belongs on the same side of a tone curve as the values it was
 tuned against.
 
+**Zoom into a pushed raw and you will see coloured dots on a 2-pixel grid.**
+That is not a demosaic bug, and it is worth knowing before chasing it. On a
+Bayer sensor green is sampled at half of all sites while red and blue get a
+quarter each, so red and blue are interpolated from samples twice as far apart
+and carry roughly twice the noise — at exactly the sensor's own spacing.
+Measured on `_DSC0162.ARW` after a 1.85-stop push, the chroma speckle is
+0.0752 against 0.0210 of luma detail: the visible noise is overwhelmingly
+chroma. Both `demosaic_malvar` and `demosaic_bilinear` score the same parity
+swing, which is the check that says the demosaic is not at fault — a real
+demosaic bug would separate them.
+
+The defaults follow from that: chroma 0.08, luma 0.005. The luma default was
+originally 0.02, taken from a synthetic fixture far noisier than a real photo,
+and since the entire luma detail of a developed image is around 0.02 that
+threshold removed 62% of the picture. Chroma at 0.08 removes 88% of the
+speckle and costs nothing visible, because chroma carries almost no fine
+detail.
+
 [scripts/denoise.tgl](scripts/denoise.tgl) puts the original and the denoised
 result side by side, with develop before the denoise for this reason.
 
