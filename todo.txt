@@ -13,7 +13,6 @@ BUGS / SMALL FEATURES
   Note the "copy of the sliders" worry turned out not to exist: the suggestion
   sets DEFAULTS, so an untouched slider follows it and a dragged one survives
   every re-run. Verified in tests/test_autodev.cpp.
-- thumbnail in the image palette for raw images is really dark because raw images need to be "developed". Can we get an auto-developed thumbnail, or an embedded thumbnail directly from disk?
 - can we add a gpu watchdog that catches and breaks out of gpu hangs?
 
 - denoise: dust and scratch removal for scanned slides. Different problem from

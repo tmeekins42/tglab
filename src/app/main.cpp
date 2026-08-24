@@ -78,9 +78,40 @@ std::string ResolveDataPath(const std::string& rel) {
 // Box-downsamples `src` so its longest side is at most `maxSide`. Cheap and
 // done once per image, so the palette never uploads a full-resolution texture
 // just to draw a small icon.
-void MakeThumbnail(Image& src, int maxSide, Image* out) {
+// sRGB encode for the thumbnail path.
+//
+// basic_adjust has its own copy, but this is app UI rather than pipeline code
+// and reaching into an algorithm for it would couple the two for four lines.
+inline float LinearToSrgbThumb(float c) {
+    c = std::clamp(c, 0.0f, 1.0f);
+    return (c <= 0.0031308f) ? c * 12.92f
+                             : 1.055f * std::pow(c, 1.0f / 2.4f) - 0.055f;
+}
+
+// `exposureStops` develops a raw mosaic for display -- see the R32F branch.
+// Zero for an ordinary image, which needs no development.
+void MakeThumbnail(Image& src, int maxSide, Image* out, float exposureStops) {
     ImageView v = src.MapCpuRead();
     if (!v.Valid()) { out->Reset(); return; }
+
+    const bool  mosaic  = v.desc.IsMosaic();
+    const float expGain = std::pow(2.0f, exposureStops);
+
+    // The camera's own white balance, per channel.
+    //
+    // Without it a raw thumbnail comes out heavily green: the sensor's green
+    // sensels are the most sensitive, which is exactly what camMul exists to
+    // correct. Measured on a Sony ARW, the channel means were R 71 G 114 B 89
+    // before applying it -- legible, but visibly not the photograph.
+    //
+    // Normalised on green so this balances rather than doubling as an exposure
+    // change, which the measured push has already handled.
+    float wb[3] = {1.0f, 1.0f, 1.0f};
+    if (mosaic) {
+        const float g = (v.desc.camMul[1] > 1e-6f) ? v.desc.camMul[1] : 1.0f;
+        for (int c = 0; c < 3; ++c)
+            wb[c] = (v.desc.camMul[c] > 1e-6f) ? v.desc.camMul[c] / g : 1.0f;
+    }
 
     const int sw = v.desc.width;
     const int sh = v.desc.height;
@@ -97,6 +128,14 @@ void MakeThumbnail(Image& src, int maxSide, Image* out) {
             // scanned page into noise.
             int acc[4] = {0, 0, 0, 0};
             int n = 0;
+
+            // Per-channel counts, for the mosaic path only.
+            //
+            // A Bayer block does not contribute equally to each channel: green
+            // has two sensels per 2x2 tile against one each for red and blue,
+            // so dividing all three by the same n would halve red and blue and
+            // leave every raw thumbnail green.
+            int chN[3] = {0, 0, 0};
             for (int sy = y * step; sy < std::min((y + 1) * step, sh); ++sy) {
                 for (int sx = x * step; sx < std::min((x + 1) * step, sw); ++sx) {
                     if (v.desc.format == Format::R32F) {
@@ -108,9 +147,51 @@ void MakeThumbnail(Image& src, int maxSide, Image* out) {
                         // no-op for it.
                         const float black = v.desc.blackLevel;
                         const float range = std::max(v.desc.whiteLevel - black, 1e-6f);
-                        const float f = (*v.At<float>(sx, sy) - black) / range;
-                        const int g = int(std::clamp(f, 0.0f, 1.0f) * 255.0f);
-                        acc[0] += g; acc[1] += g; acc[2] += g; acc[3] += 255;
+                        float f = (*v.At<float>(sx, sy) - black) / range;
+
+                        // Sensel colour, from the CFA. Averaging a Bayer block
+                        // as though it were grey is not the reason raw
+                        // thumbnails looked wrong, but it is why they were
+                        // monochrome -- a colour photograph rendered as a grey
+                        // smear is not much of a preview. Accumulating each
+                        // sensel into its own channel makes the block average
+                        // an ordinary (if soft) demosaic, which is exactly
+                        // right at 48 pixels.
+                        const int cc = mosaic ? CfaColorAt(v.desc.cfa, sx, sy) : -1;
+
+                        // Develop, so the preview looks like a photograph
+                        // rather than sensor data. Scene-linear values sit far
+                        // below where the eye expects them: measured across
+                        // three raws the mean landed at 17..30 out of 255,
+                        // which is Tim's "unreadable thumbnails".
+                        //
+                        // The gamma matters more than the exposure here. A
+                        // linear 0.067 is 17/255 shown directly and 134/255
+                        // through the sRGB transfer -- the display curve is
+                        // most of the fix, and the auto push is the rest.
+                        // Only a MOSAIC is developed. An ordinary R32F -- a
+                        // threshold mask, a gradient, a sobel magnitude -- is
+                        // already 0..1 display data and was rendering
+                        // correctly; putting it through a transfer function
+                        // would brighten it for no reason.
+                        if (mosaic) {
+                            // White balance before exposure, matching the order
+                            // the real develop path uses: balance is a property
+                            // of the capture, brightness is a choice made after.
+                            f = std::clamp(f * wb[cc] * expGain, 0.0f, 1.0f);
+                            f = LinearToSrgbThumb(f);
+                        } else {
+                            f = std::clamp(f, 0.0f, 1.0f);
+                        }
+
+                        const int g = int(f * 255.0f);
+                        if (cc < 0) {
+                            acc[0] += g; acc[1] += g; acc[2] += g;
+                        } else {
+                            acc[cc] += g;
+                            ++chN[cc];
+                        }
+                        acc[3] += 255;
                     } else if (v.desc.format == Format::RGBA32F) {
                         const float* p = v.At<float>(sx, sy);
                         for (int c = 0; c < 4; ++c)
@@ -127,7 +208,13 @@ void MakeThumbnail(Image& src, int maxSide, Image* out) {
                 }
             }
             uint8_t* d = o.At<uint8_t>(x, y);
-            for (int c = 0; c < 4; ++c) d[c] = uint8_t(n ? acc[c] / n : 0);
+            if (mosaic) {
+                for (int c = 0; c < 3; ++c)
+                    d[c] = uint8_t(chN[c] ? acc[c] / chN[c] : 0);
+                d[3] = 255;
+            } else {
+                for (int c = 0; c < 4; ++c) d[c] = uint8_t(n ? acc[c] / n : 0);
+            }
         }
     }
 }
@@ -1720,7 +1807,19 @@ void App::DrawPalettePanel() {
         if (std::holds_alternative<Image>(e.data)) {
             Image& img = std::get<Image>(e.data);
             if (img.Valid() && e.thumbVersion != e.version) {
-                MakeThumbnail(img, int(thumbSize) * 2, &e.thumbImage);
+                // Develop a raw for the preview, using the same measurement the
+                // auto-exposure control uses. Deliberately independent of the
+                // script: the palette is app UI, and a raw's thumbnail should
+                // be legible whether or not the open script happens to develop
+                // anything. Measured once and cached against `version`, so
+                // this costs nothing on the frames that redraw it.
+                if (img.Desc().IsMosaic() && e.autoDevVersion != e.version) {
+                    e.autoDev        = SuggestExposure(img);
+                    e.autoDevVersion = e.version;
+                }
+                const float stops = (img.Desc().IsMosaic() && e.autoDev.valid)
+                                        ? e.autoDev.exposure : 0.0f;
+                MakeThumbnail(img, int(thumbSize) * 2, &e.thumbImage, stops);
                 e.thumbVersion = e.version;
             }
             if (e.thumbImage.Valid() && e.thumb.Update(m_dev, e.thumbImage, e.version)) {

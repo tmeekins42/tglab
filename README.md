@@ -119,6 +119,22 @@ Names are case-sensitive and are the filename without its extension, so
 script, so a script referring to the old name will report the missing image
 rather than failing silently.
 
+**Raw thumbnails are developed for the preview.** The palette holds a sensor
+mosaic, and drawn as it stands that is a dark grey smear — measured across
+three raws, the mean landed at 17–30 out of 255. The thumbnail therefore
+applies the camera's white balance, the same auto-exposure measurement the
+`auto_exposure` control uses, and an sRGB transfer, and accumulates each sensel
+into its own channel so the preview is in colour. The same three raws now
+measure 106–134.
+
+Deliberately independent of the script: the palette is app UI, so a raw's
+thumbnail should be legible whether or not the open script happens to develop
+anything. The gamma turns out to matter more than the exposure — a linear
+0.067 is 17/255 shown directly and 134/255 through the transfer.
+
+Only mosaics are developed. An ordinary `R32F` image — a threshold mask, a
+sobel magnitude — is already display data and is drawn exactly as before.
+
 ### Camera raw
 
 `.CR3`, `.CR2`, `.NEF`, `.ARW`, `.DNG` and the other common raw formats load
