@@ -8,18 +8,7 @@ BUGS / SMALL FEATURES
 - thumbnail in the image palette for raw images is really dark because raw images need to be "developed". Can we get an auto-developed thumbnail, or an embedded thumbnail directly from disk?
 - can we add a gpu watchdog that catches and breaks out of gpu hangs?
 
-- BUG: blown highlights come out PINK on a raw until develop is adjusted.
-  Confirmed on _dsc0037.arw and it is not a develop artifact -- the demosaic
-  applies camMul white-balance gains to sensels that are already CLIPPED at
-  the white level. A clipped white (1,1,1) has camMul 1.578/1.000/2.961
-  applied, then the rgbCam matrix, and comes out 5.79/1.00/13.93 -- magenta.
-  Moving the develop sliders only masks it, because basic_adjust's highlight
-  recovery re-equalises the channels after the damage.
-  The fix is highlight reconstruction at the demosaic: a sensel at the white
-  level is a LOWER BOUND, not a measurement, so a clipped channel should be
-  raised to at least the max of the unclipped ones rather than being white
-  balanced as though it were real data. That is what dcraw/RawTherapee do.
-  Worth doing before more denoise work -- it affects every over-exposed raw.
+- denoise: dust and scratch removal for scanned slides. Different problem from
   ISO noise -- sparse impulse defects rather than broad-band -- so it wants a
   DETECT-then-repair filter shaped like hot_pixel_repair (2D, colour) rather
   than a blur. median_blur handles it today but destroys detail everywhere.

@@ -223,7 +223,22 @@ void main(uint3 tid : SV_DispatchThreadID) {
         rgb[2 - c] = 0.25 * xSum + beta * lap;
     }
 
+    // Which channels saturated is decided here, against the sensor's white
+    // level, but the repair happens AFTER white balance -- see RecoverClipped
+    // in the CPU path. Equalising first and then applying the gains makes the
+    // magenta worse, not better.
+    const float kClip = 0.99;
+    bool3 clipped = bool3(rgb.r >= kClip, rgb.g >= kClip, rgb.b >= kClip);
+
     rgb *= float3(asfloat(CamMul0), asfloat(CamMul1), asfloat(CamMul2));
+
+    if (any(clipped)) {
+        float hi = max(rgb.r, max(rgb.g, rgb.b));
+        rgb = float3(clipped.x ? hi : rgb.r,
+                     clipped.y ? hi : rgb.g,
+                     clipped.z ? hi : rgb.b);
+    }
+
     rgb = float3(
         asfloat(M0) * rgb.r + asfloat(M1) * rgb.g + asfloat(M2) * rgb.b,
         asfloat(M3) * rgb.r + asfloat(M4) * rgb.g + asfloat(M5) * rgb.b,
@@ -250,9 +265,18 @@ void main(uint3 tid : SV_DispatchThreadID) {
 
 private:
     static void ApplyColour(const ImageDesc& d, float* rgb) {
+        // Which channels saturated must be decided BEFORE white balance --
+        // that is the only place the sensor's white level means anything --
+        // but the repair must happen AFTER, in the space where "neutral"
+        // means the channels are equal. Doing both before simply hands the
+        // gains an equal triple to pull apart again, which is the bug.
+        const bool clipped[3] = {rgb[0] >= kClip, rgb[1] >= kClip, rgb[2] >= kClip};
+
         rgb[0] *= d.camMul[0];
         rgb[1] *= d.camMul[1];
         rgb[2] *= d.camMul[2];
+
+        RecoverClipped(rgb, clipped);
 
         const float r = rgb[0], g = rgb[1], b = rgb[2];
         rgb[0] = d.rgbCam[0] * r + d.rgbCam[1] * g + d.rgbCam[2] * b;
@@ -261,6 +285,42 @@ private:
 
         for (int i = 0; i < 3; ++i) rgb[i] = std::max(rgb[i], 0.0f);
     }
+
+    // A sensel at the white level is not a measurement, it is a lower bound:
+    // the scene was at least this bright, and how much brighter is unknowable.
+    // Treating that bound as data and applying per-channel white-balance gains
+    // to it is what turns a blown highlight magenta. On Tim's ARW the gains are
+    // R 1.578, G 1.000, B 2.961, so a clipped white sensel comes out with green
+    // crushed and red and blue running away -- the pink he saw on the
+    // over-exposed lights, before any develop slider was touched.
+    //
+    // Called AFTER white balance, with a mask captured before it. In the
+    // balanced space a neutral highlight is one where the channels are equal,
+    // so lifting the clipped ones to the brightest present restores that.
+    // A pixel where all three clipped becomes neutral; one where only red
+    // clipped keeps its hue from the channels that still hold information.
+    //
+    // The first version of this ran BEFORE white balance and made the cast
+    // WORSE, measured 1.95/1.00/1.32 to 2.34/1.00/1.72: equalising and then
+    // multiplying by the gains simply hands them a neutral triple to pull
+    // apart again. The order is the whole point.
+    //
+    // It cannot invent the true brightness -- nothing can -- but
+    // neutral-and-blown is what the eye expects from a blown highlight, and
+    // magenta is simply wrong.
+    static void RecoverClipped(float* rgb, const bool (&clipped)[3]) {
+        if (!clipped[0] && !clipped[1] && !clipped[2]) return;   // the common case
+        const float hi = std::max(rgb[0], std::max(rgb[1], rgb[2]));
+        if (clipped[0]) rgb[0] = hi;
+        if (clipped[1]) rgb[1] = hi;
+        if (clipped[2]) rgb[2] = hi;
+    }
+
+    // Normalised so 1.0 is the sensor's white level (the demosaic divides by
+    // the black-to-white range first). A little under 1 to catch sensels that
+    // saturate slightly early, which real ones do -- the ARW's own maximum
+    // reads 16596 against a declared white of 16383.
+    static constexpr float kClip = 0.99f;
 
     void PassThrough(ImageView& dst, int w, int h) {
         const int ch = m_in.Channels();

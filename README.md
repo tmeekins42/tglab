@@ -812,8 +812,31 @@ around 4.5 sigma (broad-band, no impulse component — impulse noise would want
 a median instead), and sigma tracks √signal, meaning it is shot-noise dominated
 rather than a constant read-noise floor. Both point at coefficient shrinkage.
 
+**Denoise after develop, not before.** This has a measured answer rather than
+a stylistic one. On an under-exposed ARW pushed hard (exposure 1.85, shadows
+0.6), measuring robust sigma in the darkest 40% of the frame for noise and the
+same statistic in the brightest 40% for detail:
+
+| | shadow noise | detail kept |
+|---|---|---|
+| develop only | 0.02481 | 0.04903 (100%) |
+| **denoise after develop** | **0.00903** (−64%) | **0.04325 (88%)** |
+| denoise before develop | 0.00004 | 0.00283 (6%) |
+
+Denoising first looks spectacular on the noise column and is catastrophic: it
+keeps 6% of the detail. Develop applies a strong non-linear tone curve, so
+denoising ahead of it means thresholding in linear scene space where shadow
+detail is compressed into a tiny value range — a fixed threshold eats nearly
+all of it, and the curve then stretches what little survives, amplifying the
+damage. After develop, the threshold is applied in the space the eye actually
+sees.
+
+The general rule: a shrinkage threshold is a fixed distance in the value
+domain, so it belongs on the same side of a tone curve as the values it was
+tuned against.
+
 [scripts/denoise.tgl](scripts/denoise.tgl) puts the original and the denoised
-result side by side.
+result side by side, with develop before the denoise for this reason.
 
 **On the GPU** it is one dispatch per level, ping-ponging the accumulator
 between the output and the scratch. Measured on a 24 MP Sony ARW through the

@@ -204,9 +204,21 @@ void main(uint3 tid : SV_DispatchThreadID) {
 
     #undef S
 
+    // Record which channels saturated before white balance; repair after it.
+    // Matches the CPU path -- see RecoverClipped in demosaic_malvar.cpp.
+    const float kClip = 0.99;
+    bool3 clipped = bool3(rgb.r >= kClip, rgb.g >= kClip, rgb.b >= kClip);
+
     // White balance, then camera primaries -> sRGB. Same order as the CPU
     // path; without either the image is heavily green with wrong hues.
     rgb *= float3(asfloat(CamMul0), asfloat(CamMul1), asfloat(CamMul2));
+
+    if (any(clipped)) {
+        float hi = max(rgb.r, max(rgb.g, rgb.b));
+        rgb = float3(clipped.x ? hi : rgb.r,
+                     clipped.y ? hi : rgb.g,
+                     clipped.z ? hi : rgb.b);
+    }
     rgb = float3(
         asfloat(M0) * rgb.r + asfloat(M1) * rgb.g + asfloat(M2) * rgb.b,
         asfloat(M3) * rgb.r + asfloat(M4) * rgb.g + asfloat(M5) * rgb.b,
@@ -240,9 +252,23 @@ private:
     // them leaves a heavily green image with wrong hues -- the sensor's green
     // photosites are about twice as sensitive as its red and blue ones.
     static void ApplyColour(const ImageDesc& d, float* rgb) {
+        // Which channels saturated is decided BEFORE white balance, against the
+        // sensor's white level; the repair happens AFTER, where neutral means
+        // the channels are equal. See RecoverClipped in demosaic_malvar.cpp --
+        // the two must agree, since a script can switch between them.
+        constexpr float kClip = 0.99f;
+        const bool clipped[3] = {rgb[0] >= kClip, rgb[1] >= kClip, rgb[2] >= kClip};
+
         rgb[0] *= d.camMul[0];
         rgb[1] *= d.camMul[1];
         rgb[2] *= d.camMul[2];
+
+        if (clipped[0] || clipped[1] || clipped[2]) {
+            const float hi = std::max(rgb[0], std::max(rgb[1], rgb[2]));
+            if (clipped[0]) rgb[0] = hi;
+            if (clipped[1]) rgb[1] = hi;
+            if (clipped[2]) rgb[2] = hi;
+        }
 
         const float r = rgb[0], g = rgb[1], b = rgb[2];
         rgb[0] = d.rgbCam[0] * r + d.rgbCam[1] * g + d.rgbCam[2] * b;
