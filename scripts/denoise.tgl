@@ -5,11 +5,13 @@
 
 src = image("test")
 
+developed = params(basic_adjust)(src)
+
 luma   = slider("luma", 0.0, 0.08, 0.02)
 chroma = slider("chroma", 0.0, 0.25, 0.08)
 levels = slider("levels", 1, 6, 4)
 
-clean = wavelet_denoise(src, luma = luma, chroma = chroma, levels = levels)
+clean = wavelet_denoise(developed, luma = luma, chroma = chroma, levels = levels)
 
-display(src,   "original")
+display(developed,   "original")
 display(clean, "denoised")

@@ -1052,6 +1052,36 @@ static void TestGpuAgreement(ID3D12Device* dev) {
          "o = threshold_adaptive_mean(src, window = 15, c = 5)\n"
          "display(o)\n", 255.0, 0.5},
 
+
+        // wavelet_denoise: five chained dispatches ping-ponging an accumulator,
+        // where every other GPU algorithm here is one or two passes. A parity
+        // mistake would leave the result in the scratch buffer and show the
+        // input unchanged, which the mean check below would catch and a "did it
+        // run" check would not.
+        //
+        // The GPU fuses the separable blur into one 5x5 dilated pass while the
+        // CPU does two 1D passes -- mathematically identical, but only because
+        // the kernel is separable, which is worth having asserted.
+        //
+        // The max tolerance is looser than its neighbours for a measured
+        // reason: the GPU.s ping-pong buffers take the output.s format, so on
+        // this RGBA8 fixture every one of the four levels rounds to 8 bits
+        // where the CPU stays in float. On an RGBA32F image the same code
+        // agrees to 4e-7, which is what says the difference is quantisation
+        // rather than a divergence. The MEAN check below is the one that would
+        // catch a real bug, and it is held tight.
+        //
+        // The max tolerance is looser than its neighbours for a measured reason:
+        // the GPU's ping-pong buffers take the output's format, so on this RGBA8
+        // fixture every one of the four levels rounds to 8 bits where the CPU
+        // stays in float. On an RGBA32F image the same code agrees to 4e-7,
+        // which is what says the difference is quantisation and not a
+        // divergence. The MEAN check is the one that would catch a real bug.
+        {"wavelet_denoise",
+         "src = image(\"test\")\n"
+         "o = wavelet_denoise(src, luma = 0.03, chroma = 0.09, levels = 4)\n"
+         "display(o)\n", 10.0, 1.0},
+
         {"threshold_bernsen",
          "src = image(\"test\")\n"
          "o = threshold_bernsen(src, window = 15, contrast_min = 15, "

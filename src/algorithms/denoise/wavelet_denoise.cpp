@@ -120,10 +120,20 @@ public:
         // work, and it is invisible in an RGB basis where all three channels
         // get the same treatment.
         const bool colour = (ch >= 3);
-        if (colour) ToYcc(cur, w, h, ch);
 
         for (int lvl = 0; lvl < levels; ++lvl) {
             if (ctx.Cancelled()) return;
+
+            // Rotate into luma/chroma for THIS level only, and back at the end
+            // of it, rather than once around the whole pyramid.
+            //
+            // The GPU has to work this way -- its ping-pong buffers take the
+            // output.s format, and chroma is a signed difference that an RGBA8
+            // UNORM target clamps to zero -- so the CPU follows suit to keep
+            // the two paths computing the same thing. The cost is a rotation
+            // pair per level; the benefit is that neither path can silently
+            // destroy chroma on an 8-bit image.
+            if (colour) ToYcc(cur, w, h, ch);
 
             const int step = 1 << lvl;
             ATrousBlur(cur, blurred, w, h, ch, step, tmp);
@@ -153,12 +163,144 @@ public:
 
             // Reassemble: the shrunk detail plus the coarser approximation.
             for (size_t i = 0; i < cur.size(); ++i) cur[i] = blurred[i] + residual[i];
-        }
 
-        if (colour) FromYcc(cur, w, h, ch);
+            if (colour) FromYcc(cur, w, h, ch);
+        }
 
         buf.Data() = std::move(cur);
         buf.PackInto(dst);
+    }
+
+    // --- GPU implementation -------------------------------------------------
+    //
+    // One dispatch per level, ping-ponging the accumulator between the output
+    // and the scratch. Each pass computes the level's blur with a 2D 5x5
+    // dilated kernel, takes the detail band against its own input, shrinks it,
+    // and writes blur + shrunk detail.
+    //
+    // The blur is NOT split into separable horizontal and vertical passes here,
+    // although the CPU does exactly that. Separating would need three buffers:
+    // the accumulator, the horizontal partial, and the destination -- and the
+    // ping-pong has two, so the vertical pass would no longer have the
+    // accumulator it must subtract from. 25 taps against 10 is more arithmetic
+    // but it all comes from cache, and it removes a full-image round trip per
+    // level, which on a GPU is the term that actually costs.
+    //
+    // No custom scratch format: the output is SameAsInput, which for a
+    // developed photograph is already four channels, so the default scratch is
+    // the right shape.
+    bool HasGPU() const override { return true; }
+
+    int GpuIterations() const override { return std::clamp(int(m_levels), 1, 6); }
+
+    const char* GpuSource() const override {
+        return R"(
+Texture2D<float4>   Src  : register(t0);   // ping-pong: the accumulator
+Texture2D<float4>   Orig : register(t1);   // the untouched input, every pass
+RWTexture2D<float4> Dst  : register(u0);
+
+cbuffer Params : register(b0) {
+    uint  Width;
+    uint  Height;
+    uint  LumaBits;
+    uint  ChromaBits;
+    uint  Level;        // which scale this pass is working at
+    uint  LastLevel;    // so the final pass can rotate back to RGB
+    uint  Colour;       // 1 when there are three channels to rotate
+};
+
+static const float kB3[5] = { 0.0625, 0.25, 0.375, 0.25, 0.0625 };
+
+// Reversible luma/chroma rotation, matching the CPU exactly. Not colorimetric
+// -- only ever a basis to threshold in -- but it round trips, which is what
+// matters. Chroma tolerates far harder shrinkage than luma, and that asymmetry
+// is most of what makes sensor-noise denoising work.
+float4 ToYcc(float4 p) {
+    return float4(0.25 * p.r + 0.5 * p.g + 0.25 * p.b, p.r - p.g, p.b - p.g, p.a);
+}
+float4 FromYcc(float4 p) {
+    float g = p.x - 0.25 * p.y - 0.25 * p.z;
+    return float4(p.y + g, g, p.z + g, p.a);
+}
+
+// Soft shrinkage. Hard thresholding leaves a discontinuity, and a coefficient
+// sitting either side of it from one pixel to the next flips between kept and
+// discarded -- the mottled "wavelet blotch" that gives the method its bad name.
+float Shrink(float v, float t) {
+    float a = abs(v);
+    return (a <= t) ? 0.0 : (v > 0.0 ? a - t : -(a - t));
+}
+
+[numthreads(8, 8, 1)]
+void main(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= Width || tid.y >= Height) return;
+
+    int  x = int(tid.x), y = int(tid.y);
+    int  step = 1 << Level;
+    int2 hi = int2(Width - 1, Height - 1);
+
+    // Rotate into luma/chroma for THIS level and back out at the end of it,
+    // rather than once around the whole pyramid.
+    //
+    // Not a stylistic choice: the ping-pong buffers take the OUTPUT's format,
+    // and chroma is a signed difference. On an RGBA8 image the UNORM target
+    // clamps every negative chroma value to zero the moment an intermediate is
+    // written, which silently destroyed half the colour information -- it
+    // agreed perfectly on float images and was wrong by 182/255 on 8-bit ones.
+    // Keeping the rotation inside one dispatch means the buffers only ever hold
+    // RGB, which is non-negative and survives. The CPU does the same, so the
+    // two paths compute the same thing.
+    float4 cur = Src[int2(x, y)];
+    if (Colour != 0) cur = ToYcc(cur);
+
+    float4 blur = 0.0;
+    for (int dy = -2; dy <= 2; ++dy) {
+        for (int dx = -2; dx <= 2; ++dx) {
+            int2 p = clamp(int2(x + dx * step, y + dy * step), int2(0, 0), hi);
+            float4 s = Src[p];
+            if (Colour != 0) s = ToYcc(s);
+            blur += (kB3[dx + 2] * kB3[dy + 2]) * s;
+        }
+    }
+
+    float4 detail = cur - blur;
+
+    // Coarser levels hold more real structure and less grain, so the threshold
+    // falls as the scale grows -- matching how a noise field's energy
+    // distributes across an a-trous pyramid.
+    float falloff = 1.0 / float(1 << Level);
+    float lt = asfloat(LumaBits)   * falloff;
+    float ct = (Colour != 0 ? asfloat(ChromaBits) : asfloat(LumaBits)) * falloff;
+
+    detail.x = Shrink(detail.x, lt);
+    detail.y = Shrink(detail.y, ct);
+    detail.z = Shrink(detail.z, ct);
+
+    float4 outv = blur + detail;
+    outv.a = cur.a;                      // alpha is carried, never shrunk
+
+    if (Colour != 0) outv = FromYcc(outv);
+    Dst[tid.xy] = outv;
+}
+)";
+    }
+
+    std::vector<uint32_t> GpuConstants(int iteration) const override {
+        auto bits = [](float f) {
+            uint32_t u;
+            std::memcpy(&u, &f, sizeof(u));
+            return u;
+        };
+        const int levels = std::clamp(int(m_levels), 1, 6);
+        // Thresholds are a fraction of the intensity range on both paths. A
+        // float image reaches the shader in its own units and ValueScale() is
+        // 1, so unlike the RGBA8 kernels there is no 255 to divide out -- and
+        // the CPU/GPU agreement test is what catches getting that backwards.
+        return {bits(float(m_lumaStrength)),
+                bits(float(m_chromaStrength)),
+                uint32_t(iteration),
+                uint32_t(levels - 1),
+                1u};
     }
 
 private:

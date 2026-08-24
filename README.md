@@ -781,9 +781,9 @@ Several filters above already denoise — `bilateral`, `nonlocal_means`,
 `Category()=="denoise"` adds is the multi-scale approach, which is a different
 idea rather than another neighbourhood shape.
 
-| Algorithm | CPU | Notes |
-|---|---|---|
-| `wavelet_denoise` | ~170 ms/MP | À-trous wavelet shrinkage. Separate luma and chroma thresholds. |
+| Algorithm | CPU | GPU | Notes |
+|---|---|---|---|
+| `wavelet_denoise` | ~170 ms/MP | **14x** | À-trous wavelet shrinkage. Separate luma and chroma thresholds. |
 
 **Why multi-scale.** A spatial filter has one neighbourhood and must trade
 grain against texture inside it. A wavelet decomposition splits the image into
@@ -813,9 +813,28 @@ a median instead), and sigma tracks √signal, meaning it is shot-noise dominate
 rather than a constant read-noise floor. Both point at coefficient shrinkage.
 
 [scripts/denoise.tgl](scripts/denoise.tgl) puts the original and the denoised
-result side by side. There is no GPU kernel yet: it needs 2×levels passes and a
-two-channel scratch, and `GpuScratchFormat` currently allows a custom scratch
-format only for exactly two passes.
+result side by side.
+
+**On the GPU** it is one dispatch per level, ping-ponging the accumulator
+between the output and the scratch. Measured on a 24 MP Sony ARW through the
+full develop-and-denoise pipeline: **7.8 s → 0.54 s (14x)**, which is the
+difference between a slider you nudge and one you drag.
+
+Two things the kernel does differently from the obvious version, both forced
+by the two-buffer ping-pong:
+
+- **The blur is one 5×5 dilated pass, not two separable 1D passes.** Splitting
+  it would need three buffers — accumulator, horizontal partial, destination —
+  and the vertical pass would no longer have the accumulator it must subtract
+  from. 25 taps against 10 is more arithmetic but it all comes from cache, and
+  it removes a full-image round trip per level.
+- **The luma/chroma rotation happens inside each dispatch,** rather than once
+  around the whole pyramid. The ping-pong buffers take the *output's* format,
+  and chroma is a signed difference: on an 8-bit image a UNORM target clamps
+  every negative chroma value to zero the moment an intermediate is written.
+  That agreed perfectly on float images and was wrong by 182/255 on 8-bit ones
+  — caught by the CPU/GPU agreement test, not by looking at a picture. The CPU
+  path was changed to match, so both compute the same thing.
 
 A GPU path is used only within the radius each kernel declares safe. Beyond
 that the stage falls back to the CPU, because a single dispatch doing millions
