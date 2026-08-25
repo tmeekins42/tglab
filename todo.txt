@@ -14,7 +14,6 @@ BUGS / SMALL FEATURES
   sets DEFAULTS, so an untouched slider follows it and a dragged one survives
   every re-run. Verified in tests/test_autodev.cpp.
 - can we add a gpu watchdog that catches and breaks out of gpu hangs?
-
 - denoise: dust and scratch removal for scanned slides. Different problem from
   ISO noise -- sparse impulse defects rather than broad-band -- so it wants a
   DETECT-then-repair filter shaped like hot_pixel_repair (2D, colour) rather
@@ -37,6 +36,7 @@ BUGS / SMALL FEATURES
   Cheaper alternative worth trying first: scale the threshold by the local
   level inside the existing kernel. No transform, no round-trip, and it can be
   a parameter so the effect is visible rather than baked in.
+
 FEATURES
 - add support for additional image channels, such as alpha channels and depth channels
 - channel merging. Astronomy images are captured single channel with colored filters. How to merge them?
@@ -69,6 +69,7 @@ FEATURES
 - can we detect dead/stuck pixels from the raw capure? test: d:\lrwork\little\_MG_9673.CR2 has a stuck solid red pixel on the right eye. (this is a common issue on cameras)
 - can algorithms be toggled on/off?
 - algorithm to fix chromatic aberation. can it be detected and auto fixed without analysing the lens?
+- have an option to drag a splitter so we can see before/after on a single image.
 
 NOTES
 - if we need matrix functions, I suggest the Euler library and Ceres for bundle solving

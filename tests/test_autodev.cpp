@@ -132,6 +132,49 @@ int main(int argc, char** argv) {
             Check(sh == 0.0, "no shadow lift when nothing is crushed");
     }
 
+    // Toggling the checkbox on the panel must take effect.
+    //
+    // params() exposes auto_exposure as a control, and ticking it did nothing:
+    // PrepareDefaults ran on the probe using only what the SCRIPT said, and the
+    // control's value was read further down, after the defaults had already
+    // been decided. So the checkbox was written every frame and never once
+    // looked at before the decision it was meant to make.
+    //
+    // Driven the way the app does it -- set the control, re-interpret -- since
+    // that is the path that was broken.
+    {
+        UiState ui;
+        const char* script =
+            "src = image(\"test\")\n"
+            "o = params(basic_adjust)(src)\ndisplay(o)\n";   // no script argument
+        if (!run(script, &ui)) return 1;
+
+        double v = -999;
+        ControlValue(ui, "basic_adjust.exposure", &v);
+        Check(v == 0.0, "exposure starts at 0 with the box unticked");
+
+        // Tick it, as clicking the checkbox does.
+        bool found = false;
+        for (UiControl& c : ui.Controls())
+            if (c.label == "basic_adjust.auto_exposure") { c.value = 1; found = true; }
+        Check(found, "the auto_exposure control exists on the panel");
+
+        if (!run(script, &ui)) return 1;
+        ControlValue(ui, "basic_adjust.exposure", &v);
+        std::printf("       after ticking auto_exposure: %+.2f\n", v);
+        Check(std::abs(v - s.exposure) < 0.01,
+              "ticking the box moves exposure to the suggestion");
+
+        // And untick it again: the control must go back, not stay stuck on a
+        // value the measurement chose.
+        for (UiControl& c : ui.Controls())
+            if (c.label == "basic_adjust.auto_exposure") c.value = 0;
+        if (!run(script, &ui)) return 1;
+        ControlValue(ui, "basic_adjust.exposure", &v);
+        std::printf("       after unticking:             %+.2f\n", v);
+        Check(v == 0.0, "unticking the box returns exposure to 0");
+    }
+
     std::printf("\n%s\n", g_fail ? "FAILURES" : "auto-exposure wiring ok");
     return g_fail ? 1 : 0;
 }

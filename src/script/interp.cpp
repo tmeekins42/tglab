@@ -571,6 +571,16 @@ private:
         auto probe = Registry::Get().Create(name);
         if (!probe) return Fail(e.line, "unknown algorithm '" + name + "'");
 
+        // The optional instance name is what lets the same algorithm appear
+        // twice with independent settings. Without it, params(op) twice on one
+        // algorithm shares a single set of controls -- so a script comparing an
+        // algorithm against itself could not vary anything.
+        //
+        // Computed here rather than further down because the control lookup
+        // below needs it: a control's label carries the instance.
+        const std::string instance = a.pos.size() == 2 ? a.pos[1].AsString() : std::string();
+        const std::string key      = instance.empty() ? name : name + "@" + instance;
+
         // Named arguments to params() are applied to the probe BEFORE it
         // derives defaults, because some of them decide what the defaults are.
         //
@@ -584,6 +594,26 @@ private:
             if (!p) return Fail(e.line, "'" + name + "' has no parameter '" + pname + "'");
             std::string perr;
             if (!p->SetFromScript(pval, &perr)) return Fail(e.line, perr);
+        }
+
+        // ... and so do values the USER has already set on the panel.
+        //
+        // Without this, ticking the auto_exposure checkbox did nothing. The
+        // control's value is only read further down, when the controls are
+        // described -- by which point PrepareDefaults has already run and
+        // decided the defaults from whatever the script said. So the checkbox
+        // was written every frame and never once looked at before the decision
+        // it was supposed to make.
+        //
+        // Applied after the script's own arguments so a script that states
+        // `auto_exposure = 1` still wins on the first run, before any control
+        // exists; from then on the panel is the live value, which is what a
+        // control means.
+        for (ParamBase* p : probe->Params()) {
+            const UiControl* c = m_ui->Find(key + "." + p->Name());
+            if (!c) continue;
+            std::string perr;
+            p->SetFromScript(Value(c->value), &perr);
         }
 
         // Let the algorithm derive defaults from the source before its controls
@@ -608,13 +638,6 @@ private:
             probe->PrepareDefaults(facts);
             break;
         }
-
-        // The optional instance name is what lets the same algorithm appear
-        // twice with independent settings. Without it, params(op) twice on one
-        // algorithm shares a single set of controls -- so a script comparing an
-        // algorithm against itself could not vary anything.
-        const std::string instance = a.pos.size() == 2 ? a.pos[1].AsString() : std::string();
-        const std::string key      = instance.empty() ? name : name + "@" + instance;
 
         // The group is what the user sees, so it leads with the instance name
         // when there is one: "A (bilateral)" reads better than the reverse.
