@@ -68,4 +68,26 @@ bool LoadRawMosaic(const std::string& path, Image* out, std::string* err);
 // shifts the CFA phase.
 CfaPattern RotateCfa(CfaPattern src, int flip, int w, int h);
 
+// The camera's own JPEG rendering of the frame, embedded in the raw file.
+//
+// Nearly every raw carries one, and it is the picture the body's own processing
+// produced -- picture style, tone curve and white balance already applied. On a
+// Canon CR3 from an R5 it is the full 8192x5464 frame at 5.2 MB. It is what
+// Windows Explorer shows for a raw, and what makes those icons look so much
+// better than a naive decode of the sensor data.
+//
+// Worth having because it is both faster and better-looking than developing the
+// mosaic ourselves for a 48-pixel icon: no demosaic, no measurement pass, and
+// the result carries the manufacturer's rendering rather than our
+// approximation of one.
+//
+// Scaled down to fit `maxSide` on load, since the only caller wants a
+// thumbnail and decoding 45 megapixels to draw an icon would defeat the point.
+// Honours the raw's orientation flag, like LoadRawMosaic does.
+//
+// Returns false when the file carries no usable preview, which is a normal
+// outcome and not an error -- the caller should fall back to developing the
+// mosaic. `err` is only set for a genuine failure.
+bool LoadRawPreview(const std::string& path, int maxSide, Image* out, std::string* err);
+
 } // namespace tglab

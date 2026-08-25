@@ -25,6 +25,7 @@
 #include "../core/image_loader.h"
 #include "../core/image_stats.h"
 #include "../core/worker.h"
+#include "../core/raw_io.h"
 #include "about.h"
 #include "../script/interp.h"
 #include "../script/parser.h"
@@ -1850,13 +1851,34 @@ void App::DrawPalettePanel() {
                 // be legible whether or not the open script happens to develop
                 // anything. Measured once and cached against `version`, so
                 // this costs nothing on the frames that redraw it.
-                if (img.Desc().IsMosaic() && e.autoDevVersion != e.version) {
-                    e.autoDev        = SuggestExposure(img);
-                    e.autoDevVersion = e.version;
+                // Prefer the camera's own JPEG preview for a raw.
+                //
+                // Nearly every raw embeds one -- a Canon CR3 from an R5 carries
+                // the full 8192x5464 frame at 5.2 MB -- and it is the body's own
+                // rendering, with its picture style and tone curve already
+                // applied. It is what Windows Explorer displays for a raw, which
+                // is why those icons look better than a naive decode.
+                //
+                // Better AND cheaper than developing the mosaic for a 48-pixel
+                // icon: no demosaic, no measurement pass, and the manufacturer's
+                // rendering instead of our approximation of one. Falls back to
+                // developing when a file carries no usable preview, which is a
+                // normal outcome rather than an error.
+                bool haveThumb = false;
+                if (img.Desc().IsMosaic() && !e.path.empty()) {
+                    std::string perr;
+                    haveThumb = LoadRawPreview(e.path, int(thumbSize) * 2,
+                                               &e.thumbImage, &perr);
                 }
-                const float stops = (img.Desc().IsMosaic() && e.autoDev.valid)
-                                        ? e.autoDev.exposure : 0.0f;
-                MakeThumbnail(img, int(thumbSize) * 2, &e.thumbImage, stops);
+                if (!haveThumb) {
+                    if (img.Desc().IsMosaic() && e.autoDevVersion != e.version) {
+                        e.autoDev        = SuggestExposure(img);
+                        e.autoDevVersion = e.version;
+                    }
+                    const float stops = (img.Desc().IsMosaic() && e.autoDev.valid)
+                                            ? e.autoDev.exposure : 0.0f;
+                    MakeThumbnail(img, int(thumbSize) * 2, &e.thumbImage, stops);
+                }
                 e.thumbVersion = e.version;
             }
             if (e.thumbImage.Valid() && e.thumb.Update(m_dev, e.thumbImage, e.version)) {

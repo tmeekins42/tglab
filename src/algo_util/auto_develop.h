@@ -45,6 +45,14 @@ struct AutoDevelopSuggestion {
     float clippedFrac  = 0.0f;   // at or above the white level, as captured
     float clippedAfter = 0.0f;   // ... after the suggested exposure
     float crushedFrac  = 0.0f;   // at or below black
+
+    // The scene's range from the 10th to the 99th percentile, in stops.
+    //
+    // What drives the highlight and shadow suggestions PROACTIVELY: a scene
+    // wider than the display can show needs compressing whether or not it has
+    // clipped yet, and clipping alone can only be reacted to after detail is
+    // already gone.
+    float dynamicRange = 0.0f;
 };
 
 // Measures a Bayer mosaic and suggests exposure adjustments.

@@ -10,6 +10,9 @@
 // a DLL that cannot do the job fails the build instead of shipping.
 #include <cstdio>
 
+#include <string>
+
+#include "../src/algo_util/tone_curve.h"
 #include "../src/gpu/shader.h"
 
 using namespace tglab;
@@ -58,5 +61,36 @@ void main(uint3 tid : SV_DispatchThreadID) {
     }
 
     std::printf("ok: DXC compiled and signed a %zu-byte kernel\n", blob.dxil.size());
+
+    // The tone curve's HLSL, which the display shader concatenates in.
+    //
+    // Checked here for the same reason this file exists at all: a display
+    // shader that fails to compile does not report an error to the user, it
+    // falls back to CPU readback -- so the viewer still shows a picture and
+    // nothing looks wrong, it merely gets slower. That precise failure mode
+    // already cost a day once, when Reserve() demanded descriptors from index 0
+    // and every conversion quietly took the slow path.
+    //
+    // The curve lives in a C++ header and is duplicated as an HLSL string, so
+    // this is also what catches the two drifting apart in a way that only
+    // breaks at runtime.
+    {
+        const std::string display = std::string(kToneCurveHlsl) + R"(
+RWTexture2D<float4> Dst : register(u0);
+[numthreads(8, 8, 1)]
+void main(uint3 tid : SV_DispatchThreadID) {
+    Dst[tid.xy] = float4(ToneCurve3(float3(0.18, 1.0, 4.0)), 1.0);
+}
+)";
+        ShaderBlob  db;
+        std::string derr;
+        if (!sc.CompileCompute(display, "main", "tone_curve", &db, &derr)) {
+            std::fprintf(stderr, "FAIL: the tone-curve HLSL does not compile: %s\n",
+                         derr.c_str());
+            return 1;
+        }
+        std::printf("ok: the tone-curve HLSL compiles (%zu bytes)\n", db.dxil.size());
+    }
+
     return 0;
 }

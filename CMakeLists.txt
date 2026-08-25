@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(tglab VERSION 0.5.0 LANGUAGES CXX)
+project(tglab VERSION 0.6.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -287,6 +287,23 @@ target_link_libraries(tglab_autodev_tests PRIVATE tglab_core)
 if(MSVC)
     target_compile_definitions(tglab_autodev_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
+
+# The base tone curve, and extracting the camera's embedded preview.
+#
+# The curve's properties need no photograph, so this one DOES run in ctest.
+# Passing a raw file additionally checks preview extraction and what the
+# measurement suggests for a real scene:
+#   build/Release/tglab_tone_tests.exe <some.cr3>
+add_executable(tglab_tone_tests
+    tests/test_tone.cpp
+    $<TARGET_OBJECTS:tglab_algorithms>
+)
+target_link_libraries(tglab_tone_tests PRIVATE tglab_core)
+if(MSVC)
+    target_compile_definitions(tglab_tone_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+add_test(NAME tone COMMAND tglab_tone_tests)
+
 
 
 

@@ -5,8 +5,10 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <memory>
 
 #include "libraw/libraw.h"
+#include "stb_image.h"
 
 namespace tglab {
 namespace {
@@ -431,6 +433,118 @@ bool LoadRawFile(const std::string& path, Image* out, std::string* err) {
     }
 
     LibRaw::dcraw_clear_mem(img);
+    return true;
+}
+
+bool LoadRawPreview(const std::string& path, int maxSide, Image* out, std::string* err) {
+    if (!out) return false;
+
+    // Heap rather than the stack. LibRaw is around a megabyte, and while the
+    // three instances above live happily on the app's 1 MB main-thread stack,
+    // this one also gets called from the loader thread and from test binaries,
+    // whose stacks are smaller. A bare console exe with one on the stack
+    // overflows before reaching main -- observed while investigating this very
+    // feature, as a silent exit with code 0xC00000FD.
+    auto raw = std::make_unique<LibRaw>();
+
+    if (raw->open_file(path.c_str()) != LIBRAW_SUCCESS) return false;
+    if (raw->unpack_thumb() != LIBRAW_SUCCESS) return false;
+
+    const libraw_thumbnail_t& t = raw->imgdata.thumbnail;
+    if (!t.thumb || t.tlength == 0) return false;
+
+    // Only JPEG previews. LibRaw also reports bitmap thumbnails, but those are
+    // the small low-quality ones -- the full-frame render that makes this
+    // worthwhile is always JPEG.
+    if (t.tformat != LIBRAW_THUMBNAIL_JPEG) return false;
+
+    int w = 0, h = 0, comp = 0;
+    // Decode at reduced size where stb can do it for us... it cannot, so decode
+    // fully and downsample below. Acceptable because this runs once per file on
+    // the loader thread, never per frame.
+    unsigned char* pixels = stbi_load_from_memory(
+        reinterpret_cast<const unsigned char*>(t.thumb),
+        int(t.tlength), &w, &h, &comp, 4);
+    if (!pixels) {
+        if (err) *err = "embedded preview is not decodable JPEG";
+        return false;
+    }
+
+    // The preview is stored in the sensor's orientation, so it needs the same
+    // flip the mosaic gets. Without this a portrait frame's thumbnail comes out
+    // sideways while its developed image is upright.
+    const int flip = raw->imgdata.sizes.flip;
+    const bool swapAxes = (flip == 5 || flip == 6);
+    const int rw = swapAxes ? h : w;
+    const int rh = swapAxes ? w : h;
+
+    // Box-filter down to the requested size in one pass, straight out of the
+    // decoded buffer. Nearest-neighbour would alias badly on a 45 MP source
+    // reduced to 96 pixels -- fine detail like the brickwork turns into noise.
+    const int scale = std::max(1, std::min(rw / std::max(maxSide, 1),
+                                           rh / std::max(maxSide, 1)));
+    const int ow = std::max(1, rw / scale);
+    const int oh = std::max(1, rh / scale);
+
+    ImageDesc d;
+    d.width  = ow;
+    d.height = oh;
+    d.format = Format::RGBA8;
+    d.linear = false;          // a JPEG is already display-encoded
+    out->Alloc(d);
+    if (!out->Valid()) {
+        stbi_image_free(pixels);
+        if (err) *err = "could not allocate preview image";
+        return false;
+    }
+    ImageView v = out->MapCpuWrite();
+
+    for (int y = 0; y < oh; ++y) {
+        uint8_t* dst = v.At<uint8_t>(0, y);
+        for (int x = 0; x < ow; ++x) {
+            uint32_t acc[4] = {0, 0, 0, 0};
+            int n = 0;
+            for (int sy = 0; sy < scale; ++sy) {
+                for (int sx = 0; sx < scale; ++sx) {
+                    // Map the output pixel back through the rotation to find
+                    // which source pixel feeds it. Inverting the flip here
+                    // rather than rotating a second buffer keeps this to one
+                    // pass over the data.
+                    //
+                    // The inverse is expressed in terms of the SOURCE
+                    // dimensions (w, h), not the rotated ones. Writing it with
+                    // the rotated extents is the obvious mistake and a quiet
+                    // one: for a 90-degree flip it produces coordinates up to
+                    // the long edge, the bounds check below skips them, and
+                    // the skipped samples simply do not contribute -- so the
+                    // image still appears, just darker. Measured on the
+                    // Petaluma CR3, that read as mean 0.140 against the
+                    // decoded preview's true 0.308.
+                    const int rx = x * scale + sx;
+                    const int ry = y * scale + sy;
+                    if (rx >= rw || ry >= rh) continue;
+                    int ux = rx, uy = ry;
+                    switch (flip) {
+                        case 3: ux = w - 1 - rx; uy = h - 1 - ry; break;  // 180
+                        case 5: ux = w - 1 - ry; uy = rx;         break;  // 90 CCW
+                        case 6: ux = ry;         uy = h - 1 - rx; break;  // 90 CW
+                        default: break;
+                    }
+                    if (ux < 0 || ux >= w || uy < 0 || uy >= h) continue;
+                    const unsigned char* s = pixels + (size_t(uy) * size_t(w) + size_t(ux)) * 4;
+                    acc[0] += s[0]; acc[1] += s[1]; acc[2] += s[2]; acc[3] += s[3];
+                    ++n;
+                }
+            }
+            if (n == 0) n = 1;
+            dst[x * 4 + 0] = uint8_t(acc[0] / uint32_t(n));
+            dst[x * 4 + 1] = uint8_t(acc[1] / uint32_t(n));
+            dst[x * 4 + 2] = uint8_t(acc[2] / uint32_t(n));
+            dst[x * 4 + 3] = 255;
+        }
+    }
+
+    stbi_image_free(pixels);
     return true;
 }
 

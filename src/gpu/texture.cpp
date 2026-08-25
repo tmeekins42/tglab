@@ -3,11 +3,14 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include "device.h"
 #include "gpu_image.h"
 #include "shader.h"
+
+#include "../algo_util/tone_curve.h"
 
 namespace tglab {
 
@@ -111,6 +114,23 @@ const uint8_t* HalfDisplayTable() {
     return table.data();
 }
 
+// The same table, but through the tone curve, for scene-linear sources.
+//
+// A second table rather than calling ToneCurve() per component. The curve costs
+// a log2 and an exp2, and this loop runs 85 million times per frame at 21 MP --
+// it is the path that was measured at 260 ms before the first table replaced
+// it. Precomputing keeps the conversion at one indexed load, so the curve is
+// free rather than a regression.
+const uint8_t* HalfToneCurveTable() {
+    static const std::vector<uint8_t> table = [] {
+        std::vector<uint8_t> t(65536);
+        for (int i = 0; i < 65536; ++i)
+            t[size_t(i)] = uint8_t(ToneCurve(HalfToFloat(uint16_t(i))) * 255.0f + 0.5f);
+        return t;
+    }();
+    return table.data();
+}
+
 } // namespace
 bool GpuTexture::Update(Device& dev, Image& img, uint64_t contentVersion) {
     if (!img.Valid()) return false;
@@ -155,15 +175,23 @@ bool GpuTexture::Update(Device& dev, Image& img, uint64_t contentVersion) {
     } else if (d.format == Format::RGBA32F) {
         const float* p = reinterpret_cast<const float*>(v.data);
         rgba.resize(size_t(w) * size_t(h) * 4);
-        for (int i = 0; i < w * h * 4; ++i)
-            rgba[size_t(i)] = uint8_t(std::clamp(p[i], 0.0f, 1.0f) * 255.0f);
+        // Alpha must not go through the tone curve: it is coverage, not light.
+        for (int i = 0; i < w * h * 4; ++i) {
+            const bool alpha = (i & 3) == 3;
+            const float f = (d.linear && !alpha) ? ToneCurve(p[i])
+                                                 : std::clamp(p[i], 0.0f, 1.0f);
+            rgba[size_t(i)] = uint8_t(f * 255.0f + 0.5f);
+        }
         srcBytes = rgba.data();
     } else if (d.format == Format::RGBA16F) {
         const uint16_t* p = reinterpret_cast<const uint16_t*>(v.data);
-        const uint8_t* lut = HalfDisplayTable();
+        const uint8_t* lut = d.linear ? HalfToneCurveTable() : HalfDisplayTable();
         rgba.resize(size_t(w) * size_t(h) * 4);
         const size_t count = size_t(w) * size_t(h) * 4;
-        for (size_t i = 0; i < count; ++i) rgba[i] = lut[p[i]];
+        // Alpha keeps the plain table for the same reason as above.
+        const uint8_t* plain = HalfDisplayTable();
+        for (size_t i = 0; i < count; ++i)
+            rgba[i] = ((i & 3) == 3) ? plain[p[i]] : lut[p[i]];
         srcBytes = rgba.data();
     } else {
         return false;
@@ -279,7 +307,7 @@ DXGI_FORMAT DisplaySrvFormat(Format f) {
 // The R32F branch normalises over a range supplied by the caller so that signed
 // data (a sobel gradient) is visible rather than clipped to black, matching
 // what the CPU path did.
-const char* kDisplayHlsl = R"(
+const std::string kDisplayHlsl = std::string(kToneCurveHlsl) + R"(
 Texture2D<float4>   Src : register(t0);
 RWTexture2D<float4> Dst : register(u0);
 
@@ -289,6 +317,7 @@ cbuffer Params : register(b0) {
     uint Mode;      // 0 = pass through, 1 = single channel normalised
     uint LoBits;
     uint SpanBits;
+    uint Linear;    // 1 = source is scene-linear and needs the tone curve
 };
 
 [numthreads(8, 8, 1)]
@@ -300,6 +329,11 @@ void main(uint3 tid : SV_DispatchThreadID) {
         float span = asfloat(SpanBits);
         float g = saturate((c.x - lo) / span);
         Dst[tid.xy] = float4(g, g, g, 1.0);
+    } else if (Linear != 0) {
+        // Scene-linear input: the display is not linear, so writing these
+        // values straight out renders the whole image about a stop and a half
+        // too dark. This is the branch that was missing.
+        Dst[tid.xy] = float4(ToneCurve3(c.rgb), 1.0);
     } else {
         Dst[tid.xy] = float4(saturate(c.rgb), 1.0);
     }
@@ -684,6 +718,9 @@ bool GpuTexture::UpdateFromGpu(Device& dev, const SharedGpuTexture& src,
     // CPU path only had one because it already held every pixel.
     roots[3] = bits(0.0f);
     roots[4] = bits(1.0f);
+    // Scene-linear results go through the tone curve; anything already
+    // gamma-encoded is passed straight through.
+    roots[5] = src.desc.linear ? 1u : 0u;
     cl->SetComputeRoot32BitConstants(0, 8, roots, 0);
     cl->SetComputeRootDescriptorTable(1, tableGpu);
 
