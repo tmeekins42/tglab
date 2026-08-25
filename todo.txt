@@ -19,12 +19,24 @@ BUGS / SMALL FEATURES
   ISO noise -- sparse impulse defects rather than broad-band -- so it wants a
   DETECT-then-repair filter shaped like hot_pixel_repair (2D, colour) rather
   than a blur. median_blur handles it today but destroys detail everywhere.
-- denoise: measured noise on the ISO 1000 CR2 for reference -- sigma ~53 levels
-  at ISO 1000, ~33 at ISO 400, tails stopping around 4.5 sigma (so broad-band,
-  no impulse component) and sigma tracking sqrt(signal), i.e. shot-noise
-  dominated. A variance-stabilising transform before shrinkage is the textbook
-  next step and is worth trying.
-
+- denoise: level-dependent thresholds, MEASURED and worth doing but not urgent.
+  The earlier note here said a variance-stabilising (Anscombe/sqrt) transform
+  was "the textbook next step". That was reasoned from the raw mosaic, where
+  noise is shot-limited. Measured on the DEVELOPED image, which is what
+  wavelet_denoise actually sees, the picture is different:
+    sigma across the brightness range, after develop
+      _dsc0037 (ISO 6400, pushed +1.82)  0.0061 .. 0.0398  = 6.5x
+      _MG_9673 (ISO 1000)                0.0034 .. 0.0060  = 1.8x
+      _DSC0162 (ISO 125)                 0.0047 .. 0.0049  = 1.1x
+  So one fixed threshold is badly wrong on a heavily pushed high-ISO frame and
+  nearly right on everything else -- the sRGB curve has already done most of
+  the stabilising.
+  And sqrt is the WRONG exponent for that reason. Flatness (max/min of sigma)
+  on _dsc0037: raw 6.5x, after sqrt 2.0x, after log 1.8x, after L^0.75 1.2x.
+  If this is done, L^0.75 is the transform, not Anscombe.
+  Cheaper alternative worth trying first: scale the threshold by the local
+  level inside the existing kernel. No transform, no round-trip, and it can be
+  a parameter so the effect is visible rather than baked in.
 FEATURES
 - add support for additional image channels, such as alpha channels and depth channels
 - channel merging. Astronomy images are captured single channel with colored filters. How to merge them?
