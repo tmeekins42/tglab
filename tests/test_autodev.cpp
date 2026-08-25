@@ -132,48 +132,32 @@ int main(int argc, char** argv) {
             Check(sh == 0.0, "no shadow lift when nothing is crushed");
     }
 
-    // Toggling the checkbox on the panel must take effect.
+    // auto_exposure is an option of params(), not a control on the algorithm.
     //
-    // params() exposes auto_exposure as a control, and ticking it did nothing:
-    // PrepareDefaults ran on the probe using only what the SCRIPT said, and the
-    // control's value was read further down, after the defaults had already
-    // been decided. So the checkbox was written every frame and never once
-    // looked at before the decision it was meant to make.
+    // It was a Param<bool>, which put a checkbox on the panel that could not
+    // work: PrepareDefaults decides the defaults, and by the time a control has
+    // a value that decision has already been made. Rather than contrive a way
+    // for a control to reach backwards, it became what it always was -- a
+    // property of the CALL. The script says whether to measure; every slider is
+    // then an ordinary control the user can override.
     //
-    // Driven the way the app does it -- set the control, re-interpret -- since
-    // that is the path that was broken.
+    // So there must be NO such control, and asking for the option must not be
+    // reported as an unknown parameter.
     {
         UiState ui;
-        const char* script =
-            "src = image(\"test\")\n"
-            "o = params(basic_adjust)(src)\ndisplay(o)\n";   // no script argument
-        if (!run(script, &ui)) return 1;
+        if (!run("src = image(\"test\")\n"
+                 "o = params(basic_adjust, auto_exposure = 1)(src)\ndisplay(o)\n", &ui)) return 1;
+
+        double unused = 0;
+        Check(!ControlValue(ui, "basic_adjust.auto_exposure", &unused),
+              "auto_exposure is not a control on the panel");
 
         double v = -999;
         ControlValue(ui, "basic_adjust.exposure", &v);
-        Check(v == 0.0, "exposure starts at 0 with the box unticked");
-
-        // Tick it, as clicking the checkbox does.
-        bool found = false;
-        for (UiControl& c : ui.Controls())
-            if (c.label == "basic_adjust.auto_exposure") { c.value = 1; found = true; }
-        Check(found, "the auto_exposure control exists on the panel");
-
-        if (!run(script, &ui)) return 1;
-        ControlValue(ui, "basic_adjust.exposure", &v);
-        std::printf("       after ticking auto_exposure: %+.2f\n", v);
         Check(std::abs(v - s.exposure) < 0.01,
-              "ticking the box moves exposure to the suggestion");
-
-        // And untick it again: the control must go back, not stay stuck on a
-        // value the measurement chose.
-        for (UiControl& c : ui.Controls())
-            if (c.label == "basic_adjust.auto_exposure") c.value = 0;
-        if (!run(script, &ui)) return 1;
-        ControlValue(ui, "basic_adjust.exposure", &v);
-        std::printf("       after unticking:             %+.2f\n", v);
-        Check(v == 0.0, "unticking the box returns exposure to 0");
+              "params(auto_exposure = 1) still fills the defaults");
     }
+
 
     std::printf("\n%s\n", g_fail ? "FAILURES" : "auto-exposure wiring ok");
     return g_fail ? 1 : 0;

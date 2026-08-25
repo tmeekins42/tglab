@@ -210,6 +210,14 @@ than a mode. A slider you have not touched follows the suggestion; one you drag
 stays exactly where you put it through every re-run; double-clicking returns it
 to the suggestion. There is no second set of controls and nothing to switch off.
 
+`auto_exposure` is an option of `params()`, not a parameter of the algorithm, so
+it puts no control on the panel. It was briefly a `Param<bool>` and that could
+not work: `PrepareDefaults` decides the defaults, and by the time a control has
+a value that decision has already been made — the checkbox was written every
+frame and never read before the decision it was meant to make. It is not an
+adjustment anyway; it decides *where the adjustments start*, which belongs in
+the script.
+
 The measurement runs on the **mosaic**, before demosaic, and only on green
 sensels. Green is half of all sites so it is the best-sampled channel, and using
 all three would fold the white-balance imbalance into the estimate — a warm

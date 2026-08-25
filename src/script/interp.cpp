@@ -581,39 +581,32 @@ private:
         const std::string instance = a.pos.size() == 2 ? a.pos[1].AsString() : std::string();
         const std::string key      = instance.empty() ? name : name + "@" + instance;
 
-        // Named arguments to params() are applied to the probe BEFORE it
-        // derives defaults, because some of them decide what the defaults are.
+        // params() takes options of its own, distinct from the algorithm's
+        // parameters.
         //
-        // basic_adjust's auto_exposure is the case: it asks the algorithm to
-        // open its exposure controls where a measurement suggests, so it has to
-        // be set before PrepareDefaults runs rather than after. Applied to the
-        // real algorithm too, further down, so the setting also takes effect --
-        // this copy only steers the defaults.
+        // `auto_exposure` is one: it does not adjust the image, it decides
+        // WHERE the adjustments start. That is a property of the call, not a
+        // control -- as a checkbox it read as something you could toggle to see
+        // the effect, and it could not honestly behave that way, because by the
+        // time a control has a value the defaults have already been chosen.
+        //
+        // So the script says it, and every slider is then an ordinary control
+        // the user can override.
+        bool wantAuto = false;
+
         for (const auto& [pname, pval] : a.named) {
+            if (pname == "auto_exposure") {
+                if (!pval.IsNumber())
+                    return Fail(e.line, "params()'s auto_exposure expects 0 or 1");
+                wantAuto = pval.AsNumber() != 0.0;
+                continue;
+            }
+            // Anything else is one of the algorithm's own parameters, applied
+            // to the probe so a script-set value is what the control opens at.
             ParamBase* p = probe->FindParam(pname);
             if (!p) return Fail(e.line, "'" + name + "' has no parameter '" + pname + "'");
             std::string perr;
             if (!p->SetFromScript(pval, &perr)) return Fail(e.line, perr);
-        }
-
-        // ... and so do values the USER has already set on the panel.
-        //
-        // Without this, ticking the auto_exposure checkbox did nothing. The
-        // control's value is only read further down, when the controls are
-        // described -- by which point PrepareDefaults has already run and
-        // decided the defaults from whatever the script said. So the checkbox
-        // was written every frame and never once looked at before the decision
-        // it was supposed to make.
-        //
-        // Applied after the script's own arguments so a script that states
-        // `auto_exposure = 1` still wins on the first run, before any control
-        // exists; from then on the panel is the live value, which is what a
-        // control means.
-        for (ParamBase* p : probe->Params()) {
-            const UiControl* c = m_ui->Find(key + "." + p->Name());
-            if (!c) continue;
-            std::string perr;
-            p->SetFromScript(Value(c->value), &perr);
         }
 
         // Let the algorithm derive defaults from the source before its controls
@@ -630,7 +623,9 @@ private:
             facts.isMosaic     = true;
             facts.asShotKelvin = s.asShotKelvin;
             facts.asShotTint   = s.asShotTint;
-            facts.hasExposure  = s.hasAutoExposure;
+            // Only when the script asked. The measurement is always available;
+            // whether it steers the defaults is the script's decision.
+            facts.hasExposure  = wantAuto && s.hasAutoExposure;
             facts.autoExposure = s.autoExposure;
             facts.autoHighlights = s.autoHighlights;
             facts.autoShadows  = s.autoShadows;

@@ -11,7 +11,7 @@
 
 src = image("test")
 
-developed = params(basic_adjust)(src)
+developed = params(basic_adjust, auto_exposure = 1)(src)
 
 # The luma range is deliberately much smaller than chroma's.
 #

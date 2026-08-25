@@ -351,12 +351,17 @@ void main(uint3 tid : SV_DispatchThreadID) {
 
         // Exposure from what the sensor actually captured.
         //
-        // Only when auto is on, and off by default: opening a raw with the
-        // exposure already moved would be startling, and the whole point of a
-        // lab is that nothing happens to the data unasked. With it on, these
-        // are defaults like any other -- drag one and it stops following the
-        // measurement, double-click and it returns to it.
-        if (f.hasExposure && bool(m_autoExposure)) {
+        // `hasExposure` is the script's decision -- params(basic_adjust,
+        // auto_exposure = 1) -- rather than a parameter here. It is not an
+        // adjustment: it decides WHERE the adjustments start, which is a
+        // property of the call. As a checkbox it read as something you could
+        // toggle to see the effect, and could not honestly behave that way,
+        // because by the time a control has a value the defaults have already
+        // been chosen.
+        //
+        // These are defaults like any other: drag one and it stops following
+        // the measurement, double-click and it returns to it.
+        if (f.hasExposure) {
             m_exposure.SetDefault(f.autoExposure);
             m_highlights.SetDefault(f.autoHighlights);
             m_shadows.SetDefault(f.autoShadows);
@@ -566,24 +571,6 @@ private:
                  "starts where the camera had it: matching a raw's white balance "
                  "needs both axes, not just the temperature.",
          .step = 0.01, .softMin = -0.5, .softMax = 0.5}};
-    // Auto-exposure, off by default.
-    //
-    // It sets DEFAULTS rather than values, so it is a starting point rather
-    // than a mode: with it on, an untouched exposure/shadows/blacks slider
-    // opens where the measurement suggests, a slider you have dragged is left
-    // exactly where you put it, and double-clicking one returns it to the
-    // suggestion. That is what Tim's note asked for -- "a copy of the sliders
-    // so the user can adjust them after they've been auto-fixed" -- without
-    // there being a second copy of anything.
-    //
-    // Off by default because a lab should not silently alter what it loaded.
-    // The measurement is only meaningful for a raw mosaic; a JPEG has already
-    // had a tone curve applied and its midtone says nothing about exposure.
-    Param<bool> m_autoExposure{
-        this, "auto_exposure", false,
-        "Open exposure, shadows and blacks where a measurement of the raw "
-        "suggests, instead of at zero. Only affects sliders you have not "
-        "touched; drag one and it stays where you put it."};
 
     Param<float> m_exposure{
         this, "exposure", 0.0f, -5.0f, 5.0f,

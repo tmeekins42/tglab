@@ -16,6 +16,8 @@
 
 src = image("test")
 
+# auto_exposure is an option of params(), not a slider. It decides where the
+# controls START; everything after that is an ordinary control you can drag.
 developed = params(basic_adjust, auto_exposure = 1)(src)
 
 display(src,       "1 original")
