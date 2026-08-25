@@ -309,3 +309,17 @@ add_test(NAME tone COMMAND tglab_tone_tests)
 
 
 
+
+# ---------------------------------------------------------------------------
+# Research tools. Not part of the app, not run by ctest -- these answer design
+# questions and are kept because the answers are worth reproducing.
+#
+# headroom: how much accuracy is left above the current best demosaic, measured
+# on real photographs at high-frequency sites. Written to decide whether a
+# learned demosaic is worth building:
+#   build/Release/headroom.exe <raw> [raw...]
+add_executable(headroom tools/headroom.cpp $<TARGET_OBJECTS:tglab_algorithms>)
+target_link_libraries(headroom PRIVATE tglab_core)
+if(MSVC)
+    target_compile_definitions(headroom PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
