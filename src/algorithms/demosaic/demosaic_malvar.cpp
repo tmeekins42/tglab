@@ -31,6 +31,42 @@
 
 namespace tglab {
 
+namespace {
+
+// Bound an interpolated value by the real samples it was interpolated from.
+//
+// This is the fix for the colour speckling, and it is worth being precise about
+// what goes wrong without it.
+//
+// Malvar's correction term is a Laplacian, and a Laplacian is UNBOUNDED. On a
+// smooth gradient that is exactly what you want -- it recovers detail bilinear
+// throws away. On a hard edge it overshoots, in the same way an unwindowed
+// sharpening filter rings. The interpolated channel is then pushed past every
+// sample of that colour anywhere nearby, so the pixel is assigned a colour that
+// appears in none of the data it came from.
+//
+// Measured on a CR3 of backlit conifer branches against bright fog -- eight
+// million high-contrast edges, which is the worst case for this: the largest
+// single-channel overshoot was 1.677 on a 0..1 scale, and the result had 2738
+// isolated saturated pixels against bilinear's 119 on identical input. Malvar
+// is supposed to have LESS colour fringing than bilinear, so a 23x difference
+// the other way is the signature of a real defect rather than a tuning choice.
+//
+// The remedy is standard and cheap: an interpolated value may not leave the
+// range of the samples it interpolates between. That keeps the correction
+// wherever it helps -- on a gradient the estimate sits comfortably inside its
+// neighbours and the clamp never engages -- while refusing to invent colour on
+// an edge, which is the only place it fires.
+//
+// Deliberately NOT a clamp to 0..1: the scene-linear headroom above 1.0 is real
+// and the highlight recovery depends on it. This clamps to the local data, not
+// to a fixed range.
+inline float ClampToNeighbours(float v, float a, float b) {
+    return std::clamp(v, std::min(a, b), std::max(a, b));
+}
+
+} // namespace
+
 class DemosaicMalvar : public AlgorithmBase {
 public:
     const char* Name()     const override { return "demosaic_malvar"; }
@@ -110,6 +146,13 @@ public:
                     // rather than as a correction to a symmetric term.
                     rgb[horizColor]     = 0.5f * hSum + gamma * (5.0f * lapH - lapV);
                     rgb[2 - horizColor] = 0.5f * vSum + gamma * (5.0f * lapV - lapH);
+
+                    // Bound each estimate by the samples it was interpolated
+                    // from. See ClampToNeighbours for why.
+                    rgb[horizColor] = ClampToNeighbours(
+                        rgb[horizColor], at(x - 1, y), at(x + 1, y));
+                    rgb[2 - horizColor] = ClampToNeighbours(
+                        rgb[2 - horizColor], at(x, y - 1), at(x, y + 1));
                 } else {
                     // Red or blue site. Green from the 4 edge neighbours plus
                     // the centre's Laplacian -- this is the term bilinear
@@ -120,6 +163,18 @@ public:
                     // correction: it is sampled at half the density of green,
                     // so it has more to gain from the centre channel.
                     rgb[2 - c] = 0.25f * xSum + beta * lap;
+
+                    const float g0 = at(x - 1, y), g1 = at(x + 1, y);
+                    const float g2 = at(x, y - 1), g3 = at(x, y + 1);
+                    rgb[1] = ClampToNeighbours(
+                        rgb[1], std::min(std::min(g0, g1), std::min(g2, g3)),
+                        std::max(std::max(g0, g1), std::max(g2, g3)));
+
+                    const float c0 = at(x - 1, y - 1), c1 = at(x + 1, y - 1);
+                    const float c2 = at(x - 1, y + 1), c3 = at(x + 1, y + 1);
+                    rgb[2 - c] = ClampToNeighbours(
+                        rgb[2 - c], std::min(std::min(c0, c1), std::min(c2, c3)),
+                        std::max(std::max(c0, c1), std::max(c2, c3)));
                 }
 
                 ApplyColour(src.desc, rgb);
@@ -196,9 +251,17 @@ void main(uint3 tid : SV_DispatchThreadID) {
     #define S(dx, dy) clamp((Src[clamp(int2(x + (dx), y + (dy)), int2(0,0), hi)].x - black) / range, 0.0, 4.0)
 
     float centre = S(0, 0);
-    float hSum = S(-1, 0) + S(1, 0);
-    float vSum = S(0, -1) + S(0, 1);
-    float xSum = S(-1, -1) + S(1, -1) + S(-1, 1) + S(1, 1);
+
+    // Kept individually, not just summed: the clamp below needs the range of
+    // the actual samples, and a sum cannot answer that. See ClampToNeighbours
+    // in the C++ for why the clamp exists.
+    float left = S(-1, 0), right = S(1, 0);
+    float up   = S(0, -1), down  = S(0, 1);
+    float ul   = S(-1, -1), ur = S(1, -1), dl = S(-1, 1), dr = S(1, 1);
+
+    float hSum = left + right;
+    float vSum = up + down;
+    float xSum = ul + ur + dl + dr;
 
     // The centre channel's second derivative: what bilinear discards.
     float lapH = 2.0 * centre - S(-2, 0) - S(2, 0);
@@ -218,9 +281,24 @@ void main(uint3 tid : SV_DispatchThreadID) {
         int horizColor = CfaColor(Cfa, x - 1, y);
         rgb[horizColor]     = 0.5 * hSum + gamma * (5.0 * lapH - lapV);
         rgb[2 - horizColor] = 0.5 * vSum + gamma * (5.0 * lapV - lapH);
+
+        // Bound each estimate by the samples it came from. Matching the CPU
+        // path step for step -- compare mode checks one against the other.
+        rgb[horizColor] = clamp(rgb[horizColor],
+                                min(left, right), max(left, right));
+        rgb[2 - horizColor] = clamp(rgb[2 - horizColor],
+                                    min(up, down), max(up, down));
     } else {
         rgb[1]     = 0.25 * (hSum + vSum) + alpha * lap;
         rgb[2 - c] = 0.25 * xSum + beta * lap;
+
+        float gLo = min(min(left, right), min(up, down));
+        float gHi = max(max(left, right), max(up, down));
+        rgb[1] = clamp(rgb[1], gLo, gHi);
+
+        float xLo = min(min(ul, ur), min(dl, dr));
+        float xHi = max(max(ul, ur), max(dl, dr));
+        rgb[2 - c] = clamp(rgb[2 - c], xLo, xHi);
     }
 
     // Which channels saturated is decided here, against the sensor's white

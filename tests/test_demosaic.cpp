@@ -372,6 +372,238 @@ int main() {
         }
     }
     {
+        // AHD must beat Malvar on thin high-contrast detail, measured against
+        // ground truth.
+        //
+        // This is the case Malvar structurally cannot do well: it is a linear
+        // filter with fixed weights, so on a feature finer than the green
+        // sampling grid it must guess, and it guesses without regard to which
+        // way the detail runs. The error correlates with CFA phase, which is
+        // why it appears as a lattice of coloured dots rather than as noise --
+        // measured at 11.5% higher chroma error on green sites than on
+        // red/blue sites on a real backlit-branch CR3.
+        //
+        // Ground truth rather than statistics on a photograph. On a raw there
+        // is no true answer, so "more colour variation" can mean the method
+        // recovered real colour OR invented it -- during development the
+        // real-photo numbers pointed the wrong way for exactly that reason,
+        // while against a known scene AHD was ahead by 9.5 dB.
+        constexpr int kEW = 96, kEH = 96;
+        auto edgeTruth = [](int x, int y, float* rgb) {
+            rgb[0] = 0.72f; rgb[1] = 0.74f; rgb[2] = 0.76f;   // bright fog
+            // Thin dark lines, 1-2 px, slightly tilted so they cross the CFA
+            // phase -- conifer twigs against sky, the motivating content.
+            for (int k = 0; k < 4; ++k) {
+                const float bx = 12.0f + float(k) * 22.0f + float(y) * 0.15f;
+                if (std::fabs(float(x) - bx) < (k % 2 ? 0.6f : 1.1f)) {
+                    rgb[0] = 0.10f; rgb[1] = 0.12f; rgb[2] = 0.11f;
+                }
+            }
+            if (std::fabs(float(y) - 70.0f) < 1.0f) {
+                rgb[0] = 0.09f; rgb[1] = 0.11f; rgb[2] = 0.10f;
+            }
+        };
+        auto makeEdgeScene = [&](CfaPattern cfa) {
+            Image img;
+            ImageDesc d{kEW, kEH, Format::R32F};
+            d.cfa = cfa;
+            d.blackLevel = 0.0f;
+            d.whiteLevel = 1.0f;
+
+            // A REAL camera's white balance and colour matrix, not identity.
+            //
+            // This matters more than it looks. A camera matrix has large
+            // negative off-diagonal terms -- these are a Canon R5's, where red
+            // out is 1.535 of red in MINUS 0.555 of green -- so a reconstructed
+            // red that is merely short relative to green comes out negative,
+            // clamps at zero, and renders fully saturated.
+            //
+            // With an identity matrix that mechanism cannot occur at all, so a
+            // fixture using one silently cannot test for it: the check below
+            // passed identically with the fix present and removed, which is
+            // exactly the kind of green tick that proves nothing.
+            d.camMul[0] = 1.883f; d.camMul[1] = 1.0f; d.camMul[2] = 1.910f;
+            const float r5[9] = { 1.535f, -0.555f,  0.019f,
+                                 -0.173f,  1.653f, -0.479f,
+                                 -0.014f, -0.453f,  1.467f};
+            for (int i = 0; i < 9; ++i) d.rgbCam[i] = r5[i];
+
+            img.Alloc(d);
+            ImageView v = img.MapCpuWrite();
+            for (int y = 0; y < kEH; ++y)
+                for (int x = 0; x < kEW; ++x) {
+                    float rgb[3];
+                    edgeTruth(x, y, rgb);
+                    *v.At<float>(x, y) = rgb[CfaColorAt(cfa, x, y)];
+                }
+            return img;
+        };
+        // Colour error at EDGE pixels, as a high percentile rather than a mean.
+        //
+        // Two deliberate choices, both learned the hard way.
+        //
+        // A percentile, because demosaic fringing is thin, bright and
+        // localised: a mean over the frame averages it away against a large
+        // majority of correct pixels, and during development a change that
+        // improved the mean past Malvar's simultaneously painted visible green
+        // streaks along every twig. The p95 sees what the eye sees.
+        //
+        // Edge pixels only, because that is where reconstruction is ambiguous.
+        // A flat region is reconstructed correctly by every method and only
+        // dilutes the measurement.
+        //
+        // Saturation is normalised by the pixel's own brightness, since a real
+        // camera matrix pushes values well above 1.0 and an absolute max-minus-
+        // min then measures exposure as much as colour error.
+        auto chromaError = [&](Image& img) {
+            ImageView v = img.MapCpuRead();
+            auto lumAt = [&](int x, int y) {
+                const uint16_t* p = v.At<uint16_t>(x, y);
+                return 0.2126f * HalfToFloat(p[0]) + 0.7152f * HalfToFloat(p[1]) +
+                       0.0722f * HalfToFloat(p[2]);
+            };
+            std::vector<double> sats;
+            for (int y = 3; y < kEH - 3; ++y)
+                for (int x = 3; x < kEW - 3; ++x) {
+                    const float lum = lumAt(x, y);
+                    if (lum < 1e-4f) continue;
+                    const float grad = std::max(
+                        std::fabs(lumAt(x + 1, y) - lumAt(x - 1, y)),
+                        std::fabs(lumAt(x, y + 1) - lumAt(x, y - 1)));
+                    if (grad < 0.15f * lum) continue;      // not an edge
+                    const uint16_t* p = v.At<uint16_t>(x, y);
+                    const float r = HalfToFloat(p[0]);
+                    const float g = HalfToFloat(p[1]);
+                    const float b = HalfToFloat(p[2]);
+                    const float mx = std::max({r, g, b});
+                    const float mn = std::min({r, g, b});
+                    sats.push_back(double((mx - mn) / std::max(mx, 1e-6f)));
+                }
+            if (sats.empty()) return 0.0;
+            std::sort(sats.begin(), sats.end());
+            return sats[size_t(0.95 * double(sats.size() - 1))];
+        };
+
+        Image mv, ah;
+        std::string e1, e2;
+        const bool a = RunDemosaic("demosaic_malvar", makeEdgeScene(CfaPattern::RGGB),
+                                   {}, &mv, &e1);
+        const bool b = RunDemosaic("demosaic_ahd", makeEdgeScene(CfaPattern::RGGB),
+                                   {}, &ah, &e2);
+        if (a && b) {
+            const double cm = chromaError(mv), ca = chromaError(ah);
+            // Not asserted as a ratio.
+            //
+            // This scene's hard 0.10-against-0.72 step, put through a real
+            // camera matrix, drives some channel negative for EVERY method --
+            // so the p95 saturates at 1.0 for all of them and the number
+            // discriminates nothing. Reported for information; the assertions
+            // that carry weight are the zero-channel count below (which does
+            // discriminate: 256 against 305) and the ratio test on the
+            // identity-matrix scene further up.
+            std::printf("       edge p95 saturation: AHD %.3f, Malvar %.3f\n", ca, cm);
+            // AHD must not drive MORE channels to zero than Malvar.
+            //
+            // A camera matrix has large negative off-diagonal terms -- the R5's
+            // first row is [1.535, -0.555, 0.019], so red out is red in minus
+            // 0.555 of green. A reconstructed red that is merely SHORT relative
+            // to green therefore goes negative after the matrix, is clamped at
+            // zero, and the pixel renders fully saturated. That is what made
+            // AHD's fringes vivid rather than faint: on the Oregon frame it
+            // produced 898 such pixels against Malvar's 22, and bounding each
+            // reconstructed channel by the real samples around it brought that
+            // to 27.
+            //
+            // A caveat worth stating plainly: on THIS synthetic scene the bound
+            // makes the count worse rather than better (256 with it, 126
+            // without), because a hard 0.10-against-0.72 step is more extreme
+            // than any real edge and the bound then pins estimates to samples
+            // that are themselves far apart. The fixture cannot demonstrate the
+            // improvement it was written for -- it only guards the invariant
+            // that AHD stays in Malvar's league, which is the part that would
+            // regress catastrophically. The 33x improvement is real but is
+            // evidenced on the raw file, not here.
+            auto zeroChannels = [&](Image& img) {
+                ImageView v = img.MapCpuRead();
+                long z = 0;
+                for (int y = 3; y < kEH - 3; ++y)
+                    for (int x = 3; x < kEW - 3; ++x) {
+                        const uint16_t* p = v.At<uint16_t>(x, y);
+                        const float r = HalfToFloat(p[0]);
+                        const float g = HalfToFloat(p[1]);
+                        const float b = HalfToFloat(p[2]);
+                        if (std::max({r, g, b}) < 1e-6f) continue;   // genuinely black
+                        if (r <= 0.0f || g <= 0.0f || b <= 0.0f) ++z;
+                    }
+                return z;
+            };
+            const long za = zeroChannels(ah), zm = zeroChannels(mv);
+            Check(za <= zm + 2,
+                  "AHD drives no more channels to zero than Malvar (" +
+                      std::to_string(za) + " vs " + std::to_string(zm) + ")");
+        } else {
+            Check(false, "both methods ran: " + e1 + e2);
+        }
+    }
+    {
+        // Malvar must not invent a value outside the samples it interpolated
+        // from.
+        //
+        // Its correction term is a Laplacian, and a Laplacian is unbounded: on
+        // a hard edge it overshoots the way an unwindowed sharpening filter
+        // rings, pushing an interpolated channel past every sample of that
+        // colour nearby. The pixel then gets a colour present in none of the
+        // data, which reads as isolated saturated confetti.
+        //
+        // Found on a CR3 of backlit conifer branches against bright fog --
+        // millions of hard edges, the worst case for this. Malvar produced
+        // 2738 isolated saturated pixels against bilinear's 119 on identical
+        // input, and overshot by up to 1.677 on a 0..1 scale. A method whose
+        // entire purpose is LESS colour fringing than bilinear being 23x worse
+        // is a defect, not a tuning choice.
+        //
+        // A hard step rather than the sine grating above: the smooth case is
+        // where Malvar's correction is right and the clamp never fires, so it
+        // cannot detect this.
+        auto makeStep = [](CfaPattern cfa) {
+            Image img;
+            ImageDesc d{kW, kH, Format::R32F};
+            d.cfa = cfa;
+            d.whiteLevel = 1.0f;
+            img.Alloc(d);
+            ImageView v = img.MapCpuWrite();
+            for (int y = 0; y < kH; ++y)
+                for (int x = 0; x < kW; ++x) {
+                    // Grey again, so any colour out is interpolation error.
+                    // Several stripes, so every CFA phase meets an edge.
+                    const bool bright = ((x / 3) & 1) != 0;
+                    *v.At<float>(x, y) = bright ? 0.95f : 0.05f;
+                }
+            return img;
+        };
+
+        Image mal;
+        std::string e;
+        if (RunDemosaic("demosaic_malvar", makeStep(CfaPattern::RGGB), {}, &mal, &e)) {
+            ImageView v = mal.MapCpuRead();
+            double worst = 0.0;
+            for (int y = 3; y < kH - 3; ++y)
+                for (int x = 3; x < kW - 3; ++x)
+                    for (int c = 0; c < 3; ++c)
+                        worst = std::max(worst, double(HalfToFloat(v.At<uint16_t>(x, y)[c])));
+
+            // The scene tops out at 0.95. White balance gains are applied after
+            // interpolation and legitimately push a channel above that, so this
+            // allows generous room -- it is checking for the 1.6x overshoot,
+            // not for exact bounds.
+            Check(worst < 1.4,
+                  "Malvar does not overshoot a hard edge (peak " +
+                      std::to_string(worst) + ", scene peak 0.95)");
+        } else {
+            Check(false, "step-edge demosaic ran: " + e);
+        }
+    }
+    {
         // With its gains at zero Malvar reduces to exactly bilinear. That is
         // what makes the correction term testable rather than taken on trust.
         Image bil, mal;
@@ -480,8 +712,14 @@ int main() {
         if (SUCCEEDED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev)))) {
             ComputeContext gpu;
             if (gpu.Init(dev)) {
+                // demosaic_ahd is the reason the multi-pass GPU path exists --
+                // four different kernels over shared scratch planes rather than
+                // one kernel run repeatedly. This check is what proves the
+                // buffer bindings are right: a pass reading the wrong plane
+                // still produces a plausible-looking image, so nothing but a
+                // direct comparison against the CPU catches it.
                 for (const char* name : {"demosaic_passthrough", "demosaic_bilinear",
-                                         "demosaic_malvar"}) {
+                                         "demosaic_malvar", "demosaic_ahd"}) {
                     for (CfaPattern cfa : {CfaPattern::RGGB, CfaPattern::BGGR,
                                            CfaPattern::GRBG, CfaPattern::GBRG}) {
                         Image cpuOut, gpuOut;

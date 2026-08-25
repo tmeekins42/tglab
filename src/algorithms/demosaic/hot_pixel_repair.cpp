@@ -109,7 +109,39 @@ public:
                 // by a margin. That keeps a genuine one-pixel star -- which
                 // sits on quiet sky -- detectable, which is why the threshold
                 // and the whole algorithm remain switchable for astro work.
-                const double spread = n[6] - n[1];   // robust: ignores the ends
+
+                // The spread is the FULL range, not a trimmed one.
+                //
+                // This was n[6] - n[1], discarding the brightest and darkest
+                // neighbour on the reasoning that a second nearby defect should
+                // not inflate the spread. That reasoning is sound for a defect
+                // and exactly backwards for detail: a neighbourhood that
+                // already contains a bright sample reports a SMALL trimmed
+                // spread, so the margin the centre has to beat is small, so
+                // genuine detail passes the test.
+                //
+                // Measured on the Oregon conifer frame -- backlit twigs against
+                // fog, one-pixel highlights everywhere -- the trimmed spread
+                // flagged 3273 sensels, of which the sampled ones were plainly
+                // real: a centre of 3355 among neighbours spanning 832..2458 is
+                // a twig edge, not a stuck sensel. The full range flags 805,
+                // four times fewer.
+                //
+                // And it costs almost nothing where the algorithm is meant to
+                // work: on _MG_9673, which has actual stuck pixels, the count
+                // goes from 15 to 12 and the real defects are still found. That
+                // asymmetry is the point -- a genuine defect sits in a QUIET
+                // neighbourhood (spread ~54 there) while a false positive sits
+                // in a busy one (~122 on the conifer frame, up to 2427), so
+                // measuring the neighbourhood's true range is what separates
+                // them.
+                //
+                // This mattered more than it looks. image() inserts this stage
+                // before the demosaic while mosaic() does not, so the false
+                // positives made every script using image() -- develop, denoise
+                // -- look worse than the demosaic comparison script on the same
+                // file, with no visible reason why.
+                const double spread = n[7] - n[0];
                 const double margin = double(float(m_spreadFactor)) * spread;
 
                 const bool hot  = (c - med > minExcess) && (c > hiN) &&
@@ -205,7 +237,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     }
 
     float med    = 0.5 * (n[3] + n[4]);
-    float spread = n[6] - n[1];
+    float spread = n[7] - n[0];   // full range -- see the CPU path for why
     float margin = asfloat(SpreadFactorBits) * spread;
     float minEx  = asfloat(MinExcessBits);
 
@@ -273,12 +305,32 @@ private:
     // falls from 8334 to 642 going from 3.0 to 6.0, while all four real R5
     // defects survive with margins of 2.5x to 6x. Set to 0 to disable the test
     // and fall back to the absolute threshold alone.
-    Param<float> m_spreadFactor{this, "spread_factor", 6.0f, 0.0f, 20.0f,
+    //
+    // Then raised again to 12.0, together with the change to a full-range
+    // spread above. Sweeping it across three frames separates the two
+    // populations cleanly:
+    //
+    //   factor      6      9     12     16     20
+    //   5D (real defects)
+    //              12     11      7      7      7
+    //   conifers (no known defects)
+    //             805    331    156     62     27
+    //
+    // The defect count PLATEAUS at 7 from 12 onward -- those are real, and no
+    // further tightening removes them -- while the detail count keeps falling
+    // steeply, which is what a population of false positives does. 12 is where
+    // the plateau begins, so it is the most conservative value that still costs
+    // nothing in detection.
+    //
+    // Both documented defects survive comfortably: (3457,1530) reads 11322
+    // against a median of 1128 with a spread of 53, and (1671,2108) reads 10989
+    // against 1092 with a spread of 45. Neither is close to the boundary.
+    Param<float> m_spreadFactor{this, "spread_factor", 12.0f, 0.0f, 40.0f,
         {.help = "How many times the local variation the excess must exceed. "
                  "Stops bright textured areas -- specular highlights, glints -- "
                  "from being mistaken for defects, since a real stuck sensel "
                  "sits in a quiet neighbourhood. 0 disables the test.",
-         .step = 0.1, .softMin = 0.0, .softMax = 12.0}};
+         .step = 0.1, .softMin = 0.0, .softMax = 24.0}};
 
     // Off by default: a dead sensel is far less visible than a bright one on a
     // dark background, and the test is more likely to catch real dark detail

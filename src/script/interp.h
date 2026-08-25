@@ -117,10 +117,18 @@ struct InterpResult {
 // script never has to mention demosaicing on the chance a raw file is dropped
 // on it. A script that wants a specific method calls mosaic() and demosaics
 // explicitly, which is what makes side-by-side comparison possible.
+//
+// demosaic_ahd rather than demosaic_malvar, since it gained a GPU path. On the
+// CPU it was 22 s against Malvar's 3 s at 45 MP, far too slow to sit in front
+// of every dropped raw; on the GPU the two are indistinguishable -- 495 ms and
+// 509 ms on the same frame -- because both are bandwidth-bound rather than
+// compute-bound, and AHD's extra arithmetic is free against the cost of moving
+// 45 megapixels. Given equal cost the better reconstruction should be what a
+// raw opens with.
 InterpResult Interpret(const Program& prog,
                        const std::vector<SourceImage>& sources,
                        UiState* ui,
                        Pipeline* out,
-                       const std::string& defaultDemosaic = "demosaic_malvar");
+                       const std::string& defaultDemosaic = "demosaic_ahd");
 
 } // namespace tglab

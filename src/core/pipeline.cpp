@@ -212,8 +212,12 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
         // GPU when asked for and available; otherwise CPU. A GPU failure falls
         // back rather than failing the run — a broken kernel should degrade to
         // a slow correct result, not an empty viewer.
-        const bool wantGpu = gpu && mode != ExecMode::ForceCPU &&
-                             s.algo->HasGPU() && s.algo->GpuSource();
+        // A multi-pass stage carries its HLSL in GpuPasses() rather than in
+        // GpuSource(), so requiring the latter would silently keep every
+        // multi-pass algorithm on the CPU -- looking merely slow, with no error
+        // anywhere.
+        const bool wantGpu = gpu && mode != ExecMode::ForceCPU && s.algo->HasGPU() &&
+                             (s.algo->GpuSource() || !s.algo->GpuPasses().empty());
         bool ranOnGpu = false;
         if (wantGpu) {
             std::string gpuErr;
@@ -283,7 +287,24 @@ bool Pipeline::RunStageGpu(Stage& s, const std::vector<const Data*>& in,
 
     // Kernels are compiled once per stage and cached on the stage, so dragging
     // a slider does not recompile HLSL every frame.
-    if (!s.kernel) {
+    const std::vector<AlgorithmBase::GpuPass> passes = s.algo->GpuPasses();
+
+    if (!passes.empty()) {
+        if (s.passKernels.size() != passes.size()) {
+            s.passKernels.clear();
+            for (const AlgorithmBase::GpuPass& p : passes) {
+                auto k = std::make_shared<ComputeKernel>();
+                std::string compileErr;
+                const std::string label = s.algoName + "." + p.name;
+                if (!gpu->CreateKernel(p.source, "main", label, k.get(), &compileErr)) {
+                    s.passKernels.clear();
+                    *err = compileErr;
+                    return false;
+                }
+                s.passKernels.push_back(std::move(k));
+            }
+        }
+    } else if (!s.kernel) {
         s.kernel = std::make_shared<ComputeKernel>();
         std::string compileErr;
         if (!gpu->CreateKernel(s.algo->GpuSource(), "main", s.algoName,
@@ -325,6 +346,108 @@ bool Pipeline::RunStageGpu(Stage& s, const std::vector<const Data*>& in,
                      s.algoName.c_str(), od.width, od.height);
         std::fflush(stderr);
     }
+    // Multi-pass: several DIFFERENT kernels over a shared pool of scratch
+    // planes. See AlgorithmBase::GpuPasses.
+    if (!passes.empty()) {
+        const ImageDesc outDesc = std::get<Image>(s.outputs[0]).Desc();
+        ImageDesc planeDesc = outDesc;
+        switch (s.algo->GpuScratchPlanes()) {
+            case FormatSpec::RGBA8:   planeDesc.format = Format::RGBA8;   break;
+            case FormatSpec::R32F:    planeDesc.format = Format::R32F;    break;
+            case FormatSpec::RGBA32F: planeDesc.format = Format::RGBA32F; break;
+            case FormatSpec::RGBA16F: planeDesc.format = Format::RGBA16F; break;
+            case FormatSpec::Any:
+            case FormatSpec::SameAsInput: break;
+        }
+        // The planes are intermediates, never displayed, so they carry no CFA
+        // and no transfer function. Leaving the input's CFA on them would make
+        // a later stage think it still had a mosaic to demosaic.
+        planeDesc.cfa    = CfaPattern::None;
+        planeDesc.linear = true;
+
+        const int planeCount = std::max(0, s.algo->GpuScratchCount());
+        const bool resized = s.planeDesc.width  != planeDesc.width  ||
+                             s.planeDesc.height != planeDesc.height ||
+                             s.planeDesc.format != planeDesc.format;
+        if (int(s.gpuPlanes.size()) != planeCount || resized) {
+            s.gpuPlanes.clear();
+            for (int i = 0; i < planeCount; ++i) {
+                auto p = std::make_shared<GpuImage>();
+                if (!gpu->CreateImage(planeDesc, p.get())) {
+                    s.gpuPlanes.clear();
+                    *err = "could not allocate scratch planes for a multi-pass stage";
+                    return false;
+                }
+                s.gpuPlanes.push_back(std::move(p));
+            }
+            s.planeDesc = planeDesc;
+        }
+
+        // Resolve a declared index to a real buffer. Negative addresses the
+        // stage's own ports, non-negative the scratch pool. Checked rather than
+        // trusted: an out-of-range index would otherwise be a wild pointer, and
+        // the failure mode of a bad binding is a silent race.
+        auto resolveRead = [&](int idx, const GpuImage** out) {
+            if (idx < 0) {
+                const size_t port = size_t(-idx - 1);
+                if (port >= gin.size()) return false;
+                *out = gin[port];
+                return true;
+            }
+            if (size_t(idx) >= s.gpuPlanes.size()) return false;
+            *out = s.gpuPlanes[size_t(idx)].get();
+            return true;
+        };
+        auto resolveWrite = [&](int idx, GpuImage** out) {
+            if (idx < 0) {
+                const size_t port = size_t(-idx - 1);
+                if (port >= gout.size()) return false;
+                *out = gout[port];
+                return true;
+            }
+            if (size_t(idx) >= s.gpuPlanes.size()) return false;
+            *out = s.gpuPlanes[size_t(idx)].get();
+            return true;
+        };
+
+        for (size_t p = 0; p < passes.size(); ++p) {
+            std::vector<const GpuImage*> passIn;
+            std::vector<GpuImage*>       passOut;
+            for (int idx : passes[p].reads) {
+                const GpuImage* g = nullptr;
+                if (!resolveRead(idx, &g)) {
+                    *err = "pass '" + std::string(passes[p].name) +
+                           "' reads a buffer that does not exist";
+                    return false;
+                }
+                passIn.push_back(g);
+            }
+            for (int idx : passes[p].writes) {
+                GpuImage* g = nullptr;
+                if (!resolveWrite(idx, &g)) {
+                    *err = "pass '" + std::string(passes[p].name) +
+                           "' writes a buffer that does not exist";
+                    return false;
+                }
+                // A pass that reads and writes the same buffer is a race: the
+                // threads have no ordering, so some read the old value and some
+                // the new. It shows as noise on one GPU and not another, which
+                // is the worst kind of bug to chase.
+                for (const GpuImage* r : passIn)
+                    if (r == g) {
+                        *err = "pass '" + std::string(passes[p].name) +
+                               "' reads and writes the same buffer";
+                        return false;
+                    }
+                passOut.push_back(g);
+            }
+            if (!gpu->Dispatch(*s.passKernels[p], passIn, passOut,
+                               s.algo->GpuPassConstants(int(p)), err))
+                return false;
+        }
+        return true;
+    }
+
     const int iterations = std::max(1, s.algo->GpuIterations());
 
     if (iterations == 1) {

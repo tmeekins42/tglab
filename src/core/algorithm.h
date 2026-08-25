@@ -157,6 +157,54 @@ public:
         return {};
     }
 
+    // --- multi-pass GPU (several DIFFERENT kernels) -------------------------
+    //
+    // GpuIterations() runs ONE kernel repeatedly. That covers separable filters
+    // and iterative schemes, and it is not enough for an algorithm whose passes
+    // do different things: AHD demosaicing interpolates green, then reconstructs
+    // two colour-difference planes from it, then medians those, then combines --
+    // four distinct kernels over three intermediate planes that must persist
+    // between them.
+    //
+    // Such an algorithm returns a non-empty GpuPasses(). Each pass names its own
+    // HLSL and declares which buffers it reads and writes, by index into a pool
+    // the framework allocates: negative indices are the stage's real inputs and
+    // outputs, non-negative ones are scratch planes.
+    //
+    // Deliberately explicit about buffers rather than inferring them. Getting a
+    // ping-pong wrong is silent -- a pass reads the buffer it is writing and the
+    // result is a race that shows as noise on some hardware and not others --
+    // and a declaration the framework can check turns that into an error at
+    // build time.
+    struct GpuPass {
+        const char* source = nullptr;   // HLSL with a `main` entry point
+        const char* name   = "";        // for compile errors and PIX markers
+
+        // Buffer indices. Negative values address the stage's own ports:
+        //   -1 = input 0,  -2 = input 1, ...
+        //   -1 in `writes` = output 0, -2 = output 1, ...
+        // Non-negative values index the scratch pool, sized by GpuScratchCount().
+        std::vector<int> reads;
+        std::vector<int> writes;
+    };
+
+    virtual std::vector<GpuPass> GpuPasses() const { return {}; }
+
+    // How many scratch planes the passes above share, and what format they are.
+    //
+    // Allocated once and cached on the stage, like the iterative scratch, since
+    // reallocating three full-size planes per slider nudge would cost more than
+    // the passes themselves.
+    virtual int        GpuScratchCount()  const { return 0; }
+    virtual FormatSpec GpuScratchPlanes() const { return FormatSpec::R32F; }
+
+    // Root constants for a specific pass, when they differ between passes.
+    // Defaults to GpuConstants(pass), so an algorithm whose passes share their
+    // constants needs no override.
+    virtual std::vector<uint32_t> GpuPassConstants(int pass) const {
+        return GpuConstants(pass);
+    }
+
     // How many times to dispatch the kernel, feeding each pass's output back in
     // as the next pass's input. 1 (the default) is the ordinary single-dispatch
     // case.

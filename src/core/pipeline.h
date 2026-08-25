@@ -48,6 +48,14 @@ struct Stage {
     // more than the iterations themselves.
     std::shared_ptr<GpuImage> gpuScratch;
     ImageDesc                 scratchDesc{};
+
+    // Multi-pass stages: one compiled kernel per declared pass, and the pool of
+    // scratch planes they share. Cached for the same reason as the above --
+    // recompiling four kernels and reallocating three full-size planes on every
+    // slider nudge would dwarf the work itself.
+    std::vector<std::shared_ptr<ComputeKernel>> passKernels;
+    std::vector<std::shared_ptr<GpuImage>>      gpuPlanes;
+    ImageDesc                                   planeDesc{};
 };
 
 // A viewer declared by the script via display().
