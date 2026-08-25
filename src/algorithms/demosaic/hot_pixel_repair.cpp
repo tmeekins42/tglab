@@ -128,10 +128,24 @@ public:
         m_lastRepaired = repaired;
     }
 
-    // How many sensels the last run replaced, for the info panel. A count that
-    // suddenly jumps is the signal that the threshold has been set too low and
-    // the filter has started eating real detail.
-    int LastRepaired() const { return m_lastRepaired; }
+    // How many sensels the last run replaced.
+    //
+    // Worth surfacing because it is invisible in the result and it is what
+    // tells you the threshold is set sensibly: a handful is defects, and a
+    // count in the thousands means the filter has started eating detail. The
+    // difference between the two is not something the picture shows.
+    //
+    // Only the CPU path counts. The GPU kernel decides per sensel with no
+    // shared counter, and adding an atomic to every dispatch to report a number
+    // nobody reads while dragging a slider is not a good trade -- so this says
+    // plainly that it does not know rather than reporting a stale or zero
+    // count as though it were the answer.
+    std::string RunReport() const override {
+        if (m_lastRepaired < 0) return "hot pixels: not counted on the GPU";
+        if (m_lastRepaired == 0) return "hot pixels: none found";
+        return "hot pixels: " + std::to_string(m_lastRepaired) +
+               (m_lastRepaired == 1 ? " sensel repaired" : " sensels repaired");
+    }
 
     // --- GPU implementation -------------------------------------------------
     //
@@ -142,6 +156,11 @@ public:
     // One dispatch, no scratch: each sensel reads its eight same-colour
     // neighbours and decides independently.
     bool HasGPU() const override { return true; }
+
+    // Clear the count when the GPU is about to run, so the report says "not
+    // counted" rather than repeating whatever a previous CPU run found. A
+    // stale number presented as current is worse than admitting ignorance.
+    void PrepareGpu(const std::vector<ImageDesc>&) override { m_lastRepaired = -1; }
 
     const char* GpuSource() const override {
         return R"(
@@ -267,7 +286,10 @@ private:
     Param<bool> m_repairDark{this, "repair_dark", false,
         "Also replace sensels reading far BELOW their neighbours (dead pixels)."};
 
-    int m_lastRepaired = 0;
+    // -1 means "not counted", which is the honest state before any run and
+    // after a GPU one. Starting at 0 would have reported "none found" for a
+    // dispatch that may well have repaired plenty.
+    int m_lastRepaired = -1;
 };
 
 REGISTER_ALGORITHM(HotPixelRepair);

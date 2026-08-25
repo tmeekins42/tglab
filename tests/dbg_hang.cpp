@@ -138,6 +138,33 @@ int main(int argc, char** argv) {
     }
     std::printf("  ok: slider moved 40 times\n");
 
+
+    // Stage reports reach the UI.
+    //
+    // hot_pixel_repair counts the sensels it replaces, and that count was dead
+    // code for a while -- computed every run and read by nothing. This checks
+    // the whole path: the algorithm produces a line, the worker collects it,
+    // and the app can hand it to the info panel.
+    if (getenv("TGLAB_REPORTTEST")) {
+        // Let the pipeline finish first. The slider nudges above end mid-drag,
+        // so the last submitted run is still in flight -- and a cancelled run
+        // deliberately reports nothing, since its counts describe work that was
+        // abandoned part-way.
+        settle(180, "pipeline settled");
+
+        const std::vector<std::string> reports = app.ReportsForTest();
+        std::printf("  pipeline reported %zu line(s)\n", reports.size());
+        for (const std::string& r : reports) std::printf("    %s\n", r.c_str());
+        bool sawHot = false;
+        for (const std::string& r : reports)
+            if (r.find("hot pixels") != std::string::npos) sawHot = true;
+        if (!sawHot) {
+            std::printf("  FAIL: no hot-pixel report reached the UI\n");
+            return 1;
+        }
+        std::printf("  ok: the hot-pixel count reached the UI\n");
+    }
+
     app.Shutdown();
     DestroyWindow(hwnd);
     UnregisterClassA(wc.lpszClassName, wc.hInstance);

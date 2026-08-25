@@ -110,6 +110,14 @@ public:
     int LastCachedStages() const { return m_lastCachedStages.load(std::memory_order_relaxed); }
     double LastRunMs() const { return m_lastMs.load(std::memory_order_relaxed); }
 
+    // What the stages reported about the last completed run -- see
+    // AlgorithmBase::RunReport. One short line each, in stage order; usually
+    // empty, since most algorithms have nothing to add.
+    std::vector<std::string> LastReports() const {
+        std::lock_guard<std::mutex> lock(m_mtx);
+        return m_lastReports;
+    }
+
     // Replaces any pending job. A slider drag produces ~60 requests/second
     // against a run that may take much longer, so queueing them would build an
     // unbounded backlog of results nobody will ever see — only the newest
@@ -152,7 +160,9 @@ private:
     void Run();
 
     std::thread             m_thread;
-    std::mutex              m_mtx;
+    // mutable so const accessors (LastReports) can lock it -- the lock protects
+    // the data, not the logical constness of reading it.
+    mutable std::mutex      m_mtx;
     std::condition_variable m_cv;
 
     std::unique_ptr<PipelineJob>     m_pending;    // at most one, newest wins
@@ -172,6 +182,9 @@ private:
     std::atomic<int>      m_lastCpuStages{0};
     std::atomic<int>      m_lastCachedStages{0};
     std::atomic<double>   m_lastMs{0.0};
+
+    // Guarded by m_mtx rather than atomic: a vector of strings cannot be.
+    std::vector<std::string> m_lastReports;
 
     // Per-viewer bookkeeping for skipping unchanged viewers (see Run()).
     // Worker-thread only, so unguarded.

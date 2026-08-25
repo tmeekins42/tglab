@@ -269,6 +269,10 @@ public:
     // heap, and that cannot be reached without driving real frames.
     // Opens the About modal, so a test can drive it through real frames --
     // an ImGui layout error only asserts when the widget actually draws.
+    // What the stages reported about the last run, for a test that wants to
+    // check the info panel is being given something to show.
+    std::vector<std::string> ReportsForTest() const { return m_worker.LastReports(); }
+
     void OpenAboutForTest() { m_aboutOpen = true; }
     bool AboutOpenForTest() const { return m_aboutOpen; }
 
@@ -429,6 +433,20 @@ bool App::Init(HWND hwnd) {
     // After the device exists: the worker builds its own compute context (and
     // its own compute queue) from it, on the worker thread.
     m_worker.Start(m_dev.Get());
+
+    // TGLAB_EXECMODE=cpu|gpu forces a backend at startup.
+    //
+    // For tests that need one path specifically -- the hot-pixel count is only
+    // available on the CPU, since the GPU kernel decides per sensel with no
+    // shared counter -- and for reproducing a report that only appears on one
+    // of them. Otherwise the menu is the way to switch.
+    {
+        char buf[16] = {};
+        if (GetEnvironmentVariableA("TGLAB_EXECMODE", buf, sizeof(buf)) > 0) {
+            if (std::strcmp(buf, "cpu") == 0) m_worker.SetExecMode(ExecMode::ForceCPU);
+            if (std::strcmp(buf, "gpu") == 0) m_worker.SetExecMode(ExecMode::ForceGPU);
+        }
+    }
     m_loader.Start();
     m_statsWorker.Start();
 
@@ -1576,6 +1594,25 @@ void App::DrawInfoPanel() {
         // letting a stale curve look current.
         if (m_stats.source != shownName || m_stats.version != shownVersion)
             ImGui::TextDisabled("(updating...)");
+    }
+
+    // --- what the pipeline did ----------------------------------------------
+    //
+    // Facts a stage knows and the picture does not show. hot_pixel_repair's
+    // count is the motivating one: whether it replaced 12 sensels or 12,000 is
+    // the difference between fixing defects and eating detail, and both look
+    // identical on screen.
+    //
+    // Only shown when something has something to say, so an ordinary run adds
+    // no empty section.
+    {
+        const std::vector<std::string> reports = m_worker.LastReports();
+        if (!reports.empty()) {
+            ImGui::Spacing();
+            ImGui::SeparatorText("Pipeline");
+            for (const std::string& r : reports)
+                ImGui::TextDisabled("%s", r.c_str());
+        }
     }
 
     // --- capture settings ---------------------------------------------------

@@ -168,6 +168,23 @@ public:
     // holds the final result, so the algorithm only writes one pass.
     virtual int GpuIterations() const { return 1; }
 
+    // One short line about what the last run actually did, for the info panel.
+    //
+    // Some algorithms know something the pixels do not show. hot_pixel_repair
+    // counts the sensels it replaced -- 12 out of 44 million on one file --
+    // which is invisible in the result and exactly what tells you whether the
+    // threshold is set sensibly: a count that suddenly jumps into the thousands
+    // means it has started eating detail rather than defects.
+    //
+    // Empty by default, and an empty report is simply not shown. Deliberately a
+    // string rather than a number: what is worth reporting differs per
+    // algorithm, and a scheme general enough to hold all of them would be more
+    // machinery than the feature is worth.
+    //
+    // Called on the UI thread against the algorithm the worker just ran, so it
+    // must only read values RunCPU/RunGPU already computed -- never recompute.
+    virtual std::string RunReport() const { return {}; }
+
     // Format for the ping-pong scratch image of an iterative GPU stage.
     //
     // FormatSpec::SameAsInput (the default) means "match the output", which is

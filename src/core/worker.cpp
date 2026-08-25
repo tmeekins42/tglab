@@ -253,6 +253,28 @@ void PipelineWorker::Run() {
             m_lastGpuStages.store(job->pipe.GpuStageCount(), std::memory_order_relaxed);
             m_lastCpuStages.store(job->pipe.CpuStageCount(), std::memory_order_relaxed);
             m_lastCachedStages.store(job->pipe.CachedStageCount(), std::memory_order_relaxed);
+
+            // Whatever the stages have to say about what they just did.
+            //
+            // Collected here, on the worker, rather than letting the UI reach
+            // into the pipeline: the algorithm objects live on this thread and
+            // are replaced under the lock, so a UI-thread call into them would
+            // be a race. Copying a handful of short strings is cheap and makes
+            // the ownership obvious.
+            //
+            // Same `!cancelled` guard as the timings, and for the same reason:
+            // a cancelled run's counts describe work that was abandoned
+            // part-way, and showing them would flicker mid-drag.
+            std::vector<std::string> reports;
+            for (const Stage& s : job->pipe.Stages()) {
+                if (!s.algo || !s.valid) continue;
+                std::string r = s.algo->RunReport();
+                if (!r.empty()) reports.push_back(std::move(r));
+            }
+            {
+                std::lock_guard<std::mutex> lock(m_mtx);
+                m_lastReports = std::move(reports);
+            }
         }
         if (cancelled) {
             // The abandoned pipeline's stage cache is half-finished, so it
