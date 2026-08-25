@@ -11,7 +11,7 @@
 
 src = image("test")
 
-developed = params(basic_adjust, auto_exposure = 1)(src)
+developed = params(basic_adjust)(src)
 
 # The luma range is deliberately much smaller than chroma's.
 #
@@ -20,11 +20,8 @@ developed = params(basic_adjust, auto_exposure = 1)(src)
 # when you zoom in -- is overwhelmingly CHROMA. Luma needs very little: the
 # whole luma detail of a developed photo measures around 0.02, so a threshold
 # anywhere near that erases the picture rather than the noise.
-luma   = slider("luma", 0.0, 0.03, 0.005)
-chroma = slider("chroma", 0.0, 0.25, 0.08)
-levels = slider("levels", 1, 6, 4)
 
-clean = wavelet_denoise(developed, luma = luma, chroma = chroma, levels = levels)
+clean = params(wavelet_denoise)(developed)
 
 display(developed, "original")
 display(clean,     "denoised")

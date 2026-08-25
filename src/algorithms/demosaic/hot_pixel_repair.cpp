@@ -215,11 +215,26 @@ void main(uint3 tid : SV_DispatchThreadID) {
     }
 
 private:
-    // Default 2000 levels, from measurement rather than taste: the real defects
-    // on Tim's files sit +4100 to +10500 above their neighbours, and ordinary
-    // sensel-to-sensel variation in a flat area was under 300. 2000 is clear of
-    // the noise and well below the smallest real defect.
-    Param<float> m_threshold{this, "threshold", 2000.0f, 100.0f, 8000.0f,
+    // Default 500 levels.
+    //
+    // This was 2000, calibrated on a 5D at ISO 1000 whose defects sit +4100 to
+    // +10500 above their neighbours. That number does not travel: a hot pixel's
+    // excess scales with ISO, so on an R5 at ISO 400 the same kind of defect
+    // measures only +644 to +2012 and a 2000-level floor missed three of four.
+    // At ISO 100 the same sites read +2 to +352, which is why they are
+    // invisible there.
+    //
+    // 500 is where the counts stop being defects and start being texture.
+    // Repaired sensels per frame at each floor, spread factor 6:
+    //
+    //             2000   1000    500    250    100
+    //   R5          1      3     11     114    669
+    //   5D          7      8     15      49   1349
+    //   RX100       42    232    642    1039  2076
+    //
+    // The jump below 500 is an order of magnitude on every body, and it is fine
+    // detail -- grass, sand, foliage -- not defects.
+    Param<float> m_threshold{this, "threshold", 500.0f, 100.0f, 8000.0f,
         {.help = "How far above its same-colour neighbours a sensel must read "
                  "to count as stuck, in sensor levels (0..16383 for a 14-bit "
                  "sensor). Lower catches fainter defects but risks eating real "
@@ -230,16 +245,21 @@ private:
 
     // How far above the neighbourhood's own variation the excess must sit.
     //
-    // 3.0 from measurement: it removes all 18 false positives on _MG_9673
-    // while keeping both real defects, which have excesses 40x their local
-    // spread. Set to 0 to disable the test and fall back to the absolute
-    // threshold alone.
-    Param<float> m_spreadFactor{this, "spread_factor", 3.0f, 0.0f, 20.0f,
+    // 6.0, raised from 3.0 when the absolute floor came down. This is the test
+    // that actually travels between cameras -- it scales with the image, where
+    // the floor above does not -- so it carries more of the work now.
+    //
+    // Measured on a frame of coastal grass and sand, where fine detail
+    // legitimately produces isolated bright sensels: at floor 500 the count
+    // falls from 8334 to 642 going from 3.0 to 6.0, while all four real R5
+    // defects survive with margins of 2.5x to 6x. Set to 0 to disable the test
+    // and fall back to the absolute threshold alone.
+    Param<float> m_spreadFactor{this, "spread_factor", 6.0f, 0.0f, 20.0f,
         {.help = "How many times the local variation the excess must exceed. "
                  "Stops bright textured areas -- specular highlights, glints -- "
                  "from being mistaken for defects, since a real stuck sensel "
                  "sits in a quiet neighbourhood. 0 disables the test.",
-         .step = 0.1, .softMin = 0.0, .softMax = 8.0}};
+         .step = 0.1, .softMin = 0.0, .softMax = 12.0}};
 
     // Off by default: a dead sensel is far less visible than a bright one on a
     // dark background, and the test is more likely to catch real dark detail
