@@ -66,10 +66,11 @@ FEATURES
   Maybe we can have image/image group in the palette that is the output from another script?
   Or is it better to expand our scripting? so we need iteration?
   Example: merge 3 photos into 1 HDR photo. I have a dozen of the group of 3 HDRs that are then stitched into an HDR panorama.
-- can we detect dead/stuck pixels from the raw capure? test: d:\lrwork\little\_MG_9673.CR2 has a stuck solid red pixel on the right eye. (this is a common issue on cameras)
 - can algorithms be toggled on/off?
 - algorithm to fix chromatic aberation. can it be detected and auto fixed without analysing the lens?
 - have an option to drag a splitter so we can see before/after on a single image.
+- new color models, AdobeRGB, ProPhotoRGB instead of sRGB. Still requires conversion to sRGB for the monitor.
+- create thousands of synthetic images, sample them like a raw sensor, then use deep learning to find a demosaic neural network
 
 NOTES
 - if we need matrix functions, I suggest the Euler library and Ceres for bundle solving
