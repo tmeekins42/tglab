@@ -10,8 +10,8 @@
 
 raw = mosaic("test")
 
-a = choose("method A", "demosaic", demosaic_ahd)
-b = choose("method B", "demosaic", demosaic_malvar)
+a = choose("method A", "demosaic", demosaic_consistent)
+b = choose("method B", "demosaic", demosaic_ahd)
 
 outA = params(a, "A")(raw)
 outB = params(b, "B")(raw)
@@ -23,13 +23,30 @@ display(outB, "2 method B")
 # itself -- zoom in and the colour filter array is visible, one colour per
 # pixel, before any interpolation.
 #
-# demosaic_ahd is adaptive: it interpolates green ALONG edges rather than
-# across them, so thin high-contrast detail -- bare branches against sky, wires,
-# hair -- keeps its colour instead of breaking into coloured speckles. Against a
-# known scene it scores 36.1 dB where Malvar scores 26.4, with five times less
-# false colour.
+# The four methods, in the order they were added:
 #
-# It is now the default that image() inserts. It was not, while it was CPU-only
-# -- 22 s on a 45 MP frame against Malvar's single GPU dispatch. With a GPU path
-# the two cost the same (495 ms against 509 ms), because at that size both are
-# bound by memory bandwidth rather than arithmetic.
+# demosaic_bilinear averages the neighbours. A correct LOW-PASS reconstruction
+# -- downsample its output and its error largely vanishes -- but it discards
+# high-frequency detail.
+#
+# demosaic_malvar adds a gradient correction from the centre channel. Better,
+# and still a fixed kernel: the same weights everywhere, no per-pixel decisions.
+#
+# demosaic_ahd is adaptive. It interpolates green ALONG edges rather than across
+# them, so thin high-contrast detail -- bare branches against sky, wires, hair
+# -- keeps its colour instead of breaking into coloured speckles. Against a
+# known scene it scores 36.1 dB where Malvar scores 26.4.
+#
+# demosaic_consistent takes the opposite approach and is the current default.
+# Rather than interpolating more cleverly, it starts from bilinear and RESTORES
+# the detail bilinear discarded, using the sensor's own samples: at each site
+# the sensor measured one channel exactly, so a reconstruction can be checked
+# against it. The correction is applied to luminance only, leaving the colour
+# differences alone, so it cannot introduce false colour.
+#
+# It measures better than AHD on detail (174% of bilinear against 150%) and on
+# chroma noise (72% against 74%), and reads visibly better on fine texture --
+# fur, feathers, a fluffy jacket against a background.
+#
+# Its `strength` reduces it exactly to bilinear at 0, which is worth trying:
+# sweeping it from 0 to 1 shows precisely what the correction is doing.

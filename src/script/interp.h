@@ -118,17 +118,29 @@ struct InterpResult {
 // on it. A script that wants a specific method calls mosaic() and demosaics
 // explicitly, which is what makes side-by-side comparison possible.
 //
-// demosaic_ahd rather than demosaic_malvar, since it gained a GPU path. On the
-// CPU it was 22 s against Malvar's 3 s at 45 MP, far too slow to sit in front
-// of every dropped raw; on the GPU the two are indistinguishable -- 495 ms and
-// 509 ms on the same frame -- because both are bandwidth-bound rather than
-// compute-bound, and AHD's extra arithmetic is free against the cost of moving
-// 45 megapixels. Given equal cost the better reconstruction should be what a
-// raw opens with.
+// demosaic_consistent, which measures better than AHD on both axes that
+// matter and costs 31 ms more at 45 MP:
+//
+//                 detail   luma noise   chroma noise
+//   ahd             150%       102%          74%
+//   consistent      174%       106%          72%      (ISO 100)
+//   ahd             144%       100%          90%
+//   consistent      148%       102%          74%      (ISO 12800)
+//
+// It also reads visibly better on fine texture -- fur, feathers, a fluffy
+// jacket against a background -- which is the content where the headroom
+// measurement showed the largest gap and where an error metric is least able to
+// judge, since squared error rewards not being wrong rather than being sharp.
+//
+// The history here is worth keeping: Malvar was the default until AHD gained a
+// GPU path, and AHD until this did. Each time the argument was the same -- at
+// 45 MP these are bandwidth-bound rather than compute-bound, so extra
+// arithmetic is nearly free against the cost of moving the pixels, and given
+// near-equal cost the better reconstruction should be what a raw opens with.
 InterpResult Interpret(const Program& prog,
                        const std::vector<SourceImage>& sources,
                        UiState* ui,
                        Pipeline* out,
-                       const std::string& defaultDemosaic = "demosaic_ahd");
+                       const std::string& defaultDemosaic = "demosaic_consistent");
 
 } // namespace tglab

@@ -630,6 +630,74 @@ int main() {
             Check(false, "both methods ran: " + (a ? e2 : e1));
         }
     }
+    {
+        // demosaic_consistent at strength 0 must be exactly bilinear.
+        //
+        // That reduction is what makes the algorithm's measurements
+        // trustworthy: at zero the correction is off, so any divergence is a
+        // bug in the correction rather than a property of it. The numbers in
+        // that file's header -- reliably better than bilinear, reliably behind
+        // AHD -- only mean something while this holds.
+        // A scene with EDGES, not the smooth gradient MakeMosaic() produces.
+        //
+        // That matters, and it was checked: bilinear reconstructs a linear
+        // gradient exactly, so the consistency residual there is genuinely
+        // zero, the correction has nothing to apply, and the test passes no
+        // matter how badly `strength` is mishandled. Verified by breaking the
+        // strength handling deliberately -- the smooth fixture still reported
+        // "worst 0.000000". A fixture that cannot express the failure cannot
+        // test for it.
+        auto edged = [](CfaPattern cfa) {
+            Image img;
+            ImageDesc d{kW, kH, Format::R32F};
+            d.cfa = cfa;
+            d.blackLevel = 0.0f;
+            d.whiteLevel = 1.0f;
+            img.Alloc(d);
+            ImageView v = img.MapCpuWrite();
+            for (int y = 0; y < kH; ++y)
+                for (int x = 0; x < kW; ++x) {
+                    // Stripes at several widths, so some are finer than the
+                    // green sampling grid -- which is where bilinear loses
+                    // detail and the residual becomes non-zero.
+                    const bool on = ((x / 3) & 1) != 0 || ((y / 5) & 1) != 0;
+                    const float rgb[3] = {on ? 0.80f : 0.15f,
+                                          on ? 0.75f : 0.12f,
+                                          on ? 0.70f : 0.18f};
+                    *v.At<float>(x, y) = rgb[CfaColorAt(cfa, x, y)];
+                }
+            return img;
+        };
+
+        Image bil, con;
+        std::string e1, e2;
+        const bool a = RunDemosaic("demosaic_bilinear", edged(CfaPattern::RGGB),
+                                   {}, &bil, &e1);
+        // Both the correction AND the chroma median off. The median is a
+        // separate stage with its own control, so "reduces to bilinear" means
+        // "with everything this algorithm adds turned off" -- turning off only
+        // the correction leaves the median running, which legitimately differs
+        // from bilinear.
+        const bool b = RunDemosaic("demosaic_consistent", edged(CfaPattern::RGGB),
+                                   {{"strength", 0.0}, {"chroma_median", 0.0}},
+                                   &con, &e2);
+        if (a && b) {
+            ImageView va = bil.MapCpuRead();
+            ImageView vb = con.MapCpuRead();
+            double worst = 0.0;
+            for (int y = 3; y < kH - 3; ++y)
+                for (int x = 3; x < kW - 3; ++x)
+                    for (int c = 0; c < 3; ++c)
+                        worst = std::max(worst,
+                            std::abs(double(HalfToFloat(va.At<uint16_t>(x, y)[c])) -
+                                     double(HalfToFloat(vb.At<uint16_t>(x, y)[c]))));
+            Check(worst < 0.002,
+                  "consistent at strength 0 is exactly bilinear (worst " +
+                      std::to_string(worst) + ")");
+        } else {
+            Check(false, "both methods ran: " + (a ? e2 : e1));
+        }
+    }
 
     // --- white balance and the colour matrix are applied --------------------
     //
@@ -719,7 +787,8 @@ int main() {
                 // still produces a plausible-looking image, so nothing but a
                 // direct comparison against the CPU catches it.
                 for (const char* name : {"demosaic_passthrough", "demosaic_bilinear",
-                                         "demosaic_malvar", "demosaic_ahd"}) {
+                                         "demosaic_malvar", "demosaic_ahd",
+                                         "demosaic_consistent"}) {
                     for (CfaPattern cfa : {CfaPattern::RGGB, CfaPattern::BGGR,
                                            CfaPattern::GRBG, CfaPattern::GBRG}) {
                         Image cpuOut, gpuOut;
