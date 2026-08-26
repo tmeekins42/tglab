@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(tglab VERSION 0.6.0 LANGUAGES CXX)
+project(tglab VERSION 0.7.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -322,4 +322,23 @@ add_executable(headroom tools/headroom.cpp $<TARGET_OBJECTS:tglab_algorithms>)
 target_link_libraries(headroom PRIVATE tglab_core)
 if(MSVC)
     target_compile_definitions(headroom PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
+# paper_data: regenerates the tables and figure crops under papers/, so every
+# number in the write-up has reproducible provenance.
+#   build/Release/paper_data.exe --table <raw>...
+#   build/Release/paper_data.exe --crops <raw> <x> <y> <size> [outdir] [stops]
+add_executable(paper_data tools/paper_data.cpp $<TARGET_OBJECTS:tglab_algorithms>)
+target_link_libraries(paper_data PRIVATE tglab_core)
+if(MSVC)
+    target_compile_definitions(paper_data PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
+# overview: a whole frame rendered small with a coordinate grid, for picking
+# crop regions to compare.
+#   build/Release/overview.exe <raw> out.png [stops]
+add_executable(overview tools/overview.cpp $<TARGET_OBJECTS:tglab_algorithms>)
+target_link_libraries(overview PRIVATE tglab_core)
+if(MSVC)
+    target_compile_definitions(overview PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()

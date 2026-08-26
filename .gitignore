@@ -6,3 +6,6 @@ tglab_layout.ini
 
 # Fixtures the dbg_hang harness generates for TGLAB_PALETTE_TEST.
 palette_fixture_*.png
+
+# Local planning notes, deliberately not tracked.
+docs/
