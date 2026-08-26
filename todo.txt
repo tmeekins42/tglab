@@ -37,7 +37,7 @@ BUGS / SMALL FEATURES
   level inside the existing kernel. No transform, no round-trip, and it can be
   a parameter so the effect is visible rather than baked in.
 
-FEATURES
+NEW FEATURES / IDEAS
 - add support for additional image channels, such as alpha channels and depth channels
 - channel merging. Astronomy images are captured single channel with colored filters. How to merge them?
 - image export
