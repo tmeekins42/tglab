@@ -1302,16 +1302,26 @@ void App::DrawMenuBar() {
         if (ImGui::MenuItem("About tglab...")) m_aboutOpen = true;
         ImGui::EndMenu();
     }
-
     // Script picker on the bar itself rather than in a docked panel.
     //
     // Switching experiments is the most frequent thing done here, and it used
     // to cost a tab switch away from the palette -- which is exactly what Tim
-    // asked to remove. A combo is one click and always visible.
+    // asked to remove.
+    //
+    // Separated from the menus and LABELLED: the first version sat flush
+    // against Help with no caption, and read as just another menu -- Tim did
+    // not notice it was there.
     {
         if (m_scriptListDirty) { m_scriptListDirty = false; RescanScripts(); }
 
-        ImGui::SetNextItemWidth(220.0f);
+        ImGui::Spacing();
+        ImGui::SameLine(0.0f, 24.0f);
+        ImGui::TextDisabled("|");
+        ImGui::SameLine(0.0f, 12.0f);
+        ImGui::TextUnformatted("Script:");
+        ImGui::SameLine();
+
+        ImGui::SetNextItemWidth(240.0f);
         const char* label = m_scriptName.empty() ? "(no script)" : m_scriptName.c_str();
         if (ImGui::BeginCombo("##script", label)) {
             if (m_scriptList.empty()) {
@@ -1327,6 +1337,8 @@ void App::DrawMenuBar() {
             if (ImGui::Selectable("Rescan directory")) m_scriptListDirty = true;
             ImGui::EndCombo();
         }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", m_scriptDir.empty() ? "(no directory)" : m_scriptDir.c_str());
     }
 
     ImGui::EndMainMenuBar();
