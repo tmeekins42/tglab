@@ -14,12 +14,14 @@
 
 #include <d3d12.h>
 #include <dxgi1_4.h>
+#include <windows.h>
 
 #include "../src/core/image_group.h"
 #include "../src/core/pipeline.h"
 #include "../src/core/raw_io.h"
 #include "../src/script/interp.h"
 #include "../src/gpu/compute.h"
+#include "../src/gpu/gpu_image.h"
 #include "../src/script/parser.h"
 
 using namespace tglab;
@@ -69,9 +71,32 @@ int main(int argc, char** argv) {
     std::printf("\n");
 
     ComputeContext gpu;
+    // Debug layer and DRED, so a device hang leaves breadcrumbs naming the op
+    // the GPU stopped on. Opt-in: both cost per-op overhead.
+    if (GetEnvironmentVariableA("TGLAB_DEBUG", nullptr, 0) > 0) {
+        ID3D12Debug* dbg = nullptr;
+        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dbg)))) {
+            dbg->EnableDebugLayer();
+            dbg->Release();
+        }
+        ID3D12DeviceRemovedExtendedDataSettings1* dred = nullptr;
+        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dred)))) {
+            dred->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            dred->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            dred->Release();
+        }
+        std::printf("debug layer + DRED on\n");
+    }
+
     ID3D12Device* dev = nullptr;
     if (SUCCEEDED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev))))
         gpu.Init(dev);
+    // Without this, Image::MapCpuRead cannot pull a GPU-resident image back:
+    // the readback hook is null, the assert is compiled out in release, and the
+    // caller silently gets an uninitialised buffer. Omitting it here cost an
+    // afternoon -- it made every frame pile into one command list, which the
+    // GPU watchdog then killed.
+    InstallGpuResidencyHooks();
     std::printf("gpu: %s\n", gpu.Ready() ? "yes" : "no");
 
     // Per-frame VRAM, to see whether a fused reduction releases each frame or

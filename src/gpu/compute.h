@@ -188,6 +188,8 @@ private:
     // True when work is recorded but not yet submitted, so BeginRecording()
     // knows not to reset the list out from under it.
     bool                       m_pendingWork = false;
+    uint64_t                   m_batchPixels = 0;
+    static uint64_t            BatchPixelBudget();
 
     ID3D12Device*              m_device    = nullptr;
     ID3D12CommandQueue*        m_queue     = nullptr;

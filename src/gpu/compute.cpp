@@ -532,8 +532,58 @@ bool ComputeContext::Dispatch(const ComputeKernel& k,
     // nothing and cost a full submit-and-block per stage. Whoever needs the
     // pixels -- Upload, Readback, or an explicit Flush -- submits.
     m_pendingWork = true;
-    (void)err;
+
+    // Submit once a batch has accumulated enough pixel work.
+    //
+    // Batching is worth having: it turns a chain of stages into one submission
+    // and avoids a submit-and-block per dispatch. But on this hardware a batch
+    // of large dispatches HANGS the device -- measured, and sharply:
+    //
+    //   21 MP raw, any number of dispatches batched   fine (1.4 s)
+    //   45 MP raw, ONE dispatch per submission        fine
+    //   45 MP raw, TWO dispatches per submission      DXGI_ERROR_DEVICE_HUNG
+    //
+    // Not the kernels: timed individually, every one of the seven dispatches in
+    // a raw develop is 1-22 ms, ~45 ms in total, nowhere near the ~2 s
+    // watchdog. Not the dispatch size either -- a single 45 MP dispatch is
+    // fine however large. It is specifically several LARGE dispatches recorded
+    // into one command list, and DRED blames the FIRST one, which is what makes
+    // a kernel-level explanation untenable.
+    //
+    // The root cause is unexplained and probably below us. This bounds the
+    // exposure instead: batch by pixels rather than by dispatch count, so small
+    // images keep batching exactly as before and large ones submit sooner.
+    // TGLAB_BATCHCAP overrides the budget (in megapixels) for bisecting.
+    m_batchPixels += uint64_t(od.width) * uint64_t(od.height);
+    if (m_batchPixels >= BatchPixelBudget()) {
+        if (!Flush(err)) return false;
+    }
     return true;
+}
+
+// Pixels a batch may accumulate before it is submitted.
+//
+// 16 MP, chosen by bisection rather than by argument. 24 MP was tried first --
+// above the largest image seen to batch safely -- and a 20 MP Sony frame still
+// hung, because one 20 MP dispatch stays under a 24 MP budget and lets a second
+// join it. The budget has to be small enough that a SECOND large dispatch
+// cannot fit beside the first.
+//
+// Verified at 16 MP across 21 MP Canon, 20 MP Sony and 45 MP Canon frames: all
+// stages on the GPU, no fallbacks, no device removals.
+//
+// Expressed in pixels rather than dispatches because that is the axis the
+// failure follows.
+uint64_t ComputeContext::BatchPixelBudget() {
+    static const uint64_t budget = [] {
+        char buf[16] = {};
+        if (GetEnvironmentVariableA("TGLAB_BATCHCAP", buf, sizeof buf) > 0) {
+            const int mp = atoi(buf);
+            if (mp > 0) return uint64_t(mp) * 1000000ull;
+        }
+        return 16ull * 1000000ull;
+    }();
+    return budget;
 }
 
 bool ComputeContext::Flush(std::string* err) {
@@ -547,6 +597,7 @@ bool ComputeContext::Flush(std::string* err) {
     // on failure the list is closed and must be reset before anything else can
     // record into it.
     m_pendingWork = false;
+    m_batchPixels = 0;
 
     if (FAILED(m_list->Close())) { *err = "could not close command list"; return false; }
 
