@@ -296,6 +296,7 @@ public:
     void AppendToGroup(PaletteEntry& e, Image&& img, const std::string& path);
     void RefreshMembers(PaletteEntry& e);
     std::string UniqueSlotName(const std::string& base) const;
+    std::string NewGroupSlot();
     void MakeGroup(PaletteEntry& e);
     void Ungroup(PaletteEntry& e);
 
@@ -2095,6 +2096,23 @@ std::string App::UniqueSlotName(const std::string& base) const {
     return base;
 }
 
+// Adds an empty group to the palette and returns its script-visible name.
+//
+// Shared by the "New group" button and by an Alt-drop, which needs a slot to
+// aim every file at. Returning the name rather than a pointer keeps the caller
+// out of m_palette, which reallocates as entries are added.
+std::string App::NewGroupSlot() {
+    PaletteEntry g;
+    g.name     = UniqueSlotName("group");
+    g.isGroup  = true;
+    g.expanded = true;
+    tglab::MakeGroup(&g.data, g.axis);
+    const std::string name = g.name;
+    m_palette.push_back(std::move(g));
+    m_dirty = true;
+    return name;
+}
+
 // Keeps a group's per-member UI state the same length as its images.
 //
 // The images live in core's ImageSet and the thumbnails here, so the two can
@@ -2120,17 +2138,12 @@ void App::DrawPalettePanel() {
     // An empty group can be created and then dropped into, rather than needing
     // an image first and converting it. Tim: "currently I need one image to
     // create a group. Can I create an empty group to drag images into?"
-    if (ImGui::SmallButton("New group")) {
-        PaletteEntry g;
-        g.name    = UniqueSlotName("group");
-        g.isGroup = true;
-        g.expanded = true;
-        tglab::MakeGroup(&g.data, g.axis);
-        m_palette.push_back(std::move(g));
-        m_dirty = true;
-    }
+    if (ImGui::SmallButton("New group")) NewGroupSlot();
     ImGui::SameLine();
-    ImGui::TextDisabled("drop files on a row to add");
+    ImGui::TextDisabled("(?)");
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Drop files on a row to add them to it.\n"
+                          "Hold ALT while dropping several files to make them one group.");
     ImGui::Separator();
 
     if (m_palette.empty()) {
@@ -2861,7 +2874,22 @@ LRESULT WINAPI WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             std::string target;
             if (g_app) target = g_app->SlotNameAt(pt.x, pt.y);
 
+            // ALT held: the whole drop becomes ONE group rather than N entries.
+            //
+            // Alt rather than Shift, which Windows already means "move" during
+            // a drag -- Explorer has trained that reflex, and contradicting it
+            // would make the drag cursor say one thing while we do another.
+            // Alt is free, and is the conventional "alternate interpretation"
+            // modifier in creative applications.
+            //
+            // WM_DROPFILES carries no modifier state, so it is read at drop
+            // time. That is accurate enough: the key is either down as the
+            // mouse is released or it is not.
             const UINT n = DragQueryFileA(drop, 0xFFFFFFFF, nullptr, 0);
+            const bool altDown = (GetKeyState(VK_MENU) & 0x8000) != 0;
+            if (altDown && n > 1 && target.empty() && g_app)
+                target = g_app->NewGroupSlot();
+
             for (UINT i = 0; i < n; ++i) {
                 char path[MAX_PATH] = {};
                 if (DragQueryFileA(drop, i, path, MAX_PATH) && g_app) {
