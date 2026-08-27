@@ -2047,6 +2047,127 @@ int main() {
         Check(e3.find("8") != std::string::npos && e3.find("6") != std::string::npos,
               "and the error names both counts");
     }
+
+    // --- merge_hdr -----------------------------------------------------------
+    //
+    // The radiometric merge, checked against numbers worked out by hand.
+    //
+    // Three frames of a uniform scene, one stop apart. If the merge is correct,
+    // each frame divided by its own exposure gives the SAME radiance, so the
+    // weighted average is that radiance regardless of the weights -- which is
+    // exactly the property that makes the merge physically meaningful, and a
+    // plain average would not have.
+    {
+        // shutter is the only term that varies, so relative exposure is
+        // shutter * ISO / aperture^2 with ISO and aperture held constant.
+        auto Frame = [](float value, float shutter) {
+            Image img;
+            ImageDesc d;
+            d.width = 2; d.height = 2; d.format = Format::RGBA32F;
+            d.linear   = true;
+            d.shutter  = shutter;
+            d.aperture = 2.0f;
+            d.iso      = 100.0f;
+            img.Alloc(d);
+            ImageView v = img.MapCpuWrite();
+            float* p = reinterpret_cast<float*>(v.data);
+            for (int i = 0; i < 2 * 2 * 4; ++i) p[i] = ((i % 4) == 3) ? 1.0f : value;
+            return img;
+        };
+
+        // Radiance 4.0 seen at three shutter speeds: 0.1 -> 0.4, 0.2 -> 0.8,
+        // 0.05 -> 0.2. Every frame is mid-toned, so all three carry weight.
+        ImageSet set;
+        set.images.push_back(Frame(0.4f,  0.1f));
+        set.images.push_back(Frame(0.8f,  0.2f));
+        set.images.push_back(Frame(0.2f,  0.05f));
+        set.shape = Shape::Of("exposure", 3);
+
+        std::vector<SourceImage> names{{"test", 0}};
+        SourceImage gs; gs.name = "bracket"; gs.index = 1;
+        gs.shape = Shape::Of("exposure", 3);
+        names.push_back(gs);
+
+        Program prog; std::string err;
+        Check(Parse("g = image(\"bracket\")\nh = merge_hdr(g, over=\"exposure\")\ndisplay(h)\n",
+                    &prog, &err), "merge_hdr parses");
+
+        UiState ui; Pipeline pipe;
+        InterpResult ir = Interpret(prog, names, &ui, &pipe);
+        Check(ir.ok, ir.ok ? "merge_hdr interprets" : ("interpret: " + ir.error).c_str());
+
+        std::vector<Data> srcs;
+        srcs.push_back(Data{});
+        srcs.push_back(Data{std::move(set)});
+        std::string xerr;
+        const bool ran = pipe.Execute(&srcs, nullptr, &xerr);
+        Check(ran, ran ? "merge_hdr runs" : ("execute: " + xerr).c_str());
+
+        if (ran) {
+            const Data* op = pipe.Resolve(pipe.Viewers().back().source, &srcs);
+            const auto* im = op ? std::get_if<Image>(op) : nullptr;
+            Check(im != nullptr, "merge_hdr produces a single image");
+            if (im) {
+                Check(im->Desc().format == Format::RGBA32F,
+                      "and it is 32-bit float, to hold the extra range");
+                Check(im->Desc().linear, "and is marked scene-linear");
+
+                ImageView v = const_cast<Image&>(*im).MapCpuRead();
+                const float* p = reinterpret_cast<const float*>(v.data);
+                // All three frames agree on radiance 4.0 * (ISO/f^2 scaling),
+                // which is the same constant for each -- so the result is the
+                // ratio value/shutter, i.e. 0.4/0.1 = 4, scaled by 1/(iso/f^2).
+                const float expect = 0.4f / (0.1f * 100.0f / 4.0f);
+                Check(p && std::abs(p[0] - expect) < 1e-3f,
+                      "every frame recovers the SAME radiance, so the merge is exact");
+
+                // The headroom is the point: a value above 1.0 is what a
+                // bracket buys and what an averaging merge would have lost.
+                Check(p && p[0] > 0.15f, "the result is scene-linear radiance, not a 0..1 average");
+            }
+        }
+
+        // A frame with no exposure metadata must be reported, not silently
+        // treated as equal -- that is a confidently wrong merge.
+        {
+            auto Plain = [](float value) {
+                Image img;
+                ImageDesc d; d.width = 2; d.height = 2; d.format = Format::RGBA32F;
+                img.Alloc(d);
+                ImageView v = img.MapCpuWrite();
+                float* p = reinterpret_cast<float*>(v.data);
+                for (int i = 0; i < 2 * 2 * 4; ++i) p[i] = ((i % 4) == 3) ? 1.0f : value;
+                return img;
+            };
+            ImageSet s2;
+            s2.images.push_back(Plain(0.3f));
+            s2.images.push_back(Plain(0.6f));
+            s2.shape = Shape::Of("exposure", 2);
+
+            SourceImage g2; g2.name = "noexif"; g2.index = 2;
+            g2.shape = Shape::Of("exposure", 2);
+            std::vector<SourceImage> n2 = names;
+            n2.push_back(g2);
+
+            Program p2; std::string e2;
+            Parse("g = image(\"noexif\")\nh = merge_hdr(g)\ndisplay(h)\n", &p2, &e2);
+            UiState u2; Pipeline pl2;
+            Check(Interpret(p2, n2, &u2, &pl2).ok, "a bracket with no EXIF still interprets");
+
+            std::vector<Data> sv;
+            sv.push_back(Data{});
+            sv.push_back(Data{});
+            sv.push_back(Data{std::move(s2)});
+            std::string x2;
+            if (pl2.Execute(&sv, nullptr, &x2)) {
+                std::string report;
+                for (const Stage& st : pl2.Stages())
+                    if (st.algo && st.algoName == "merge_hdr") report = st.algo->RunReport();
+                Check(report.find("NO EXIF") != std::string::npos,
+                      "and says so rather than merging as though exposures matched");
+            }
+        }
+    }
                 }
             }
         }

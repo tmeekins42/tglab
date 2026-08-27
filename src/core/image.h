@@ -81,6 +81,34 @@ struct ImageDesc {
     float      whiteLevel = 1.0f;   // ... and saturation
 
     // As-shot white balance, as per-channel gains normalised so green is 1.
+    // What the camera was set to, as NUMBERS rather than the display strings
+    // EXIF carries. An HDR merge needs the relative exposure between frames,
+    // and "1/250 s" has to be parsed back into a float to be useful -- so the
+    // value LibRaw already hands us is kept instead of being formatted away.
+    //
+    // Zero means unknown, which is the honest answer for a JPEG or a scan and
+    // is what merge_hdr checks before assuming it can weight anything.
+    float shutter  = 0.0f;   // seconds
+    float aperture = 0.0f;   // f-number
+    float iso      = 0.0f;   // ISO speed
+
+    // Relative exposure of this frame: how much light reached the sensor
+    // compared with a reference, up to a constant that cancels in a merge.
+    //
+    //   exposure ~ shutter * ISO / aperture^2
+    //
+    // Aperture is squared because f-number is a ratio of focal length to
+    // diameter, so light gathered goes as its inverse square. ISO is a gain,
+    // not light, but it scales the recorded value identically -- which is what
+    // the merge is dividing out.
+    //
+    // Returns 0 when any term is missing, so a caller can tell "no information"
+    // apart from "a very dark frame".
+    float RelativeExposure() const {
+        if (shutter <= 0.0f || aperture <= 0.0f || iso <= 0.0f) return 0.0f;
+        return shutter * iso / (aperture * aperture);
+    }
+
     //
     // A sensor's green photosites are roughly twice as sensitive as its red and
     // blue ones, so raw data is heavily green without these -- which is exactly

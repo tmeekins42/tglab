@@ -276,6 +276,16 @@ bool LoadRawMosaic(const std::string& path, Image* out, std::string* err) {
         d.camMul[2] = (m[2] > 0.0f) ? m[2] / g : 1.0f;
     }
 
+    // Exposure settings as numbers, for an HDR merge to divide out. Kept
+    // alongside the formatted EXIF rather than instead of it: the info panel
+    // wants "1/250 s" and merge_hdr wants 0.004.
+    {
+        const auto& o = raw.imgdata.other;
+        d.shutter  = (o.shutter   > 0.0f) ? o.shutter   : 0.0f;
+        d.aperture = (o.aperture  > 0.0f) ? o.aperture  : 0.0f;
+        d.iso      = (o.iso_speed > 0.0f) ? o.iso_speed : 0.0f;
+    }
+
     // The camera's DAYLIGHT reference: the gains that make a D65 white neutral
     // on this sensor. Distinct from cam_mul, which is what the camera chose for
     // this particular shot.
