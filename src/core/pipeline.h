@@ -5,6 +5,7 @@
 // changed, reusing cached outputs before that point.
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -13,6 +14,10 @@
 #include "data.h"
 
 namespace tglab {
+
+// Diagnostic hook: called once per frame inside a fused reduction. Null in
+// normal builds. See pipeline.cpp.
+extern std::function<void(int)> g_frameTrace;
 
 // Reference to one output port of a stage. stage == -1 means a source image
 // from the palette, with `port` as its palette index.
@@ -129,6 +134,11 @@ private:
 
     // Runs one stage on the GPU. Returns false (with `err` set) if anything
     // about the stage is unsupported, so the caller can fall back to the CPU.
+    std::vector<int> FusableChain(int reduceStage, PortRef* srcPort) const;
+    bool RunFusedReduction(int reduceStage, const std::vector<int>& chain,
+                           PortRef srcPort, const std::vector<Data>* sources,
+                           ComputeContext* gpu, ExecMode mode,
+                           const CancelToken* cancel, std::string* err);
     bool RunStageOnce(Stage& s, const std::vector<const Data*>& in,
                       ComputeContext* gpu, ExecMode mode,
                       const CancelToken* cancel, std::string* err);

@@ -1,6 +1,10 @@
 #include "pipeline.h"
 
+#include <algorithm>
+#include <functional>
 #include <cassert>
+#include <map>
+#include <set>
 
 #include "../gpu/compute.h"
 #include "../gpu/gpu_image.h"
@@ -9,6 +13,18 @@
 #include <cstdio>
 
 namespace tglab {
+
+// Diagnostic tracing for GPU fallbacks, off unless TGLAB_GPUWHY is set.
+// A silent fallback looks like the GPU merely being slow, which is what made
+// the multi-pass device hang invisible for so long.
+static bool GpuWhy() {
+    static const bool on = GetEnvironmentVariableA("TGLAB_GPUWHY", nullptr, 0) > 0;
+    return on;
+}
+
+// Optional per-frame callback for diagnosing fused-reduction memory growth.
+// Null in normal builds; set by tools/group_merge.
+std::function<void(int)> g_frameTrace;
 
 void Pipeline::Clear() {
     m_stages.clear();
@@ -67,6 +83,151 @@ bool Pipeline::SameStage(const Stage& a, const Stage& b) {
 // -- which needs a set-valued OUTPUT to hold the results. That is the next step
 // and is deliberately not faked here: returning a wrong-shaped answer would be
 // worse than refusing.
+// Finds the run of broadcast stages feeding a reduction, so they can be fused.
+//
+// This is the memory fix. Run stage by stage, a reduction over five 45 MP raws
+// demosaics all five and holds all five results before merging -- 1.7 GB of
+// intermediates. Run frame by frame, one frame is live at a time.
+//
+// The chain qualifies only when it is a simple line: each stage takes its ONLY
+// set input from the previous one, produces one output, and nothing else reads
+// that output. Anything else -- a branch, a second consumer, a display() on an
+// intermediate -- means the intermediate is genuinely wanted and fusing it away
+// would change what the script produces.
+//
+// Returns the stages in execution order, or empty when the chain does not
+// qualify. `srcPort` is left pointing at whatever feeds the head of it.
+std::vector<int> Pipeline::FusableChain(int reduceStage, PortRef* srcPort) const {
+    std::vector<int> chain;
+    const Stage& red = m_stages[size_t(reduceStage)];
+    if (red.inputs.size() != 1) return {};
+
+    PortRef cur = red.inputs[0];
+    while (cur.stage >= 0) {
+        const Stage& s = m_stages[size_t(cur.stage)];
+
+        // One output only, and this must be it: a multi-output stage's other
+        // ports would be discarded by fusing.
+        if (s.outputs.size() != 1 || cur.port != 0) break;
+
+        // A reduction inside the chain is a different shape of problem -- two
+        // accumulators live at once -- and is not fused here.
+        if (s.algo->IsReduction()) break;
+
+        // Exactly one input, so the frame identity is unambiguous. A stage
+        // combining a set with a second image is legitimate but needs the
+        // scalar input held across frames, which is a further step.
+        if (s.inputs.size() != 1) break;
+
+        // Nothing else may read this stage's output, or fusing would delete an
+        // intermediate something still wants.
+        int readers = 0;
+        for (const Stage& other : m_stages)
+            for (const PortRef& r : other.inputs)
+                if (r.stage == cur.stage) ++readers;
+        for (const ViewerDecl& v : m_viewers)
+            if (v.source.stage == cur.stage) ++readers;
+        if (readers != 1) break;
+
+        chain.push_back(cur.stage);
+        cur = s.inputs[0];
+    }
+
+    std::reverse(chain.begin(), chain.end());
+    *srcPort = cur;
+    return chain;
+}
+
+// Runs a broadcast chain and its reduction one frame at a time.
+//
+// The difference from running them separately is only WHEN the work happens,
+// not what it computes: instead of demosaicing every frame and then merging,
+// each frame is carried through the whole chain and handed to the accumulator
+// before the next is started. One frame is live at a time rather than N.
+//
+// Measured on five 45 MP CR3s: 1.7 GB of demosaiced intermediates becomes one
+// frame's 341 MB. The design calls this depth-first evaluation and predicted
+// the level-by-level order would be the expensive one, which is what the
+// unfused path was doing.
+bool Pipeline::RunFusedReduction(int reduceStage, const std::vector<int>& chain,
+                                 PortRef srcPort, const std::vector<Data>* sources,
+                                 ComputeContext* gpu, ExecMode mode,
+                                 const CancelToken* cancel, std::string* err) {
+    Stage& red = m_stages[size_t(reduceStage)];
+    auto Where = [&] { return "line " + std::to_string(red.line) + ": '" + red.algoName + "' "; };
+
+    const Data* srcData = Resolve(srcPort, sources);
+    if (!srcData) { *err = Where() + "has an input that produced no data"; return false; }
+    const auto* set = std::get_if<ImageSet>(srcData);
+    if (!set) { *err = Where() + "reduces a set, but its input is a single image"; return false; }
+    if (set->shape.Rank() != 1) {
+        *err = Where() + "can only reduce a single axis so far, and its input is " +
+               set->shape.ToString();
+        return false;
+    }
+    if (set->images.empty()) { *err = Where() + "was given an empty group"; return false; }
+
+    Reducer* r = red.algo->AsReducer();
+    if (!r) { *err = Where() + "declares itself a reduction but provides no accumulator"; return false; }
+
+    const std::string axis = red.reduceAxis.empty() ? set->shape.Axes()[0].name : red.reduceAxis;
+    if (!r->Begin(int(set->images.size()), axis, err)) return false;
+
+    for (size_t f = 0; f < set->images.size(); ++f) {
+        if (cancel && cancel->Cancelled()) { *err = kCancelled; return false; }
+
+        // Carry this one frame through every stage of the chain. `carried` owns
+        // the frame between stages and is overwritten each time, which is what
+        // makes the peak one frame rather than N.
+        Data carried{set->images[f].Clone()};
+        for (int si : chain) {
+            Stage& cs = m_stages[size_t(si)];
+            const Data* one = &carried;
+            std::vector<const Data*> csIn{one};
+            if (!RunStageOnce(cs, csIn, gpu, mode, cancel, err)) return false;
+            if (cs.outputs.size() != 1) { *err = Where() + "chain stage produced no result"; return false; }
+            carried = std::move(cs.outputs[0]);
+            cs.outputs[0] = Data{};
+        }
+
+        const auto* img = std::get_if<Image>(&carried);
+        if (!img) { *err = Where() + "chain produced no image for frame " + std::to_string(f); return false; }
+
+        // Accept() reads CPU pixels, which pulls this frame back from the GPU
+        // (and flushes the batch on the way, since Readback submits).
+        if (!r->Accept(int(f), *img, err)) return false;
+
+
+        // Per-frame trace, for diagnosing GPU memory growth. Installed by a
+        // harness rather than queried here, since core/ has no DXGI adapter.
+        if (g_frameTrace) g_frameTrace(int(f));
+        // Release the frame NOW rather than at the top of the next iteration.
+        //
+        // This is the whole point of fusing, and it is specifically the GPU
+        // side that matters: every stage's output holds a GPU resource, and
+        // letting five 45 MP frames' worth accumulate exhausted VRAM -- at
+        // which point AcquireGpuRead fails, every stage silently falls back to
+        // the CPU, and the "faster" path measured SLOWER than the unfused one.
+        // That is what the timing said before this line existed.
+        carried = Data{};
+    }
+
+    Image out;
+    if (!r->Finish(&out, err)) return false;
+    if (!out.Valid()) { *err = Where() + "produced no result"; return false; }
+
+    red.outputs.clear();
+    red.outputs.resize(1);
+    red.outputs[0] = Data{std::move(out)};
+
+    // The chain's stages ran, but their outputs were consumed frame by frame
+    // and no longer exist as sets. Marking them invalid stops a later run from
+    // reusing a cache entry that holds nothing.
+    for (int si : chain) m_stages[size_t(si)].valid = false;
+    red.valid = true;
+    return true;
+}
+
 bool Pipeline::RunReduction(Stage& s, const std::vector<const Data*>& in,
                             const CancelToken* cancel, std::string* err) {
     auto Where = [&] { return "line " + std::to_string(s.line) + ": '" + s.algoName + "' "; };
@@ -197,7 +358,10 @@ bool Pipeline::RunStageOnce(Stage& s, const std::vector<const Data*>& in,
         if (RunStageGpu(s, in, gpu, &gpuErr)) {
             ranOnGpu = true;
             ++m_gpuStages;
-        } else if (mode == ExecMode::ForceGPU) {
+        } else if (GpuWhy()) {
+            std::fprintf(stderr, "[gpu-fallback] %s: %s\n", s.algoName.c_str(), gpuErr.c_str());
+        }
+        if (!ranOnGpu && mode == ExecMode::ForceGPU) {
             *err = "line " + std::to_string(s.line) + ": '" + s.algoName +
                    "' GPU path failed: " + gpuErr;
             return false;
@@ -390,6 +554,32 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
         }
     } batchGuard{gpu};
 
+    // Reductions that will run their input chain frame by frame, and the chain
+    // stages they will consume.
+    //
+    // Computed BEFORE the loop because a chain runs ahead of the reduction that
+    // owns it: by the time the reduction is reached, its stages would already
+    // have run and built the whole intermediate set -- which is the memory this
+    // exists to avoid.
+    std::map<int, std::pair<std::vector<int>, PortRef>> fusedPlan;
+    std::set<int> fused;
+    for (size_t i = firstDirty; i < m_stages.size(); ++i) {
+        if (!m_stages[i].algo->IsReduction()) continue;
+        PortRef srcPort{};
+        std::vector<int> chain = FusableChain(int(i), &srcPort);
+        if (chain.empty()) continue;
+
+        // A stage already claimed by an earlier reduction cannot also feed this
+        // one -- FusableChain's single-reader rule makes that impossible, but
+        // the check is cheap and the failure would be silent.
+        bool clash = false;
+        for (int c : chain) if (fused.count(c)) clash = true;
+        if (clash) continue;
+
+        for (int c : chain) fused.insert(c);
+        fusedPlan.emplace(int(i), std::make_pair(std::move(chain), srcPort));
+    }
+
     for (size_t i = firstDirty; i < m_stages.size(); ++i) {
         // Between stages as well as within them: a pipeline of several
         // moderately slow stages should abandon at the next boundary even if no
@@ -397,7 +587,22 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
         if (cancel && cancel->Cancelled()) { *err = kCancelled; return false; }
 
         Stage& s = m_stages[i];
+
+        // Already consumed frame by frame by a fused reduction below.
+        if (fused.count(int(i))) continue;
+
         s.valid = false;
+
+        // A reduction whose input is a straight line of broadcast stages runs
+        // them per FRAME rather than per stage, so one frame is live at a time
+        // instead of all N. Checked before the inputs are gathered, because
+        // gathering is what would materialise the whole intermediate set.
+        if (auto fp = fusedPlan.find(int(i)); fp != fusedPlan.end()) {
+            if (!RunFusedReduction(int(i), fp->second.first, fp->second.second,
+                                   sources, gpu, mode, cancel, err))
+                return false;
+            continue;
+        }
 
         // Gather inputs.
         std::vector<const Data*> in;

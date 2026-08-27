@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "compute.h"
 
 #include <cstring>
@@ -5,6 +6,13 @@
 #include "device.h"
 
 namespace tglab {
+
+// Diagnostic tracing for GPU allocation and dispatch failures, off unless
+// TGLAB_GPUWHY is set. Cached: this is queried inside per-frame loops.
+static bool GpuWhy() {
+    static const bool on = GetEnvironmentVariableA("TGLAB_GPUWHY", nullptr, 0) > 0;
+    return on;
+}
 
 // Defined in gpu_image.cpp; declared here rather than included because
 // gpu_image.h includes this header.
@@ -191,13 +199,21 @@ bool ComputeContext::CreateImage(const ImageDesc& d, GpuImage* out) {
     rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS |
                D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
 
-    if (rd.Format == DXGI_FORMAT_UNKNOWN) return false;
+    if (rd.Format == DXGI_FORMAT_UNKNOWN) {
+        if (GpuWhy()) std::fprintf(stderr, "[gpu] unknown format %d\n", int(d.format));
+        return false;
+    }
 
     ID3D12Resource* res = nullptr;
-    if (FAILED(m_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
-                                                 D3D12_RESOURCE_STATE_COMMON,
-                                                 nullptr, IID_PPV_ARGS(&res))))
+    const HRESULT crhr = m_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                                          D3D12_RESOURCE_STATE_COMMON,
+                                                          nullptr, IID_PPV_ARGS(&res));
+    if (FAILED(crhr)) {
+        if (GpuWhy())
+            std::fprintf(stderr, "[gpu] CreateCommittedResource 0x%08X %dx%d fmt=%d\n",
+                         unsigned(crhr), d.width, d.height, int(d.format));
         return false;
+    }
 
     out->res  = res;
     out->desc = d;

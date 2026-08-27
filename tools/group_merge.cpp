@@ -13,6 +13,7 @@
 #include <vector>
 
 #include <d3d12.h>
+#include <dxgi1_4.h>
 
 #include "../src/core/image_group.h"
 #include "../src/core/pipeline.h"
@@ -72,6 +73,26 @@ int main(int argc, char** argv) {
     if (SUCCEEDED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev))))
         gpu.Init(dev);
     std::printf("gpu: %s\n", gpu.Ready() ? "yes" : "no");
+
+    // Per-frame VRAM, to see whether a fused reduction releases each frame or
+    // accumulates them.
+    IDXGIFactory4* factory = nullptr;
+    IDXGIAdapter3* adapter = nullptr;
+    if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+        IDXGIAdapter1* a1 = nullptr;
+        if (SUCCEEDED(factory->EnumAdapters1(0, &a1))) a1->QueryInterface(&adapter);
+        if (a1) a1->Release();
+    }
+    if (adapter) {
+        g_frameTrace = [adapter](int f) {
+            DXGI_QUERY_VIDEO_MEMORY_INFO info{};
+            if (SUCCEEDED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info)))
+                std::printf("  frame %d: vram %.0f MB used, %.0f MB budget\n", f,
+                            double(info.CurrentUsage) / (1024.0 * 1024.0),
+                            double(info.Budget) / (1024.0 * 1024.0));
+        };
+    }
+
     std::vector<Data> sources;
     sources.push_back(std::move(group));
 
@@ -79,6 +100,7 @@ int main(int argc, char** argv) {
     std::string xerr;
     const bool ok = pipe.Execute(&sources, nullptr, &xerr, gpu.Ready() ? &gpu : nullptr,
                                  ExecMode::Auto);
+    std::printf("stages run: %d cpu, %d gpu\n", pipe.CpuStageCount(), pipe.GpuStageCount());
     std::printf("execute: %s in %.1fs\n", ok ? "ok" : xerr.c_str(), Now() - t1);
     return ok ? 0 : 1;
 }
