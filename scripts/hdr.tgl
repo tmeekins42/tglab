@@ -1,4 +1,4 @@
-# Merging an exposure bracket into one scene-linear image.
+# Merging an exposure bracket, then fitting it onto a display.
 #
 # Drop your bracket on one palette row -- hold ALT while dropping to make them
 # a group in one go -- then right-click the group and "Sort by filename" so the
@@ -6,19 +6,28 @@
 #
 # merge_hdr reads each frame's shutter, aperture and ISO from its EXIF and
 # divides them out, so every frame contributes the same radiance where it is
-# well exposed. The result carries real headroom: values well above 1.0 where
-# the scene was brighter than any single frame could hold.
+# well exposed. The result is scene-linear with real headroom: on a seven-frame
+# bracket it reaches 900-odd, with the midtones near 2.0.
 #
-# Watch the status line after a run -- it reports how many stops the bracket
-# spanned, and warns if a frame carried no exposure metadata.
+# tonemap is what makes that displayable. It MEASURES the image -- a merge's
+# absolute scale depends on the shutter speeds used, so no fixed anchor could
+# be right -- puts the median on middle grey, and rolls the highlights off. It
+# is a separate stage rather than part of the merge on purpose: any
+# scene-linear image can need it, and swapping in a different operator should
+# be a one-line change.
 
 frames = image("bracket")
 merged = merge_hdr(frames)
 
-# The merge is scene-linear, so exposure here means what it means on a raw:
-# a stop is a stop. Pull the highlights down to see what the bracket captured
-# above what one frame could hold.
-final = params(basic_adjust, auto_exposure = 1)(merged)
+# exposure moves the midtones (1.0 = middle grey), shoulder sets how much
+# highlight headroom is kept above them. Watch the status line: it reports the
+# scale it chose and how far the highlights reach.
+shown = tonemap(merged)
+
+# Ordinary develop on top, now that the data is in a sane range. The sliders
+# mean what they mean on a raw.
+final = basic_adjust(shown)
 
 display(merged, "linear")
+display(shown,  "tonemapped")
 display(final,  "developed")

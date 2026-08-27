@@ -11,6 +11,7 @@
 #include "../src/core/algorithm.h"
 #include "../src/algo_util/histogram.h"
 #include "../src/core/exif.h"
+#include "../src/algo_util/pixel_buffer.h"
 #include "../src/core/image_group.h"
 #include "../src/core/image_loader.h"
 #include "../src/core/image_io.h"
@@ -2165,6 +2166,118 @@ int main() {
                     if (st.algo && st.algoName == "merge_hdr") report = st.algo->RunReport();
                 Check(report.find("NO EXIF") != std::string::npos,
                       "and says so rather than merging as though exposures matched");
+            }
+        }
+    }
+
+    // --- tonemap -------------------------------------------------------------
+    //
+    // Fits scene-linear data into the range the display curve expects. The
+    // measurement is the whole point: a merge's absolute scale depends on the
+    // shutter speeds in the bracket, so no fixed anchor can be right and the
+    // operator has to read its own input.
+    {
+        // A gradient with a huge range, like a merged bracket: most of the
+        // frame dark, a few pixels enormously bright.
+        auto Ramp = []() {
+            Image img;
+            ImageDesc d;
+            d.width = 64; d.height = 64; d.format = Format::RGBA32F;
+            d.linear = true;
+            img.Alloc(d);
+            ImageView v = img.MapCpuWrite();
+            float* p = reinterpret_cast<float*>(v.data);
+            for (int i = 0; i < 64 * 64; ++i) {
+                // 0.5 .. 500, so the median sits near 5 -- well above grey.
+                const float t = float(i) / float(64 * 64 - 1);
+                const float val = 0.5f * std::pow(1000.0f, t);
+                for (int c = 0; c < 3; ++c) p[i * 4 + c] = val;
+                p[i * 4 + 3] = 1.0f;
+            }
+            return img;
+        };
+
+        auto RunTone = [&](const char* src, std::string* err) -> Data {
+            Program prog;
+            if (!Parse(src, &prog, err)) return Data{};
+            std::vector<SourceImage> nm{{"test", 0}};
+            UiState ui; Pipeline pipe;
+            InterpResult r = Interpret(prog, nm, &ui, &pipe);
+            if (!r.ok) { *err = r.error; return Data{}; }
+            std::vector<Data> srcs;
+            srcs.push_back(Data{Ramp()});
+            if (!pipe.Execute(&srcs, nullptr, err)) return Data{};
+            const Data* o = pipe.Resolve(pipe.Viewers().back().source, &srcs);
+            if (const auto* im = o ? std::get_if<Image>(o) : nullptr) return Data{im->Clone()};
+            return Data{};
+        };
+
+        auto Stats = [](const Data& d, float* median, float* hi) {
+            const auto* im = std::get_if<Image>(&d);
+            if (!im) return false;
+            ImageView v = const_cast<Image&>(*im).MapCpuRead();
+            if (!v.data) return false;
+            PixelBuffer pb;
+            pb.Unpack(v);
+            std::vector<float> lum;
+            for (int y = 0; y < pb.Height(); ++y)
+                for (int x = 0; x < pb.Width(); ++x) lum.push_back(pb.At(x, y)[0]);
+            std::sort(lum.begin(), lum.end());
+            *median = lum[lum.size() / 2];
+            *hi     = lum.back();
+            return true;
+        };
+
+        std::string e1;
+        Data d1 = RunTone("s = image(\"test\")\nt = tonemap(s)\ndisplay(t)\n", &e1);
+        float med = 0.0f, hi = 0.0f;
+        Check(Stats(d1, &med, &hi), e1.empty() ? "tonemap runs" : ("failed: " + e1).c_str());
+
+        // The median should land on middle grey. That is the measurement doing
+        // its job -- the input median is about 5.0, some 4.8 stops above grey.
+        Check(std::abs(med - 0.18f) < 0.02f,
+              "the measured median lands on middle grey");
+
+        // And the top must be bounded. The input reaches 500; the shoulder is
+        // asymptotic to grey * (1 + shoulder), which at the default 4 is 0.9.
+        Check(hi < 0.95f, "the highlights are compressed, not clipped");
+        Check(hi > 0.5f,  "and are still well separated from the midtones");
+
+        // The exposure parameter moves the median, proportionally.
+        std::string e2;
+        Data d2 = RunTone("s = image(\"test\")\nt = tonemap(s, exposure = 2.0)\ndisplay(t)\n", &e2);
+        float med2 = 0.0f, hi2 = 0.0f;
+        if (Stats(d2, &med2, &hi2))
+            Check(med2 > med * 1.5f, "exposure = 2 places the midtones brighter");
+
+        // Below middle grey the mapping is exactly linear, so shadows are not
+        // touched at all. Checked directly rather than inferred.
+        {
+            Image dark;
+            ImageDesc dd; dd.width = 4; dd.height = 4; dd.format = Format::RGBA32F;
+            dd.linear = true;
+            dark.Alloc(dd);
+            ImageView dv = dark.MapCpuWrite();
+            float* dp = reinterpret_cast<float*>(dv.data);
+            for (int i = 0; i < 4 * 4; ++i) {
+                for (int c = 0; c < 3; ++c) dp[i * 4 + c] = 0.18f;   // exactly grey
+                dp[i * 4 + 3] = 1.0f;
+            }
+            Program p3; std::string e3;
+            Parse("s = image(\"test\")\nt = tonemap(s)\ndisplay(t)\n", &p3, &e3);
+            std::vector<SourceImage> nm{{"test", 0}};
+            UiState u3; Pipeline pl3;
+            Interpret(p3, nm, &u3, &pl3);
+            std::vector<Data> sv;
+            sv.push_back(Data{std::move(dark)});
+            if (pl3.Execute(&sv, nullptr, &e3)) {
+                const Data* o = pl3.Resolve(pl3.Viewers().back().source, &sv);
+                if (const auto* im = o ? std::get_if<Image>(o) : nullptr) {
+                    ImageView v = const_cast<Image&>(*im).MapCpuRead();
+                    const float* p = reinterpret_cast<const float*>(v.data);
+                    Check(p && std::abs(p[0] - 0.18f) < 1e-4f,
+                          "an image already at middle grey passes through unchanged");
+                }
             }
         }
     }
