@@ -125,6 +125,11 @@ int main(int argc, char** argv) {
     std::string xerr;
     const bool ok = pipe.Execute(&sources, nullptr, &xerr, gpu.Ready() ? &gpu : nullptr,
                                  ExecMode::Auto);
+    if (adapter) {
+        DXGI_QUERY_VIDEO_MEMORY_INFO info{};
+        if (SUCCEEDED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info)))
+            std::printf("vram at end: %.0f MB\n", double(info.CurrentUsage) / (1024.0 * 1024.0));
+    }
     std::printf("stages run: %d cpu, %d gpu\n", pipe.CpuStageCount(), pipe.GpuStageCount());
     std::printf("execute: %s in %.1fs\n", ok ? "ok" : xerr.c_str(), Now() - t1);
     return ok ? 0 : 1;

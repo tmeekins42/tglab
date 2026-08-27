@@ -55,10 +55,14 @@ BUGS / SMALL FEATURES
       images into?
     + when a large number of images are dropped, it takes time (thumbnails, exif, etc). 
       Can this processing be done on multiple threads?
+    + also, when dropping multiple images, can the status at the bottom show the progress,
+      such as 1/5, 2/5 ... 5/5
   The row is the wrong container for N images -- it was built to show one file
   and now has to represent a set. Whatever replaces it needs to expand, so the
   members are addressable. Tim has ideas and is writing them up; do not
   redesign this unprompted.
+- demosaic chroma pass is 22ms of the entire ~45ms... worth optimizing this. I think
+  several demosaic algorithms use the chroma pass.
 
 NEW FEATURES / IDEAS
 - add support for additional image channels, such as alpha channels and depth channels

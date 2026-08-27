@@ -580,6 +580,10 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
     std::map<int, std::pair<std::vector<int>, PortRef>> fusedPlan;
     std::set<int> fused;
     for (size_t i = firstDirty; i < m_stages.size(); ++i) {
+        // TGLAB_NOFUSE runs the chain stage by stage instead, for measuring what
+        // fusing actually saves.
+        static const bool noFuse = GetEnvironmentVariableA("TGLAB_NOFUSE", nullptr, 0) > 0;
+        if (noFuse) break;
         if (!m_stages[i].algo->IsReduction()) continue;
         PortRef srcPort{};
         std::vector<int> chain = FusableChain(int(i), &srcPort);
