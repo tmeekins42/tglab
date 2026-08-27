@@ -316,7 +316,6 @@ private:
     void CommitRename(int i);
     int  SlotAtScreenPos(int sx, int sy) const;
     void DrawAlgorithmsPanel();
-    void DrawScriptsPanel();
     void RescanScripts();
     void DrawComparePanel();
     void DrawInfoPanel();
@@ -417,6 +416,7 @@ private:
     GpuTexture m_diffTex;
     bool       m_compareOpen       = false;
     bool       m_aboutOpen         = false;
+    bool       m_algorithmsOpen    = false;   // reference dialog, opened from View
 
     // Info panel: dimensions, per-channel histogram, and capture settings for
     // whichever image is being looked at.
@@ -494,6 +494,32 @@ bool App::Init(HWND hwnd) {
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
     io.IniFilename = "tglab_layout.ini";   // remembers panel layout across runs
     ImGui::StyleColorsDark();
+
+    // Discard a layout saved before the panels changed.
+    //
+    // "Scripts" and "Algorithms" no longer exist as docked windows, and ImGui
+    // remembers windows by name: an old .ini leaves their tab stubs behind and
+    // keeps Images tabbed against them, which is exactly the arrangement this
+    // change removes. Bumping the version resets the layout ONCE.
+    //
+    // The marker is a separate file rather than a field in the .ini, because
+    // ImGui owns that format and will drop anything it does not recognise.
+    {
+        const char* kVersionFile = "tglab_layout.version";
+        const int   kLayoutVersion = 2;   // 2: palette alone in the left column
+        int saved = 0;
+        if (FILE* f = nullptr; fopen_s(&f, kVersionFile, "rb") == 0 && f) {
+            std::fread(&saved, sizeof saved, 1, f);
+            std::fclose(f);
+        }
+        if (saved != kLayoutVersion) {
+            DeleteFileA(io.IniFilename);
+            if (FILE* f = nullptr; fopen_s(&f, kVersionFile, "wb") == 0 && f) {
+                std::fwrite(&kLayoutVersion, sizeof kLayoutVersion, 1, f);
+                std::fclose(f);
+            }
+        }
+    }
 
     // If the user already has a layout, never overwrite it with the default.
     m_haveSavedLayout = (GetFileAttributesA(io.IniFilename) != INVALID_FILE_ATTRIBUTES);
@@ -1170,11 +1196,15 @@ void App::BuildDefaultLayout(ImGuiID dockspace) {
     const ImGuiID right  = ImGui::DockBuilderSplitNode(centre, ImGuiDir_Right, 0.28f, nullptr, &centre);
     const ImGuiID bottom = ImGui::DockBuilderSplitNode(centre, ImGuiDir_Down, 0.18f, nullptr, &centre);
     ImGuiID leftBottom   = left;
-    const ImGuiID leftTop = ImGui::DockBuilderSplitNode(leftBottom, ImGuiDir_Up, 0.5f, nullptr, &leftBottom);
+    // The palette gets the larger share: it is now the only thing in the upper
+    // left and holds a scrolling list of images, while Controls is a handful of
+    // sliders.
+    const ImGuiID leftTop = ImGui::DockBuilderSplitNode(leftBottom, ImGuiDir_Up, 0.62f, nullptr, &leftBottom);
 
+    // The palette sits alone in the upper-left, always visible rather than
+    // tabbed against panels that are consulted occasionally. Scripts moved to a
+    // combo on the menu bar; the algorithm list to a dialog under View.
     ImGui::DockBuilderDockWindow("Images",     leftTop);
-    ImGui::DockBuilderDockWindow("Algorithms", leftTop);
-    ImGui::DockBuilderDockWindow("Scripts",    leftTop);
     ImGui::DockBuilderDockWindow("Controls",   leftBottom);
     ImGui::DockBuilderDockWindow("Status",     bottom);
     // Compare and Image Info share the right-hand column: both are read
@@ -1208,6 +1238,8 @@ void App::DrawMenuBar() {
     }
     if (ImGui::BeginMenu("View")) {
         if (ImGui::MenuItem("Image Info", nullptr, m_infoOpen)) m_infoOpen = !m_infoOpen;
+        if (ImGui::MenuItem("Algorithm reference", nullptr, m_algorithmsOpen))
+            m_algorithmsOpen = !m_algorithmsOpen;
         ImGui::Separator();
         if (ImGui::MenuItem("Sync pan/zoom", nullptr, &m_syncCameras)) SyncViews();
         if (ImGui::MenuItem("Reset layout")) m_rebuildLayout = true;
@@ -1270,6 +1302,33 @@ void App::DrawMenuBar() {
         if (ImGui::MenuItem("About tglab...")) m_aboutOpen = true;
         ImGui::EndMenu();
     }
+
+    // Script picker on the bar itself rather than in a docked panel.
+    //
+    // Switching experiments is the most frequent thing done here, and it used
+    // to cost a tab switch away from the palette -- which is exactly what Tim
+    // asked to remove. A combo is one click and always visible.
+    {
+        if (m_scriptListDirty) { m_scriptListDirty = false; RescanScripts(); }
+
+        ImGui::SetNextItemWidth(220.0f);
+        const char* label = m_scriptName.empty() ? "(no script)" : m_scriptName.c_str();
+        if (ImGui::BeginCombo("##script", label)) {
+            if (m_scriptList.empty()) {
+                ImGui::TextDisabled("No .tgl files found.");
+            }
+            for (const std::string& name : m_scriptList) {
+                const bool current = (name == m_scriptName);
+                if (ImGui::Selectable(name.c_str(), current) && !current)
+                    SetScriptPath(m_scriptDir + "\\" + name);
+                if (current) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::Separator();
+            if (ImGui::Selectable("Rescan directory")) m_scriptListDirty = true;
+            ImGui::EndCombo();
+        }
+    }
+
     ImGui::EndMainMenuBar();
 }
 
@@ -1916,37 +1975,6 @@ void App::DrawComparePanel() {
     ImGui::End();
 }
 
-// Lists every .tgl beside the current script, so switching experiments is a
-// click rather than a relaunch. Scanned on demand rather than watched: the
-// directory changes far less often than the script itself.
-void App::DrawScriptsPanel() {
-    if (!ImGui::Begin("Scripts")) { ImGui::End(); return; }
-
-    if (ImGui::Button("Refresh")) m_scriptListDirty = true;
-    ImGui::SameLine();
-    ImGui::TextDisabled("%s", m_scriptDir.empty() ? "(no directory)" : m_scriptDir.c_str());
-    ImGui::Separator();
-
-    if (m_scriptListDirty) {
-        m_scriptListDirty = false;
-        RescanScripts();
-    }
-
-    if (m_scriptList.empty()) {
-        ImGui::TextDisabled("No .tgl files found.");
-        ImGui::End();
-        return;
-    }
-
-    for (const std::string& name : m_scriptList) {
-        const bool current = (name == m_scriptName);
-        if (ImGui::Selectable(name.c_str(), current) && !current) {
-            SetScriptPath(m_scriptDir + "\\" + name);
-        }
-    }
-    ImGui::End();
-}
-
 // Fills m_scriptList with the .tgl files in m_scriptDir, sorted.
 void App::RescanScripts() {
     m_scriptList.clear();
@@ -2252,8 +2280,13 @@ void App::CommitRename(int i) {
     m_dirty = true;   // the script may now resolve differently
 }
 
+// A scripting reference rather than a working panel, so it is a dialog opened
+// from View rather than a tab competing with the image palette for the left
+// column. Tim's note: "I'm not sure what use the algorithms tab is, other than
+// a scripting reference".
 void App::DrawAlgorithmsPanel() {
-    if (!ImGui::Begin("Algorithms")) { ImGui::End(); return; }
+    if (!m_algorithmsOpen) return;
+    if (!ImGui::Begin("Algorithm reference", &m_algorithmsOpen)) { ImGui::End(); return; }
 
     for (const std::string& name : Registry::Get().Names()) {
         auto a = Registry::Get().Create(name);
@@ -2415,7 +2448,6 @@ void App::Frame() {
     DrawMenuBar();
     // DrawPalettePanel() uploads thumbnail textures, so it runs after
     // BeginFrame() opens the command list -- see below with the image views.
-    DrawScriptsPanel();
     DrawControlsPanel();
     DrawAlgorithmsPanel();
     // DrawComparePanel() uploads a texture, so it must run after BeginFrame()

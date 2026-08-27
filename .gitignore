@@ -3,6 +3,7 @@ out/
 .vs/
 *.user
 tglab_layout.ini
+tglab_layout.version
 
 # Fixtures the dbg_hang harness generates for TGLAB_PALETTE_TEST.
 palette_fixture_*.png
