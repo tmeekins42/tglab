@@ -4,6 +4,8 @@
 #include <cmath>
 #include <vector>
 
+#include "pixel_buffer.h"
+
 namespace tglab {
 namespace {
 
@@ -121,28 +123,58 @@ AutoDevelopSuggestion SuggestExposure(const Image& mosaic) {
     AutoDevelopSuggestion out;
 
     const ImageDesc& d = mosaic.Desc();
-    if (!d.Valid() || !d.IsMosaic()) return out;
+    if (!d.Valid()) return out;
 
     ImageView v = const_cast<Image&>(mosaic).MapCpuRead();
     if (!v.Valid()) return out;
 
-    const double black = double(d.blackLevel);
-    const double range = std::max(double(d.whiteLevel) - black, 1.0);
-
-    // Green sensels on a sampled grid.
+    // Luminance samples on a grid, from EITHER a raw mosaic or an image that
+    // has already been developed.
     //
-    // Sampling rather than reading every pixel: this runs once per image load
-    // on the UI thread, and at 24 MP a full scan is tens of milliseconds for a
-    // number that a few hundred thousand samples already pins down. The stride
-    // is odd so it does not lock onto one CFA phase.
+    // It used to take only a mosaic, which meant auto-exposure did nothing at
+    // all for an HDR merge -- the merge is demosaiced RGBA32F, so the function
+    // returned empty and every slider sat at its zero default on an image that
+    // needed several stops of correction.
+    //
+    // Sampling rather than reading every pixel: this runs on the UI thread, and
+    // at 24 MP a full scan is tens of milliseconds for a number a few hundred
+    // thousand samples already pins down. The stride is odd so a mosaic scan
+    // does not lock onto one CFA phase.
+    //
+    // The clamp ceiling is generous rather than 4.0 because a merged bracket
+    // genuinely reaches into the hundreds, and clamping there would drag every
+    // percentile down and make the frame look darker than it is.
     std::vector<float> g;
     g.reserve(400000);
     const int stride = std::max(1, std::min(d.width, d.height) / 700) | 1;
-    for (int y = 0; y < d.height; y += stride) {
-        for (int x = 0; x < d.width; x += stride) {
-            if (CfaColorAt(d.cfa, x, y) != 1) continue;      // green only
-            const double s = (double(*v.At<float>(x, y)) - black) / range;
-            g.push_back(float(std::clamp(s, 0.0, 4.0)));
+    const bool mosaicSrc = d.IsMosaic();
+
+    if (mosaicSrc) {
+        const double black = double(d.blackLevel);
+        const double range = std::max(double(d.whiteLevel) - black, 1.0);
+        for (int y = 0; y < d.height; y += stride) {
+            for (int x = 0; x < d.width; x += stride) {
+                if (CfaColorAt(d.cfa, x, y) != 1) continue;   // green only
+                const double s = (double(*v.At<float>(x, y)) - black) / range;
+                g.push_back(float(std::clamp(s, 0.0, 4.0)));
+            }
+        }
+    } else {
+        // A developed image: sample luminance. Green-weighted like the mosaic
+        // path, so the two produce comparable numbers and the thresholds tuned
+        // against raws still mean the same thing.
+        PixelBuffer pb;
+        pb.Unpack(v);
+        if (!pb.Valid()) return out;
+        const int ch = pb.Channels();
+        for (int y = 0; y < pb.Height(); y += stride) {
+            for (int x = 0; x < pb.Width(); x += stride) {
+                const float* p = pb.At(x, y);
+                const double lum = (ch >= 3)
+                    ? 0.2126 * double(p[0]) + 0.7152 * double(p[1]) + 0.0722 * double(p[2])
+                    : double(p[0]);
+                g.push_back(float(std::clamp(lum / double(pb.ValueScale()), 0.0, 1e6)));
+            }
         }
     }
     if (g.size() < 1000) return out;                          // too little to judge
@@ -241,10 +273,19 @@ AutoDevelopSuggestion SuggestExposure(const Image& mosaic) {
         }
     }
 
-    // Only ever suggest a push. A raw that needs pulling down is usually one
+    // A raw is only ever pushed UP. One that needs pulling down is usually one
     // with blown highlights, and the fix there is highlight recovery rather
     // than a global darkening that muddies everything else.
-    stops = std::clamp(stops, 0.0, kMaxStops);
+    //
+    // A merged bracket is the opposite case and needs the other direction. Its
+    // values are scene-linear radiance rather than sensor counts, so a median
+    // well above middle grey is not an over-exposed capture -- it is simply
+    // where the merge put the scale, and no amount of highlight recovery moves
+    // it. Tim's seven-frame bracket lands at a median near 2.0, about 3.5 stops
+    // above grey, and without a pull the image opens washed out with every
+    // slider at zero.
+    const double floorStops = mosaicSrc ? 0.0 : -kMaxStops;
+    stops = std::clamp(stops, floorStops, kMaxStops);
     out.exposure = float(stops);
 
     // How much of the frame the push will drive into saturation.

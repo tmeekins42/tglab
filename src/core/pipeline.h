@@ -47,6 +47,11 @@ struct Stage {
     // Target shape for a reshape stage, computed by the interpreter so that
     // later lines can be checked against it at build time. Empty otherwise.
     Shape                reshapeTo;
+
+    // When this stage was consumed by a fused reduction, the stage that owns
+    // its result. -1 otherwise. The cache scan uses it to look past a stage
+    // that legitimately holds nothing.
+    int                  fusedInto = -1;
     // Versions of the palette images this stage read, so replacing one is
     // detected as a change rather than looking identical.
     uint64_t             sourceHash = 0;

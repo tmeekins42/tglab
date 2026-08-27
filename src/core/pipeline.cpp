@@ -250,10 +250,16 @@ bool Pipeline::RunFusedReduction(int reduceStage, const std::vector<int>& chain,
     red.outputs.resize(1);
     red.outputs[0] = Data{std::move(out)};
 
-    // The chain's stages ran, but their outputs were consumed frame by frame
-    // and no longer exist as sets. Marking them invalid stops a later run from
-    // reusing a cache entry that holds nothing.
-    for (int si : chain) m_stages[size_t(si)].valid = false;
+    // The chain stages ran but hold nothing: their outputs were consumed frame
+    // by frame and never existed as sets. `fusedInto` records which reduction
+    // owns them, so the cache scan can skip past an empty stage to a valid
+    // result rather than stopping at it -- otherwise ONE fused chain forces
+    // every later stage to recompute, and a develop slider re-ran the whole
+    // merge.
+    for (int si : chain) {
+        m_stages[size_t(si)].valid      = false;
+        m_stages[size_t(si)].fusedInto  = reduceStage;
+    }
     red.valid = true;
     return true;
 }
@@ -593,9 +599,24 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
     size_t firstDirty = 0;
     if (prev) {
         const size_t n = std::min(m_stages.size(), prev->m_stages.size());
-        while (firstDirty < n &&
-               prev->m_stages[firstDirty].valid &&
-               SameStage(m_stages[firstDirty], prev->m_stages[firstDirty])) {
+        while (firstDirty < n && SameStage(m_stages[firstDirty], prev->m_stages[firstDirty])) {
+            const Stage& ps = prev->m_stages[firstDirty];
+
+            // A stage consumed by a fused reduction holds nothing and is not
+            // valid, but that is not a reason to stop: its RESULT lives in the
+            // reduction downstream, which is cached like anything else. Treat
+            // it as unchanged and carry on.
+            //
+            // Without this the scan stopped at the first chain stage, so a
+            // develop slider re-ran the entire HDR merge -- seven raws
+            // demosaiced and merged for a one-line parameter change.
+            if (!ps.valid && ps.fusedInto >= 0) {
+                m_stages[firstDirty].fusedInto = ps.fusedInto;
+                ++firstDirty;
+                continue;
+            }
+            if (!ps.valid) break;
+
             // Steal the cached outputs — Data is move-only, and the previous
             // pipeline is discarded right after this call. The compiled kernel
             // comes along too, so an unchanged stage never recompiles.
