@@ -2188,7 +2188,45 @@ void App::DrawPalettePanel() {
                                &e.autoDev, &e.autoDevVersion, e.version);
                 e.thumbVersion = e.version;
             }
-            if (e.thumbImage.Valid() && e.thumb.Update(m_dev, e.thumbImage, e.version)) {
+            // A collapsed group draws as a STACK: up to three members behind
+            // the front one, offset and progressively darker.
+            //
+            // Tim's idea, and a better tell than the disclosure triangle alone
+            // -- the triangle says "this expands", the stack says "there are
+            // several images in here" at a glance, without reading anything.
+            // Drawn back-to-front so the front image is the one fully lit.
+            if (e.isGroup && !e.expanded && setPtr && setPtr->images.size() > 1) {
+                RefreshMembers(e);
+                const int layers = std::min<int>(3, int(setPtr->images.size()));
+                const ImVec2 p = ImGui::GetCursorScreenPos();
+
+                for (int L = layers - 1; L >= 0; --L) {
+                    PaletteMember& pm = e.members[size_t(L)];
+                    Image& mi = const_cast<Image&>(setPtr->images[size_t(L)]);
+                    if (!pm.thumbBuilt && mi.Valid()) {
+                        BuildThumbnail(mi, pm.path, int(thumbSize) * 2, &pm.thumbImage,
+                                       nullptr, nullptr, 0);
+                        pm.thumbBuilt = true;
+                    }
+                    if (!pm.thumbImage.Valid() || !pm.thumb.Update(m_dev, pm.thumbImage, 1))
+                        continue;
+
+                    // Each layer back is offset down-right and dimmed, so the
+                    // stack reads as depth rather than as a wider image.
+                    const float off  = float(L) * 4.0f;
+                    const float lit  = 1.0f - 0.10f * float(L) * 2.0f;
+                    const float box  = thumbSize - float(layers - 1) * 4.0f;
+                    const float iw = float(pm.thumb.Width()), ih = float(pm.thumb.Height());
+                    const float sc = (iw > 0 && ih > 0) ? std::min(box / iw, box / ih) : 1.0f;
+                    const ImVec2 sz(iw * sc, ih * sc);
+                    const ImVec2 a(p.x + off + (box - sz.x) * 0.5f,
+                                   p.y + off + (box - sz.y) * 0.5f);
+                    const ImU32 tint = ImGui::GetColorU32(ImVec4(lit, lit, lit, 1.0f));
+                    ImGui::GetWindowDrawList()->AddImage(
+                        ImTextureRef(static_cast<ImTextureID>(pm.thumb.Handle().ptr)),
+                        a, ImVec2(a.x + sz.x, a.y + sz.y), ImVec2(0, 0), ImVec2(1, 1), tint);
+                }
+            } else if (e.thumbImage.Valid() && e.thumb.Update(m_dev, e.thumbImage, e.version)) {
                 const float iw = float(e.thumb.Width());
                 const float ih = float(e.thumb.Height());
                 const float scale = (iw > 0 && ih > 0) ? std::min(thumbSize / iw, thumbSize / ih) : 1.0f;
@@ -2667,9 +2705,30 @@ void App::Frame() {
                 const float frac = float(p.Done()) / float(total);
                 ImGui::ProgressBar(frac, ImVec2(-1.0f, 0.0f));
             }
+        } else if (const int pending = m_loader.Pending(); pending > 0) {
+            // Loading REPLACES the OK line rather than sitting in grey beneath
+            // it. Tim: "my issue with the loading status is that it's gray
+            // text... and the green OK is above it, so it's not obvious."
+            //
+            // Same spinner and colour as a pipeline run, because it is the same
+            // kind of fact: something is happening and the app is not idle.
+            const char* spin = "|/-\\";
+            m_spinner = (m_spinner + 1) % 4;
+            const int done = m_dropTotal - pending;
+            if (m_dropTotal > 1) {
+                ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f),
+                                   "%c loading %d/%d", spin[m_spinner], done + 1, m_dropTotal);
+                ImGui::ProgressBar(float(done) / float(m_dropTotal), ImVec2(-1.0f, 0.0f));
+            } else {
+                ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f),
+                                   "%c loading %d image%s...", spin[m_spinner],
+                                   pending, pending == 1 ? "" : "s");
+            }
         } else if (m_error.empty()) {
+            m_dropTotal = 0;   // the burst is over; the next drop counts afresh
             ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1.0f), "OK");
         } else {
+            m_dropTotal = 0;
             ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f), "%s", m_error.c_str());
         }
         ImGui::TextDisabled("%s", m_scriptPath.empty() ? "(no script)" : m_scriptPath.c_str());
@@ -2683,19 +2742,6 @@ void App::Frame() {
             case ExecMode::ForceCPU: modeName = "CPU"; break;
             case ExecMode::ForceGPU: modeName = "GPU"; break;
             case ExecMode::Auto:     modeName = "auto"; break;
-        }
-        // A large scan on a slow drive takes real time to decode. Saying so
-        // beats an unexplained pause, which reads as a hang.
-        if (const int pending = m_loader.Pending(); pending > 0) {
-            ImGui::SameLine();
-            const int done = m_dropTotal - pending;
-            if (m_dropTotal > 1)
-                ImGui::TextDisabled("| loading %d/%d", done + 1, m_dropTotal);
-            else
-                ImGui::TextDisabled("| loading %d image%s...", pending, pending == 1 ? "" : "s");
-        } else {
-            // The burst is finished; the next drop starts its own count.
-            m_dropTotal = 0;
         }
         if (g_worstFrameMs > 100.0) {
             ImGui::SameLine();

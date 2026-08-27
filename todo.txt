@@ -63,6 +63,9 @@ BUGS / SMALL FEATURES
   redesign this unprompted.
 - demosaic chroma pass is 22ms of the entire ~45ms... worth optimizing this. I think
   several demosaic algorithms use the chroma pass.
+- when an image is loading/processing, put a spinner over the thumbnail in the image palette
+  if the image is cached, etc, maybe another icon over the thumbnail to show this
+  this has no practical purpose, but I think it's nice for the user to watch the processing
 
 NEW FEATURES / IDEAS
 - add support for additional image channels, such as alpha channels and depth channels
@@ -103,6 +106,8 @@ NEW FEATURES / IDEAS
 - at some point i think we might need an interactive sceipt editor in the app instead of depending
   on an external text editor. It could even be smart with pulldowns for commands and algorithms
   should also support syntax highlighting.
+  Since we're add an icon over the image thumbnail, we could have an error icon, if the
+  file fails to load, etc.
 
 NOTES
 - if we need matrix functions, I suggest the Euler library and Ceres for bundle solving
