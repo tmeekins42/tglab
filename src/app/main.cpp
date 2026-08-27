@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "../core/algorithm.h"
+#include "../core/image_group.h"
 #include "../core/image_io.h"
 #include "../core/compare.h"
 #include "../core/pipeline.h"
@@ -237,6 +238,19 @@ struct PaletteEntry {
     // given point can find which slot it landed on.
     ImVec2      rowMin{}, rowMax{};
 
+    // True when dropping a file ADDS to this entry rather than replacing it.
+    //
+    // A mode rather than something inferred: dumping 180 files off a camera
+    // should not silently become a group, and the name a file happens to carry
+    // is the wrong thing to trigger off. Turned on from the row's context menu.
+    //
+    // The axis a group's images lie on. "frame" is the neutral default -- what
+    // a video or an unlabelled burst is -- and the menu offers the ones a
+    // script reduces over: exposure, focus, position.
+    bool        isGroup = false;
+    std::string axis    = "frame";
+
+
     // Auto-exposure measurement, cached.
     //
     // Measuring costs a pass over the mosaic, and the script is re-interpreted
@@ -255,6 +269,9 @@ public:
     void OnResize(UINT w, UINT h) { if (m_dev.Ready()) m_dev.OnResize(w, h); }
 
     void LoadImageIntoPalette(const std::string& path, const std::string& targetSlot = "");
+    void AppendToGroup(PaletteEntry& e, Image&& img, const std::string& path);
+    void MakeGroup(PaletteEntry& e);
+    void Ungroup(PaletteEntry& e);
 
     // Queues a load on the loader thread. Used by the drop handler, which runs
     // on the UI thread and must not block on file I/O.
@@ -263,6 +280,7 @@ public:
     // Name of the palette slot at a screen point, or "" if none. Used by the
     // drop handler, which only has the App pointer.
     std::string SlotNameAt(int sx, int sy) const;
+    bool SlotIsGroup(const std::string& name) const;
     void SetScriptPath(const std::string& path);
 
     // Moves the first slider and re-runs, as dragging one does. Exists for the
@@ -590,6 +608,31 @@ void App::LoadImageIntoPalette(const std::string& path, const std::string& targe
     InstallLoadedImage(std::move(r));
 }
 
+// Group edits on a palette entry. The state machine itself lives in
+// core/image_group so it can be tested; these add what only the app knows --
+// bumping the version so the thumbnail rebuilds, and the path shown under the
+// name, which stops describing the entry once several files are behind it.
+void App::AppendToGroup(PaletteEntry& e, Image&& img, const std::string& path) {
+    tglab::AppendToGroup(&e.data, std::move(img), e.axis);
+    const auto& set = std::get<ImageSet>(e.data);
+    e.path = set.images.size() == 1 ? path : "";
+}
+
+void App::MakeGroup(PaletteEntry& e) {
+    if (e.isGroup) return;
+    e.isGroup = true;
+    tglab::MakeGroup(&e.data, e.axis);
+    ++e.version;
+}
+
+void App::Ungroup(PaletteEntry& e) {
+    if (!e.isGroup) return;
+    e.isGroup = false;
+    tglab::Ungroup(&e.data);
+    ++e.version;
+}
+
+
 void App::InstallLoadedImage(LoadResult&& r) {
     if (!r.ok) {
         m_error = r.error;
@@ -601,8 +644,11 @@ void App::InstallLoadedImage(LoadResult&& r) {
     if (!r.targetSlot.empty()) {
         for (PaletteEntry& e : m_palette) {
             if (e.name == r.targetSlot) {
-                e.path = r.path;
-                e.data = Data{std::move(r.image)};
+                if (e.isGroup) AppendToGroup(e, std::move(r.image), r.path);
+                else {
+                    e.path = r.path;
+                    e.data = Data{std::move(r.image)};
+                }
                 ++e.version;            // makes the thumbnail rebuild
                 m_dirty = true;
                 return;
@@ -663,6 +709,24 @@ void App::PollStats() {
 // Takes the entry by reference because measuring caches into it: the auto
 // exposure costs a pass over the mosaic and this is called on every
 // re-interpret, which is every slider tick.
+// A palette entry's data, copied for the pipeline to consume.
+//
+// The pipeline mutates what it is given, so it gets a clone rather than the
+// palette's own copy. A set clones each image; an empty Data stays empty so the
+// slot keeps its index and a script referring to it fails with "produced no
+// data" rather than silently reading the wrong palette entry.
+Data CloneSource(const Data& d) {
+    if (const auto* img = std::get_if<Image>(&d)) return Data{img->Clone()};
+    if (const auto* set = std::get_if<ImageSet>(&d)) {
+        ImageSet out;
+        out.shape = set->shape;
+        out.images.reserve(set->images.size());
+        for (const Image& i : set->images) out.images.push_back(i.Clone());
+        return Data{std::move(out)};
+    }
+    return Data{};
+}
+
 SourceImage DescribeSource(PaletteEntry& pe, int index) {
     SourceImage si;
     si.name  = pe.name;
@@ -719,10 +783,7 @@ void App::RunScript() {
     std::vector<SourceImage> names;
     std::vector<uint64_t> versions;
     for (size_t i = 0; i < m_palette.size(); ++i) {
-        if (std::holds_alternative<Image>(m_palette[i].data))
-            sources.push_back(Data{std::get<Image>(m_palette[i].data).Clone()});
-        else
-            sources.push_back(Data{});
+        sources.push_back(CloneSource(m_palette[i].data));
         names.push_back(DescribeSource(m_palette[i], int(i)));
         // Bumped when a drop replaces the file behind this slot, which is what
         // lets the stage cache notice the pixels changed.
@@ -772,10 +833,7 @@ void App::RequestCompare() {
     std::vector<SourceImage> names;
     std::vector<uint64_t> versions;
     for (size_t i = 0; i < m_palette.size(); ++i) {
-        if (std::holds_alternative<Image>(m_palette[i].data))
-            sources.push_back(Data{std::get<Image>(m_palette[i].data).Clone()});
-        else
-            sources.push_back(Data{});
+        sources.push_back(CloneSource(m_palette[i].data));
         names.push_back(DescribeSource(m_palette[i], int(i)));
         // Bumped when a drop replaces the file behind this slot, which is what
         // lets the stage cache notice the pixels changed.
@@ -1879,8 +1937,17 @@ void App::DrawPalettePanel() {
         // the full-resolution source: an 8 MP scan is a 33 MB texture, and
         // building one every frame to draw a 48 px icon locks the UI thread
         // solid -- which looks exactly like the whole app hanging.
-        if (std::holds_alternative<Image>(e.data)) {
-            Image& img = std::get<Image>(e.data);
+
+        // A group previews its first image, so the row is not blank. Written as
+        // a pointer rather than by duplicating the branch below: the thumbnail
+        // path is long, and two copies of it would drift.
+        Image* thumbSrc = std::get_if<Image>(&e.data);
+        if (!thumbSrc)
+            if (auto* set = std::get_if<ImageSet>(&e.data); set && !set->images.empty())
+                thumbSrc = &set->images.front();
+
+        if (thumbSrc) {
+            Image& img = *thumbSrc;
             if (img.Valid() && e.thumbVersion != e.version) {
                 // Develop a raw for the preview, using the same measurement the
                 // auto-exposure control uses. Deliberately independent of the
@@ -1967,6 +2034,18 @@ void App::DrawPalettePanel() {
         if (std::holds_alternative<Image>(e.data)) {
             const ImageDesc& d = std::get<Image>(e.data).Desc();
             ImGui::TextDisabled("%d x %d", d.width, d.height);
+        } else if (const auto* set = std::get_if<ImageSet>(&e.data)) {
+            // A group shows its shape, which is what a script reduces over,
+            // and the frame size when they agree.
+            ImGui::TextDisabled("%s", set->shape.ToString().c_str());
+            if (!set->images.empty()) {
+                const ImageDesc& d = set->images.front().Desc();
+                bool same = true;
+                for (const Image& im : set->images)
+                    if (im.Desc().width != d.width || im.Desc().height != d.height) { same = false; break; }
+                if (same) ImGui::TextDisabled("%d x %d", d.width, d.height);
+                else      ImGui::TextDisabled("mixed sizes");
+            }
         }
         ImGui::EndGroup();
 
@@ -1982,10 +2061,43 @@ void App::DrawPalettePanel() {
 
         if (ImGui::BeginPopupContextItem("slot")) {
             if (ImGui::MenuItem("Rename...")) BeginRename(i);
-            if (ImGui::MenuItem("Reload from disk")) {
+            if (!e.isGroup && ImGui::MenuItem("Reload from disk")) {
                 const std::string p = e.path, n = e.name;
                 LoadImageIntoPalette(p, n);
             }
+
+            ImGui::Separator();
+
+            // Group mode. Explicit rather than inferred -- dumping a card full
+            // of files should not silently become a group.
+            if (!e.isGroup) {
+                if (ImGui::MenuItem("Make a group"))
+                    MakeGroup(e);
+            } else {
+                // The axis a script reduces over. Renaming it restates the
+                // shape, so a script's over="exposure" matches what is here.
+                if (ImGui::BeginMenu("Axis")) {
+                    for (const char* ax : {"frame", "exposure", "focus", "position"}) {
+                        if (ImGui::MenuItem(ax, nullptr, e.axis == ax)) {
+                            e.axis = ax;
+                            tglab::SetGroupAxis(&e.data, e.axis);
+                            ++e.version;
+                            m_dirty = true;
+                        }
+                    }
+                    ImGui::EndMenu();
+                }
+                if (ImGui::MenuItem("Remove last image")) {
+                    tglab::RemoveLastFromGroup(&e.data, e.axis);
+                    ++e.version;
+                    m_dirty = true;
+                }
+                if (ImGui::MenuItem("Ungroup (keeps the first)")) {
+                    Ungroup(e);
+                    m_dirty = true;
+                }
+            }
+
             ImGui::Separator();
             if (ImGui::MenuItem("Remove from palette")) removeIndex = i;
             ImGui::EndPopup();
@@ -2004,6 +2116,7 @@ void App::DrawPalettePanel() {
 
     ImGui::TextDisabled("Reference from a script as image(\"name\")");
     ImGui::TextDisabled("Drop a file on a row to swap it, keeping the name.");
+    ImGui::TextDisabled("Right-click a row to make it a group; drops then add to it.");
     ImGui::End();
 }
 
@@ -2018,6 +2131,15 @@ int App::SlotAtScreenPos(int sx, int sy) const {
             return i;
     }
     return -1;
+}
+
+// Whether a slot is in group mode, so a multi-file drop knows to send every
+// file to it rather than only the first.
+bool App::SlotIsGroup(const std::string& name) const {
+    if (name.empty()) return false;
+    for (const PaletteEntry& e : m_palette)
+        if (e.name == name) return e.isGroup;
+    return false;
 }
 
 std::string App::SlotNameAt(int sx, int sy) const {
@@ -2378,9 +2500,12 @@ LRESULT WINAPI WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             for (UINT i = 0; i < n; ++i) {
                 char path[MAX_PATH] = {};
                 if (DragQueryFileA(drop, i, path, MAX_PATH) && g_app) {
-                    // Only the first file replaces the slot; any others are
-                    // added normally, since one row cannot hold several images.
-                    g_app->RequestImageLoad(path, i == 0 ? target : std::string());
+                    // Every file goes to the slot when it is a group -- that is
+                    // the whole point of dropping a folder's worth on one row.
+                    // Otherwise only the first replaces it and the rest become
+                    // their own entries, since a single-image row holds one.
+                    const bool all = g_app->SlotIsGroup(target);
+                    g_app->RequestImageLoad(path, (all || i == 0) ? target : std::string());
                 }
             }
             DragFinish(drop);

@@ -11,6 +11,7 @@
 #include "../src/core/algorithm.h"
 #include "../src/algo_util/histogram.h"
 #include "../src/core/exif.h"
+#include "../src/core/image_group.h"
 #include "../src/core/image_io.h"
 #include "../src/core/image_stats.h"
 #include "../src/core/raw_io.h"
@@ -1535,6 +1536,73 @@ int main() {
             Check(BuildWith("b = image(\"bracket\")\nm = test_merge(b)\no = brightness(m)\n", &e2),
                   "a reduced set chains into a single-image algorithm");
 
+
+        // The group state machine, which the palette UI drives. Extracted from
+        // the app so it can be tested: the invariant is that the shape's extent
+        // always equals the image count, and a stale extent would surface much
+        // later as a reduction over the wrong number of frames.
+        {
+            auto Px = [](int w) {
+                Image img;
+                ImageDesc d; d.width = w; d.height = 4; d.format = Format::RGBA8;
+                img.Alloc(d);
+                return img;
+            };
+
+            // A single image becomes a group of one, not of zero.
+            Data d{Px(4)};
+            tglab::MakeGroup(&d, "frame");
+            Check(TypeOf(d) == DataType::ImageSet, "MakeGroup produces a set");
+            Check(ShapeOf(d) == Shape::Of("frame", 1),
+                  "a grouped single image is a group of one");
+
+            tglab::AppendToGroup(&d, Px(4), "frame");
+            tglab::AppendToGroup(&d, Px(4), "frame");
+            Check(ShapeOf(d) == Shape::Of("frame", 3), "appending restates the extent");
+            Check(std::get<ImageSet>(d).images.size() == 3, "and the images are there");
+
+            // Renaming the axis keeps the extent.
+            tglab::SetGroupAxis(&d, "exposure");
+            Check(ShapeOf(d) == Shape::Of("exposure", 3),
+                  "renaming the axis keeps the count");
+
+            tglab::RemoveLastFromGroup(&d, "exposure");
+            Check(ShapeOf(d) == Shape::Of("exposure", 2), "removing restates the extent");
+
+            // Ungroup keeps the FIRST image, so a script naming the slot still
+            // resolves rather than the entry going empty.
+            std::get<ImageSet>(d).images.front() = Px(99);
+            tglab::Ungroup(&d);
+            Check(TypeOf(d) == DataType::Image, "Ungroup returns a single image");
+            Check(std::get<Image>(d).Desc().width == 99, "and it keeps the first");
+
+            // An empty slot grouped and appended to is still consistent -- the
+            // path a fresh entry takes when group mode is set before any drop.
+            Data e2{};
+            tglab::MakeGroup(&e2, "focus");
+            Check(ShapeOf(e2) == Shape::Of("focus", 0),
+                  "grouping an empty slot gives an empty group");
+            tglab::AppendToGroup(&e2, Px(4), "focus");
+            Check(ShapeOf(e2) == Shape::Of("focus", 1), "and appending starts the count");
+
+            // Removing past the end must not underflow the extent.
+            tglab::RemoveLastFromGroup(&e2, "focus");
+            tglab::RemoveLastFromGroup(&e2, "focus");
+            Check(ShapeOf(e2) == Shape::Of("focus", 0), "removing past empty stays at zero");
+
+            // Ungrouping an empty group yields an invalid image rather than
+            // crashing -- the slot stays addressable and fails at run time with
+            // "produced no data".
+            tglab::Ungroup(&e2);
+            Check(TypeOf(e2) == DataType::Image, "ungrouping an empty group is safe");
+
+            // MakeGroup on an existing group is idempotent, not nesting.
+            Data e3{Px(4)};
+            tglab::MakeGroup(&e3, "frame");
+            tglab::AppendToGroup(&e3, Px(4), "frame");
+            tglab::MakeGroup(&e3, "frame");
+            Check(ShapeOf(e3) == Shape::Of("frame", 2), "MakeGroup on a group changes nothing");
+        }
             // Execute must refuse too, not just the interpreter: a set reaching
             // a scalar port at run time would otherwise allocate from a zeroed
             // ImageDesc and silently produce a zero-sized output.
