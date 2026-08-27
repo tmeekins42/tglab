@@ -16,6 +16,9 @@
 #include <dxgi1_4.h>
 #include <windows.h>
 
+#include <algorithm>
+
+#include "../src/algo_util/pixel_buffer.h"
 #include "../src/core/image_group.h"
 #include "../src/core/pipeline.h"
 #include "../src/core/raw_io.h"
@@ -44,13 +47,26 @@ int main(int argc, char** argv) {
             return 2;
         }
         const ImageDesc& d = img.Desc();
-        std::printf("  %s  %dx%d mosaic=%d\n", argv[i], d.width, d.height, int(d.IsMosaic()));
+        // Exposure is printed because merge_hdr depends on it entirely: a
+        // bracket whose frames all report the same relative exposure is not a
+        // bracket as far as the merge is concerned, and that is worth seeing
+        // rather than inferring from a flat-looking result.
+        std::printf("  %s  %dx%d mosaic=%d  %.4fs f/%.1f ISO%.0f  rel=%.5f\n",
+                    argv[i], d.width, d.height, int(d.IsMosaic()),
+                    double(d.shutter), double(d.aperture), double(d.iso),
+                    double(d.RelativeExposure()));
         AppendToGroup(&group, std::move(img), "frame");
     }
     std::printf("loaded %d frames in %.1fs, shape %s\n\n",
                 argc - 1, Now() - t0, ShapeOf(group).ToString().c_str());
 
-    const char* src = "frames = image(\"group\")\nmerged = merge_mean(frames)\ndisplay(merged)\n";
+    // TGLAB_MERGE picks the reduction, so the same harness exercises either.
+    char algo[64] = "merge_mean";
+    GetEnvironmentVariableA("TGLAB_MERGE", algo, sizeof algo);
+    const std::string srcStr =
+        std::string("frames = image(\"group\")\nmerged = ") + algo +
+        "(frames)\ndisplay(merged)\n";
+    const char* src = srcStr.c_str();
     Program prog;
     std::string err;
     if (!Parse(src, &prog, &err)) { std::printf("parse: %s\n", err.c_str()); return 2; }
@@ -131,6 +147,44 @@ int main(int argc, char** argv) {
             std::printf("vram at end: %.0f MB\n", double(info.CurrentUsage) / (1024.0 * 1024.0));
     }
     std::printf("stages run: %d cpu, %d gpu\n", pipe.CpuStageCount(), pipe.GpuStageCount());
+
+    // What the merge actually produced. For an HDR merge the headroom is the
+    // whole point -- a maximum at or below 1.0 would mean the extra range the
+    // bracket captured was thrown away somewhere.
+    if (ok && !pipe.Viewers().empty()) {
+        if (const Data* d = pipe.Resolve(pipe.Viewers().back().source, &sources)) {
+            if (const auto* im = std::get_if<Image>(d)) {
+                ImageView v = const_cast<Image&>(*im).MapCpuRead();
+                if (v.data) {
+                    PixelBuffer pb;
+                    pb.Unpack(v);
+                    const std::vector<float>& px = pb.Data();
+                    float lo = 1e30f, hi = -1e30f;
+                    double sum = 0.0;
+                    size_t n = 0;
+                    const int ch = pb.Channels();
+                    for (size_t i = 0; i < px.size(); ++i) {
+                        if (ch == 4 && (i % 4) == 3) continue;   // skip alpha
+                        lo = std::min(lo, px[i]);
+                        hi = std::max(hi, px[i]);
+                        sum += double(px[i]);
+                        ++n;
+                    }
+                    std::printf("result: %dx%d  min %.5f  max %.4f  mean %.5f\n",
+                                im->Desc().width, im->Desc().height,
+                                double(lo), double(hi), n ? sum / double(n) : 0.0);
+                }
+            }
+        }
+    }
+
+    for (const std::string& r : pipe.GpuFallbacks())
+        std::printf("gpu fallback: %s\n", r.c_str());
+    for (const auto& st : pipe.Stages())
+        if (st.algo) {
+            const std::string rep = st.algo->RunReport();
+            if (!rep.empty()) std::printf("report: %s\n", rep.c_str());
+        }
     std::printf("execute: %s in %.1fs\n", ok ? "ok" : xerr.c_str(), Now() - t1);
     return ok ? 0 : 1;
 }

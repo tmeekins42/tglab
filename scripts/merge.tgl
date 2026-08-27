@@ -16,7 +16,7 @@ frames = image("group")
 # Any single-image algorithm can be applied the same way. This runs on each
 # frame, before the merge:
 #
-#   frames = basic_adjust(frames, auto_exposure = 1)
+#   frames = params(basic_adjust, auto_exposure = 1)(frames)
 
 # over= names the axis to reduce. Optional when the group has one axis, which
 # is every group the palette can build today:

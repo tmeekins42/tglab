@@ -18,7 +18,7 @@ merged = merge_hdr(frames)
 # The merge is scene-linear, so exposure here means what it means on a raw:
 # a stop is a stop. Pull the highlights down to see what the bracket captured
 # above what one frame could hold.
-final = basic_adjust(merged, auto_exposure = 1)
+final = params(basic_adjust, auto_exposure = 1)(merged)
 
 display(merged, "linear")
 display(final,  "developed")
