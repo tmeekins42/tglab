@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <map>
 #include <vector>
 
 #include "../core/algorithm.h"
@@ -712,7 +713,19 @@ private:
                 return Fail(e.line, "'" + name + "' input '" + inPorts[i].name +
                                         "' expects an image, got " + a.pos[i].TypeName());
             const PortHandle h = a.pos[i].AsPort();
-            inputs.push_back(PortRef{h.stage, h.port});
+            const PortRef ref{h.stage, h.port};
+
+            // Shape check. Scalar is the default, so this fires only when
+            // something has actually produced a set and handed it to an
+            // algorithm that takes one image.
+            const Shape got = ShapeAt(ref);
+            if (inPorts[i].shape == ShapeSpec::Scalar && !got.IsScalar()) {
+                return Fail(e.line, "'" + name + "' input '" + inPorts[i].name +
+                                        "' takes a single image, got " + got.ToString() +
+                                        " -- reduce it first, e.g. over=\"" +
+                                        got.Axes()[0].name + "\"");
+            }
+            inputs.push_back(ref);
         }
 
         // Values from a params() declaration are applied first, so an explicit
@@ -737,8 +750,22 @@ private:
             if (!p->SetFromScript(pval, &perr)) return Fail(e.line, perr);
         }
 
+        // First input's shape decides what SameAsInput/Reduced mean. Captured
+        // before the move, since AddStage takes `inputs` by value.
+        const Shape inShape = inputs.empty() ? Shape::Scalar() : ShapeAt(inputs[0]);
+
         const int idx = m_pipe->AddStage(std::move(algo), name, std::move(inputs),
                                          outPorts.size(), e.line);
+
+        // Propagate shapes to this stage's outputs so a later line can be
+        // checked against them.
+        for (size_t p = 0; p < outPorts.size(); ++p) {
+            Shape s;   // Scalar and Any both produce one image today
+            if (outPorts[p].shape == ShapeSpec::SameAsInput) s = inShape;
+            else if (outPorts[p].shape == ShapeSpec::Reduced && inShape.Rank() > 0)
+                s = inShape.Without(0);
+            if (!s.IsScalar()) m_shapeOf[{idx, int(p)}] = s;
+        }
 
         // Remember which stage a single-target variable refers to, so that
         // `blur.sigma = x` can find it later.
@@ -766,6 +793,24 @@ private:
     // than demosaicing the same sensor data twice.
     std::string                    m_defaultDemosaic;
     std::unordered_map<int, int>   m_demosaicStage;   // palette index -> stage
+
+    // Shape of every port produced so far, keyed by {stage, port}.
+    //
+    // Build-time, symbolic: the interpreter never sees a Data, so the only way
+    // to check a shape mismatch at the line that caused it is to propagate
+    // shapes forward as stages are recorded. A palette image is scalar, and a
+    // stage's outputs follow its declared ShapeSpec.
+    //
+    // Everything is scalar today. This exists so that when a non-scalar
+    // producer lands, the check that catches a misuse is already in place and
+    // reports the script line rather than failing at run time.
+    std::map<std::pair<int, int>, Shape> m_shapeOf;
+
+    Shape ShapeAt(const PortRef& r) const {
+        if (r.stage < 0) return Shape::Scalar();   // palette image
+        auto it = m_shapeOf.find({r.stage, r.port});
+        return it == m_shapeOf.end() ? Shape::Scalar() : it->second;
+    }
 
     std::string                            m_err;
 };

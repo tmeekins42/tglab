@@ -32,6 +32,7 @@ target_link_libraries(imgui PUBLIC d3d12 dxgi dwmapi)
 # ---------------------------------------------------------------------------
 # Core library: images, params, algorithm base, registry, pipeline, script
 add_library(tglab_core STATIC
+    src/core/shape.cpp
     src/core/image.cpp
     src/core/image_io.cpp
     src/core/param.cpp

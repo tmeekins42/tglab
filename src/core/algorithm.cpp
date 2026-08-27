@@ -7,6 +7,7 @@ namespace tglab {
 
 const char* DataTypeName(DataType t) {
     switch (t) {
+        case DataType::ImageSet: return "ImageSet";
         case DataType::Image: return "Image";
         case DataType::None:  return "None";
     }

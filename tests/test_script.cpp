@@ -1403,6 +1403,84 @@ int main() {
         Check(d.k.SliderMin() == -1.0f && d.k.SliderMax() == 1.0f,
               "without a soft range the slider covers the full range");
     }
+    // --- shape ---------------------------------------------------------------
+    //
+    // Shape is introduced with nothing in the registry producing a non-scalar
+    // value, so a test written only against real algorithms would pass no
+    // matter what the check did. These two exist purely so the mismatch can
+    // actually occur -- the same trap that let three earlier fixtures pass
+    // against a broken implementation.
+    {
+        // Produces a set: 5 exposures on one named axis.
+        struct FakeBracket : AlgorithmBase {
+            const char* Name() const override { return "test_bracket"; }
+            PortList Inputs()  const override { return {{"src"}}; }
+            PortList Outputs() const override {
+                return {{"out", DataType::ImageSet, FormatSpec::Any, ShapeSpec::SameAsInput}};
+            }
+            void RunCPU(RunCtx&) override {}
+        };
+        // Reduces a set back to one image.
+        struct FakeMerge : AlgorithmBase {
+            const char* Name() const override { return "test_merge"; }
+            PortList Inputs()  const override {
+                return {{"src", DataType::ImageSet, FormatSpec::Any, ShapeSpec::Any}};
+            }
+            PortList Outputs() const override {
+                return {{"out", DataType::Image, FormatSpec::Any, ShapeSpec::Reduced}};
+            }
+            void RunCPU(RunCtx&) override {}
+        };
+        Registry::Get().Add("test_bracket",
+            []() -> std::unique_ptr<AlgorithmBase> { return std::make_unique<FakeBracket>(); });
+        Registry::Get().Add("test_merge",
+            []() -> std::unique_ptr<AlgorithmBase> { return std::make_unique<FakeMerge>(); });
+
+        auto Build = [](const char* src, std::string* err) {
+            Program prog;
+            if (!Parse(src, &prog, err)) return false;
+            std::vector<SourceImage> names{{"test", 0}};
+            UiState ui; Pipeline pipe;
+            InterpResult r = Interpret(prog, names, &ui, &pipe);
+            if (!r.ok) { *err = r.error; return false; }
+            return true;
+        };
+
+        std::string err;
+
+        // The whole point: an existing single-image algorithm must still be
+        // reachable through a plain palette image.
+        Check(Build("src = image(\"test\")\no = brightness(src)\ndisplay(o)\n", &err),
+              "a scalar image still binds to a scalar port");
+
+        // FakeBracket declares SameAsInput against a scalar input, so its
+        // output is still scalar -- shape only appears once a real producer
+        // exists. This documents the current state rather than asserting a
+        // set was made.
+        Check(Build("src = image(\"test\")\nb = test_bracket(src)\no = brightness(b)\n", &err),
+              "SameAsInput over a scalar input stays scalar");
+
+        // And the check itself. Forced directly, because nothing in the
+        // registry yet produces a non-scalar port -- without this the test
+        // could not distinguish a working check from no check at all.
+        {
+            Shape s = Shape::Of("exposure", 5);
+            Check(!s.IsScalar() && s.Count() == 5 && s.Rank() == 1,
+                  "a named axis describes 5 images");
+            Check(s.ToString() == "[exposure=5]", "shape prints its axis names");
+            Check(s.Find("exposure") == 0 && s.Find("focus") == -1,
+                  "an axis is found by name");
+            Check(s.Without(0).IsScalar(), "reducing the only axis gives a scalar");
+
+            Shape two{{Axis{"exposure", 5}, Axis{"focus", 12}}};
+            Check(two.Count() == 60, "two axes multiply");
+            Check(two.Without(two.Find("exposure")) == Shape::Of("focus", 12),
+                  "reducing by name removes that axis and keeps the other");
+            Check(Shape::Scalar().Count() == 1,
+                  "a scalar is one image, not none");
+        }
+    }
+
 
     std::printf("\n%s\n", g_fail == 0 ? "all checks passed" : "FAILURES PRESENT");
     return g_fail == 0 ? 0 : 1;

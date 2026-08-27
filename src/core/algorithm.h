@@ -21,6 +21,11 @@ struct Port {
     const char* name;
     DataType    type   = DataType::Image;
     FormatSpec  format = FormatSpec::Any;   // only meaningful for Image ports
+
+    // How many images this port carries. Scalar -- one image -- is the default,
+    // so every algorithm written before shape existed declares the right thing
+    // by saying nothing. See shape.h for why the default matters.
+    ShapeSpec   shape  = ShapeSpec::Scalar;
 };
 
 using PortList = std::vector<Port>;
