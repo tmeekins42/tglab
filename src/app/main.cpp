@@ -831,7 +831,24 @@ SourceImage DescribeSource(PaletteEntry& pe, int index) {
     // to refuse the case for now, but the answer is a property of the entry and
     // the caller should not have to reach into the Data to find it.
     if (const auto* set = std::get_if<ImageSet>(&pe.data)) {
-        if (!set->images.empty()) si.isMosaic = set->images.front().Desc().IsMosaic();
+        if (!set->images.empty()) {
+            const ImageDesc& fd = set->images.front().Desc();
+            si.isMosaic = fd.IsMosaic();
+
+            // A group's white balance comes from its first frame.
+            //
+            // This used to return early, so a merged bracket reached
+            // basic_adjust with kelvin defaulting to 0 -- the control opened at
+            // "no idea" on a raw whose camera had recorded exactly what it
+            // chose. Tim spotted it from the symptom: a magenta cast that
+            // neither kelvin nor tint would remove, because both were starting
+            // from the wrong place.
+            //
+            // The first frame is the right answer rather than an approximation:
+            // a bracket varies exposure, not white balance, so every frame
+            // carries the same as-shot value.
+            AsShotWhiteBalance(fd, &si.asShotKelvin, &si.asShotTint);
+        }
         return si;
     }
 

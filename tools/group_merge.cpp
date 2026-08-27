@@ -19,6 +19,7 @@
 #include <algorithm>
 
 #include "../src/algo_util/pixel_buffer.h"
+#include "../src/algo_util/white_balance.h"
 #include "../src/core/image_group.h"
 #include "../src/core/pipeline.h"
 #include "../src/core/raw_io.h"
@@ -62,6 +63,13 @@ int main(int argc, char** argv) {
                     argv[i], d.width, d.height, int(d.IsMosaic()),
                     double(d.shutter), double(d.aperture), double(d.iso),
                     double(d.RelativeExposure()));
+        // White balance, because a merged bracket reaching develop with kelvin
+        // at 0 is a real symptom -- the control then opens at "no idea" and a
+        // cast cannot be corrected from either end.
+        float kk = 0.0f, tt = 0.0f;
+        AsShotWhiteBalance(d, &kk, &tt);
+        std::printf("      daylightWb=%d  kelvin=%.0f tint=%.2f\n",
+                    int(d.hasDaylightWb), double(kk), double(tt));
         AppendToGroup(&group, std::move(img), "frame");
     }
     std::printf("loaded %d frames in %.1fs, shape %s\n\n",
@@ -182,6 +190,35 @@ int main(int argc, char** argv) {
                         hi = std::max(hi, px[i]);
                         sum += double(px[i]);
                         ++n;
+                    }
+                    // Percentiles say what a min/max cannot: WHERE the picture
+                    // sits, and how many stops separate its shadows from its
+                    // highlights. That is the number a tone mapper has to fit.
+                    {
+                        std::vector<float> s;
+                        s.reserve(200000);
+                        const int st = std::max(1, im->Desc().width / 700);
+                        PixelBuffer sb;
+                        sb.Unpack(v);
+                        for (int y = 0; y < sb.Height(); y += st)
+                            for (int x = 0; x < sb.Width(); x += st) {
+                                const float* q = sb.At(x, y);
+                                const float l = 0.2126f * q[0] + 0.7152f * q[1] + 0.0722f * q[2];
+                                if (l > 0.0f) s.push_back(l);
+                            }
+                        if (s.size() > 100) {
+                            std::sort(s.begin(), s.end());
+                            auto P = [&](double f) {
+                                return s[std::min(s.size() - 1,
+                                                  size_t(f * double(s.size() - 1)))];
+                            };
+                            std::printf("percentiles: p1 %.4g  p10 %.4g  p50 %.4g  "
+                                        "p90 %.4g  p99 %.4g  p99.9 %.4g\n",
+                                        double(P(0.01)), double(P(0.10)), double(P(0.50)),
+                                        double(P(0.90)), double(P(0.99)), double(P(0.999)));
+                            std::printf("dynamic range p1..p99: %.1f stops\n",
+                                        std::log2(double(P(0.99)) / std::max(double(P(0.01)), 1e-9)));
+                        }
                     }
                     std::printf("result: %dx%d  min %.5f  max %.4f  mean %.5f\n",
                                 im->Desc().width, im->Desc().height,

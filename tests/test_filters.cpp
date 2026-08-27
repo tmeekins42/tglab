@@ -969,6 +969,59 @@ int main() {
         } else {
             Check(false, "basic_adjust highlights on linear input: " + err);
         }
+        // Recovery must PRESERVE VARIATION in the highlights, not flatten it.
+        //
+        // Tim's report: on a tonemapped sky, pulling highlights down turned the
+        // whole sky into a solid grey mass -- "I've never seen that behavior in
+        // other photo editing apps". He was right, and the cause was that
+        // recovery subtracted the ENTIRE excess above the band top, landing
+        // every bright pixel on exactly that value.
+        //
+        // The tests above could not see it: their blown region is UNIFORM, so a
+        // control that maps every bright pixel to one number passes happily. It
+        // takes a gradient to tell compression from collapse.
+        //
+        // This matters far more for scene-linear data than it ever did for
+        // sRGB. A gamma-encoded image has little above the band top and the
+        // window still varies across it; a tonemapped sky sits entirely above
+        // it, where SmoothBand saturates at 1.0 and every pixel gets the same
+        // full-strength correction.
+        {
+            auto makeSky = []() {
+                ImageDesc d{32, 32, Format::RGBA16F};
+                d.linear = true;
+                Image img;
+                img.Alloc(d);
+                ImageView v = img.MapCpuWrite();
+                for (int y = 0; y < 32; ++y)
+                    for (int x = 0; x < 32; ++x) {
+                        // A bright gradient, all of it above kLinearShoulder
+                        // (0.70) -- 1.0 at the top to 3.0 at the bottom, like
+                        // cloud detail in a tonemapped sky.
+                        const float lum = 1.0f + 2.0f * (float(y) / 31.0f);
+                        uint16_t* p = v.At<uint16_t>(x, y);
+                        for (int c = 0; c < 3; ++c) p[c] = FloatToHalf(lum);
+                        p[3] = FloatToHalf(1.0f);
+                    }
+                return img;
+            };
+
+            Image sky;
+            std::string skyErr;
+            if (RunFilter("basic_adjust", makeSky(), {{"highlights", -1.0}}, &sky, &skyErr)) {
+                const double top = bandMax(sky, 0, 4);     // was 1.0 in
+                const double bot = bandMax(sky, 28, 32);   // was 3.0 in
+                Check(bot > top * 1.15,
+                      "highlights -1 keeps a bright gradient ORDERED rather than "
+                      "flattening it (" + std::to_string(top) + " .. " +
+                      std::to_string(bot) + ")");
+                Check(bot < 3.0,
+                      "and still brings the brightest end down");
+            } else {
+                Check(false, "basic_adjust on a bright gradient: " + skyErr);
+            }
+        }
+
 
         // The band pitch, isolated. Real raws mostly do NOT peak above 1.0 --
         // measured across six files, peak luminance ran 0.25 to 0.75 -- so the

@@ -271,7 +271,15 @@ void main(uint3 tid : SV_DispatchThreadID) {
         // as colour crushing rather than recovery.
         float amount = -hi * w;
         if (amount > 0.0) {
-            c -= max(c - wp, 0.0) * amount;
+            // Compress the excess above the top rather than pulling every
+            // channel onto it -- see the CPU path for why. Subtracting the full
+            // excess put every bright pixel on the same value, which on a
+            // tonemapped sky is one flat grey plate.
+            // max(c - wp, 0) rather than a per-channel branch: a channel below
+            // the top contributes nothing, so the same expression covers both
+            // cases without HLSL needing a vector condition.
+            float shed = 0.5 * amount;
+            c -= max(c - wp, 0.0) * shed;
             c *= (1.0 - 0.35 * amount);
         } else if (amount < 0.0) {
             c *= (1.0 - amount);
@@ -495,9 +503,36 @@ private:
             // red does not get dragged upward.
             const float amount = -hi * w;   // hi is negative when recovering
             if (amount > 0.0f) {
-                r -= std::max(r - white, 0.0f) * amount;
-                g -= std::max(g - white, 0.0f) * amount;
-                b -= std::max(b - white, 0.0f) * amount;
+                // Compress the excess above the band top, rather than pulling
+                // every channel to a fixed value.
+                //
+                // The previous version subtracted `(c - white) * amount`, which
+                // at full strength lands EVERY channel of EVERY bright pixel on
+                // `white` exactly -- one flat grey plate. On an SDR image that
+                // was nearly invisible, because little sits far above 0.70 and
+                // SmoothBand's window still varied. On tonemapped HDR the whole
+                // sky sits above the top, SmoothBand saturates at 1.0 across all
+                // of it, and the result was the solid grey Tim reported.
+                //
+                // Scaling the excess instead keeps the ORDER and the spacing of
+                // what is up there: a cloud edge brighter than its centre stays
+                // brighter, just by less. At full strength the excess is halved
+                // rather than erased, which is a recovery a photographer would
+                // recognise.
+                //
+                // Per channel still, not a uniform multiply: a blown highlight
+                // is blown because ONE channel clipped, so recovery has to move
+                // that channel down relative to the others. A uniform scale only
+                // darkens and leaves the cast behind -- measured, a 1.20/0.35/
+                // 0.20 red held saturation 0.833 at every slider position.
+                // Written as "subtract a FRACTION of the excess" rather than
+                // "scale toward the top" so the GPU path can use the same
+                // expression -- HLSL cannot take a ternary on a vector
+                // condition, and max(c - white, 0) covers both cases.
+                const float shed = 0.5f * amount;
+                r -= std::max(r - white, 0.0f) * shed;
+                g -= std::max(g - white, 0.0f) * shed;
+                b -= std::max(b - white, 0.0f) * shed;
 
                 // Below the top there is nothing clipped to pull back, so fall
                 // back to a gentle overall darkening -- which is what the
