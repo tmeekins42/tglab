@@ -180,9 +180,13 @@ public:
                 ApplyColour(src.desc, rgb);
 
                 uint16_t* p = dst.At<uint16_t>(x, y);
-                p[0] = FloatToHalf(std::max(rgb[0], 0.0f));
-                p[1] = FloatToHalf(std::max(rgb[1], 0.0f));
-                p[2] = FloatToHalf(std::max(rgb[2], 0.0f));
+                // Stored UNCLAMPED. A negative channel is a real colour outside
+
+                // sRGB's gamut, not an error -- see ApplyColour.
+
+                p[0] = FloatToHalf(rgb[0]);
+                p[1] = FloatToHalf(rgb[1]);
+                p[2] = FloatToHalf(rgb[2]);
                 p[3] = FloatToHalf(1.0f);
             }
         }
@@ -361,7 +365,11 @@ private:
         rgb[1] = d.rgbCam[3] * r + d.rgbCam[4] * g + d.rgbCam[5] * b;
         rgb[2] = d.rgbCam[6] * r + d.rgbCam[7] * g + d.rgbCam[8] * b;
 
-        for (int i = 0; i < 3; ++i) rgb[i] = std::max(rgb[i], 0.0f);
+        // Negatives NOT clamped: a colour outside sRGB's gamut lands below zero
+        // after the camera matrix, and clamping destroys it before the user has
+        // touched anything. The pipeline is linear float, so it costs nothing to
+        // carry -- clamping belongs at display or export. See
+        // demosaic_consistent.cpp for the measurement.
     }
 
     // A sensel at the white level is not a measurement, it is a lower bound:

@@ -72,8 +72,23 @@ inline float DecodeIn(float c, bool linear) {
 }
 
 inline float EncodeOut(float c, bool linear) {
-    // No clamp on the linear path -- the headroom is the point.
-    return linear ? std::max(c, 0.0f) : LinearToSrgb(c);
+    // The linear path is passed through UNCLAMPED, at both ends.
+    //
+    // The comment here used to say "no clamp on the linear path -- the headroom
+    // is the point" while the code clamped negatives to zero. The headroom
+    // argument was only half applied: values above 1.0 were preserved, which is
+    // what highlight recovery needs, and values below 0.0 were destroyed.
+    //
+    // Both ends matter for the same reason. A colour the sensor recorded that
+    // sRGB cannot represent lands outside the gamut triangle, which in linear
+    // sRGB coordinates means a channel below zero -- and such a value can come
+    // back INTO gamut after a desaturation or a white-balance change. Clamping
+    // it here makes that impossible.
+    //
+    // Nothing downstream requires non-negative input: ToneCurve() maps anything
+    // at or below zero to black, which is the correct behaviour at display and
+    // the wrong behaviour in the middle of an edit.
+    return linear ? c : LinearToSrgb(c);
 }
 
 // Rec. 709 luminance, matching the primaries the image is already in.

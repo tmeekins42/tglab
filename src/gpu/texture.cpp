@@ -44,6 +44,7 @@ void GpuTexture::Release() {
     }
     m_desc    = {};
     m_version = UINT64_MAX;
+    m_overlay = UINT32_MAX;
 }
 
 bool GpuTexture::Create(Device& dev, const ImageDesc& d) {
@@ -131,7 +132,61 @@ const uint8_t* HalfToneCurveTable() {
     return table.data();
 }
 
+// One display preference, shared by every viewer. See the header.
+uint32_t g_clipOverlay = 0;
+
+// The clipping overlay for the CPU readback path.
+//
+// The GPU display shader does this too, and the two must agree: a script can
+// mix CPU-only and GPU stages, and TGLAB_CPUDISPLAY=1 forces every viewer down
+// this route. Without it the toggles silently did nothing on those paths --
+// exactly the kind of "works sometimes" behaviour that is hard to attribute.
+//
+// Judged on the LINEAR values, before the tone curve, for the same reason as in
+// the shader: afterwards everything is inside 0..1 by construction, so a blown
+// highlight reads as merely bright.
+template <class Fetch>
+void ApplyOverlay(uint8_t* rgba, int w, int h, Fetch fetch) {
+    const uint32_t mask = g_clipOverlay;
+    if (!mask) return;
+    static const uint8_t kWhite[3] = {255, 38, 38};
+    static const uint8_t kBlack[3] = {38, 89, 255};
+    static const uint8_t kGamut[3] = {255, 217, 26};
+    const size_t n = size_t(w) * size_t(h);
+    for (size_t i = 0; i < n; ++i) {
+        float r, g, b;
+        fetch(i, &r, &g, &b);
+        const float mx = std::max(r, std::max(g, b));
+        const float mn = std::min(r, std::min(g, b));
+        const uint8_t* c = nullptr;
+        if      ((mask & 1) && mx >= 1.0f) c = kWhite;
+        else if ((mask & 2) && mx <= 0.0f) c = kBlack;
+        else if ((mask & 4) && mn <  0.0f) c = kGamut;
+        if (!c) continue;
+        uint8_t* p = rgba + i * 4;
+        p[0] = c[0]; p[1] = c[1]; p[2] = c[2];
+    }
+}
+
+void ApplyOverlayF32(const float* src, uint8_t* rgba, int w, int h) {
+    ApplyOverlay(rgba, w, h, [src](size_t i, float* r, float* g, float* b) {
+        *r = src[i * 4 + 0]; *g = src[i * 4 + 1]; *b = src[i * 4 + 2];
+    });
+}
+
+void ApplyOverlayF16(const uint16_t* src, uint8_t* rgba, int w, int h) {
+    ApplyOverlay(rgba, w, h, [src](size_t i, float* r, float* g, float* b) {
+        *r = HalfToFloat(src[i * 4 + 0]);
+        *g = HalfToFloat(src[i * 4 + 1]);
+        *b = HalfToFloat(src[i * 4 + 2]);
+    });
+}
+
 } // namespace
+
+void GpuTexture::SetClipOverlay(uint32_t mask) { g_clipOverlay = mask; }
+uint32_t GpuTexture::GetClipOverlay() { return g_clipOverlay; }
+
 bool GpuTexture::Update(Device& dev, Image& img, uint64_t contentVersion) {
     if (!img.Valid()) return false;
     const ImageDesc& d = img.Desc();
@@ -143,8 +198,13 @@ bool GpuTexture::Update(Device& dev, Image& img, uint64_t contentVersion) {
 
     // Skip the upload entirely when nothing changed — the common case once
     // the pipeline is idle, and what keeps a static frame free.
-    if (!recreated && contentVersion == m_version) return true;
+    //
+    // The overlay mask is part of the key: it changes what is drawn from
+    // identical content. See the GPU path for the symptom this caused.
+    if (!recreated && contentVersion == m_version && g_clipOverlay == m_overlay)
+        return true;
     m_version = contentVersion;
+    m_overlay = g_clipOverlay;
 
     // Convert to RGBA8 for display. Float formats are normalized so that
     // signed data (e.g. gradients) is visible rather than clipped to black.
@@ -182,6 +242,7 @@ bool GpuTexture::Update(Device& dev, Image& img, uint64_t contentVersion) {
                                                  : std::clamp(p[i], 0.0f, 1.0f);
             rgba[size_t(i)] = uint8_t(f * 255.0f + 0.5f);
         }
+        if (d.linear) ApplyOverlayF32(p, rgba.data(), w, h);
         srcBytes = rgba.data();
     } else if (d.format == Format::RGBA16F) {
         const uint16_t* p = reinterpret_cast<const uint16_t*>(v.data);
@@ -192,6 +253,7 @@ bool GpuTexture::Update(Device& dev, Image& img, uint64_t contentVersion) {
         const uint8_t* plain = HalfDisplayTable();
         for (size_t i = 0; i < count; ++i)
             rgba[i] = ((i & 3) == 3) ? plain[p[i]] : lut[p[i]];
+        if (d.linear) ApplyOverlayF16(p, rgba.data(), w, h);
         srcBytes = rgba.data();
     } else {
         return false;
@@ -318,6 +380,7 @@ cbuffer Params : register(b0) {
     uint LoBits;
     uint SpanBits;
     uint Linear;    // 1 = source is scene-linear and needs the tone curve
+    uint Overlay;   // bit 0 = white clip, 1 = black clip, 2 = out of gamut
 };
 
 [numthreads(8, 8, 1)]
@@ -333,7 +396,34 @@ void main(uint3 tid : SV_DispatchThreadID) {
         // Scene-linear input: the display is not linear, so writing these
         // values straight out renders the whole image about a stop and a half
         // too dark. This is the branch that was missing.
-        Dst[tid.xy] = float4(ToneCurve3(c.rgb), 1.0);
+        float3 o = ToneCurve3(c.rgb);
+
+        // Clipping and gamut overlay.
+        //
+        // Judged on the LINEAR values, before the curve, because that is where
+        // the conditions are actually defined. After the curve everything is
+        // in 0..1 by construction and the information is gone -- the shoulder
+        // maps 4.0 linear to 0.91, so a blown highlight looks merely bright.
+        //
+        // Three distinct conditions, deliberately given three colours rather
+        // than one:
+        //
+        //   white  -- at or above the sensor's white level. Detail is gone;
+        //             nothing downstream can recover it.
+        //   black  -- at or below zero. Crushed shadow.
+        //   gamut  -- a NEGATIVE channel. Not clipping at all: a real colour
+        //             the sensor recorded that sRGB's primaries cannot
+        //             represent. It survives editing now that the demosaic no
+        //             longer clamps, and may return to gamut after a
+        //             desaturation, so it is worth distinguishing from a loss.
+        if (Overlay != 0) {
+            float mx = max(c.r, max(c.g, c.b));
+            float mn = min(c.r, min(c.g, c.b));
+            if ((Overlay & 1) && mx >= 1.0)        o = float3(1.0, 0.15, 0.15);
+            else if ((Overlay & 2) && mx <= 0.0)   o = float3(0.15, 0.35, 1.0);
+            else if ((Overlay & 4) && mn <  0.0)   o = float3(1.0, 0.85, 0.10);
+        }
+        Dst[tid.xy] = float4(o, 1.0);
     } else {
         Dst[tid.xy] = float4(saturate(c.rgb), 1.0);
     }
@@ -594,8 +684,14 @@ bool GpuTexture::UpdateFromGpu(Device& dev, const SharedGpuTexture& src,
 
     // Nothing changed since the last upload: the common case once the pipeline
     // is idle, and what keeps a static frame free.
-    if (!recreated && contentVersion == m_version) return true;
+    //
+    // The overlay mask is part of the key. It changes what the shader draws
+    // from identical content, so comparing the content version alone made a
+    // toggle appear to do nothing until a slider happened to bump the version.
+    if (!recreated && contentVersion == m_version && g_clipOverlay == m_overlay)
+        return true;
     m_version = contentVersion;
+    m_overlay = g_clipOverlay;
 
     // Say so, once, if the conversion pipeline cannot be built.
     //
@@ -721,6 +817,7 @@ bool GpuTexture::UpdateFromGpu(Device& dev, const SharedGpuTexture& src,
     // Scene-linear results go through the tone curve; anything already
     // gamma-encoded is passed straight through.
     roots[5] = src.desc.linear ? 1u : 0u;
+    roots[6] = g_clipOverlay;
     cl->SetComputeRoot32BitConstants(0, 8, roots, 0);
     cl->SetComputeRootDescriptorTable(1, tableGpu);
 

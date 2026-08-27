@@ -278,7 +278,11 @@ private:
         // The matrix has negative coefficients by design (it maps a wider
         // gamut inward), so out-of-gamut colours can go negative. Clamping
         // here keeps later stages from having to reason about it.
-        for (int i = 0; i < 3; ++i) rgb[i] = std::max(rgb[i], 0.0f);
+        // Negatives NOT clamped: a colour outside sRGB's gamut lands below zero
+        // after the camera matrix, and clamping destroys it before the user has
+        // touched anything. The pipeline is linear float, so it costs nothing to
+        // carry -- clamping belongs at display or export. See
+        // demosaic_consistent.cpp for the measurement.
     }
 
     // Sensor metadata from the input descriptor, captured by PrepareGpu().

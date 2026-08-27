@@ -1,6 +1,7 @@
 #include "image_view.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 
 #include "../gpu/device.h"
@@ -90,6 +91,55 @@ void ImageViewPanel::Draw(Device& dev, Image* img) {
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("1:1 magnifier at the cursor, point-sampled, with the "
                           "pixel's actual values");
+
+    // Clipping and gamut toggles, each with a swatch of the colour it paints.
+    //
+    // The swatch is the point: three overlays in three colours is more than a
+    // label can carry, and a user should not have to remember that yellow means
+    // gamut rather than clipping. Drawn as a filled square in the button's own
+    // colour slots so it reads as a swatch rather than a coloured button.
+    //
+    // Global rather than per-viewer, unlike the loupe. The loupe is for
+    // inspecting ONE panel while comparing; these answer "where is this frame
+    // losing data", which is a property of the image and wants the same answer
+    // everywhere.
+    {
+        uint32_t mask = GpuTexture::GetClipOverlay();
+        const struct { uint32_t bit; ImVec4 col; const char* label; const char* tip; } kOverlays[] = {
+            {GpuTexture::kOverlayWhite,      ImVec4(1.0f, 0.15f, 0.15f, 1.0f), "hi",
+             "Blown highlights: at or above the sensor's white level. The detail "
+             "is gone and no adjustment recovers it."},
+            {GpuTexture::kOverlayBlack,      ImVec4(0.15f, 0.35f, 1.0f, 1.0f), "lo",
+             "Crushed shadows: at or below zero."},
+            {GpuTexture::kOverlayOutOfGamut, ImVec4(1.0f, 0.85f, 0.10f, 1.0f), "gamut",
+             "Out of gamut: a real colour the sensor captured that sRGB cannot "
+             "represent. NOT a loss -- it survives editing and returns to range "
+             "if you desaturate."},
+        };
+        for (const auto& o : kOverlays) {
+            ImGui::SameLine();
+            const bool on = (mask & o.bit) != 0;
+
+            // The swatch. Filled when the overlay is on, outlined when off, so
+            // the state is legible without reading the label.
+            const ImVec2 p = ImGui::GetCursorScreenPos();
+            const float  sz = ImGui::GetFontSize() * 0.75f;
+            const float  yOff = (ImGui::GetFrameHeight() - sz) * 0.5f;
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const ImU32 col = ImGui::ColorConvertFloat4ToU32(o.col);
+            if (on) dl->AddRectFilled(ImVec2(p.x, p.y + yOff),
+                                      ImVec2(p.x + sz, p.y + yOff + sz), col, 2.0f);
+            else    dl->AddRect(ImVec2(p.x, p.y + yOff),
+                                ImVec2(p.x + sz, p.y + yOff + sz), col, 2.0f);
+            ImGui::Dummy(ImVec2(sz + 3.0f, sz));
+
+            ImGui::SameLine(0.0f, 0.0f);
+            char btn[32];
+            std::snprintf(btn, sizeof btn, on ? "[%s]" : "%s", o.label);
+            if (ImGui::SmallButton(btn)) GpuTexture::SetClipOverlay(mask ^ o.bit);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", o.tip);
+        }
+    }
 
     // End the toolbar row, then take the whole remaining content rect as the
     // canvas. GetContentRegion* is measured from the window's content edges,

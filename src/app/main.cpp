@@ -1096,6 +1096,38 @@ void App::DrawMenuBar() {
         ImGui::Separator();
         if (ImGui::MenuItem("Sync pan/zoom", nullptr, &m_syncCameras)) SyncViews();
         if (ImGui::MenuItem("Reset layout")) m_rebuildLayout = true;
+
+        // Highlight what the display cannot show.
+        //
+        // Three separate toggles rather than one, because they mean different
+        // things and only two of them are losses. White and black clipping are
+        // detail that is gone. Out-of-gamut is a real colour the sensor
+        // recorded that sRGB's primaries cannot represent -- it survives
+        // editing, since the demosaic no longer clamps negatives, and can come
+        // back into range after a desaturation. Worth seeing, and worth NOT
+        // confusing with a loss.
+        ImGui::Separator();
+        if (ImGui::BeginMenu("Show clipping")) {
+            uint32_t mask = GpuTexture::GetClipOverlay();
+            auto toggle = [&](const char* label, uint32_t bit, const char* tip) {
+                bool on = (mask & bit) != 0;
+                if (ImGui::MenuItem(label, nullptr, on)) {
+                    mask ^= bit;
+                    GpuTexture::SetClipOverlay(mask);
+                }
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
+            };
+            toggle("Blown highlights", GpuTexture::kOverlayWhite,
+                   "Red. At or above the sensor's white level: the detail is "
+                   "gone and no adjustment recovers it.");
+            toggle("Crushed shadows", GpuTexture::kOverlayBlack,
+                   "Blue. At or below zero.");
+            toggle("Out of gamut", GpuTexture::kOverlayOutOfGamut,
+                   "Yellow. A real colour the sensor captured that sRGB cannot "
+                   "represent -- a negative channel. Not a loss: it survives "
+                   "editing and may return to gamut if you desaturate.");
+            ImGui::EndMenu();
+        }
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Compute")) {

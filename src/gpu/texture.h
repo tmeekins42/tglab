@@ -84,6 +84,27 @@ public:
                        uint64_t contentVersion);
     void Release();
 
+    // Which out-of-range conditions the viewers highlight, as a bit mask.
+    //
+    // A global rather than a per-viewer setting or a parameter threaded through
+    // UpdateFromGpu: it is one display preference, set from a menu, and every
+    // viewer should agree. Threading it through the call chain would touch four
+    // layers to express something that has exactly one value.
+    //
+    // Judged on the LINEAR values, before the tone curve. After the curve
+    // everything is inside 0..1 by construction -- the shoulder maps 4.0 linear
+    // to 0.91 -- so a blown highlight would look merely bright and the
+    // condition would be untestable.
+    enum ClipOverlay : uint32_t {
+        kOverlayNone       = 0,
+        kOverlayWhite      = 1,   // at or above the white level: detail gone
+        kOverlayBlack      = 2,   // at or below zero: crushed
+        kOverlayOutOfGamut = 4,   // a negative channel: real colour sRGB cannot
+                                  // represent, recoverable by desaturating
+    };
+    static void     SetClipOverlay(uint32_t mask);
+    static uint32_t GetClipOverlay();
+
     bool Valid() const { return m_res != nullptr; }
     D3D12_GPU_DESCRIPTOR_HANDLE Handle() const { return m_gpu; }
 
@@ -105,6 +126,7 @@ private:
         m_desc           = o.m_desc;
         m_freshlyCreated = o.m_freshlyCreated;
         m_version        = o.m_version;
+        m_overlay        = o.m_overlay;
         for (int i = 0; i < kMaxFramesInFlight; ++i) {
             m_upload[i]     = o.m_upload[i];
             m_uploadSize[i] = o.m_uploadSize[i];
@@ -117,6 +139,7 @@ private:
         o.m_gpu = {};
         o.m_desc = {};
         o.m_version = UINT64_MAX;
+        o.m_overlay = UINT32_MAX;
     }
 
     Device*                     m_dev = nullptr;
@@ -132,6 +155,16 @@ private:
     ID3D12Resource* m_upload[kMaxFramesInFlight] = {};
     UINT64          m_uploadSize[kMaxFramesInFlight] = {};
     uint64_t        m_version = UINT64_MAX;   // last uploaded content version
+
+    // The overlay mask the cached conversion was produced with.
+    //
+    // Part of the cache key, not just state. The conversion is skipped when the
+    // content version is unchanged -- which is what keeps a static frame free
+    // -- but the overlay changes what the shader DRAWS from identical content.
+    // Without this, toggling an overlay did nothing until something else
+    // happened to bump the version, so it appeared to work only when a slider
+    // was touched.
+    uint32_t        m_overlay = UINT32_MAX;
 };
 
 // Frees the shared display-conversion pipeline. One shader and one descriptor

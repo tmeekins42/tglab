@@ -342,3 +342,14 @@ target_link_libraries(overview PRIVATE tglab_core)
 if(MSVC)
     target_compile_definitions(overview PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
+
+# VRAM growth when SWITCHING scripts, which gpu_leak does not cover -- that
+# re-runs one pipeline and measures steady state. Each script builds a new
+# pipeline holding kernels and scratch planes, so a missing release shows here.
+#   build/Release/gpu_leak_scripts.exe [cycles] [image]
+add_executable(gpu_leak_scripts tests/gpu_leak_scripts.cpp $<TARGET_OBJECTS:tglab_algorithms>)
+target_link_libraries(gpu_leak_scripts PRIVATE tglab_core d3d12 dxgi)
+if(MSVC)
+    target_compile_definitions(gpu_leak_scripts PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+tglab_copy_dxc(gpu_leak_scripts)
