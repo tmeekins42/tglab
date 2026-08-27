@@ -36,35 +36,11 @@ BUGS / SMALL FEATURES
   Cheaper alternative worth trying first: scale the threshold by the local
   level inside the existing kernel. No transform, no round-trip, and it can be
   a parameter so the effect is visible rather than baked in.
-- instead of the left side panel having an image tab and a script tab, I think we
-  should always have image palette visible and maybe a pull down selector in the UI 
-  somewhere for switching scripts. I'm not sure what use the algorithms tab is,
-  other than a scripting reference... if so, we could move that to a menu => dialog pop-up?
-- PALETTE UI FOR GROUPS -- deferred deliberately, to revisit once the multi-
-  image feature is done. Tim's observations on the first version:
-    + a group is hard to tell apart from a single image at a glance
-    + only the first image ever gets a thumbnail
-    + no way to see, select or delete an individual image in a group
-    + one idea is a collapsible container... so we open the group and we see the group
-      images like a new palette (the collapse button tells the user it's a group)
-    + file order is important. we should allow drag/drop to change positions.
-      also, windows drag drop likes to always have one file in the wron location.
-      DONE (sort by filename): right-click a group -> "Sort by filename".
-      Numeric, so IMG_9 precedes IMG_10. Deferred from this: reordering by
-      DRAG, and sorting by capture date (needs per-member EXIF, which is not
-      read today).
-    + right-click should have a sort by file name, sort by date (or shot time)
-    + ability to drag a non-grouped image into a group
-    + currently I need one image to create a group. Can I create an empty group to drag
-      images into?
-    + when a large number of images are dropped, it takes time (thumbnails, exif, etc). 
-      Can this processing be done on multiple threads?
-    + also, when dropping multiple images, can the status at the bottom show the progress,
-      such as 1/5, 2/5 ... 5/5
-  The row is the wrong container for N images -- it was built to show one file
-  and now has to represent a set. Whatever replaces it needs to expand, so the
-  members are addressable. Tim has ideas and is writing them up; do not
-  redesign this unprompted.
+- when adding images to the palette/group, maybe we should pre-load the EXIF
+  as well as the thumbnail. EXIF loading should be simple compared to the JPEG.
+- add right-click sort by date in the groups, like sort by name. Use EXIF shot
+  date, and fall back to file timestamp if there's no EXIF.
+- add drag/move to the image palette and group for re-ordering
 - demosaic chroma pass is 22ms of the entire ~45ms... worth optimizing this. I think
   several demosaic algorithms use the chroma pass.
 - when an image is loading/processing, put a spinner over the thumbnail in the image palette
@@ -173,28 +149,3 @@ DONE (recent, pruned periodically)
   float image because their `level` is fixed at 0..255 while the values are
   0..1. That is the same "ranges do not follow the format" issue as
   basic_adjust's, not a "did not run" bug.
-- GPU kernels for brightness and grayscale. At 21 MP, chained as hello.tgl runs
-  them: 1854 ms -> 209 ms. Note the units differ between the paths on purpose --
-  brightness's offset is scaled by 255 on the CPU (which works in the source's
-  units) and NOT in the shader (a UNORM SRV already gives 0..1). Only the
-  CPU/GPU agreement test would catch getting that wrong.
-  Three tests had used grayscale/sobel as their "CPU-only algorithm" example and
-  broke once those gained kernels; they now use guided_filter, which is
-  genuinely CPU-only rather than merely not-ported-yet.
-- thresholds.tgl now ships with assets/page.png -- a synthetic scan, text under
-  a lighting gradient -- rather than pointing at test.png. The algorithms were
-  correct all along: test.png is a smooth gradient with a checkerboard patch,
-  local stddev 3-11 across it against 127 in the patch, so every local method
-  correctly returned nearly uniform white with all its black pixels confined to
-  the corner. Correct output, useless demonstration.
-- the info-panel histogram now follows a tab switch. It is measured during a
-  pipeline RUN, and switching tabs is not one, so a viewer never shown during a
-  run had no histogram and the panel kept displaying the previous tab's. Asking
-  for a new subject now requests a run; the stage cache makes it nearly free
-  since nothing recomputes.
-- gaussian_blur and box_blur are separable on the GPU now, in two passes, so
-  their sigma/radius ceilings are gone. They used to fall back to the CPU above
-  sigma 4 / radius 24 -- exactly where a blur costs most. At sigma 12 the GPU
-  time barely moves (22 -> 25 ms) while the CPU goes 111 -> 701 ms.
-  The remaining ceilings (bilateral, kuwahara, symmetric_nearest) are real:
-  those weights do not separate.

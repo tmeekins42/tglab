@@ -42,7 +42,7 @@ void Pipeline::Clear() {
 
 int Pipeline::AddStage(std::unique_ptr<AlgorithmBase> algo, std::string name,
                        std::vector<PortRef> inputs, size_t numOutputs, int line,
-                       std::string reduceAxis) {
+                       std::string reduceAxis, Shape reshapeTo) {
     Stage s;
     s.paramHash = algo->ParamHash();
     s.algo      = std::move(algo);
@@ -51,6 +51,7 @@ int Pipeline::AddStage(std::unique_ptr<AlgorithmBase> algo, std::string name,
     s.outputs.resize(numOutputs);
     s.line      = line;
     s.reduceAxis = std::move(reduceAxis);
+    s.reshapeTo  = std::move(reshapeTo);
     m_stages.push_back(std::move(s));
     return int(m_stages.size()) - 1;
 }
@@ -80,7 +81,7 @@ const Data* Pipeline::Resolve(PortRef r, const std::vector<Data>* sources) const
 bool Pipeline::SameStage(const Stage& a, const Stage& b) {
     return a.algoName == b.algoName && a.inputs == b.inputs &&
            a.paramHash == b.paramHash && a.sourceHash == b.sourceHash &&
-           a.reduceAxis == b.reduceAxis &&
+           a.reduceAxis == b.reduceAxis && a.reshapeTo == b.reshapeTo &&
            a.outputs.size() == b.outputs.size();
 }
 
@@ -122,6 +123,12 @@ std::vector<int> Pipeline::FusableChain(int reduceStage, PortRef* srcPort) const
         // A reduction inside the chain is a different shape of problem -- two
         // accumulators live at once -- and is not fused here.
         if (s.algo->IsReduction()) break;
+
+        // A reshape is not a per-frame operation: it reinterprets the WHOLE
+        // set at once, so it cannot be run one frame at a time. Fusing it away
+        // silently dropped the reshape and the reduction then saw the original
+        // flat shape -- the chain has to stop here.
+        if (s.algo->IsReshape()) break;
 
         // Exactly one input, so the frame identity is unambiguous. A stage
         // combining a set with a second image is legitimate but needs the
@@ -171,8 +178,9 @@ bool Pipeline::RunFusedReduction(int reduceStage, const std::vector<int>& chain,
     const auto* set = std::get_if<ImageSet>(srcData);
     if (!set) { *err = Where() + "reduces a set, but its input is a single image"; return false; }
     if (set->shape.Rank() != 1) {
-        *err = Where() + "can only reduce a single axis so far, and its input is " +
-               set->shape.ToString();
+        // Should not happen: the planner checks this. Refusing rather than
+        // reducing the wrong axis, since a wrong merge does not announce itself.
+        *err = Where() + "cannot fuse a reduction of " + set->shape.ToString();
         return false;
     }
     if (set->images.empty()) { *err = Where() + "was given an empty group"; return false; }
@@ -261,11 +269,6 @@ bool Pipeline::RunReduction(Stage& s, const std::vector<const Data*>& in,
         *err = Where() + "reduces a set, but its input is a single image";
         return false;
     }
-    if (set->shape.Rank() != 1) {
-        *err = Where() + "can only reduce a single axis so far, and its input is " +
-               set->shape.ToString();
-        return false;
-    }
     if (set->images.empty()) { *err = Where() + "was given an empty group"; return false; }
 
     // The extent and the image count must agree. They always do when the
@@ -282,19 +285,71 @@ bool Pipeline::RunReduction(Stage& s, const std::vector<const Data*>& in,
     if (!r) { *err = Where() + "declares itself a reduction but provides no accumulator"; return false; }
 
     const std::string axis = s.reduceAxis.empty() ? set->shape.Axes()[0].name : s.reduceAxis;
-    if (!r->Begin(int(set->images.size()), axis, err)) return false;
-
-    for (size_t i = 0; i < set->images.size(); ++i) {
-        if (cancel && cancel->Cancelled()) { *err = kCancelled; return false; }
-        if (!r->Accept(int(i), set->images[i], err)) return false;
+    const int ax = set->shape.Find(axis);
+    if (ax < 0) {
+        *err = Where() + "cannot reduce over '" + axis + "': its input is " +
+               set->shape.ToString();
+        return false;
     }
 
-    Image out;
-    if (!r->Finish(&out, err)) return false;
-    if (!out.Valid()) { *err = Where() + "produced no result"; return false; }
+    // Reducing one axis of a higher-rank set runs the accumulator ONCE PER
+    // remaining coordinate -- [12,3] over "exposure" is twelve merges of three
+    // frames each, not one merge of thirty-six. The result keeps the axes that
+    // were not reduced, so a chain of reductions peels them off one at a time.
+    //
+    // The accumulator is reused across those runs rather than one being made
+    // per output: Begin() is documented to reset it, and an algorithm that
+    // holds state across Begin would be broken for the rank-1 case too.
+    const Shape   outShape = set->shape.Without(ax);
+    const int     extent   = set->shape.Axes()[size_t(ax)].extent;
+    const int64_t stride   = set->shape.Stride(ax);
+    const int64_t outCount = outShape.Count();
 
+    ImageSet result;
+    result.shape = outShape;
+    result.images.reserve(size_t(outCount));
+
+    for (int64_t o = 0; o < outCount; ++o) {
+        if (cancel && cancel->Cancelled()) { *err = kCancelled; return false; }
+
+        // Flat index of this output's first input image.
+        //
+        // The output's own coordinates are the input's with `ax` removed, so
+        // the base is rebuilt by walking the input's axes and taking each
+        // coordinate from the output except at `ax`, which is zero.
+        int64_t rem = o, base = 0;
+        for (int i = int(outShape.Rank()) - 1; i >= 0; --i) {
+            const int e = outShape.Axes()[size_t(i)].extent;
+            const int c = e > 0 ? int(rem % e) : 0;
+            if (e > 0) rem /= e;
+            const int inAxis = (i < ax) ? i : i + 1;
+            base += int64_t(c) * set->shape.Stride(inAxis);
+        }
+
+        if (!r->Begin(extent, axis, err)) return false;
+        for (int k = 0; k < extent; ++k) {
+            if (cancel && cancel->Cancelled()) { *err = kCancelled; return false; }
+            const int64_t idx = base + int64_t(k) * stride;
+            if (idx < 0 || idx >= int64_t(set->images.size())) {
+                *err = Where() + "indexed past the end of its input";
+                return false;
+            }
+            if (!r->Accept(k, set->images[size_t(idx)], err)) return false;
+        }
+
+        Image out;
+        if (!r->Finish(&out, err)) return false;
+        if (!out.Valid()) { *err = Where() + "produced no result"; return false; }
+        result.images.push_back(std::move(out));
+    }
+
+    s.outputs.clear();
     s.outputs.resize(1);
-    s.outputs[0] = Data{std::move(out)};
+    // A reduction to rank 0 is a single image, not a set of one: everything
+    // downstream takes an Image, and wrapping it would make every consumer
+    // unwrap a set that can only ever hold one thing.
+    if (outShape.IsScalar()) s.outputs[0] = Data{std::move(result.images[0])};
+    else                     s.outputs[0] = Data{std::move(result)};
     return true;
 }
 
@@ -440,11 +495,11 @@ bool Pipeline::BroadcastStage(Stage& s, const std::vector<const Data*>& in,
     if (setIdx < 0) { *err = Where() + "has no group to broadcast over"; return false; }
 
     const ImageSet& src = std::get<ImageSet>(*in[size_t(setIdx)]);
-    if (src.shape.Rank() != 1) {
-        *err = Where() + "can only broadcast over a single axis so far, and its input is " +
-               src.shape.ToString();
-        return false;
-    }
+
+    // Any rank. Broadcasting maps the stage over every image and keeps the
+    // shape, so the axes never have to be interpreted -- a [12,3] set produces
+    // a [12,3] set of results. Only a reduction needs to know which axis is
+    // which.
     if (src.shape.Count() != int64_t(src.images.size())) {
         *err = Where() + "has a shape of " + src.shape.ToString() + " but " +
                std::to_string(src.images.size()) + " images";
@@ -609,6 +664,16 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
         std::vector<int> chain = FusableChain(int(i), &srcPort);
         if (chain.empty()) continue;
 
+        // Only a rank-1 reduction can be fused. Fusing carries ONE frame
+        // through the chain at a time, which assumes every frame feeds the same
+        // accumulator -- a rank-2 reduction runs one accumulator per remaining
+        // coordinate, so the frames are not interchangeable. The unfused path
+        // handles any rank; it costs memory, not correctness.
+        if (const Data* sd = Resolve(srcPort, sources)) {
+            const auto* ss = std::get_if<ImageSet>(sd);
+            if (!ss || ss->shape.Rank() != 1) continue;
+        }
+
         // A stage already claimed by an earlier reduction cannot also feed this
         // one -- FusableChain's single-reader rule makes that impossible, but
         // the check is cheap and the failure would be silent.
@@ -663,6 +728,35 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
             }
             in.push_back(d);
         }
+
+        // A reshape moves no pixels: it hands its input through with a
+        // different shape. Done here rather than in RunCPU because that gets a
+        // per-image view, and this is a fact about the whole set.
+        if (s.algo->IsReshape()) {
+            const auto* src = std::get_if<ImageSet>(in[0]);
+            if (!src) {
+                *err = "line " + std::to_string(s.line) +
+                       ": shape() needs a group, not a single image";
+                return false;
+            }
+            if (s.reshapeTo.Count() != int64_t(src->images.size())) {
+                *err = "line " + std::to_string(s.line) + ": shape() describes " +
+                       std::to_string(s.reshapeTo.Count()) + " images (" +
+                       s.reshapeTo.ToString() + ") but the group holds " +
+                       std::to_string(src->images.size());
+                return false;
+            }
+            ImageSet out;
+            out.shape = s.reshapeTo;
+            out.images.reserve(src->images.size());
+            for (const Image& im : src->images) out.images.push_back(im.Clone());
+            s.outputs.clear();
+            s.outputs.resize(1);
+            s.outputs[0] = Data{std::move(out)};
+            s.valid = true;
+            continue;
+        }
+
 
         // A reduction runs its own way: stream the frames through an
         // accumulator rather than allocating an output from input 0 and calling

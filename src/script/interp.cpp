@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <map>
 #include <vector>
 
@@ -330,6 +331,7 @@ private:
 
         if (calleeName == "image")   return CallImage(e, out);
         if (calleeName == "mosaic")  return CallMosaic(e, out);
+        if (calleeName == "shape")   return CallShape(e, out);
         if (calleeName == "slider")  return CallSlider(e, out);
         if (calleeName == "check")   return CallCheck(e, out);
         if (calleeName == "choose")  return CallChoose(e, out);
@@ -419,6 +421,67 @@ private:
             return true;
         }
         return Fail(e.line, "no image named '" + want + "' in the palette");
+    }
+
+    // shape(group, position=12, focus=5, exposure=3)
+    //
+    // Declares what a flat drop MEANS. A drop gives [frame=180]; only the
+    // photographer knows that is 12 positions of 5 focus steps of 3 exposures.
+    // Named rather than positional so a script says which axis is which, and so
+    // over="exposure" later has something to match.
+    //
+    // The shape is computed HERE, at build time, because every later line is
+    // checked against it -- a reduction's output shape, and whether an axis
+    // named in over= exists at all, are both known before anything runs.
+    bool CallShape(const Expr& e, std::vector<Value>* out) {
+        EvaledArgs a;
+        if (!EvalArgs(e, &a)) return false;
+
+        if (a.pos.size() != 1 || !a.pos[0].IsPort())
+            return Fail(e.line, "shape() takes a group first: shape(g, exposure=3)");
+        if (a.named.empty())
+            return Fail(e.line, "shape() needs at least one axis, e.g. shape(g, exposure=3)");
+
+        const PortHandle h = a.pos[0].AsPort();
+        const PortRef ref{h.stage, h.port};
+        const Shape got = ShapeAt(ref);
+        if (got.IsScalar())
+            return Fail(e.line, "shape() needs a group, but its input is a single image");
+
+        // Axis order follows the ARGUMENT order, which is what makes the layout
+        // predictable: the last axis named varies fastest, matching the order a
+        // shoot is taken in and the order a filename sort produces.
+        std::vector<Axis> axes;
+        for (const auto& [aname, aval] : a.named) {
+            if (!aval.IsNumber())
+                return Fail(e.line, "shape(): axis '" + aname + "' needs a count, e.g. " +
+                                        aname + "=3");
+            const double d = aval.AsNumber();
+            const int n = int(d);
+            if (n <= 0 || double(n) != d)
+                return Fail(e.line, "shape(): axis '" + aname +
+                                        "' needs a whole count greater than zero");
+            for (const Axis& prev : axes)
+                if (prev.name == aname)
+                    return Fail(e.line, "shape(): axis '" + aname + "' named twice");
+            axes.push_back(Axis{aname, n});
+        }
+
+        Shape want{std::move(axes)};
+        if (want.Count() != got.Count()) {
+            return Fail(e.line, "shape() describes " + std::to_string(want.Count()) +
+                                    " images " + want.ToString() + " but the group holds " +
+                                    std::to_string(got.Count()));
+        }
+
+        auto algo = Registry::Get().Create("reshape");
+        if (!algo) return Fail(e.line, "the 'reshape' algorithm is missing");
+
+        const int idx = m_pipe->AddStage(std::move(algo), "reshape", {ref}, 1, e.line,
+                                         {}, want);
+        m_shapeOf[{idx, 0}] = want;
+        out->push_back(Value(PortHandle{idx, 0}));
+        return true;
     }
 
     // mosaic("name") -- the undemosaiced sensor data.
@@ -732,11 +795,6 @@ private:
             // a later line sees a set rather than a single image.
             const Shape got = ShapeAt(ref);
             if (inPorts[i].shape == ShapeSpec::Scalar && !got.IsScalar()) {
-                if (got.Rank() > 1) {
-                    return Fail(e.line, "'" + name + "' takes a single image and its input is " +
-                                            got.ToString() + "; broadcasting over more than one "
-                                            "axis is not supported yet");
-                }
                 if (broadcast.IsScalar()) broadcast = got;
                 else if (!(broadcast == got)) {
                     return Fail(e.line, "'" + name + "' was given two groups of different "

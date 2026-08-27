@@ -1851,6 +1851,207 @@ int main() {
                     Check(!FilenameLess(y, x), "the ordering is antisymmetric");
     }
 
+    // --- rank-2 reduction ----------------------------------------------------
+    //
+    // Reducing ONE axis of a multi-axis set: [position=2, exposure=3] over
+    // "exposure" is two merges of three frames each, not one merge of six. The
+    // result keeps the axis that was not reduced, which is what lets a chain of
+    // reductions peel them off one at a time.
+    //
+    // Values are chosen so a wrong grouping cannot coincidentally give the
+    // right answer: position 0 averages to 20 and position 1 to 50, while
+    // merging all six would give 35. Reducing the WRONG axis would give
+    // {30, 35, 40}, which is a different length as well as different values.
+    {
+        auto Flat = [](uint8_t v) {
+            Image img;
+            ImageDesc d; d.width = 2; d.height = 2; d.format = Format::RGBA8;
+            img.Alloc(d);
+            ImageView vw = img.MapCpuWrite();
+            for (int i = 0; i < 2 * 2 * 4; ++i) vw.data[i] = v;
+            return img;
+        };
+
+        // Row-major, last axis fastest: position 0's three exposures first.
+        ImageSet set;
+        set.images.push_back(Flat(10));   // p0 e0
+        set.images.push_back(Flat(20));   // p0 e1
+        set.images.push_back(Flat(30));   // p0 e2   -> mean 20
+        set.images.push_back(Flat(40));   // p1 e0
+        set.images.push_back(Flat(50));   // p1 e1
+        set.images.push_back(Flat(60));   // p1 e2   -> mean 50
+        set.shape = Shape{{Axis{"position", 2}, Axis{"exposure", 3}}};
+
+        std::vector<SourceImage> names{{"test", 0}};
+        SourceImage gs; gs.name = "shoot"; gs.index = 1;
+        gs.shape = Shape{{Axis{"position", 2}, Axis{"exposure", 3}}};
+        names.push_back(gs);
+
+        Program prog; std::string err;
+        Check(Parse("g = image(\"shoot\")\nm = merge_mean(g, over=\"exposure\")\ndisplay(m)\n",
+                    &prog, &err), "a rank-2 reduction parses");
+
+        UiState ui; Pipeline pipe;
+        InterpResult ir = Interpret(prog, names, &ui, &pipe);
+        Check(ir.ok, ir.ok ? "a rank-2 reduction interprets" : ("interpret: " + ir.error).c_str());
+
+        std::vector<Data> srcs;
+        srcs.push_back(Data{});
+        srcs.push_back(Data{std::move(set)});
+        std::string xerr;
+        const bool ran = pipe.Execute(&srcs, nullptr, &xerr);
+        Check(ran, ran ? "a rank-2 reduction runs" : ("execute: " + xerr).c_str());
+
+        if (ran) {
+            const Data& o = pipe.Stages().back().outputs[0];
+            Check(TypeOf(o) == DataType::ImageSet,
+                  "reducing one axis of two leaves a set, not an image");
+            if (const auto* os = std::get_if<ImageSet>(&o)) {
+                Check(os->shape == Shape::Of("position", 2),
+                      "and the reduced axis is gone, the other kept");
+                Check(os->images.size() == 2, "with one result per remaining coordinate");
+
+                bool right = os->images.size() == 2;
+                const int want[2] = {20, 50};
+                for (size_t k = 0; k < os->images.size() && right; ++k) {
+                    ImageView v = const_cast<Image&>(os->images[k]).MapCpuRead();
+                    if (!v.data || v.data[0] != want[k]) right = false;
+                }
+                Check(right, "each position averages its OWN exposures: 20 and 50");
+            }
+        }
+
+        // Reducing the other axis gives a different shape and different values,
+        // which is what proves the axis name is actually being used.
+        {
+            ImageSet s2;
+            for (uint8_t v : {10, 20, 30, 40, 50, 60}) s2.images.push_back(Flat(v));
+            s2.shape = Shape{{Axis{"position", 2}, Axis{"exposure", 3}}};
+
+            Program p2; std::string e2;
+            Parse("g = image(\"shoot\")\nm = merge_mean(g, over=\"position\")\ndisplay(m)\n",
+                  &p2, &e2);
+            UiState u2; Pipeline pl2;
+            Check(Interpret(p2, names, &u2, &pl2).ok, "reducing the other axis interprets");
+
+            std::vector<Data> sv;
+            sv.push_back(Data{});
+            sv.push_back(Data{std::move(s2)});
+            std::string x2;
+            if (pl2.Execute(&sv, nullptr, &x2)) {
+                const Data& o = pl2.Stages().back().outputs[0];
+                if (const auto* os = std::get_if<ImageSet>(&o)) {
+                    Check(os->shape == Shape::Of("exposure", 3),
+                          "reducing position leaves the exposure axis");
+                    bool right = os->images.size() == 3;
+                    const int want[3] = {25, 35, 45};   // (10+40)/2, (20+50)/2, (30+60)/2
+                    for (size_t k = 0; k < os->images.size() && right; ++k) {
+                        ImageView v = const_cast<Image&>(os->images[k]).MapCpuRead();
+                        if (!v.data || v.data[0] != want[k]) right = false;
+                    }
+                    Check(right, "and strides across position: 25, 35, 45");
+
+    // --- shape() and a chain of reductions -----------------------------------
+    //
+    // The design's headline example, at a size that can be checked by hand: a
+    // flat drop of 6 declared as [position=2, exposure=3], then reduced twice.
+    // The point is that the script never iterates and the algorithm never knows
+    // it is inside a chain -- merge_mean is the same rank-1 reducer both times.
+    {
+        auto Flat = [](uint8_t v) {
+            Image img;
+            ImageDesc d; d.width = 2; d.height = 2; d.format = Format::RGBA8;
+            img.Alloc(d);
+            ImageView vw = img.MapCpuWrite();
+            for (int i = 0; i < 2 * 2 * 4; ++i) vw.data[i] = v;
+            return img;
+        };
+
+        std::vector<SourceImage> names{{"test", 0}};
+        SourceImage gs; gs.name = "shoot"; gs.index = 1;
+        gs.shape = Shape::Of("frame", 6);          // a flat drop, as it arrives
+        names.push_back(gs);
+
+        auto Run = [&](const char* src, std::string* err) -> Data {
+            Program prog;
+            if (!Parse(src, &prog, err)) return Data{};
+            UiState ui; Pipeline pipe;
+            InterpResult r = Interpret(prog, names, &ui, &pipe);
+            if (!r.ok) { *err = r.error; return Data{}; }
+
+            ImageSet s;
+            for (uint8_t v : {10, 20, 30, 40, 50, 60}) s.images.push_back(Flat(v));
+            s.shape = Shape::Of("frame", 6);
+
+            std::vector<Data> srcs;
+            srcs.push_back(Data{});
+            srcs.push_back(Data{std::move(s)});
+            if (!pipe.Execute(&srcs, nullptr, err)) return Data{};
+
+            // Resolve what display() actually shows, rather than the last stage
+            // recorded -- shape() adds a stage, so "last" is not the reduction.
+            if (pipe.Viewers().empty()) { *err = "no viewer declared"; return Data{}; }
+            const Data* op = pipe.Resolve(pipe.Viewers().back().source, &srcs);
+            if (!op) { *err = "viewer resolved to nothing"; return Data{}; }
+            const Data& o = *op;
+            if (const auto* im = std::get_if<Image>(&o)) return Data{im->Clone()};
+            if (const auto* st = std::get_if<ImageSet>(&o)) {
+                ImageSet c; c.shape = st->shape;
+                for (const Image& i : st->images) c.images.push_back(i.Clone());
+                return Data{std::move(c)};
+            }
+            return Data{};
+        };
+
+        std::string e1;
+        Data d1 = Run("g = image(\"shoot\")\n"
+                      "g = shape(g, position=2, exposure=3)\n"
+                      "m = merge_mean(g, over=\"exposure\")\n"
+                      "display(m)\n", &e1);
+        Check(TypeOf(d1) == DataType::ImageSet,
+              TypeOf(d1) == DataType::ImageSet ? "shape() then reduce leaves a set"
+                                               : ("failed: " + e1).c_str());
+        if (const auto* os = std::get_if<ImageSet>(&d1)) {
+            Check(os->shape == Shape::Of("position", 2), "shape() named the axes");
+            bool right = os->images.size() == 2;
+            const int want[2] = {20, 50};
+            for (size_t k = 0; k < os->images.size() && right; ++k) {
+                ImageView v = const_cast<Image&>(os->images[k]).MapCpuRead();
+                if (!v.data || v.data[0] != want[k]) right = false;
+            }
+            Check(right, "and the layout is row-major: last axis varies fastest");
+        }
+
+        // Two reductions in a row, the second consuming the first's output.
+        // mean(20, 50) == 35.
+        std::string e2;
+        Data d2 = Run("g = image(\"shoot\")\n"
+                      "g = shape(g, position=2, exposure=3)\n"
+                      "a = merge_mean(g, over=\"exposure\")\n"
+                      "b = merge_mean(a, over=\"position\")\n"
+                      "display(b)\n", &e2);
+        Check(TypeOf(d2) == DataType::Image,
+              TypeOf(d2) == DataType::Image ? "a chain of reductions ends at one image"
+                                            : ("failed: " + e2).c_str());
+        if (const auto* im = std::get_if<Image>(&d2)) {
+            ImageView v = const_cast<Image&>(*im).MapCpuRead();
+            Check(v.data && v.data[0] == 35, "mean(mean(10,20,30), mean(40,50,60)) == 35");
+        }
+
+        // shape() must describe exactly the images present.
+        std::string e3;
+        Data d3 = Run("g = image(\"shoot\")\n"
+                      "g = shape(g, position=2, exposure=4)\n"
+                      "display(g)\n", &e3);
+        Check(TypeOf(d3) == DataType::None, "shape() rejects a count that does not match");
+        Check(e3.find("8") != std::string::npos && e3.find("6") != std::string::npos,
+              "and the error names both counts");
+    }
+                }
+            }
+        }
+    }
+
     std::printf("\n%s\n", g_fail == 0 ? "all checks passed" : "FAILURES PRESENT");
     return g_fail == 0 ? 0 : 1;
 }

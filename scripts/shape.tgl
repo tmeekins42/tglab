@@ -1,0 +1,23 @@
+# Declaring what a flat drop MEANS, then reducing it one axis at a time.
+#
+# Drop a folder of images on one palette row (hold ALT to make them a group),
+# then right-click the group -> "Sort by filename" so the order is what you
+# think it is. A drop gives a flat list; shape() says how to read it.
+#
+# The layout is row-major: the LAST axis named varies fastest. For
+# shape(g, position=2, exposure=3) the three exposures of position 0 come
+# first, then position 1's three -- which is the order a shoot is taken in.
+
+frames = image("shoot")
+
+# Six images = 2 camera positions x 3 exposures.
+# Adjust these to match what you actually dropped; shape() checks the count.
+shot = shape(frames, position=2, exposure=3)
+
+# Reduce one axis at a time. merge_mean knows nothing about this: it takes N
+# images and returns one, and the framework runs it once per remaining
+# coordinate. [position=2, exposure=3] -> [position=2] -> a single image.
+merged = merge_mean(shot, over="exposure")
+final  = merge_mean(merged, over="position")
+
+display(final, "merged")

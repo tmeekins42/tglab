@@ -75,6 +75,32 @@ public:
         return Shape{std::move(out)};
     }
 
+    // --- layout ---------------------------------------------------------
+    //
+    // Images are stored ROW-MAJOR over the axes as declared: the LAST axis
+    // varies fastest. For [position=12, exposure=3] that means the three
+    // exposures of position 0 are adjacent, then position 1's three, and so on.
+    //
+    // This is the order a shoot arrives in -- a bracket is shot together, then
+    // the tripod moves -- so a file listing sorted by name already lays out
+    // correctly under this rule. Choosing the other convention would silently
+    // transpose every group built from a drop.
+
+    // Stride between consecutive coordinates along `axis`.
+    int64_t Stride(int axis) const {
+        int64_t s = 1;
+        for (int i = int(m_axes.size()) - 1; i > axis; --i) s *= m_axes[size_t(i)].extent;
+        return s;
+    }
+
+    // Flat index of a full coordinate. `coord` runs parallel to Axes().
+    int64_t Offset(const std::vector<int>& coord) const {
+        int64_t off = 0;
+        for (int i = 0; i < int(m_axes.size()) && i < int(coord.size()); ++i)
+            off += int64_t(coord[size_t(i)]) * Stride(i);
+        return off;
+    }
+
     bool operator==(const Shape&) const = default;
 
     // "[]" for scalar, otherwise "[exposure=5, focus=12]". For error messages,

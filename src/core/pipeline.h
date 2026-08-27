@@ -43,6 +43,10 @@ struct Stage {
     // Empty when the stage is not a reduction. Part of SameStage, so changing
     // it re-runs rather than reusing a result reduced over a different axis.
     std::string          reduceAxis;
+
+    // Target shape for a reshape stage, computed by the interpreter so that
+    // later lines can be checked against it at build time. Empty otherwise.
+    Shape                reshapeTo;
     // Versions of the palette images this stage read, so replacing one is
     // detected as a change rather than looking identical.
     uint64_t             sourceHash = 0;
@@ -87,7 +91,7 @@ public:
     void Clear();
     int  AddStage(std::unique_ptr<AlgorithmBase> algo, std::string name,
                   std::vector<PortRef> inputs, size_t numOutputs, int line,
-                  std::string reduceAxis = {});
+                  std::string reduceAxis = {}, Shape reshapeTo = {});
     void AddViewer(std::string name, PortRef src);
 
     // --- execution (phase 2) ---
