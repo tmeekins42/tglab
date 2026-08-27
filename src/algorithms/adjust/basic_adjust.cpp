@@ -117,6 +117,26 @@ inline float Luma(float r, float g, float b) {
 // leaves it alone.
 constexpr float kLinearShoulder = 0.70f;
 
+// Where the shadow band tops out, for scene-linear input.
+//
+// The band was hardcoded 0.0 to 0.5, which is a GAMMA-ENCODED assumption: in
+// sRGB, 0.5 is roughly a midtone, so a band ending there covers the lower half
+// of the picture and nothing above it. In linear light 0.5 is well ABOVE the
+// midtones -- middle grey is 0.18 -- so the same band gave middle grey 70% of
+// the full shadow lift and only stopped short of the brightest highlights.
+//
+// That is precisely the symptom Tim reported on a tonemapped merge: "the
+// shadows slider seems to brighten the entire scene except clouds". It was not
+// a shadow control at all, it was a global brightener with the highlights
+// masked out.
+//
+// 0.18 is middle grey, so the band now runs from black to the midtones and
+// fades out there -- which is what "shadows" means. Chosen for the same reason
+// kLinearShoulder is a constant rather than per-image: a band pitched off the
+// image's own statistics would make the same slider position mean something
+// different on every frame.
+constexpr float kLinearShadowTop = 0.18f;
+
 // A smooth 0..1 window used to target a tonal band without a hard edge, which
 // would show as banding on a gradient.
 inline float SmoothBand(float x, float lo, float hi) {
@@ -164,6 +184,7 @@ public:
         // with detail at 1.0. That is what makes highlight recovery reach the
         // headroom a raw actually carries.
         const float white = linear ? kLinearShoulder : 1.0f;
+        const float shadowTop = linear ? kLinearShadowTop : 0.5f;
 
         // White balance gains, derived once rather than per pixel.
         float wbR = 1.0f, wbG = 1.0f, wbB = 1.0f;
@@ -186,7 +207,7 @@ public:
                     b = DecodeIn(p[2] / scale, linear);
                 }
 
-                Apply(&r, &g, &b, wbR, wbG, wbB, expGain, white);
+                Apply(&r, &g, &b, wbR, wbG, wbB, expGain, white, shadowTop);
 
                 if (ch == 1) {
                     m_out.Set(x, y, 0, EncodeOut(Luma(r, g, b), linear) * scale);
@@ -223,6 +244,7 @@ cbuffer Params : register(b0) {
     uint  Vibrance, Saturation;
     uint  Linear;               // 1 = scene-linear input: no transfer, no clamp
     uint  HighlightTop;         // top of the highlight band (1.0 unless linear)
+    uint  ShadowTop;            // top of the shadow band (0.5 unless linear)
 };
 
 static const float3 kLumaW = float3(0.2126, 0.7152, 0.0722);
@@ -287,7 +309,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     }
     float sh = asfloat(Shadows);
     if (abs(sh) > 1e-4) {
-        float w = 1.0 - SmoothBand(lum, 0.0, 0.5);
+        float w = 1.0 - SmoothBand(lum, 0.0, asfloat(ShadowTop));
         c *= (1.0 + sh * w);
     }
 
@@ -340,7 +362,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
                 bits(float(m_highlights)), bits(float(m_shadows)),
                 bits(float(m_whites)),     bits(float(m_blacks)),
                 bits(float(m_vibrance)),   bits(float(m_saturation)),
-                uint32_t(m_linear ? 1 : 0), bits(m_white)};
+                uint32_t(m_linear ? 1 : 0), bits(m_white), bits(m_shadowTop)};
     }
 
     // HasGPU() is consulted before PrepareGpu(), so this is where the input
@@ -394,6 +416,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     void PrepareGpu(const std::vector<ImageDesc>& inputs) override {
         m_linear = !inputs.empty() && inputs[0].linear;
         m_white  = m_linear ? kLinearShoulder : 1.0f;
+        m_shadowTop = m_linear ? kLinearShadowTop : 0.5f;
         if (!inputs.empty()) CaptureWhiteBalance(inputs[0]);
     }
 
@@ -476,7 +499,8 @@ private:
     // the caller for why it is not 1.0 on scene-linear input.
 
     void Apply(float* rr, float* gg, float* bb,
-               float wbR, float wbG, float wbB, float expGain, float white) const {
+               float wbR, float wbG, float wbB, float expGain, float white,
+               float shadowTop) const {
         float r = *rr * wbR * expGain;
         float g = *gg * wbG * expGain;
         float b = *bb * wbB * expGain;
@@ -547,7 +571,7 @@ private:
         }
         const float sh = float(m_shadows);
         if (std::abs(sh) > 1e-4f) {
-            const float w = 1.0f - SmoothBand(lum, 0.0f, 0.5f);
+            const float w = 1.0f - SmoothBand(lum, 0.0f, shadowTop);
             const float k = 1.0f + sh * w;
             r *= k; g *= k; b *= k;
         }
@@ -667,6 +691,7 @@ private:
 
     bool  m_linear = false;   // set by PrepareGpu from the input descriptor
     float m_white  = 1.0f;
+    float m_shadowTop = 0.5f;   // see kLinearShadowTop
 
     // White-balance references from the input descriptor, needed by the Kelvin
     // control. Set in both paths -- RunCPU reads the descriptor directly, and

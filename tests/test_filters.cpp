@@ -1022,6 +1022,60 @@ int main() {
             }
         }
 
+        // The SHADOW band must stay in the shadows on linear input.
+        //
+        // Tim: "the shadows slider seems to brighten the entire scene except
+        // clouds". The band was hardcoded 0.0 to 0.5, which is a gamma-encoded
+        // assumption -- in sRGB 0.5 is roughly a midtone. In linear light
+        // middle grey is 0.18, so that band handed middle grey 70% of the full
+        // lift and only faded out near the highlights. It was a global
+        // brightener with the top masked off, not a shadow control.
+        //
+        // Checked as a RATIO between what a shadow gets and what a midtone
+        // gets. An absolute threshold would need re-tuning whenever the band
+        // moves; the property that matters is that the shadows get much more.
+        {
+            auto makeTones = []() {
+                ImageDesc d{32, 32, Format::RGBA16F};
+                d.linear = true;
+                Image img;
+                img.Alloc(d);
+                ImageView v = img.MapCpuWrite();
+                for (int y = 0; y < 32; ++y)
+                    for (int x = 0; x < 32; ++x) {
+                        // A shadow (0.02), a midtone (0.18 = middle grey), and
+                        // a highlight (0.60).
+                        const float lum = (y < 11) ? 0.02f : (y < 22 ? 0.18f : 0.60f);
+                        uint16_t* p = v.At<uint16_t>(x, y);
+                        for (int c = 0; c < 3; ++c) p[c] = FloatToHalf(lum);
+                        p[3] = FloatToHalf(1.0f);
+                    }
+                return img;
+            };
+
+            Image lifted;
+            std::string sErr;
+            if (RunFilter("basic_adjust", makeTones(), {{"shadows", 1.0}}, &lifted, &sErr)) {
+                const double sh  = bandMax(lifted, 0, 11);    // 0.02 in
+                const double mid = bandMax(lifted, 11, 22);   // 0.18 in
+                const double hl  = bandMax(lifted, 22, 32);   // 0.60 in
+
+                const double shGain  = sh  / 0.02;
+                const double midGain = mid / 0.18;
+                const double hlGain  = hl  / 0.60;
+
+                Check(shGain > midGain * 1.5,
+                      "shadows +1 lifts a shadow far more than a midtone (" +
+                      std::to_string(shGain) + "x vs " + std::to_string(midGain) + "x)");
+                Check(hlGain < 1.05,
+                      "and leaves the highlights essentially alone (" +
+                      std::to_string(hlGain) + "x)");
+                Check(shGain > 1.3, "while actually lifting the shadow");
+            } else {
+                Check(false, "basic_adjust shadows on linear input: " + sErr);
+            }
+        }
+
 
         // The band pitch, isolated. Real raws mostly do NOT peak above 1.0 --
         // measured across six files, peak luminance ran 0.25 to 0.75 -- so the
