@@ -230,10 +230,11 @@ void PipelineWorker::Run() {
 
         const auto t0 = std::chrono::steady_clock::now();
         std::string err;
+        m_progress.Set(0, 0, "starting");
         const bool ok = job->pipe.Execute(job->sources.get(), havePrev ? &prev : nullptr, &err,
                                           haveGpu ? &gpu : nullptr,
                                           m_mode.load(std::memory_order_relaxed),
-                                          &job->sourceVersions, token.get());
+                                          &job->sourceVersions, token.get(), &m_progress);
         const double elapsedMs =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 
@@ -291,7 +292,10 @@ void PipelineWorker::Run() {
             {
                 std::lock_guard<std::mutex> lock(m_mtx);
                 m_running.reset();
-                if (!m_pending) m_busy.store(false, std::memory_order_relaxed);
+                if (!m_pending) {
+                    m_busy.store(false, std::memory_order_relaxed);
+                    m_progress.Clear();
+                }
             }
             continue;
         }

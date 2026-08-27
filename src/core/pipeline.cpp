@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <functional>
 #include <cassert>
 #include <map>
@@ -160,7 +161,8 @@ std::vector<int> Pipeline::FusableChain(int reduceStage, PortRef* srcPort) const
 bool Pipeline::RunFusedReduction(int reduceStage, const std::vector<int>& chain,
                                  PortRef srcPort, const std::vector<Data>* sources,
                                  ComputeContext* gpu, ExecMode mode,
-                                 const CancelToken* cancel, std::string* err) {
+                                 const CancelToken* cancel, Progress* progress,
+                                 std::string* err) {
     Stage& red = m_stages[size_t(reduceStage)];
     auto Where = [&] { return "line " + std::to_string(red.line) + ": '" + red.algoName + "' "; };
 
@@ -185,6 +187,16 @@ bool Pipeline::RunFusedReduction(int reduceStage, const std::vector<int>& chain,
 
     for (size_t f = 0; f < set->images.size(); ++f) {
         if (cancel && cancel->Cancelled()) { *err = kCancelled; return false; }
+
+        // Per-FRAME progress, which is the granularity that matters here: a
+        // five-frame merge is one stage but several seconds, so stage-level
+        // progress alone would sit at one number the whole time.
+        if (progress) {
+            char what[64];
+            std::snprintf(what, sizeof what, "%s  frame %d/%d", red.algoName.c_str(),
+                          int(f) + 1, int(set->images.size()));
+            progress->Set(int(f), int(set->images.size()), what);
+        }
 
         // Carry this one frame through every stage of the chain. `carried` owns
         // the frame between stages and is overwritten each time, which is what
@@ -412,7 +424,8 @@ bool Pipeline::RunStageOnce(Stage& s, const std::vector<const Data*>& in,
 // answering it before anything needs it would be guessing.
 bool Pipeline::BroadcastStage(Stage& s, const std::vector<const Data*>& in,
                               ComputeContext* gpu, ExecMode mode,
-                              const CancelToken* cancel, std::string* err) {
+                              const CancelToken* cancel, Progress* progress,
+                              std::string* err) {
     auto Where = [&] { return "line " + std::to_string(s.line) + ": '" + s.algoName + "' "; };
 
     int setIdx = -1;
@@ -457,6 +470,13 @@ bool Pipeline::BroadcastStage(Stage& s, const std::vector<const Data*>& in,
     for (size_t f = 0; f < src.images.size() && ok; ++f) {
         if (cancel && cancel->Cancelled()) { *err = kCancelled; ok = false; break; }
 
+        if (progress) {
+            char what[64];
+            std::snprintf(what, sizeof what, "%s  frame %d/%d", s.algoName.c_str(),
+                          int(f) + 1, int(src.images.size()));
+            progress->Set(int(f), int(src.images.size()), what);
+        }
+
         // Swap this frame in for the set input; every other input is passed
         // through unchanged, which is what lets a broadcast stage still take
         // ordinary scalar parameters from earlier stages.
@@ -486,7 +506,7 @@ bool Pipeline::BroadcastStage(Stage& s, const std::vector<const Data*>& in,
 bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* err,
                        ComputeContext* gpu, ExecMode mode,
                        const std::vector<uint64_t>* sourceVersions,
-                       const CancelToken* cancel) {
+                       const CancelToken* cancel, Progress* progress) {
     // Stamp each stage with the versions of the palette images it reads, before
     // any cache comparison. PortRef{-1, i} is identical whichever file backs
     // slot i, so without this a swapped image reuses the cached output -- which
@@ -611,6 +631,13 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
         // Already consumed frame by frame by a fused reduction below.
         if (fused.count(int(i))) continue;
 
+        // Stage-level progress. Counted from firstDirty rather than from zero,
+        // so a cache hit that skips most of the pipeline does not show a bar
+        // crawling through work that is not happening.
+        if (progress)
+            progress->Set(int(i - firstDirty), int(m_stages.size() - firstDirty),
+                          s.algoName.c_str());
+
         s.valid = false;
 
         // A reduction whose input is a straight line of broadcast stages runs
@@ -619,7 +646,7 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
         // gathering is what would materialise the whole intermediate set.
         if (auto fp = fusedPlan.find(int(i)); fp != fusedPlan.end()) {
             if (!RunFusedReduction(int(i), fp->second.first, fp->second.second,
-                                   sources, gpu, mode, cancel, err))
+                                   sources, gpu, mode, cancel, progress, err))
                 return false;
             continue;
         }
@@ -655,7 +682,7 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
         for (const Data* d : in) if (TypeOf(*d) == DataType::ImageSet) anySet = true;
 
         if (anySet) {
-            if (!BroadcastStage(s, in, gpu, mode, cancel, err)) return false;
+            if (!BroadcastStage(s, in, gpu, mode, cancel, progress, err)) return false;
         } else if (!RunStageOnce(s, in, gpu, mode, cancel, err)) {
             return false;
         }

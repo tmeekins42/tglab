@@ -12,6 +12,7 @@
 
 #include "algorithm.h"
 #include "data.h"
+#include "progress.h"
 
 namespace tglab {
 
@@ -104,7 +105,8 @@ public:
     bool Execute(std::vector<Data>* sources, Pipeline* prev, std::string* err,
                  ComputeContext* gpu = nullptr, ExecMode mode = ExecMode::Auto,
                  const std::vector<uint64_t>* sourceVersions = nullptr,
-                 const CancelToken* cancel = nullptr);
+                 const CancelToken* cancel = nullptr,
+                 Progress* progress = nullptr);
 
     // Sentinel error text for an abandoned run, so the caller can tell "the
     // user moved on" apart from a real failure worth showing.
@@ -147,13 +149,15 @@ private:
     bool RunFusedReduction(int reduceStage, const std::vector<int>& chain,
                            PortRef srcPort, const std::vector<Data>* sources,
                            ComputeContext* gpu, ExecMode mode,
-                           const CancelToken* cancel, std::string* err);
+                           const CancelToken* cancel, Progress* progress,
+                           std::string* err);
     bool RunStageOnce(Stage& s, const std::vector<const Data*>& in,
                       ComputeContext* gpu, ExecMode mode,
                       const CancelToken* cancel, std::string* err);
     bool BroadcastStage(Stage& s, const std::vector<const Data*>& in,
                         ComputeContext* gpu, ExecMode mode,
-                        const CancelToken* cancel, std::string* err);
+                        const CancelToken* cancel, Progress* progress,
+                        std::string* err);
     bool RunReduction(Stage& s, const std::vector<const Data*>& in,
                       const CancelToken* cancel, std::string* err);
     bool RunStageGpu(Stage& s, const std::vector<const Data*>& in,

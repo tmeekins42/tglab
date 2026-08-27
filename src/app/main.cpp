@@ -2428,8 +2428,25 @@ void App::Frame() {
             // whole point of the worker is that the UI keeps drawing meanwhile.
             const char* spin = "|/-\\";
             m_spinner = (m_spinner + 1) % 4;
-            ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f),
-                               "%c working...", spin[m_spinner]);
+
+            // What it is working ON, when the worker knows. A five-frame merge
+            // of 45 MP raws is nine seconds, and a bare spinner for nine
+            // seconds is indistinguishable from a hang -- which is exactly how
+            // one was missed.
+            const Progress& p = m_worker.GetProgress();
+            const std::string what = p.Label();
+            const int total = p.Total();
+
+            ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "%c %s", spin[m_spinner],
+                               what.empty() ? "working..." : what.c_str());
+
+            // A bar only when there is an honest count to show. Total 0 means
+            // the run is not divisible into countable units, and a bar that
+            // invents a fraction is worse than none.
+            if (total > 0) {
+                const float frac = float(p.Done()) / float(total);
+                ImGui::ProgressBar(frac, ImVec2(-1.0f, 0.0f));
+            }
         } else if (m_error.empty()) {
             ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1.0f), "OK");
         } else {

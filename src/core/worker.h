@@ -25,6 +25,7 @@
 #include "compare.h"
 #include "image_stats.h"
 #include "pipeline.h"
+#include "progress.h"
 
 // Declared at global scope: writing `struct ID3D12Device*` inside namespace
 // tglab would silently declare a *different* type and fail to link.
@@ -153,6 +154,10 @@ public:
     // which the UI's version check then makes free.
     void SetVisibleViewers(std::vector<std::string> names);
 
+    // Live progress of the run in flight. Safe to read from the UI thread at
+    // any time; between runs it reports a total of 0.
+    const Progress& GetProgress() const { return m_progress; }
+
     // The viewer whose histogram the info panel wants, or "" for none.
     //
     // Computed on the worker because that is where the GPU context lives and
@@ -196,6 +201,10 @@ private:
     std::atomic<bool>     m_busy{false};
     std::atomic<uint64_t> m_lastFinished{0};
     std::atomic<ExecMode> m_mode{ExecMode::Auto};
+    // What the current run is doing, for the status bar. Written by the worker,
+    // read by the UI without a lock -- see core/progress.h.
+    Progress              m_progress;
+
     std::atomic<int>      m_lastGpuStages{0};
     std::atomic<int>      m_lastCpuStages{0};
     std::atomic<int>      m_lastCachedStages{0};

@@ -37,9 +37,9 @@ BUGS / SMALL FEATURES
   level inside the existing kernel. No transform, no round-trip, and it can be
   a parameter so the effect is visible rather than baked in.
 - instead of the left side panel having an image tab and a script tab, I think we
-  should always have image list visible and maybe a pull down selector in the UI 
+  should always have image palette visible and maybe a pull down selector in the UI 
   somewhere for switching scripts. I'm not sure what use the algorithms tab is,
-  other than a scripting reference... if so, we could move that to a menu => dialog pop-up
+  other than a scripting reference... if so, we could move that to a menu => dialog pop-up?
 - PALETTE UI FOR GROUPS -- deferred deliberately, to revisit once the multi-
   image feature is done. Tim's observations on the first version:
     + a group is hard to tell apart from a single image at a glance
