@@ -7,6 +7,7 @@
 #include <dbghelp.h>    // stack trace in the crash handler
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <chrono>
 #include <cstdlib>
@@ -297,6 +298,7 @@ public:
     void RefreshMembers(PaletteEntry& e);
     std::string UniqueSlotName(const std::string& base) const;
     std::string NewGroupSlot();
+    void SortGroupByName(PaletteEntry& e);
     void MakeGroup(PaletteEntry& e);
     void Ungroup(PaletteEntry& e);
 
@@ -2113,6 +2115,47 @@ std::string App::NewGroupSlot() {
     return name;
 }
 
+// Sorts a group's images by filename, keeping the per-member state with them.
+//
+// The images live in core's ImageSet and their thumbnails in e.members, so a
+// sort is one permutation applied to BOTH. Sorting one and not the other would
+// pair every image with the wrong thumbnail -- and, worse, with the wrong
+// recorded path, so a later sort would compound it.
+//
+// Natural-ish order: a plain lexicographic sort puts IMG_10 before IMG_9, which
+// is exactly wrong for a numbered burst. Comparing digit runs numerically fixes
+// the case that actually occurs without pretending to be a full natural sort.
+void App::SortGroupByName(PaletteEntry& e) {
+    auto* set = std::get_if<ImageSet>(&e.data);
+    if (!set || set->images.size() < 2) return;
+    RefreshMembers(e);
+
+    auto baseName = [](const std::string& p) {
+        const auto slash = p.find_last_of("/\\");
+        return slash == std::string::npos ? p : p.substr(slash + 1);
+    };
+
+    // Sort an index permutation, then apply it once to each vector. Sorting the
+    // vectors directly would need a zip; this keeps them provably in step.
+    std::vector<size_t> order(set->images.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(), [&](size_t x, size_t y) {
+        return FilenameLess(baseName(e.members[x].path), baseName(e.members[y].path));
+    });
+
+    std::vector<Image>         img;
+    std::vector<PaletteMember> mem;
+    img.reserve(order.size());
+    mem.reserve(order.size());
+    for (size_t k : order) {
+        img.push_back(std::move(set->images[k]));
+        mem.push_back(std::move(e.members[k]));
+    }
+    set->images = std::move(img);
+    e.members   = std::move(mem);
+    ++e.version;
+}
+
 // Keeps a group's per-member UI state the same length as its images.
 //
 // The images live in core's ImageSet and the thumbnails here, so the two can
@@ -2363,6 +2406,17 @@ void App::DrawPalettePanel() {
                         }
                     }
                     ImGui::EndMenu();
+                }
+
+                // Sorting matters more here than it looks. Windows hands a
+                // multi-file drop over in selection order, and the file the
+                // user clicked LAST routinely arrives out of place -- so a
+                // bracket dropped in visual order can still reach us shuffled.
+                // Since a reduction consumes the group in order, one wrong
+                // position is a silently wrong result rather than an error.
+                if (ImGui::MenuItem("Sort by filename")) {
+                    SortGroupByName(e);
+                    m_dirty = true;
                 }
                 if (ImGui::MenuItem("Remove last image")) {
                     tglab::RemoveLastFromGroup(&e.data, e.axis);

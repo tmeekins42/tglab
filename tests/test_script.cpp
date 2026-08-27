@@ -1818,6 +1818,39 @@ int main() {
         Check(ordered, "results arrive in request order, not completion order");
     }
 
+    // --- filename ordering ---------------------------------------------------
+    //
+    // Windows hands a multi-file drop over in selection order, and the file
+    // clicked last routinely arrives out of place, so a bracket dropped in
+    // visual order can still reach the palette shuffled. A reduction then
+    // consumes it in the wrong order and produces a silently wrong result --
+    // which is why this sorts numerically rather than lexicographically.
+    {
+        Check(FilenameLess("IMG_9.CR3", "IMG_10.CR3"),
+              "9 sorts before 10, not after");
+        Check(!FilenameLess("IMG_10.CR3", "IMG_9.CR3"),
+              "and the reverse does not hold");
+        Check(FilenameLess("_U0A0999.CR3", "_U0A1000.CR3"),
+              "a digit-run carry sorts correctly");
+        Check(FilenameLess("a.CR3", "b.CR3"), "plain text still compares");
+        Check(FilenameLess("IMG_2.CR3", "IMG_02b.CR3"),
+              "equal numbers fall through to the characters after them");
+        Check(!FilenameLess("IMG_1.CR3", "IMG_1.CR3"),
+              "a name is not less than itself");
+        Check(FilenameLess("IMG_1", "IMG_1x"), "a prefix sorts first");
+
+        // Case-insensitive, since a camera and a card reader disagree about it.
+        Check(!FilenameLess("IMG_2.CR3", "img_1.CR3"),
+              "case does not override the number");
+
+        // The ordering must be a strict weak ordering or std::sort is UB.
+        const char* names[] = {"IMG_10", "IMG_9", "img_9", "IMG_100", "a", "IMG_9x"};
+        for (const char* x : names)
+            for (const char* y : names)
+                if (FilenameLess(x, y))
+                    Check(!FilenameLess(y, x), "the ordering is antisymmetric");
+    }
+
     std::printf("\n%s\n", g_fail == 0 ? "all checks passed" : "FAILURES PRESENT");
     return g_fail == 0 ? 0 : 1;
 }

@@ -25,6 +25,19 @@ void RemoveLastFromGroup(Data* d, const std::string& axis);
 // Renames the axis, restating the shape so a script's over="..." matches.
 void SetGroupAxis(Data* d, const std::string& axis);
 
+// Compares two filenames with digit runs read as NUMBERS, so IMG_9 precedes
+// IMG_10 rather than following it.
+//
+// This matters more than a tidiness argument suggests: Windows hands a
+// multi-file drop over in selection order, and the file clicked last routinely
+// arrives out of place -- so a bracket dropped in visual order can still reach
+// the palette shuffled. A reduction then consumes it in the wrong order and
+// produces a silently wrong result rather than an error.
+//
+// Deliberately not a full natural sort: it handles the numbered-burst case that
+// actually occurs, and nothing else.
+bool FilenameLess(const std::string& a, const std::string& b);
+
 // Back to a single image, keeping the FIRST. Deliberately keeps one rather than
 // emptying the slot: a script referring to the entry by name should still
 // resolve, and losing every dropped file to a mis-click would be worse than

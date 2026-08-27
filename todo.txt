@@ -49,6 +49,10 @@ BUGS / SMALL FEATURES
       images like a new palette (the collapse button tells the user it's a group)
     + file order is important. we should allow drag/drop to change positions.
       also, windows drag drop likes to always have one file in the wron location.
+      DONE (sort by filename): right-click a group -> "Sort by filename".
+      Numeric, so IMG_9 precedes IMG_10. Deferred from this: reordering by
+      DRAG, and sorting by capture date (needs per-member EXIF, which is not
+      read today).
     + right-click should have a sort by file name, sort by date (or shot time)
     + ability to drag a non-grouped image into a group
     + currently I need one image to create a group. Can I create an empty group to drag
@@ -66,6 +70,7 @@ BUGS / SMALL FEATURES
 - when an image is loading/processing, put a spinner over the thumbnail in the image palette
   if the image is cached, etc, maybe another icon over the thumbnail to show this
   this has no practical purpose, but I think it's nice for the user to watch the processing
+  this would be a good time to add an error icon on the thumbnail if the image failed to load
 
 NEW FEATURES / IDEAS
 - add support for additional image channels, such as alpha channels and depth channels
@@ -103,11 +108,9 @@ NEW FEATURES / IDEAS
 - alternate form of nested script functions func1() => func2() => func3(). Many modern 
   computer languages are adopting this as long as the main object we pass is the first argument.
   I think this can be easier to read and understand by non-programmers than nested calls.
-- at some point i think we might need an interactive sceipt editor in the app instead of depending
+- at some point i think we might need an interactive script editor in the app instead of depending
   on an external text editor. It could even be smart with pulldowns for commands and algorithms
   should also support syntax highlighting.
-  Since we're add an icon over the image thumbnail, we could have an error icon, if the
-  file fails to load, etc.
 
 NOTES
 - if we need matrix functions, I suggest the Euler library and Ceres for bundle solving
