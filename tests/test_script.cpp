@@ -12,6 +12,7 @@
 #include "../src/algo_util/histogram.h"
 #include "../src/core/exif.h"
 #include "../src/core/image_group.h"
+#include "../src/core/image_loader.h"
 #include "../src/core/image_io.h"
 #include "../src/core/image_stats.h"
 #include "../src/core/raw_io.h"
@@ -1778,6 +1779,44 @@ int main() {
         }
     }
 
+
+    // --- image loader ordering ----------------------------------------------
+    //
+    // The loader runs a pool now, so results finish out of order: a small PNG
+    // queued after a 45 MP raw completes first. File order is meaningful for a
+    // group -- a bracket is an ordered thing -- so TryFetch must deliver in
+    // REQUEST order regardless.
+    //
+    // Exercised with real files of deliberately different sizes, because the
+    // whole point is that decode time varies. A test with identical inputs
+    // would pass even if ordering were dropped entirely.
+    {
+        ImageLoader loader;
+        loader.Start();
+
+        // page.png is the smaller of the two committed assets, so queuing it
+        // AFTER the larger one is what creates the overtaking opportunity.
+        const char* files[] = {
+            "assets/test.png", "assets/page.png", "assets/test.png",
+            "assets/page.png", "assets/test.png",
+        };
+        const int n = int(sizeof(files) / sizeof(files[0]));
+        for (int i = 0; i < n; ++i) loader.Request(files[i], "");
+
+        std::vector<std::string> got;
+        for (int spins = 0; spins < 20000 && int(got.size()) < n; ++spins) {
+            LoadResult r;
+            while (loader.TryFetch(&r)) got.push_back(r.path);
+            if (int(got.size()) < n) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        loader.Stop();
+
+        Check(int(got.size()) == n, "every queued file comes back");
+        bool ordered = (int(got.size()) == n);
+        for (int i = 0; i < int(got.size()) && ordered; ++i)
+            if (got[size_t(i)] != files[i]) ordered = false;
+        Check(ordered, "results arrive in request order, not completion order");
+    }
 
     std::printf("\n%s\n", g_fail == 0 ? "all checks passed" : "FAILURES PRESENT");
     return g_fail == 0 ? 0 : 1;

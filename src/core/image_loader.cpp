@@ -1,29 +1,42 @@
 #include "image_loader.h"
 
+#include <algorithm>
+
 #include "image_io.h"
 
 namespace tglab {
 
 void ImageLoader::Start() {
-    if (m_thread.joinable()) return;
+    if (!m_threads.empty()) return;
     m_quit.store(false);
-    m_thread = std::thread([this] { Run(); });
+
+    // One worker per core, less a couple left for the UI and the pipeline
+    // worker -- both of which matter more than finishing a drop a moment
+    // sooner. Clamped to at least two, so a small machine still overlaps
+    // decoding with the read that follows it.
+    unsigned n = std::thread::hardware_concurrency();
+    n = (n > 3) ? n - 2 : 2;
+    n = std::min(n, 8u);   // beyond this the disk, not the CPU, is the limit
+
+    m_threads.reserve(n);
+    for (unsigned i = 0; i < n; ++i) m_threads.emplace_back([this] { Run(); });
 }
 
 void ImageLoader::Stop() {
-    if (!m_thread.joinable()) return;
+    if (m_threads.empty()) return;
     {
         std::lock_guard<std::mutex> lock(m_mtx);
         m_quit.store(true);
     }
     m_cv.notify_all();
-    m_thread.join();
+    for (std::thread& t : m_threads) if (t.joinable()) t.join();
+    m_threads.clear();
 }
 
 void ImageLoader::Request(std::string path, std::string targetSlot) {
     {
         std::lock_guard<std::mutex> lock(m_mtx);
-        m_queue.push_back({std::move(path), std::move(targetSlot)});
+        m_queue.push_back({std::move(path), std::move(targetSlot), m_nextSeq++});
         m_pending.fetch_add(1, std::memory_order_relaxed);
     }
     m_cv.notify_one();
@@ -31,10 +44,18 @@ void ImageLoader::Request(std::string path, std::string targetSlot) {
 
 bool ImageLoader::TryFetch(LoadResult* out) {
     std::lock_guard<std::mutex> lock(m_mtx);
-    if (m_done.empty()) return false;
-    *out = std::move(m_done.front());
-    m_done.erase(m_done.begin());
-    return true;
+
+    // Hand over the next result IN REQUEST ORDER, even if a later one finished
+    // first. Holding a finished load back briefly costs nothing; delivering a
+    // group's files out of order would silently reorder a bracket.
+    for (size_t i = 0; i < m_done.size(); ++i) {
+        if (m_done[i].seq != m_deliverSeq) continue;
+        *out = std::move(m_done[i]);
+        m_done.erase(m_done.begin() + i);
+        ++m_deliverSeq;
+        return true;
+    }
+    return false;
 }
 
 void ImageLoader::Run() {
@@ -51,6 +72,7 @@ void ImageLoader::Run() {
         LoadResult res;
         res.path       = req.path;
         res.targetSlot = req.targetSlot;
+        res.seq        = req.seq;
         res.ok         = LoadImageFile(req.path, &res.image, &res.error);
 
         {

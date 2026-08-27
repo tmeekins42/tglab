@@ -435,6 +435,7 @@ private:
     ImGuiID     m_compareNode = 0;         // right-hand column for compare
     ImGuiID     m_lastViewerNode = 0;      // where viewers were docked, for script switches
     int         m_spinner = 0;             // "working..." animation
+    int         m_dropTotal = 0;           // files queued in the current drop burst
 
     // Compare mode (M4). TGLAB_COMPARE=1 opens the panel at startup, which is
     // how the panel gets verified without driving the menus.
@@ -666,6 +667,10 @@ void App::RequestImageLoad(const std::string& path, const std::string& targetSlo
     ReportError(prevError);
     UpdateWindowTitle();
 
+    // Counted so the status can say 2/5 rather than just "loading 3 images".
+    // A bare countdown does not tell you how far in you are, which is what Tim
+    // asked for when dropping a card full of files.
+    ++m_dropTotal;
     m_loader.Request(path, targetSlot);
 }
 
@@ -2683,7 +2688,14 @@ void App::Frame() {
         // beats an unexplained pause, which reads as a hang.
         if (const int pending = m_loader.Pending(); pending > 0) {
             ImGui::SameLine();
-            ImGui::TextDisabled("| loading %d image%s...", pending, pending == 1 ? "" : "s");
+            const int done = m_dropTotal - pending;
+            if (m_dropTotal > 1)
+                ImGui::TextDisabled("| loading %d/%d", done + 1, m_dropTotal);
+            else
+                ImGui::TextDisabled("| loading %d image%s...", pending, pending == 1 ? "" : "s");
+        } else {
+            // The burst is finished; the next drop starts its own count.
+            m_dropTotal = 0;
         }
         if (g_worstFrameMs > 100.0) {
             ImGui::SameLine();
