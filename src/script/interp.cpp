@@ -363,18 +363,6 @@ private:
         const std::string& want = a.pos[0].AsString();
         for (const SourceImage& s : m_sources) {
             if (s.name != want) continue;
-            // A group of raws is not handled yet. The demosaic image() would
-            // normally insert takes one image, and mapping it across a set is
-            // the broadcasting step that has not been built -- so say so here
-            // rather than handing the script undemosaiced sensor data that
-            // would merge into a plausible-looking mess.
-            if (!s.shape.IsScalar()) {
-                if (s.isMosaic)
-                    return Fail(e.line, "'" + want + "' is a group of raw images, which "
-                                        "cannot be demosaiced yet");
-                out->push_back(Value(PortHandle{-1, s.index}));
-                return true;
-            }
             // An ordinary image is handed straight through.
             if (!s.isMosaic) {
                 out->push_back(Value(PortHandle{-1, s.index}));
@@ -406,10 +394,16 @@ private:
             // ordinary registered stage, so it appears in the stage list, has
             // its own sliders, and can be turned off -- which matters for
             // astrophotography, where a star IS a genuine one-pixel highlight.
+
+            // Both inserted stages broadcast when the source is a group: they
+            // take one image each, so the framework maps them across the
+            // frames. Their output shapes have to be recorded here because
+            // these AddStage calls bypass CallAlgorithm's propagation.
             PortRef demosaicInput{-1, s.index};
             if (auto repair = Registry::Get().Create("hot_pixel_repair")) {
                 const int rs = m_pipe->AddStage(std::move(repair), "hot_pixel_repair",
                                                 {PortRef{-1, s.index}}, 1, e.line);
+                if (!s.shape.IsScalar()) m_shapeOf[{rs, 0}] = s.shape;
                 demosaicInput = PortRef{rs, 0};
             }
 
@@ -419,6 +413,7 @@ private:
 
             const int stage = m_pipe->AddStage(std::move(algo), m_defaultDemosaic,
                                                {demosaicInput}, 1, e.line);
+            if (!s.shape.IsScalar()) m_shapeOf[{stage, 0}] = s.shape;
             m_demosaicStage[s.index] = stage;
             out->push_back(Value(PortHandle{stage, 0}));
             return true;
@@ -717,6 +712,10 @@ private:
                                     std::to_string(a.pos.size()) + " given");
         }
 
+        // The shape this call broadcasts over, if any input is a set on a port
+        // that takes one image. Empty means an ordinary scalar call.
+        Shape broadcast;
+
         std::vector<PortRef> inputs;
         inputs.reserve(a.pos.size());
         for (size_t i = 0; i < a.pos.size(); ++i) {
@@ -726,15 +725,24 @@ private:
             const PortHandle h = a.pos[i].AsPort();
             const PortRef ref{h.stage, h.port};
 
-            // Shape check. Scalar is the default, so this fires only when
-            // something has actually produced a set and handed it to an
-            // algorithm that takes one image.
+            // A set on a port that takes one image BROADCASTS: the framework
+            // maps the stage across the frames. That is the useful answer --
+            // developing every frame of a bracket is exactly this -- so it is
+            // no longer an error, but the resulting shape has to be tracked so
+            // a later line sees a set rather than a single image.
             const Shape got = ShapeAt(ref);
             if (inPorts[i].shape == ShapeSpec::Scalar && !got.IsScalar()) {
-                return Fail(e.line, "'" + name + "' input '" + inPorts[i].name +
-                                        "' takes a single image, got " + got.ToString() +
-                                        " -- reduce it first, e.g. over=\"" +
-                                        got.Axes()[0].name + "\"");
+                if (got.Rank() > 1) {
+                    return Fail(e.line, "'" + name + "' takes a single image and its input is " +
+                                            got.ToString() + "; broadcasting over more than one "
+                                            "axis is not supported yet");
+                }
+                if (broadcast.IsScalar()) broadcast = got;
+                else if (!(broadcast == got)) {
+                    return Fail(e.line, "'" + name + "' was given two groups of different "
+                                        "shapes, " + broadcast.ToString() + " and " +
+                                        got.ToString());
+                }
             }
             inputs.push_back(ref);
         }
@@ -805,10 +813,16 @@ private:
         // Propagate shapes to this stage's outputs so a later line can be
         // checked against them.
         for (size_t p = 0; p < outPorts.size(); ++p) {
-            Shape s;   // Scalar and Any both produce one image today
+            Shape s;
             if (outPorts[p].shape == ShapeSpec::SameAsInput) s = inShape;
             else if (outPorts[p].shape == ShapeSpec::Reduced && reduceIdx >= 0)
                 s = inShape.Without(reduceIdx);
+
+            // A broadcast call produces one result per frame, so a scalar
+            // algorithm mapped across [frame=5] yields [frame=5] -- which is
+            // what lets develop-then-merge chain without the script saying so.
+            if (!broadcast.IsScalar() && s.IsScalar()) s = broadcast;
+
             if (!s.IsScalar()) m_shapeOf[{idx, int(p)}] = s;
         }
 

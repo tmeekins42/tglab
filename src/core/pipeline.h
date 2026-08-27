@@ -129,6 +129,12 @@ private:
 
     // Runs one stage on the GPU. Returns false (with `err` set) if anything
     // about the stage is unsupported, so the caller can fall back to the CPU.
+    bool RunStageOnce(Stage& s, const std::vector<const Data*>& in,
+                      ComputeContext* gpu, ExecMode mode,
+                      const CancelToken* cancel, std::string* err);
+    bool BroadcastStage(Stage& s, const std::vector<const Data*>& in,
+                        ComputeContext* gpu, ExecMode mode,
+                        const CancelToken* cancel, std::string* err);
     bool RunReduction(Stage& s, const std::vector<const Data*>& in,
                       const CancelToken* cancel, std::string* err);
     bool RunStageGpu(Stage& s, const std::vector<const Data*>& in,

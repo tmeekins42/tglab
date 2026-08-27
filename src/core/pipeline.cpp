@@ -115,6 +115,195 @@ bool Pipeline::RunReduction(Stage& s, const std::vector<const Data*>& in,
     return true;
 }
 
+// Runs one stage against one set of scalar inputs, writing scalar outputs.
+//
+// Extracted from Execute so broadcasting can call it once per frame. It writes
+// into s.outputs, which RunStageGpu also reads and writes throughout -- so the
+// broadcast loop swaps each frame's outputs in and out around the call rather
+// than threading a buffer through the GPU path. Everything
+// here assumes single images -- allocation from input 0, the GPU/CPU choice,
+// cancellation -- which is exactly what makes it the right unit to map across a
+// set rather than duplicating any of it.
+bool Pipeline::RunStageOnce(Stage& s, const std::vector<const Data*>& in,
+                            ComputeContext* gpu, ExecMode mode,
+                            const CancelToken* cancel, std::string* err) {
+    // Allocate outputs. Every port is an image sized from input 0, with the
+    // format resolved from the port's FormatSpec.
+    const PortList outPorts = s.algo->Outputs();
+    ImageDesc base{};
+    if (!in.empty() && std::holds_alternative<Image>(*in[0]))
+        base = std::get<Image>(*in[0]).Desc();
+
+    // A set reaching here means the broadcast dispatch was bypassed. Refuse
+    // rather than allocating from a zeroed descriptor, which would silently
+    // produce a zero-sized output instead of an error.
+    for (const Data* d : in) {
+        if (TypeOf(*d) == DataType::ImageSet) {
+            *err = "line " + std::to_string(s.line) + ": '" + s.algoName +
+                   "' was given " + ShapeOf(*d).ToString() + " but is not broadcasting";
+            return false;
+        }
+    }
+
+    for (size_t p = 0; p < s.outputs.size(); ++p) {
+        ImageDesc d = base;
+        switch (outPorts[p].format) {
+            case FormatSpec::RGBA8:       d.format = Format::RGBA8;   break;
+            case FormatSpec::R32F:        d.format = Format::R32F;    break;
+            case FormatSpec::RGBA32F:     d.format = Format::RGBA32F; break;
+            case FormatSpec::RGBA16F:     d.format = Format::RGBA16F; break;
+            case FormatSpec::SameAsInput: /* keep base.format */      break;
+            case FormatSpec::Any:         /* keep base.format */      break;
+        }
+
+        // The output of a multi-channel stage is no longer a mosaic, even
+        // though it inherited the input's descriptor. Anything that widens a
+        // single sample per pixel into RGB has, by definition, done the
+        // demosaicing -- and leaving the CFA metadata set would make a finished
+        // image claim to still need it, so a second demosaic in the chain would
+        // happily mangle it.
+        if (base.IsMosaic() && d.format != Format::R32F) {
+            d.cfa = CfaPattern::None;
+
+            // ...and what comes out is scene-linear. A demosaic converts sensor
+            // counts to linear RGB; it never applies a transfer function, so the
+            // result carries headroom above 1.0 wherever the white-balance gains
+            // pushed a channel past saturation. Tonal algorithms downstream need
+            // to know not to gamma-decode it and not to clamp it.
+            d.linear = true;
+        }
+        if (!d.Valid()) {
+            *err = "line " + std::to_string(s.line) + ": '" + s.algoName +
+                   "' could not determine output size";
+            return false;
+        }
+        Image img;
+        img.Alloc(d);
+        s.outputs[p] = Data{std::move(img)};
+    }
+
+    // GPU when asked for and available; otherwise CPU. A GPU failure falls back
+    // rather than failing the run -- a broken kernel should degrade to a slow
+    // correct result, not an empty viewer.
+    //
+    // A multi-pass stage carries its HLSL in GpuPasses() rather than in
+    // GpuSource(), so requiring the latter would silently keep every multi-pass
+    // algorithm on the CPU -- looking merely slow, with no error anywhere.
+    const bool wantGpu = gpu && mode != ExecMode::ForceCPU && s.algo->HasGPU() &&
+                         (s.algo->GpuSource() || !s.algo->GpuPasses().empty());
+    bool ranOnGpu = false;
+    if (wantGpu) {
+        std::string gpuErr;
+        if (RunStageGpu(s, in, gpu, &gpuErr)) {
+            ranOnGpu = true;
+            ++m_gpuStages;
+        } else if (mode == ExecMode::ForceGPU) {
+            *err = "line " + std::to_string(s.line) + ": '" + s.algoName +
+                   "' GPU path failed: " + gpuErr;
+            return false;
+        }
+    }
+
+    if (!ranOnGpu) {
+        RunCtx ctx(in, s.outputs, cancel);
+        s.algo->RunCPU(ctx);
+        ++m_cpuStages;
+
+        // An algorithm that honoured the token has written only part of its
+        // output. Leaving the stage valid would cache that partial result and,
+        // worse, let a later run reuse it as though it were finished.
+        if (cancel && cancel->Cancelled()) {
+            *err = kCancelled;
+            return false;
+        }
+    }
+    return true;
+}
+
+// Maps a single-image stage across every frame of a set.
+//
+// This is what lets an ordinary algorithm -- one that knows nothing about
+// groups -- be applied to all of them: develop every frame of a bracket, or
+// demosaic every raw in a group. The algorithm still declares "one image in,
+// one out"; the framework does the mapping, which is the same rule as NumPy
+// broadcasting or SQL GROUP BY.
+//
+// Only ONE input may be a set, and only rank 1. Broadcasting several sets
+// together raises the question of what to do when their shapes differ, and
+// answering it before anything needs it would be guessing.
+bool Pipeline::BroadcastStage(Stage& s, const std::vector<const Data*>& in,
+                              ComputeContext* gpu, ExecMode mode,
+                              const CancelToken* cancel, std::string* err) {
+    auto Where = [&] { return "line " + std::to_string(s.line) + ": '" + s.algoName + "' "; };
+
+    int setIdx = -1;
+    for (size_t i = 0; i < in.size(); ++i) {
+        if (TypeOf(*in[i]) != DataType::ImageSet) continue;
+        if (setIdx >= 0) {
+            *err = Where() + "cannot broadcast over two groups at once";
+            return false;
+        }
+        setIdx = int(i);
+    }
+    if (setIdx < 0) { *err = Where() + "has no group to broadcast over"; return false; }
+
+    const ImageSet& src = std::get<ImageSet>(*in[size_t(setIdx)]);
+    if (src.shape.Rank() != 1) {
+        *err = Where() + "can only broadcast over a single axis so far, and its input is " +
+               src.shape.ToString();
+        return false;
+    }
+    if (src.shape.Count() != int64_t(src.images.size())) {
+        *err = Where() + "has a shape of " + src.shape.ToString() + " but " +
+               std::to_string(src.images.size()) + " images";
+        return false;
+    }
+
+    // One output set per port, all sharing the input's shape.
+    const size_t nPorts = s.outputs.size();
+    std::vector<ImageSet> results(nPorts);
+    for (ImageSet& r : results) {
+        r.shape = src.shape;
+        r.images.reserve(src.images.size());
+    }
+
+    // s.outputs is the scalar working buffer for one frame. RunStageGpu reads
+    // and writes it, so each frame's result is moved out afterwards rather than
+    // the buffer being threaded through the GPU path.
+    std::vector<Data> saved = std::move(s.outputs);
+    s.outputs.clear();
+    s.outputs.resize(nPorts);
+
+    bool ok = true;
+    for (size_t f = 0; f < src.images.size() && ok; ++f) {
+        if (cancel && cancel->Cancelled()) { *err = kCancelled; ok = false; break; }
+
+        // Swap this frame in for the set input; every other input is passed
+        // through unchanged, which is what lets a broadcast stage still take
+        // ordinary scalar parameters from earlier stages.
+        Data frame{src.images[f].Clone()};
+        std::vector<const Data*> frameIn = in;
+        frameIn[size_t(setIdx)] = &frame;
+
+        if (!RunStageOnce(s, frameIn, gpu, mode, cancel, err)) { ok = false; break; }
+
+        for (size_t p = 0; p < nPorts; ++p) {
+            auto* img = std::get_if<Image>(&s.outputs[p]);
+            if (!img) { *err = Where() + "produced no image for frame " + std::to_string(f);
+                        ok = false; break; }
+            results[p].images.push_back(std::move(*img));
+            s.outputs[p] = Data{};
+        }
+    }
+
+    if (!ok) { s.outputs = std::move(saved); return false; }
+
+    s.outputs.clear();
+    s.outputs.resize(nPorts);
+    for (size_t p = 0; p < nPorts; ++p) s.outputs[p] = Data{std::move(results[p])};
+    return true;
+}
+
 bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* err,
                        ComputeContext* gpu, ExecMode mode,
                        const std::vector<uint64_t>* sourceVersions,
@@ -220,21 +409,6 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
                        "' has an input that produced no data";
                 return false;
             }
-            // A set reaching a port that declared Scalar means the interpreter's
-            // build-time check was bypassed -- a stage inserted directly, or a
-            // producer whose declared shape does not match what it made. Fail
-            // loudly here rather than allocating from a zeroed ImageDesc below,
-            // which would silently produce a zero-sized output.
-            if (TypeOf(*d) == DataType::ImageSet) {
-                const PortList ports = s.algo->Inputs();
-                const size_t   pi    = in.size();
-                if (pi >= ports.size() || ports[pi].shape == ShapeSpec::Scalar) {
-                    *err = "line " + std::to_string(s.line) + ": '" + s.algoName +
-                           "' was given " + ShapeOf(*d).ToString() +
-                           " on an input that takes a single image";
-                    return false;
-                }
-            }
             in.push_back(d);
         }
 
@@ -249,86 +423,16 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
             continue;
         }
 
-        // Allocate outputs. M1: every port is an image sized from input 0,
-        // with the format resolved from the port's FormatSpec.
-        const PortList outPorts = s.algo->Outputs();
-        ImageDesc base{};
-        if (!in.empty() && std::holds_alternative<Image>(*in[0]))
-            base = std::get<Image>(*in[0]).Desc();
+        // A set on an input that accepts one image means the framework maps the
+        // stage across the frames -- the broadcasting rule. Checked here rather
+        // than in the interpreter because it depends on what actually arrived.
+        bool anySet = false;
+        for (const Data* d : in) if (TypeOf(*d) == DataType::ImageSet) anySet = true;
 
-        for (size_t p = 0; p < s.outputs.size(); ++p) {
-            ImageDesc d = base;
-            switch (outPorts[p].format) {
-                case FormatSpec::RGBA8:       d.format = Format::RGBA8;   break;
-                case FormatSpec::R32F:        d.format = Format::R32F;    break;
-                case FormatSpec::RGBA32F:     d.format = Format::RGBA32F; break;
-                case FormatSpec::RGBA16F:     d.format = Format::RGBA16F; break;
-                case FormatSpec::SameAsInput: /* keep base.format */      break;
-                case FormatSpec::Any:         /* keep base.format */      break;
-            }
-
-            // The output of a multi-channel stage is no longer a mosaic, even
-            // though it inherited the input's descriptor. Anything that widens
-            // a single sample per pixel into RGB has, by definition, done the
-            // demosaicing -- and leaving the CFA metadata set would make a
-            // finished image claim to still need it, so a second demosaic in
-            // the chain would happily mangle it.
-            if (base.IsMosaic() && d.format != Format::R32F) {
-                d.cfa = CfaPattern::None;
-
-                // ...and what comes out is scene-linear. A demosaic converts
-                // sensor counts to linear RGB; it never applies a transfer
-                // function, so the result carries headroom above 1.0 wherever
-                // the white-balance gains pushed a channel past saturation.
-                // Tonal algorithms downstream need to know not to gamma-decode
-                // it and not to clamp it.
-                d.linear = true;
-            }
-            if (!d.Valid()) {
-                *err = "line " + std::to_string(s.line) + ": '" + s.algoName +
-                       "' could not determine output size";
-                return false;
-            }
-            Image img;
-            img.Alloc(d);
-            s.outputs[p] = Data{std::move(img)};
-        }
-
-        // GPU when asked for and available; otherwise CPU. A GPU failure falls
-        // back rather than failing the run — a broken kernel should degrade to
-        // a slow correct result, not an empty viewer.
-        // A multi-pass stage carries its HLSL in GpuPasses() rather than in
-        // GpuSource(), so requiring the latter would silently keep every
-        // multi-pass algorithm on the CPU -- looking merely slow, with no error
-        // anywhere.
-        const bool wantGpu = gpu && mode != ExecMode::ForceCPU && s.algo->HasGPU() &&
-                             (s.algo->GpuSource() || !s.algo->GpuPasses().empty());
-        bool ranOnGpu = false;
-        if (wantGpu) {
-            std::string gpuErr;
-            if (RunStageGpu(s, in, gpu, &gpuErr)) {
-                ranOnGpu = true;
-                ++m_gpuStages;
-            } else if (mode == ExecMode::ForceGPU) {
-                *err = "line " + std::to_string(s.line) + ": '" + s.algoName +
-                       "' GPU path failed: " + gpuErr;
-                return false;
-            }
-        }
-
-        if (!ranOnGpu) {
-            RunCtx ctx(in, s.outputs, cancel);
-            s.algo->RunCPU(ctx);
-            ++m_cpuStages;
-
-            // An algorithm that honoured the token has written only part of its
-            // output. Leaving the stage valid would cache that partial result
-            // and, worse, let a later run reuse it as though it were finished.
-            if (cancel && cancel->Cancelled()) {
-                s.valid = false;
-                *err = kCancelled;
-                return false;
-            }
+        if (anySet) {
+            if (!BroadcastStage(s, in, gpu, mode, cancel, err)) return false;
+        } else if (!RunStageOnce(s, in, gpu, mode, cancel, err)) {
+            return false;
         }
         s.valid = true;
     }

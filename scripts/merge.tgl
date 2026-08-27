@@ -9,8 +9,17 @@
 
 frames = image("group")
 
-# over= names the axis to reduce. It is optional when the group has only one
-# axis, which is every group the palette can build today:
+# Raw groups work: image() inserts hot_pixel_repair and a demosaic as usual,
+# and the framework runs each of them on EVERY frame. The script says nothing
+# about the group -- that is what broadcasting means.
+#
+# Any single-image algorithm can be applied the same way. This runs on each
+# frame, before the merge:
+#
+#   frames = basic_adjust(frames, auto_exposure = 1)
+
+# over= names the axis to reduce. Optional when the group has one axis, which
+# is every group the palette can build today:
 #   merged = merge_mean(frames, over="frame")
 merged = merge_mean(frames)
 

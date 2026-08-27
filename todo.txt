@@ -50,6 +50,11 @@ BUGS / SMALL FEATURES
     + file order is important. we should allow drag/drop to change positions.
       also, windows drag drop likes to always have one file in the wron location.
     + right-click should have a sort by file name, sort by date (or shot time)
+    + ability to drag a non-grouped image into a group
+    + currently I need one image to create a group. Can I create an empty group to drag
+      images into?
+    + when a large number of images are dropped, it takes time (thumbnails, exif, etc). 
+      Can this processing be done on multiple threads?
   The row is the wrong container for N images -- it was built to show one file
   and now has to represent a set. Whatever replaces it needs to expand, so the
   members are addressable. Tim has ideas and is writing them up; do not

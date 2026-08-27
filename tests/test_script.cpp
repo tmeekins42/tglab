@@ -1515,12 +1515,13 @@ int main() {
             };
 
             std::string e2;
-            Check(!BuildWith("b = image(\"bracket\")\no = brightness(b)\n", &e2),
-                  "a set handed to a single-image algorithm is rejected");
-            Check(e2.find("[exposure=5]") != std::string::npos,
-                  "the error names the shape that arrived");
-            Check(e2.find("over=\"exposure\"") != std::string::npos,
-                  "the error suggests the axis to reduce over");
+
+            // A set on a single-image port now BROADCASTS rather than being
+            // rejected: the framework maps the algorithm across the frames.
+            // This assertion is inverted from its first version deliberately --
+            // rejecting was correct only while broadcasting did not exist.
+            Check(BuildWith("b = image(\"bracket\")\no = brightness(b)\n", &e2),
+                  "a set on a single-image port broadcasts");
 
             // The same set into a port declaring Any is fine.
             Check(BuildWith("b = image(\"bracket\")\no = test_merge(b)\n", &e2),
@@ -1687,21 +1688,93 @@ int main() {
             InterpResult r5 = Interpret(p5, names, &u5, &pl5);
             Check(!r5.ok, "a reduction given a single image is rejected");
         }
-            // Execute must refuse too, not just the interpreter: a set reaching
-            // a scalar port at run time would otherwise allocate from a zeroed
-            // ImageDesc and silently produce a zero-sized output.
-            {
-                Pipeline p;
-                auto br = Registry::Get().Create("brightness");
-                p.AddStage(std::move(br), "brightness", {PortRef{-1, 0}}, 1, 7);
-                std::vector<Data> srcs;
-                srcs.push_back(Data{MakeSet(5)});
-                std::string xerr;
-                Check(!p.Execute(&srcs, nullptr, &xerr),
-                      "Execute refuses a set on a scalar port");
-                Check(xerr.find("single image") != std::string::npos,
-                      "the run-time refusal says why");
+
+        // Broadcasting at run time: a scalar algorithm mapped across a group
+        // must produce a group of the same shape, with the algorithm actually
+        // applied to every frame -- not just to the first.
+        {
+            auto Flat = [](int v) {
+                Image img;
+                ImageDesc d; d.width = 2; d.height = 2; d.format = Format::RGBA8;
+                img.Alloc(d);
+                ImageView vw = img.MapCpuWrite();
+                for (int i = 0; i < 2 * 2 * 4; ++i) vw.data[i] = uint8_t(v);
+                return img;
+            };
+
+            ImageSet set;
+            set.images.push_back(Flat(10));
+            set.images.push_back(Flat(20));
+            set.images.push_back(Flat(30));
+            set.shape = Shape::Of("frame", 3);
+
+            std::vector<SourceImage> names2{{"test", 0}};
+            SourceImage gs; gs.name = "g"; gs.index = 1; gs.shape = Shape::Of("frame", 3);
+            names2.push_back(gs);
+
+            Program prog; std::string err;
+            Parse("g = image(\"g\")\nb = brightness(g, gain = 2.0)\ndisplay(b)\n", &prog, &err);
+            UiState ui; Pipeline pipe;
+            InterpResult ir = Interpret(prog, names2, &ui, &pipe);
+            Check(ir.ok, ir.ok ? "a broadcast interprets" : ("interpret: " + ir.error).c_str());
+
+            std::vector<Data> srcs;
+            srcs.push_back(Data{});
+            srcs.push_back(Data{std::move(set)});
+            std::string xerr;
+            const bool ran = pipe.Execute(&srcs, nullptr, &xerr);
+            Check(ran, ran ? "a broadcast runs" : ("execute: " + xerr).c_str());
+
+            if (ran) {
+                const Data& o = pipe.Stages().back().outputs[0];
+                Check(TypeOf(o) == DataType::ImageSet,
+                      "broadcasting a scalar algorithm produces a set");
+                if (const auto* os = std::get_if<ImageSet>(&o)) {
+                    Check(os->shape == Shape::Of("frame", 3),
+                          "and the result keeps the input's shape");
+                    Check(os->images.size() == 3, "with one image per frame");
+                    // gain 2.0 doubles: 10,20,30 -> 20,40,60. Checking EVERY
+                    // frame, since mapping only the first and copying it would
+                    // pass any test that looked at one.
+                    bool allRight = os->images.size() == 3;
+                    const int want[3] = {20, 40, 60};
+                    for (size_t f = 0; f < os->images.size() && allRight; ++f) {
+                        ImageView v = const_cast<Image&>(os->images[f]).MapCpuRead();
+                        if (!v.data || v.data[0] != want[f]) allRight = false;
+                    }
+                    Check(allRight, "and the algorithm ran on every frame, not just the first");
+                }
             }
+
+            // Broadcast then reduce, which is the whole point: develop each
+            // frame, then merge them. 20,40,60 -> mean 40.
+            Program p2; std::string e2;
+            Parse("g = image(\"g\")\nb = brightness(g, gain = 2.0)\n"
+                  "m = merge_mean(b)\ndisplay(m)\n", &p2, &e2);
+            UiState u2; Pipeline pl2;
+            Check(Interpret(p2, names2, &u2, &pl2).ok, "broadcast then reduce interprets");
+
+            ImageSet set2;
+            set2.images.push_back(Flat(10));
+            set2.images.push_back(Flat(20));
+            set2.images.push_back(Flat(30));
+            set2.shape = Shape::Of("frame", 3);
+            std::vector<Data> s2;
+            s2.push_back(Data{});
+            s2.push_back(Data{std::move(set2)});
+            std::string x2;
+            const bool ran2 = pl2.Execute(&s2, nullptr, &x2);
+            Check(ran2, ran2 ? "broadcast then reduce runs" : ("execute: " + x2).c_str());
+            if (ran2) {
+                const Data& o = pl2.Stages().back().outputs[0];
+                Check(TypeOf(o) == DataType::Image, "and collapses back to one image");
+                if (const auto* oi = std::get_if<Image>(&o)) {
+                    ImageView v = const_cast<Image&>(*oi).MapCpuRead();
+                    Check(v.data && v.data[0] == 40,
+                          "with the right value: mean(20,40,60) == 40");
+                }
+            }
+        }
         }
     }
 
