@@ -161,6 +161,21 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
                        "' has an input that produced no data";
                 return false;
             }
+            // A set reaching a port that declared Scalar means the interpreter's
+            // build-time check was bypassed -- a stage inserted directly, or a
+            // producer whose declared shape does not match what it made. Fail
+            // loudly here rather than allocating from a zeroed ImageDesc below,
+            // which would silently produce a zero-sized output.
+            if (TypeOf(*d) == DataType::ImageSet) {
+                const PortList ports = s.algo->Inputs();
+                const size_t   pi    = in.size();
+                if (pi >= ports.size() || ports[pi].shape == ShapeSpec::Scalar) {
+                    *err = "line " + std::to_string(s.line) + ": '" + s.algoName +
+                           "' was given " + ShapeOf(*d).ToString() +
+                           " on an input that takes a single image";
+                    return false;
+                }
+            }
             in.push_back(d);
         }
 

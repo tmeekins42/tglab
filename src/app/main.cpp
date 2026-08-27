@@ -667,6 +667,11 @@ SourceImage DescribeSource(PaletteEntry& pe, int index) {
     SourceImage si;
     si.name  = pe.name;
     si.index = index;
+
+    // What this entry holds. An ImageSet carries its own shape; a single image
+    // is scalar. Everything dropped as one file is scalar today.
+    si.shape = ShapeOf(pe.data);
+
     if (!std::holds_alternative<Image>(pe.data)) return si;
 
     const Image&     img = std::get<Image>(pe.data);

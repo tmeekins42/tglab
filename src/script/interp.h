@@ -85,6 +85,14 @@ struct SourceImage {
     // unchanged whether a PNG or a CR3 is dropped on the slot.
     bool isMosaic = false;
 
+    // What this palette entry holds. Scalar -- one image -- for everything
+    // dropped as a single file, which is every entry today.
+    //
+    // image() returns a port carrying this shape, so a group flows into the
+    // script as a set and the interpreter's check catches it being handed to a
+    // single-image algorithm at the line that did it.
+    Shape shape;
+
     // The colour temperature and green/magenta offset the camera chose for this
     // shot, recovered from its white-balance metadata. Zero when the file
     // carries no daylight reference to measure against.

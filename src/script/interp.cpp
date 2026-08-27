@@ -798,16 +798,18 @@ private:
     //
     // Build-time, symbolic: the interpreter never sees a Data, so the only way
     // to check a shape mismatch at the line that caused it is to propagate
-    // shapes forward as stages are recorded. A palette image is scalar, and a
-    // stage's outputs follow its declared ShapeSpec.
-    //
-    // Everything is scalar today. This exists so that when a non-scalar
-    // producer lands, the check that catches a misuse is already in place and
-    // reports the script line rather than failing at run time.
+    // shapes forward as stages are recorded. A stage's outputs follow its
+    // declared ShapeSpec; a palette image's shape is whatever its entry holds.
     std::map<std::pair<int, int>, Shape> m_shapeOf;
 
     Shape ShapeAt(const PortRef& r) const {
-        if (r.stage < 0) return Shape::Scalar();   // palette image
+        if (r.stage < 0) {
+            // Palette image: scalar for a single dropped file, which is every
+            // entry today.
+            for (const SourceImage& s : m_sources)
+                if (s.index == r.port) return s.shape;
+            return Shape::Scalar();
+        }
         auto it = m_shapeOf.find({r.stage, r.port});
         return it == m_shapeOf.end() ? Shape::Scalar() : it->second;
     }

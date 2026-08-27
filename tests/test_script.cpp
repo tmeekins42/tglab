@@ -1479,6 +1479,78 @@ int main() {
             Check(Shape::Scalar().Count() == 1,
                   "a scalar is one image, not none");
         }
+
+        // End to end, with a REAL set in the palette rather than a forced
+        // shape. This is what makes the check live: image("bracket") returns a
+        // port carrying [exposure=5], and handing it to a single-image
+        // algorithm must fail at the line that did it.
+        {
+            auto MakeSet = [](int n) {
+                ImageSet s;
+                s.shape = Shape::Of("exposure", n);
+                for (int i = 0; i < n; ++i) {
+                    Image img;
+                    ImageDesc d; d.width = 4; d.height = 4; d.format = Format::RGBA8;
+                    img.Alloc(d);
+                    s.images.push_back(std::move(img));
+                }
+                return s;
+            };
+
+            std::vector<SourceImage> names{{"test", 0}};
+            SourceImage bset;
+            bset.name  = "bracket";
+            bset.index = 1;
+            bset.shape = Shape::Of("exposure", 5);
+            names.push_back(bset);
+
+            auto BuildWith = [&](const char* src, std::string* err) {
+                Program prog;
+                if (!Parse(src, &prog, err)) return false;
+                UiState ui; Pipeline pipe;
+                InterpResult r = Interpret(prog, names, &ui, &pipe);
+                if (!r.ok) { *err = r.error; return false; }
+                return true;
+            };
+
+            std::string e2;
+            Check(!BuildWith("b = image(\"bracket\")\no = brightness(b)\n", &e2),
+                  "a set handed to a single-image algorithm is rejected");
+            Check(e2.find("[exposure=5]") != std::string::npos,
+                  "the error names the shape that arrived");
+            Check(e2.find("over=\"exposure\"") != std::string::npos,
+                  "the error suggests the axis to reduce over");
+
+            // The same set into a port declaring Any is fine.
+            Check(BuildWith("b = image(\"bracket\")\no = test_merge(b)\n", &e2),
+                  "a set binds to a port that accepts any shape");
+
+            // And a scalar palette image still works, which is the property
+            // every existing script depends on.
+            Check(BuildWith("s = image(\"test\")\no = brightness(s)\n", &e2),
+                  "a scalar palette image still binds to a scalar port");
+
+            // The reduction's output is scalar again, so it chains into
+            // ordinary single-image algorithms.
+            Check(BuildWith("b = image(\"bracket\")\nm = test_merge(b)\no = brightness(m)\n", &e2),
+                  "a reduced set chains into a single-image algorithm");
+
+            // Execute must refuse too, not just the interpreter: a set reaching
+            // a scalar port at run time would otherwise allocate from a zeroed
+            // ImageDesc and silently produce a zero-sized output.
+            {
+                Pipeline p;
+                auto br = Registry::Get().Create("brightness");
+                p.AddStage(std::move(br), "brightness", {PortRef{-1, 0}}, 1, 7);
+                std::vector<Data> srcs;
+                srcs.push_back(Data{MakeSet(5)});
+                std::string xerr;
+                Check(!p.Execute(&srcs, nullptr, &xerr),
+                      "Execute refuses a set on a scalar port");
+                Check(xerr.find("single image") != std::string::npos,
+                      "the run-time refusal says why");
+            }
+        }
     }
 
 
