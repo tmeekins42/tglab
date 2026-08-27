@@ -225,6 +225,20 @@ void MakeThumbnail(Image& src, int maxSide, Image* out, float exposureStops) {
 // from the file it came from: dropping a new file onto an existing slot keeps
 // the name, so scripts referring to image("test") keep working when the file
 // behind it changes.
+// Per-member UI state for a group entry.
+//
+// The images themselves live in the entry's ImageSet, which core/ owns and
+// knows nothing about textures. This runs parallel to that vector and holds
+// what only the palette needs: the file each member came from, and its own
+// thumbnail. Kept in step by RefreshMembers(), which is called wherever the
+// set changes rather than trusted to stay aligned.
+struct PaletteMember {
+    std::string path;         // the file this member was loaded from
+    GpuTexture  thumb;        // its own preview -- a group is N images, not one
+    Image       thumbImage;
+    bool        thumbBuilt = false;
+};
+
 struct PaletteEntry {
     std::string name;      // what image("...") refers to
     std::string path;      // where it was loaded from
@@ -233,6 +247,16 @@ struct PaletteEntry {
     Image       thumbImage;  // downsampled copy the texture is built from
     uint64_t    thumbVersion = 0;   // version thumbImage was built at
     uint64_t    version = 1;   // bumped on reload so the thumbnail refreshes
+
+    // One per image in a group, in the same order. Empty for a single image.
+    std::vector<PaletteMember> members;
+
+    // Whether the group is expanded to show its members.
+    //
+    // A group being hard to tell from a single image was the first thing Tim
+    // reported. The disclosure triangle is the tell: only a group has one.
+    bool expanded = false;
+
 
     // Screen rect of this row, recorded while drawing so a WM_DROPFILES at a
     // given point can find which slot it landed on.
@@ -270,6 +294,8 @@ public:
 
     void LoadImageIntoPalette(const std::string& path, const std::string& targetSlot = "");
     void AppendToGroup(PaletteEntry& e, Image&& img, const std::string& path);
+    void RefreshMembers(PaletteEntry& e);
+    std::string UniqueSlotName(const std::string& base) const;
     void MakeGroup(PaletteEntry& e);
     void Ungroup(PaletteEntry& e);
 
@@ -660,6 +686,11 @@ void App::AppendToGroup(PaletteEntry& e, Image&& img, const std::string& path) {
     tglab::AppendToGroup(&e.data, std::move(img), e.axis);
     const auto& set = std::get<ImageSet>(e.data);
     e.path = set.images.size() == 1 ? path : "";
+
+    // Record where this member came from, so the expanded row can name it and
+    // its thumbnail can use the embedded JPEG preview for a raw.
+    RefreshMembers(e);
+    if (!e.members.empty()) e.members.back().path = path;
 }
 
 void App::MakeGroup(PaletteEntry& e) {
@@ -2005,8 +2036,97 @@ void App::RescanScripts() {
     std::sort(m_scriptList.begin(), m_scriptList.end());
 }
 
+// Builds the small preview for one image, from a file path when there is one.
+//
+// Shared by the entry thumbnail and by each member of a group -- a group is N
+// images and each needs its own, which was the second thing Tim reported. It
+// was previously inline in the row loop, where a second copy would have drifted.
+//
+// Prefers the camera's own JPEG preview for a raw: nearly every raw embeds one
+// (an R5 CR3 carries the full 8192x5464 frame at 5.2 MB), it is the body's own
+// rendering with its picture style already applied, and it is both better and
+// cheaper than developing the mosaic for a 48-pixel icon. Falls back to
+// developing when a file carries no usable preview, which is normal rather than
+// an error.
+void BuildThumbnail(Image& img, const std::string& path, int maxSide, Image* out,
+                    AutoDevelopSuggestion* autoDevCache, uint64_t* autoDevVersion,
+                    uint64_t version) {
+    if (!img.Valid()) return;
+
+    if (img.Desc().IsMosaic() && !path.empty()) {
+        std::string perr;
+        if (LoadRawPreview(path, maxSide, out, &perr)) return;
+    }
+
+    float stops = 0.0f;
+    if (img.Desc().IsMosaic()) {
+        if (autoDevCache && autoDevVersion) {
+            if (*autoDevVersion != version) {
+                *autoDevCache   = SuggestExposure(img);
+                *autoDevVersion = version;
+            }
+            if (autoDevCache->valid) stops = autoDevCache->exposure;
+        } else {
+            const AutoDevelopSuggestion s = SuggestExposure(img);
+            if (s.valid) stops = s.exposure;
+        }
+    }
+    MakeThumbnail(img, maxSide, out, stops);
+}
+
+// A palette name not already taken, so a new group does not collide with an
+// existing slot. Scripts address slots by name, so a duplicate would make
+// image("group") ambiguous.
+std::string App::UniqueSlotName(const std::string& base) const {
+    auto taken = [&](const std::string& n) {
+        for (const PaletteEntry& e : m_palette) if (e.name == n) return true;
+        return false;
+    };
+    if (!taken(base)) return base;
+    for (int i = 2; i < 1000; ++i) {
+        const std::string n = base + std::to_string(i);
+        if (!taken(n)) return n;
+    }
+    return base;
+}
+
+// Keeps a group's per-member UI state the same length as its images.
+//
+// The images live in core's ImageSet and the thumbnails here, so the two can
+// drift whenever the set changes -- a drop, a removal, a reorder. Rather than
+// find every such site and hope, this is called before the members are drawn
+// and fixes the length in one place. A member whose file is unknown keeps an
+// empty path, which the row shows as "(no file)".
+void App::RefreshMembers(PaletteEntry& e) {
+    const auto* set = std::get_if<ImageSet>(&e.data);
+    const size_t n = set ? set->images.size() : 0;
+
+    if (e.members.size() > n) {
+        for (size_t i = n; i < e.members.size(); ++i) e.members[i].thumb.Release();
+        e.members.resize(n);
+    } else while (e.members.size() < n) {
+        e.members.emplace_back();
+    }
+}
+
 void App::DrawPalettePanel() {
     if (!ImGui::Begin("Images")) { ImGui::End(); return; }
+
+    // An empty group can be created and then dropped into, rather than needing
+    // an image first and converting it. Tim: "currently I need one image to
+    // create a group. Can I create an empty group to drag images into?"
+    if (ImGui::SmallButton("New group")) {
+        PaletteEntry g;
+        g.name    = UniqueSlotName("group");
+        g.isGroup = true;
+        g.expanded = true;
+        tglab::MakeGroup(&g.data, g.axis);
+        m_palette.push_back(std::move(g));
+        m_dirty = true;
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("drop files on a row to add");
+    ImGui::Separator();
 
     if (m_palette.empty()) {
         ImGui::TextDisabled("Drag image files here.");
@@ -2016,6 +2136,7 @@ void App::DrawPalettePanel() {
         return;
     }
 
+
     const float thumbSize = 48.0f;
     int removeIndex = -1;
 
@@ -2024,6 +2145,23 @@ void App::DrawPalettePanel() {
         ImGui::PushID(i);
 
         const ImVec2 rowStart = ImGui::GetCursorScreenPos();
+
+        // Disclosure triangle, for a group only. This is the tell that an entry
+        // holds several images -- "a group is hard to tell apart from a single
+        // image at a glance" was the first thing reported about the old row.
+        // A single image gets a blank of the same width so names stay aligned.
+        const auto* setPtr = std::get_if<ImageSet>(&e.data);
+        if (e.isGroup) {
+            const ImVec2 tri = ImGui::GetCursorScreenPos();
+            if (ImGui::InvisibleButton("##expand", ImVec2(16.0f, thumbSize)))
+                e.expanded = !e.expanded;
+            ImGui::GetWindowDrawList()->AddText(
+                ImVec2(tri.x + 3.0f, tri.y + thumbSize * 0.5f - 7.0f),
+                ImGui::GetColorU32(ImGuiCol_Text), e.expanded ? "v" : ">");
+        } else {
+            ImGui::Dummy(ImVec2(16.0f, thumbSize));
+        }
+        ImGui::SameLine(0.0f, 2.0f);
 
         // Thumbnail. Downsampled ONCE into a small image rather than uploading
         // the full-resolution source: an 8 MP scan is a 33 MB texture, and
@@ -2041,40 +2179,8 @@ void App::DrawPalettePanel() {
         if (thumbSrc) {
             Image& img = *thumbSrc;
             if (img.Valid() && e.thumbVersion != e.version) {
-                // Develop a raw for the preview, using the same measurement the
-                // auto-exposure control uses. Deliberately independent of the
-                // script: the palette is app UI, and a raw's thumbnail should
-                // be legible whether or not the open script happens to develop
-                // anything. Measured once and cached against `version`, so
-                // this costs nothing on the frames that redraw it.
-                // Prefer the camera's own JPEG preview for a raw.
-                //
-                // Nearly every raw embeds one -- a Canon CR3 from an R5 carries
-                // the full 8192x5464 frame at 5.2 MB -- and it is the body's own
-                // rendering, with its picture style and tone curve already
-                // applied. It is what Windows Explorer displays for a raw, which
-                // is why those icons look better than a naive decode.
-                //
-                // Better AND cheaper than developing the mosaic for a 48-pixel
-                // icon: no demosaic, no measurement pass, and the manufacturer's
-                // rendering instead of our approximation of one. Falls back to
-                // developing when a file carries no usable preview, which is a
-                // normal outcome rather than an error.
-                bool haveThumb = false;
-                if (img.Desc().IsMosaic() && !e.path.empty()) {
-                    std::string perr;
-                    haveThumb = LoadRawPreview(e.path, int(thumbSize) * 2,
-                                               &e.thumbImage, &perr);
-                }
-                if (!haveThumb) {
-                    if (img.Desc().IsMosaic() && e.autoDevVersion != e.version) {
-                        e.autoDev        = SuggestExposure(img);
-                        e.autoDevVersion = e.version;
-                    }
-                    const float stops = (img.Desc().IsMosaic() && e.autoDev.valid)
-                                            ? e.autoDev.exposure : 0.0f;
-                    MakeThumbnail(img, int(thumbSize) * 2, &e.thumbImage, stops);
-                }
+                BuildThumbnail(img, e.path, int(thumbSize) * 2, &e.thumbImage,
+                               &e.autoDev, &e.autoDevVersion, e.version);
                 e.thumbVersion = e.version;
             }
             if (e.thumbImage.Valid() && e.thumb.Update(m_dev, e.thumbImage, e.version)) {
@@ -2216,6 +2322,71 @@ void App::DrawPalettePanel() {
             ImGui::Separator();
             if (ImGui::MenuItem("Remove from palette")) removeIndex = i;
             ImGui::EndPopup();
+        }
+
+        // Expanded group: each member on its own row, indented, with its own
+        // thumbnail and a remove button. "No way to see, select or delete an
+        // individual image in a group" was the third thing reported.
+        if (e.isGroup && e.expanded && setPtr) {
+            RefreshMembers(e);
+            const float memberSize = 32.0f;
+            int removeMember = -1;
+
+            for (size_t m = 0; m < setPtr->images.size(); ++m) {
+                ImGui::PushID(int(m));
+                ImGui::Indent(20.0f);
+
+                PaletteMember& pm = e.members[m];
+                Image& mi = const_cast<Image&>(setPtr->images[m]);
+                if (!pm.thumbBuilt && mi.Valid()) {
+                    BuildThumbnail(mi, pm.path, int(memberSize) * 2, &pm.thumbImage,
+                                   nullptr, nullptr, 0);
+                    pm.thumbBuilt = true;
+                }
+
+                const ImVec2 p = ImGui::GetCursorScreenPos();
+                if (pm.thumbImage.Valid() && pm.thumb.Update(m_dev, pm.thumbImage, 1)) {
+                    const float iw = float(pm.thumb.Width()), ih = float(pm.thumb.Height());
+                    const float sc = (iw > 0 && ih > 0)
+                                         ? std::min(memberSize / iw, memberSize / ih) : 1.0f;
+                    const ImVec2 sz(iw * sc, ih * sc);
+                    ImGui::GetWindowDrawList()->AddImage(
+                        ImTextureRef(static_cast<ImTextureID>(pm.thumb.Handle().ptr)),
+                        ImVec2(p.x + (memberSize - sz.x) * 0.5f, p.y + (memberSize - sz.y) * 0.5f),
+                        ImVec2(p.x + (memberSize + sz.x) * 0.5f, p.y + (memberSize + sz.y) * 0.5f));
+                }
+                ImGui::Dummy(ImVec2(memberSize, memberSize));
+                ImGui::SameLine();
+
+                ImGui::BeginGroup();
+                std::string memberFile = pm.path;
+                if (auto slash = memberFile.find_last_of("/\\"); slash != std::string::npos)
+                    memberFile = memberFile.substr(slash + 1);
+                ImGui::Text("%d.", int(m) + 1);
+                ImGui::SameLine();
+                ImGui::TextUnformatted(memberFile.empty() ? "(no file)" : memberFile.c_str());
+                const ImageDesc& md = setPtr->images[m].Desc();
+                ImGui::TextDisabled("%d x %d", md.width, md.height);
+                ImGui::EndGroup();
+
+                if (ImGui::BeginPopupContextItem("member")) {
+                    if (ImGui::MenuItem("Remove this image")) removeMember = int(m);
+                    ImGui::EndPopup();
+                }
+
+                ImGui::Unindent(20.0f);
+                ImGui::PopID();
+            }
+
+            if (removeMember >= 0) {
+                auto* s = std::get_if<ImageSet>(&e.data);
+                s->images.erase(s->images.begin() + removeMember);
+                s->shape = Shape::Of(e.axis, int(s->images.size()));
+                e.members[size_t(removeMember)].thumb.Release();
+                e.members.erase(e.members.begin() + removeMember);
+                ++e.version;
+                m_dirty = true;
+            }
         }
 
         ImGui::PopID();
