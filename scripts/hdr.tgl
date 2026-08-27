@@ -26,7 +26,7 @@ shown = tonemap(merged)
 
 # Ordinary develop on top, now that the data is in a sane range. The sliders
 # mean what they mean on a raw.
-final = basic_adjust(shown)
+final = params(basic_adjust)(shown)
 
 display(merged, "linear")
 display(shown,  "tonemapped")

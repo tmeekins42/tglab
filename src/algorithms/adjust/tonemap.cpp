@@ -169,10 +169,21 @@ private:
     //
     //     y = grey + (x - grey) / (1 + (x - grey) / headroom)
     //
-    // which is asymptotic to grey + headroom. `shoulder` sets the headroom in
-    // units of middle grey, so at the default 4 the ceiling is 5 * 0.18 = 0.9
-    // linear -- comfortably inside what the display curve renders without
-    // clipping.
+    // which is asymptotic to grey + headroom.
+    //
+    // THE CEILING MUST BE EXPRESSED IN THE DISPLAY CURVE'S UNITS, not picked to
+    // look safe in linear. The first version capped at 0.9 linear, which sounds
+    // conservative until you follow it through tone_curve.h: 0.9 linear renders
+    // 0.733 display, so every tone from the midtones to the brightest highlight
+    // landed between 0.46 and 0.73. The result was exactly what Tim reported --
+    // flat, no whites, and highlight controls with nothing left to act on,
+    // because the range they operate in had already been thrown away.
+    //
+    // The display curve reaches 0.975 at 19.0 linear, which is 6.7 stops above
+    // grey. Compressing into 2.3 of them and calling it tone mapping is
+    // compressing twice. The default now targets that curve's real headroom, so
+    // the operator's job is only to bring an arbitrary merge scale INTO the
+    // range the display curve was built for -- not to re-do its work.
     //
     // Negative input passes through unchanged rather than being clamped: it is
     // the demosaic's undershoot, the out-of-gamut overlay exists to show it,
@@ -189,10 +200,17 @@ private:
     // median IS, and this decides where it should go.
     Param<float> m_exposure{this, "exposure", 1.0f, 0.1f, 4.0f, {.step = 0.05}};
 
-    // Highlight headroom above grey, in multiples of middle grey. Larger keeps
-    // more highlight separation and risks the display curve clipping; smaller
-    // compresses harder and flattens the top.
-    Param<float> m_shoulder{this, "shoulder", 4.0f, 0.5f, 16.0f, {.step = 0.1}};
+    // Highlight headroom above grey, in multiples of middle grey.
+    //
+    // 100 rather than 4, which is the fix for the flat result: the ceiling is
+    // grey * (1 + shoulder), so 100 puts it at 18.2 linear -- essentially the
+    // 19.0 where the display curve reaches 0.975. The operator now brings the
+    // merge into that range and lets the display shoulder do the rolling off it
+    // was designed for, instead of pre-compressing into a fifth of it.
+    //
+    // Still a real control: lower it to compress the highlights harder, which
+    // is what a scene with a genuinely blown sky wants.
+    Param<float> m_shoulder{this, "shoulder", 100.0f, 1.0f, 400.0f, {.step = 1.0, .softMin = 4.0f, .softMax = 200.0f}};
 
     mutable float m_scale      = 0.0f;
     mutable float m_stopsAbove = 0.0f;

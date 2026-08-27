@@ -12,6 +12,7 @@
 #include "../src/algo_util/histogram.h"
 #include "../src/core/exif.h"
 #include "../src/algo_util/pixel_buffer.h"
+#include "../src/algo_util/tone_curve.h"
 #include "../src/core/image_group.h"
 #include "../src/core/image_loader.h"
 #include "../src/core/image_io.h"
@@ -2238,10 +2239,19 @@ int main() {
         Check(std::abs(med - 0.18f) < 0.02f,
               "the measured median lands on middle grey");
 
-        // And the top must be bounded. The input reaches 500; the shoulder is
-        // asymptotic to grey * (1 + shoulder), which at the default 4 is 0.9.
-        Check(hi < 0.95f, "the highlights are compressed, not clipped");
-        Check(hi > 0.5f,  "and are still well separated from the midtones");
+        // The top must be bounded, and bounded IN DISPLAY UNITS.
+        //
+        // The first version of this checked hi < 0.95 linear, which passed
+        // while the operator was badly wrong: it capped at 0.9 linear, which
+        // the display curve renders as 0.733, so every tone from the midtones
+        // up was squeezed into 0.46-0.73 and the picture came out flat with no
+        // whites. A linear bound cannot see that -- only following the value
+        // through the display curve can.
+        Check(ToneCurve(hi) < 1.0f, "the highlights do not clip on the display");
+        Check(ToneCurve(hi) > 0.85f,
+              "and reach most of the way to white, rather than stopping short");
+        Check(ToneCurve(hi) - ToneCurve(med) > 0.35f,
+              "leaving real separation between the midtones and the highlights");
 
         // The exposure parameter moves the median, proportionally.
         std::string e2;
