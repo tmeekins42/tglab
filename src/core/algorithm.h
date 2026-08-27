@@ -12,6 +12,7 @@
 
 #include "cancel.h"
 #include "data.h"
+#include "reduction.h"
 #include "image.h"
 #include "param.h"
 
@@ -112,6 +113,21 @@ public:
     virtual PortList Outputs() const = 0;
 
     virtual void RunCPU(RunCtx& ctx) = 0;
+
+    // --- reduction (multi-image) --------------------------------------------
+    // An algorithm that consumes several images along one named axis and
+    // produces one. Opting in means overriding these AND declaring an input
+    // port with ShapeSpec::Any and an output with ShapeSpec::Reduced.
+    //
+    // The script names the axis: merge_hdr(frames, over="exposure"). `over=` is
+    // handled by the framework rather than being a parameter, because the axis
+    // decides the SHAPE of the result and so has to be known while the pipeline
+    // is being built, not when the stage runs.
+    virtual bool IsReduction() const { return false; }
+
+    // The streaming accumulator. See core/reduction.h for why it is Begin /
+    // Accept / Finish rather than "here are all N images".
+    virtual Reducer* AsReducer() { return nullptr; }
 
     // --- GPU path (M3) ------------------------------------------------------
     // An algorithm opts in by returning true from HasGPU() and providing the

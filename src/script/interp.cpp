@@ -363,7 +363,18 @@ private:
         const std::string& want = a.pos[0].AsString();
         for (const SourceImage& s : m_sources) {
             if (s.name != want) continue;
-
+            // A group of raws is not handled yet. The demosaic image() would
+            // normally insert takes one image, and mapping it across a set is
+            // the broadcasting step that has not been built -- so say so here
+            // rather than handing the script undemosaiced sensor data that
+            // would merge into a plausible-looking mess.
+            if (!s.shape.IsScalar()) {
+                if (s.isMosaic)
+                    return Fail(e.line, "'" + want + "' is a group of raw images, which "
+                                        "cannot be demosaiced yet");
+                out->push_back(Value(PortHandle{-1, s.index}));
+                return true;
+            }
             // An ordinary image is handed straight through.
             if (!s.isMosaic) {
                 out->push_back(Value(PortHandle{-1, s.index}));
@@ -742,8 +753,17 @@ private:
             }
         }
 
-        // Named arguments bind to parameters.
+        // Named arguments bind to parameters, except over=, which the framework
+        // owns: the axis decides the SHAPE of the result, so it has to be known
+        // while the pipeline is built rather than when the stage runs.
+        std::string overAxis;
         for (const auto& [pname, pval] : a.named) {
+            if (pname == "over") {
+                if (!pval.IsString())
+                    return Fail(e.line, "over= takes an axis name, e.g. over=\"exposure\"");
+                overAxis = pval.AsString();
+                continue;
+            }
             ParamBase* p = algo->FindParam(pname);
             if (!p) return Fail(e.line, "'" + name + "' has no parameter '" + pname + "'");
             std::string perr;
@@ -754,16 +774,41 @@ private:
         // before the move, since AddStage takes `inputs` by value.
         const Shape inShape = inputs.empty() ? Shape::Scalar() : ShapeAt(inputs[0]);
 
+        // over= is only meaningful on a reduction, and a reduction needs one.
+        const bool isReduction = algo->IsReduction();
+        int reduceIdx = -1;
+        if (!overAxis.empty()) {
+            if (!isReduction)
+                return Fail(e.line, "'" + name + "' is not a reduction, so it takes no over=");
+            reduceIdx = inShape.Find(overAxis);
+            if (reduceIdx < 0) {
+                return Fail(e.line, "'" + name + "' cannot reduce over '" + overAxis +
+                                        "': its input is " + inShape.ToString());
+            }
+        } else if (isReduction) {
+            // One axis is unambiguous, so naming it is optional. More than one
+            // is a real choice and the script has to make it.
+            if (inShape.Rank() == 1) {
+                reduceIdx = 0;
+                overAxis  = inShape.Axes()[0].name;
+            } else if (inShape.Rank() > 1) {
+                return Fail(e.line, "'" + name + "' needs over= to say which axis of " +
+                                        inShape.ToString() + " to reduce");
+            } else {
+                return Fail(e.line, "'" + name + "' reduces a set, but its input is a single image");
+            }
+        }
+
         const int idx = m_pipe->AddStage(std::move(algo), name, std::move(inputs),
-                                         outPorts.size(), e.line);
+                                         outPorts.size(), e.line, overAxis);
 
         // Propagate shapes to this stage's outputs so a later line can be
         // checked against them.
         for (size_t p = 0; p < outPorts.size(); ++p) {
             Shape s;   // Scalar and Any both produce one image today
             if (outPorts[p].shape == ShapeSpec::SameAsInput) s = inShape;
-            else if (outPorts[p].shape == ShapeSpec::Reduced && inShape.Rank() > 0)
-                s = inShape.Without(0);
+            else if (outPorts[p].shape == ShapeSpec::Reduced && reduceIdx >= 0)
+                s = inShape.Without(reduceIdx);
             if (!s.IsScalar()) m_shapeOf[{idx, int(p)}] = s;
         }
 

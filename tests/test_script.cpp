@@ -1603,6 +1603,90 @@ int main() {
             tglab::MakeGroup(&e3, "frame");
             Check(ShapeOf(e3) == Shape::Of("frame", 2), "MakeGroup on a group changes nothing");
         }
+
+        // A real reduction, end to end: a group of known pixel values through
+        // merge_mean, checking the ARITHMETIC and not merely that it ran.
+        {
+            auto Flat = [](int w, int h, uint8_t v) {
+                Image img;
+                ImageDesc d; d.width = w; d.height = h; d.format = Format::RGBA8;
+                img.Alloc(d);
+                ImageView vw = img.MapCpuWrite();
+                for (int i = 0; i < w * h * 4; ++i) vw.data[i] = v;
+                return img;
+            };
+
+            // 10, 20, 60 -> mean 30.
+            ImageSet set;
+            set.images.push_back(Flat(4, 4, 10));
+            set.images.push_back(Flat(4, 4, 20));
+            set.images.push_back(Flat(4, 4, 60));
+            set.shape = Shape::Of("exposure", 3);
+
+            std::vector<SourceImage> names{{"test", 0}};
+            SourceImage gs; gs.name = "grp"; gs.index = 1;
+            gs.shape = Shape::Of("exposure", 3);
+            names.push_back(gs);
+
+            Program prog; std::string err;
+            Check(Parse("g = image(\"grp\")\nm = merge_mean(g, over=\"exposure\")\ndisplay(m)\n",
+                        &prog, &err), "a reduction parses");
+
+            UiState ui; Pipeline pipe;
+            InterpResult ir = Interpret(prog, names, &ui, &pipe);
+            Check(ir.ok, ir.ok ? "a reduction interprets" : ("interpret: " + ir.error).c_str());
+
+            std::vector<Data> srcs;
+            srcs.push_back(Data{});                    // slot 0, unused
+            srcs.push_back(Data{std::move(set)});      // slot 1, the group
+            std::string xerr;
+            const bool ran = pipe.Execute(&srcs, nullptr, &xerr);
+            Check(ran, ran ? "a reduction runs" : ("execute: " + xerr).c_str());
+
+            if (ran) {
+                const Data& o = pipe.Stages().back().outputs[0];
+                Check(TypeOf(o) == DataType::Image, "a reduction produces a single image");
+                Image& oi = const_cast<Image&>(std::get<Image>(o));
+                ImageView ov = oi.MapCpuRead();
+                Check(ov.data && ov.data[0] == 30,
+                      "merge_mean averages: (10+20+60)/3 == 30");
+                Check(oi.Desc().width == 4 && oi.Desc().height == 4,
+                      "and keeps the frame size");
+            }
+
+            // over= naming an axis that is not there must fail at the line.
+            Program p2; std::string e2;
+            Parse("g = image(\"grp\")\nm = merge_mean(g, over=\"focus\")\n", &p2, &e2);
+            UiState u2; Pipeline pl2;
+            InterpResult r2 = Interpret(p2, names, &u2, &pl2);
+            Check(!r2.ok, "reducing over an axis that is not there fails");
+            Check(r2.error.find("focus") != std::string::npos &&
+                  r2.error.find("[exposure=3]") != std::string::npos,
+                  "and the error names both the axis asked for and the shape");
+
+            // A single axis makes over= optional.
+            Program p3; std::string e3;
+            Parse("g = image(\"grp\")\nm = merge_mean(g)\n", &p3, &e3);
+            UiState u3; Pipeline pl3;
+            Check(Interpret(p3, names, &u3, &pl3).ok,
+                  "over= is optional when there is only one axis");
+
+            // over= on something that does not reduce is a mistake worth
+            // reporting rather than ignoring.
+            Program p4; std::string e4;
+            Parse("s = image(\"test\")\no = brightness(s, over=\"frame\")\n", &p4, &e4);
+            UiState u4; Pipeline pl4;
+            InterpResult r4 = Interpret(p4, names, &u4, &pl4);
+            Check(!r4.ok && r4.error.find("not a reduction") != std::string::npos,
+                  "over= on a non-reduction is rejected");
+
+            // And a reduction handed a single image says so.
+            Program p5; std::string e5;
+            Parse("s = image(\"test\")\nm = merge_mean(s)\n", &p5, &e5);
+            UiState u5; Pipeline pl5;
+            InterpResult r5 = Interpret(p5, names, &u5, &pl5);
+            Check(!r5.ok, "a reduction given a single image is rejected");
+        }
             // Execute must refuse too, not just the interpreter: a set reaching
             // a scalar port at run time would otherwise allocate from a zeroed
             // ImageDesc and silently produce a zero-sized output.

@@ -736,6 +736,14 @@ SourceImage DescribeSource(PaletteEntry& pe, int index) {
     // is scalar. Everything dropped as one file is scalar today.
     si.shape = ShapeOf(pe.data);
 
+    // A group reports whether its frames are raw, from the first one. Only used
+    // to refuse the case for now, but the answer is a property of the entry and
+    // the caller should not have to reach into the Data to find it.
+    if (const auto* set = std::get_if<ImageSet>(&pe.data)) {
+        if (!set->images.empty()) si.isMosaic = set->images.front().Desc().IsMosaic();
+        return si;
+    }
+
     if (!std::holds_alternative<Image>(pe.data)) return si;
 
     const Image&     img = std::get<Image>(pe.data);
@@ -2021,8 +2029,6 @@ void App::DrawPalettePanel() {
             }
         } else {
             ImGui::TextUnformatted(e.name.c_str());
-            if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
-                BeginRename(i);
         }
 
         // Filename only, with the full path on hover.
@@ -2058,6 +2064,31 @@ void App::DrawPalettePanel() {
         const float right = ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x;
         e.rowMin = ImVec2(left, rowStart.y);
         e.rowMax = ImVec2(right, rowStart.y + rowHeight);
+
+        // An invisible button covering the row, purely so the context menu has
+        // something to attach to.
+        //
+        // BeginPopupContextItem() binds to the LAST item, and the last item
+        // here was the EndGroup() around the name and size labels -- Text and
+        // TextDisabled register no ID, so there was nothing to right-click and
+        // the menu never opened. Placed AFTER the row is drawn and rewound to
+        // its start, so it covers the whole row without displacing anything.
+        //
+        // Skipped while renaming, so the InputText keeps its own clicks.
+        if (m_renamingSlot != i) {
+            const ImVec2 afterRow = ImGui::GetCursorScreenPos();
+            ImGui::SetCursorScreenPos(e.rowMin);
+            ImGui::InvisibleButton("row", ImVec2(std::max(1.0f, right - left), rowHeight),
+                                   ImGuiButtonFlags_MouseButtonRight |
+                                   ImGuiButtonFlags_MouseButtonLeft);
+
+            // The row is also the rename target. Double-clicking the name text
+            // no longer reaches it, since this button covers it.
+            if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+                BeginRename(i);
+
+            ImGui::SetCursorScreenPos(afterRow);
+        }
 
         if (ImGui::BeginPopupContextItem("slot")) {
             if (ImGui::MenuItem("Rename...")) BeginRename(i);

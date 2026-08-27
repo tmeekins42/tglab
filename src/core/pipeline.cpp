@@ -16,7 +16,8 @@ void Pipeline::Clear() {
 }
 
 int Pipeline::AddStage(std::unique_ptr<AlgorithmBase> algo, std::string name,
-                       std::vector<PortRef> inputs, size_t numOutputs, int line) {
+                       std::vector<PortRef> inputs, size_t numOutputs, int line,
+                       std::string reduceAxis) {
     Stage s;
     s.paramHash = algo->ParamHash();
     s.algo      = std::move(algo);
@@ -24,6 +25,7 @@ int Pipeline::AddStage(std::unique_ptr<AlgorithmBase> algo, std::string name,
     s.inputs    = std::move(inputs);
     s.outputs.resize(numOutputs);
     s.line      = line;
+    s.reduceAxis = std::move(reduceAxis);
     m_stages.push_back(std::move(s));
     return int(m_stages.size()) - 1;
 }
@@ -53,7 +55,64 @@ const Data* Pipeline::Resolve(PortRef r, const std::vector<Data>* sources) const
 bool Pipeline::SameStage(const Stage& a, const Stage& b) {
     return a.algoName == b.algoName && a.inputs == b.inputs &&
            a.paramHash == b.paramHash && a.sourceHash == b.sourceHash &&
+           a.reduceAxis == b.reduceAxis &&
            a.outputs.size() == b.outputs.size();
+}
+
+// Streams one axis of a set through an algorithm's accumulator.
+//
+// Rank 1 only for now: the input is [axis=n] and the result is a single image.
+// Reducing one axis of a higher-rank set means mapping the reduction across the
+// axes that are not being reduced -- the broadcasting rule the design describes
+// -- which needs a set-valued OUTPUT to hold the results. That is the next step
+// and is deliberately not faked here: returning a wrong-shaped answer would be
+// worse than refusing.
+bool Pipeline::RunReduction(Stage& s, const std::vector<const Data*>& in,
+                            const CancelToken* cancel, std::string* err) {
+    auto Where = [&] { return "line " + std::to_string(s.line) + ": '" + s.algoName + "' "; };
+
+    if (in.size() != 1 || !in[0]) { *err = Where() + "takes one input"; return false; }
+
+    const auto* set = std::get_if<ImageSet>(in[0]);
+    if (!set) {
+        *err = Where() + "reduces a set, but its input is a single image";
+        return false;
+    }
+    if (set->shape.Rank() != 1) {
+        *err = Where() + "can only reduce a single axis so far, and its input is " +
+               set->shape.ToString();
+        return false;
+    }
+    if (set->images.empty()) { *err = Where() + "was given an empty group"; return false; }
+
+    // The extent and the image count must agree. They always do when the
+    // palette built the set, since every mutation restates the shape -- so a
+    // mismatch here means something constructed one by hand and got it wrong,
+    // which is worth saying rather than trusting.
+    if (set->shape.Count() != int64_t(set->images.size())) {
+        *err = Where() + "has a shape of " + set->shape.ToString() + " but " +
+               std::to_string(set->images.size()) + " images";
+        return false;
+    }
+
+    Reducer* r = s.algo->AsReducer();
+    if (!r) { *err = Where() + "declares itself a reduction but provides no accumulator"; return false; }
+
+    const std::string axis = s.reduceAxis.empty() ? set->shape.Axes()[0].name : s.reduceAxis;
+    if (!r->Begin(int(set->images.size()), axis, err)) return false;
+
+    for (size_t i = 0; i < set->images.size(); ++i) {
+        if (cancel && cancel->Cancelled()) { *err = kCancelled; return false; }
+        if (!r->Accept(int(i), set->images[i], err)) return false;
+    }
+
+    Image out;
+    if (!r->Finish(&out, err)) return false;
+    if (!out.Valid()) { *err = Where() + "produced no result"; return false; }
+
+    s.outputs.resize(1);
+    s.outputs[0] = Data{std::move(out)};
+    return true;
 }
 
 bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* err,
@@ -177,6 +236,17 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
                 }
             }
             in.push_back(d);
+        }
+
+        // A reduction runs its own way: stream the frames through an
+        // accumulator rather than allocating an output from input 0 and calling
+        // RunCPU. Handled here, before the ordinary path, because almost none
+        // of that path applies -- the output's size comes from the accumulator,
+        // not from an input, and there is no single input image to size it by.
+        if (s.algo->IsReduction()) {
+            if (!RunReduction(s, in, cancel, err)) return false;
+            s.valid = true;
+            continue;
         }
 
         // Allocate outputs. M1: every port is an image sized from input 0,

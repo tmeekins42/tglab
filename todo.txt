@@ -40,6 +40,20 @@ BUGS / SMALL FEATURES
   should always have image list visible and maybe a pull down selector in the UI 
   somewhere for switching scripts. I'm not sure what use the algorithms tab is,
   other than a scripting reference... if so, we could move that to a menu => dialog pop-up
+- PALETTE UI FOR GROUPS -- deferred deliberately, to revisit once the multi-
+  image feature is done. Tim's observations on the first version:
+    + a group is hard to tell apart from a single image at a glance
+    + only the first image ever gets a thumbnail
+    + no way to see, select or delete an individual image in a group
+    + one idea is a collapsible container... so we open the group and we see the group
+      images like a new palette (the collapse button tells the user it's a group)
+    + file order is important. we should allow drag/drop to change positions.
+      also, windows drag drop likes to always have one file in the wron location.
+    + right-click should have a sort by file name, sort by date (or shot time)
+  The row is the wrong container for N images -- it was built to show one file
+  and now has to represent a set. Whatever replaces it needs to expand, so the
+  members are addressable. Tim has ideas and is writing them up; do not
+  redesign this unprompted.
 
 NEW FEATURES / IDEAS
 - add support for additional image channels, such as alpha channels and depth channels

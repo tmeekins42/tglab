@@ -32,6 +32,11 @@ struct Stage {
     std::vector<PortRef> inputs;
     std::vector<Data>    outputs;
     uint64_t             paramHash = 0;
+
+    // The axis this stage reduces over, from the script's over="..." argument.
+    // Empty when the stage is not a reduction. Part of SameStage, so changing
+    // it re-runs rather than reusing a result reduced over a different axis.
+    std::string          reduceAxis;
     // Versions of the palette images this stage read, so replacing one is
     // detected as a change rather than looking identical.
     uint64_t             sourceHash = 0;
@@ -75,7 +80,8 @@ public:
     // --- recording (phase 1) ---
     void Clear();
     int  AddStage(std::unique_ptr<AlgorithmBase> algo, std::string name,
-                  std::vector<PortRef> inputs, size_t numOutputs, int line);
+                  std::vector<PortRef> inputs, size_t numOutputs, int line,
+                  std::string reduceAxis = {});
     void AddViewer(std::string name, PortRef src);
 
     // --- execution (phase 2) ---
@@ -123,6 +129,8 @@ private:
 
     // Runs one stage on the GPU. Returns false (with `err` set) if anything
     // about the stage is unsupported, so the caller can fall back to the CPU.
+    bool RunReduction(Stage& s, const std::vector<const Data*>& in,
+                      const CancelToken* cancel, std::string* err);
     bool RunStageGpu(Stage& s, const std::vector<const Data*>& in,
                      ComputeContext* gpu, std::string* err);
 

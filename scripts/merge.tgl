@@ -1,0 +1,17 @@
+# Averaging a group of images.
+#
+# Make a palette row a group first: right-click it, "Make a group", then drop
+# more files on that same row. The row shows its shape, e.g. [frame=5].
+#
+# merge_mean averages every frame into one image, which is what a stack of
+# identical exposures wants for noise reduction -- N frames cut the standard
+# deviation by sqrt(N).
+
+frames = image("group")
+
+# over= names the axis to reduce. It is optional when the group has only one
+# axis, which is every group the palette can build today:
+#   merged = merge_mean(frames, over="frame")
+merged = merge_mean(frames)
+
+display(merged, "merged")
