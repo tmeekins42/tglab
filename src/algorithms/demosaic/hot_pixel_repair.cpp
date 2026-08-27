@@ -227,14 +227,29 @@ void main(uint3 tid : SV_DispatchThreadID) {
     n[3] = S(x-2, y  );                   n[4] = S(x+2, y  );
     n[5] = S(x-2, y+2); n[6] = S(x, y+2); n[7] = S(x+2, y+2);
 
-    // Insertion sort: eight elements, no branching worth avoiding, and it keeps
-    // the kernel free of a sorting network nobody would be able to read.
-    for (int i = 1; i < 8; ++i) {
-        float v = n[i];
-        int j = i - 1;
-        while (j >= 0 && n[j] > v) { n[j+1] = n[j]; --j; }
-        n[j+1] = v;
-    }
+    // Branchless sorting network, NOT the insertion sort the CPU path uses.
+    //
+    // This is a watchdog fix, not a micro-optimisation. An insertion sort's
+    // inner `while` runs a data-dependent number of times, so within a warp
+    // every lane waits for the worst case and the divergence compounds across
+    // 45 million threads: the dispatch measured 5.0 SECONDS at 8191x5463, well
+    // past the ~2s GPU watchdog, and the device was killed mid-dispatch. The
+    // failure surfaced as DXGI_ERROR_DEVICE_HUNG with DRED pointing at the
+    // first DISPATCH -- and because a removed device fails every later
+    // allocation, every subsequent stage silently fell back to the CPU.
+    //
+    // Batcher's odd-even merge for 8 elements: 19 compare-exchanges, the same
+    // count for every thread, no branches. Sorts fully, so n[0], n[3], n[4] and
+    // n[7] mean exactly what they did before.
+    #define SWAP(a, b) { float lo = min(n[a], n[b]); float hi = max(n[a], n[b]); n[a] = lo; n[b] = hi; }
+    SWAP(0,1) SWAP(2,3) SWAP(4,5) SWAP(6,7)
+    SWAP(0,2) SWAP(1,3) SWAP(4,6) SWAP(5,7)
+    SWAP(1,2) SWAP(5,6) SWAP(0,4) SWAP(3,7)
+    SWAP(1,5) SWAP(2,6)
+    SWAP(1,4) SWAP(3,6)
+    SWAP(2,4) SWAP(3,5)
+    SWAP(3,4)
+    #undef SWAP
 
     float med    = 0.5 * (n[3] + n[4]);
     float spread = n[7] - n[0];   // full range -- see the CPU path for why

@@ -91,6 +91,10 @@ struct PipelineOutcome {
     // them where they are costs 4 KB of bins instead of an 84 MB readback.
     bool        haveStats = false;
     StatsResult stats;
+
+    // Stages that wanted the GPU and fell back, with the reason. Surfaced so a
+    // fallback is visible rather than merely slow -- see Pipeline::GpuFallbacks.
+    std::vector<std::string> gpuFallbacks;
 };
 
 class ComputeContext;

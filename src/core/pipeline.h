@@ -114,6 +114,15 @@ public:
     // stages skipped by the dirty-hash cache are counted separately rather
     // than vanishing, so "0 CPU, 0 GPU" never means "nothing happened".
     int GpuStageCount()    const { return m_gpuStages; }
+
+    // Stages that wanted the GPU and did not get it, with the reason.
+    //
+    // A GPU failure falls back to the CPU rather than failing the run, which is
+    // right -- a broken kernel should degrade to a slow correct result. But a
+    // SILENT fallback is indistinguishable from the GPU merely being slow, and
+    // that is exactly what hid a device hang on 45 MP raws: every develop was
+    // falling back and recovering, for months, with nothing said.
+    const std::vector<std::string>& GpuFallbacks() const { return m_gpuFallbacks; }
     int CpuStageCount()    const { return m_cpuStages; }
     int CachedStageCount() const { return m_cachedStages; }
 
@@ -153,6 +162,7 @@ private:
     std::vector<Stage>      m_stages;
     std::vector<ViewerDecl> m_viewers;
     int                     m_gpuStages = 0;
+    std::vector<std::string> m_gpuFallbacks;
     int                     m_cpuStages = 0;
     int                     m_cachedStages = 0;
     size_t                  m_firstDirty = 0;

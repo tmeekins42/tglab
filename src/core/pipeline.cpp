@@ -1,6 +1,7 @@
 #include "pipeline.h"
 
 #include <algorithm>
+#include <chrono>
 #include <functional>
 #include <cassert>
 #include <map>
@@ -19,6 +20,13 @@ namespace tglab {
 // the multi-pass device hang invisible for so long.
 static bool GpuWhy() {
     static const bool on = GetEnvironmentVariableA("TGLAB_GPUWHY", nullptr, 0) > 0;
+    return on;
+}
+
+// Submit and wait after every multi-pass dispatch, so a device hang can be
+// attributed to one kernel. Diagnostic only: it defeats batching entirely.
+static bool GpuPassTiming() {
+    static const bool on = GetEnvironmentVariableA("TGLAB_PASSTIME", nullptr, 0) > 0;
     return on;
 }
 
@@ -172,6 +180,8 @@ bool Pipeline::RunFusedReduction(int reduceStage, const std::vector<int>& chain,
 
     const std::string axis = red.reduceAxis.empty() ? set->shape.Axes()[0].name : red.reduceAxis;
     if (!r->Begin(int(set->images.size()), axis, err)) return false;
+    if (GpuWhy()) std::fprintf(stderr, "[fuse] chain of %zu stages, %zu frames\n",
+                               chain.size(), set->images.size());
 
     for (size_t f = 0; f < set->images.size(); ++f) {
         if (cancel && cancel->Cancelled()) { *err = kCancelled; return false; }
@@ -358,8 +368,13 @@ bool Pipeline::RunStageOnce(Stage& s, const std::vector<const Data*>& in,
         if (RunStageGpu(s, in, gpu, &gpuErr)) {
             ranOnGpu = true;
             ++m_gpuStages;
-        } else if (GpuWhy()) {
-            std::fprintf(stderr, "[gpu-fallback] %s: %s\n", s.algoName.c_str(), gpuErr.c_str());
+        } else {
+            // ALWAYS recorded and logged, not gated behind a diagnostic flag.
+            // A silent fallback reads as "the GPU is slow today" -- which is how
+            // a device hang on every 45 MP raw went unnoticed.
+            const std::string note = s.algoName + ": " + gpuErr;
+            m_gpuFallbacks.push_back(note);
+            std::fprintf(stderr, "[gpu-fallback] %s\n", note.c_str());
         }
         if (!ranOnGpu && mode == ExecMode::ForceGPU) {
             *err = "line " + std::to_string(s.line) + ": '" + s.algoName +
@@ -494,6 +509,7 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
     }
 
     m_gpuStages = 0;
+    m_gpuFallbacks.clear();
     m_cpuStages = 0;
     m_cachedStages = 0;
     // Find the first stage that differs from the previous run. Everything
@@ -718,12 +734,17 @@ bool Pipeline::RunStageGpu(Stage& s, const std::vector<const Data*>& in,
     gin.reserve(in.size());
     gout.reserve(s.outputs.size());
 
+    const auto tAcq = std::chrono::steady_clock::now();
     for (const Data* d : in) {
         Image& img = const_cast<Image&>(std::get<Image>(*d));
         GpuResidency* g = img.AcquireGpuRead(*gpu);
         if (!g) { *err = "could not make an input GPU-resident"; return false; }
         gin.push_back(&g->image);
     }
+    if (GpuPassTiming())
+        std::fprintf(stderr, "[pass] %s.<input upload> %.0f ms\n", s.algoName.c_str(),
+                     std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - tAcq).count());
     for (Data& d : s.outputs) {
         Image& img = std::get<Image>(d);
         GpuResidency* g = img.AcquireGpuWrite(*gpu);
@@ -804,6 +825,17 @@ bool Pipeline::RunStageGpu(Stage& s, const std::vector<const Data*>& in,
             return true;
         };
 
+        // Drain anything already recorded (the input upload, an earlier stage)
+        // so the per-pass timings below measure only their own dispatch.
+        if (GpuPassTiming()) {
+            const auto tu = std::chrono::steady_clock::now();
+            std::string ue;
+            gpu->Flush(&ue);
+            std::fprintf(stderr, "[pass] %s.<upload+prior> %.0f ms\n", s.algoName.c_str(),
+                         std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - tu).count());
+        }
+
         for (size_t p = 0; p < passes.size(); ++p) {
             std::vector<const GpuImage*> passIn;
             std::vector<GpuImage*>       passOut;
@@ -838,6 +870,21 @@ bool Pipeline::RunStageGpu(Stage& s, const std::vector<const Data*>& in,
             if (!gpu->Dispatch(*s.passKernels[p], passIn, passOut,
                                s.algo->GpuPassConstants(int(p)), err))
                 return false;
+
+            // Diagnostic: submit and wait per pass, so a hang can be attributed
+            // to ONE kernel rather than to the batch. Far slower than batching --
+            // this is for finding a watchdog overrun, not for normal use.
+            if (GpuPassTiming()) {
+                const auto t0 = std::chrono::steady_clock::now();
+                std::string fe;
+                const bool fok = gpu->Flush(&fe);
+                const double ms = std::chrono::duration<double, std::milli>(
+                                      std::chrono::steady_clock::now() - t0).count();
+                std::fprintf(stderr, "[pass] %s.%s %.0f ms%s\n",
+                             s.algoName.c_str(), passes[p].name, ms,
+                             fok ? "" : "  <-- FAILED HERE");
+                if (!fok) { *err = fe; return false; }
+            }
         }
         return true;
     }
@@ -845,7 +892,21 @@ bool Pipeline::RunStageGpu(Stage& s, const std::vector<const Data*>& in,
     const int iterations = std::max(1, s.algo->GpuIterations());
 
     if (iterations == 1) {
+        const auto tRec = std::chrono::steady_clock::now();
         if (!gpu->Dispatch(*s.kernel, gin, gout, s.algo->GpuConstants(0), err)) return false;
+        if (GpuPassTiming()) {
+            const double recMs = std::chrono::duration<double, std::milli>(
+                                     std::chrono::steady_clock::now() - tRec).count();
+            const auto tFl = std::chrono::steady_clock::now();
+            std::string fe;
+            const bool fok = gpu->Flush(&fe);
+            std::fprintf(stderr, "[pass] %s record %.0f ms, gpu %.0f ms%s\n",
+                         s.algoName.c_str(), recMs,
+                         std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - tFl).count(),
+                         fok ? "" : "  <-- FAILED");
+            if (!fok) { *err = fe; return false; }
+        }
         // No readback here. Outputs stay GPU-resident; whoever needs CPU pixels
         // (a later CPU stage, or a viewer) triggers the transfer via
         // MapCpuRead().

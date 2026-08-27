@@ -271,6 +271,11 @@ void PipelineWorker::Run() {
                 std::string r = s.algo->RunReport();
                 if (!r.empty()) reports.push_back(std::move(r));
             }
+            // A GPU fallback belongs with the reports: it is the single most
+            // useful thing to know about a run that was unexpectedly slow.
+            for (const std::string& f : job->pipe.GpuFallbacks())
+                reports.push_back("GPU fallback -- " + f);
+
             {
                 std::lock_guard<std::mutex> lock(m_mtx);
                 m_lastReports = std::move(reports);
