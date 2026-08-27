@@ -102,7 +102,7 @@ void PipelineWorker::Stop() {
     m_thread.join();
 }
 
-uint64_t PipelineWorker::Submit(Pipeline pipe, std::vector<Data> sources,
+uint64_t PipelineWorker::Submit(Pipeline pipe, std::shared_ptr<std::vector<Data>> sources,
                                std::vector<uint64_t> sourceVersions) {
     uint64_t seq;
     {
@@ -123,7 +123,7 @@ uint64_t PipelineWorker::Submit(Pipeline pipe, std::vector<Data> sources,
     return seq;
 }
 
-uint64_t PipelineWorker::SubmitCompare(Pipeline pipe, std::vector<Data> sources,
+uint64_t PipelineWorker::SubmitCompare(Pipeline pipe, std::shared_ptr<std::vector<Data>> sources,
                                        int stageIndex) {
     uint64_t seq;
     {
@@ -200,7 +200,7 @@ void PipelineWorker::Run() {
             // and the timing meaningless).
             outcome->isCompare = true;
             auto cr = std::make_shared<CompareResult>(
-                CompareCpuGpu(job->pipe, &job->sources,
+                CompareCpuGpu(job->pipe, job->sources.get(),
                               haveGpu ? &gpu : nullptr, job->compareStage));
             outcome->ok      = cr->ok;
             outcome->error   = cr->error;
@@ -230,7 +230,7 @@ void PipelineWorker::Run() {
 
         const auto t0 = std::chrono::steady_clock::now();
         std::string err;
-        const bool ok = job->pipe.Execute(&job->sources, havePrev ? &prev : nullptr, &err,
+        const bool ok = job->pipe.Execute(job->sources.get(), havePrev ? &prev : nullptr, &err,
                                           haveGpu ? &gpu : nullptr,
                                           m_mode.load(std::memory_order_relaxed),
                                           &job->sourceVersions, token.get());
@@ -313,7 +313,7 @@ void PipelineWorker::Run() {
             // the version check skips both.
             const size_t firstDirty = job->pipe.FirstDirtyStage();
             for (const ViewerDecl& vd : job->pipe.Viewers()) {
-                const Data* d = job->pipe.Resolve(vd.source, &job->sources);
+                const Data* d = job->pipe.Resolve(vd.source, job->sources.get());
                 if (!d || !std::holds_alternative<Image>(*d)) continue;
 
                 // A palette source (stage < 0) changes only when the file
@@ -362,7 +362,7 @@ void PipelineWorker::Run() {
             if (haveGpu && !wantStats.empty()) {
                 for (const ViewerDecl& vd : job->pipe.Viewers()) {
                     if (vd.name != wantStats) continue;
-                    const Data* d = job->pipe.Resolve(vd.source, &job->sources);
+                    const Data* d = job->pipe.Resolve(vd.source, job->sources.get());
                     if (!d || !std::holds_alternative<Image>(*d)) break;
                     const Image& result = std::get<Image>(*d);
                     const GpuResidency* g = result.RawGpu();

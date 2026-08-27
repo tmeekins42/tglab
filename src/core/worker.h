@@ -38,7 +38,11 @@ namespace tglab {
 struct PipelineJob {
     uint64_t              seq = 0;
     Pipeline              pipe;
-    std::vector<Data>     sources;
+    // Shared, not owned. A group of five 45 MP raws is 853 MB, and the UI
+    // re-interprets the script on every slider tick -- copying that per tick on
+    // the UI thread froze the app outright. The pipeline only READS sources, so
+    // the copy is made once when the pixels change and shared thereafter.
+    std::shared_ptr<std::vector<Data>> sources;
     // Parallel to `sources`: changes when that palette image is replaced, so
     // the stage cache can tell a swapped image from the same one.
     std::vector<uint64_t> sourceVersions;
@@ -122,8 +126,18 @@ public:
     // against a run that may take much longer, so queueing them would build an
     // unbounded backlog of results nobody will ever see — only the newest
     // matters. Returns the sequence number assigned to this job.
-    uint64_t Submit(Pipeline pipe, std::vector<Data> sources,
+    uint64_t Submit(Pipeline pipe, std::shared_ptr<std::vector<Data>> sources,
                     std::vector<uint64_t> sourceVersions = {});
+
+    // Convenience for callers that own their sources outright -- tests and
+    // one-shot tools. The app uses the shared form, since it re-submits the
+    // same sources on every slider tick.
+    uint64_t Submit(Pipeline pipe, std::vector<Data> sources,
+                    std::vector<uint64_t> sourceVersions = {}) {
+        return Submit(std::move(pipe),
+                      std::make_shared<std::vector<Data>>(std::move(sources)),
+                      std::move(sourceVersions));
+    }
 
     // Names of the viewers currently on screen. A docked tab that is hidden
     // behind another still has a declared viewer, and cloning its result costs
@@ -146,7 +160,7 @@ public:
     // Runs the pipeline twice (CPU then GPU) and diffs the chosen stage.
     // Deliberately not coalesced with normal runs in the caller's mind: it is
     // an explicit, one-off request, not something a slider triggers.
-    uint64_t SubmitCompare(Pipeline pipe, std::vector<Data> sources, int stageIndex = -1);
+    uint64_t SubmitCompare(Pipeline pipe, std::shared_ptr<std::vector<Data>> sources, int stageIndex = -1);
 
     // Non-blocking. Returns true and fills `out` when a newer result is ready.
     bool TryFetch(PipelineOutcome* out);

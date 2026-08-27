@@ -355,3 +355,11 @@ if(MSVC)
     target_compile_definitions(gpu_leak_scripts PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
 tglab_copy_dxc(gpu_leak_scripts)
+
+# group_merge: a group of raws through the merge script, headless. Separates a
+# pipeline fault from an app threading/display one when the UI hangs.
+add_executable(group_merge tools/group_merge.cpp $<TARGET_OBJECTS:tglab_algorithms>)
+target_link_libraries(group_merge PRIVATE tglab_core d3d12 dxgi)
+if(MSVC)
+    target_compile_definitions(group_merge PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()

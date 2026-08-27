@@ -349,6 +349,24 @@ private:
     PipelineWorker m_worker;
     ImageLoader    m_loader;
     std::vector<PaletteEntry> m_palette;
+
+    // The worker's source list, shared rather than copied per run.
+    //
+    // Groups are why this exists. A slider drag re-interprets the script on
+    // every tick, and the worker owns its sources -- so with five 45 MP raws
+    // that was 853 MB copied on the UI THREAD per tick. The app froze outright:
+    // no repaint, no spinner, nothing. The pipeline only READS sources, so one
+    // copy is made when the pixels change and shared thereafter.
+    //
+    // Rebuilt when any entry's version changes, when the palette is reordered,
+    // or when a slot is added or removed -- all of which m_sourceKey captures.
+    std::shared_ptr<std::vector<Data>> m_sources;
+    std::vector<std::pair<std::string, uint64_t>> m_sourceKey;
+
+    // Builds the shared list, reusing the last one when nothing changed.
+    void RefreshSources(std::vector<SourceImage>* names,
+                        std::vector<uint64_t>* versions);
+
     int  m_renamingSlot = -1;      // index being renamed inline, or -1
     bool m_renameFocused = false;
     char m_renameBuf[128] = {};
@@ -700,21 +718,14 @@ void App::PollStats() {
 // Phase 1 only: parse and interpret (microseconds), then hand the recorded
 // pipeline to the worker. Interpret() is what declares sliders into m_ui, so
 // keeping it here means UiState is never shared across threads.
-// Describes one palette slot to the interpreter.
-//
-// Shared by the normal run and by compare mode, which build the same source
-// list from the same palette -- and drifted apart once already, since one of
-// them is easy to forget when adding a fact.
-//
-// Takes the entry by reference because measuring caches into it: the auto
-// exposure costs a pass over the mosaic and this is called on every
-// re-interpret, which is every slider tick.
 // A palette entry's data, copied for the pipeline to consume.
 //
-// The pipeline mutates what it is given, so it gets a clone rather than the
-// palette's own copy. A set clones each image; an empty Data stays empty so the
-// slot keeps its index and a script referring to it fails with "produced no
-// data" rather than silently reading the wrong palette entry.
+// The pipeline treats sources as read-only, but the worker owns them by value
+// and may still be reading last frame's set while a newer job is submitted, so
+// it needs its own copy rather than a reference.
+//
+// The cost of that copy is why groups needed a cache above this: five 45 MP
+// raws is 853 MB, and a slider drag re-interprets the script on every tick.
 Data CloneSource(const Data& d) {
     if (const auto* img = std::get_if<Image>(&d)) return Data{img->Clone()};
     if (const auto* set = std::get_if<ImageSet>(&d)) {
@@ -727,6 +738,21 @@ Data CloneSource(const Data& d) {
     return Data{};
 }
 
+// How many images a Data holds, for the "is this worth avoiding" decision.
+size_t SourceFrameCount(const Data& d) {
+    if (const auto* set = std::get_if<ImageSet>(&d)) return set->images.size();
+    return std::holds_alternative<Image>(d) ? 1 : 0;
+}
+
+// Describes one palette slot to the interpreter.
+//
+// Shared by the normal run and by compare mode, which build the same source
+// list from the same palette -- and drifted apart once already, since one of
+// them is easy to forget when adding a fact.
+//
+// Takes the entry by reference because measuring caches into it: the auto
+// exposure costs a pass over the mosaic and this is called on every
+// re-interpret, which is every slider tick.
 SourceImage DescribeSource(PaletteEntry& pe, int index) {
     SourceImage si;
     si.name  = pe.name;
@@ -772,6 +798,38 @@ SourceImage DescribeSource(PaletteEntry& pe, int index) {
     return si;
 }
 
+// Builds the shared source list, reusing the previous one when nothing changed.
+//
+// The key is every slot's name and version. A change to any of them -- a reload,
+// a drop, a group edit, a rename, an added or removed slot -- rebuilds; a slider
+// drag does not, which is the case that matters: it is the one that repeats
+// sixty times a second.
+void App::RefreshSources(std::vector<SourceImage>* names,
+                         std::vector<uint64_t>* versions) {
+    std::vector<std::pair<std::string, uint64_t>> key;
+    key.reserve(m_palette.size());
+    for (const PaletteEntry& e : m_palette) key.emplace_back(e.name, e.version);
+
+    const bool rebuild = !m_sources || key != m_sourceKey;
+    if (rebuild) {
+        auto next = std::make_shared<std::vector<Data>>();
+        next->reserve(m_palette.size());
+        for (PaletteEntry& e : m_palette) next->push_back(CloneSource(e.data));
+        m_sources   = std::move(next);
+        m_sourceKey = std::move(key);
+    }
+
+    // These are cheap and describe the CURRENT palette, so they are rebuilt
+    // either way -- an auto-exposure measurement cached into the entry would
+    // otherwise be missed until the pixels next changed.
+    names->clear();
+    versions->clear();
+    for (size_t i = 0; i < m_palette.size(); ++i) {
+        names->push_back(DescribeSource(m_palette[i], int(i)));
+        versions->push_back(m_palette[i].version);
+    }
+}
+
 void App::RunScript() {
     const std::string prevError = m_error;
     m_error.clear();
@@ -787,16 +845,9 @@ void App::RunScript() {
 
     // Sources are rebuilt each run so PortRef{-1, i} stays in step. The worker
     // gets its own copies, since it may still be reading them next frame.
-    std::vector<Data> sources;
     std::vector<SourceImage> names;
     std::vector<uint64_t> versions;
-    for (size_t i = 0; i < m_palette.size(); ++i) {
-        sources.push_back(CloneSource(m_palette[i].data));
-        names.push_back(DescribeSource(m_palette[i], int(i)));
-        // Bumped when a drop replaces the file behind this slot, which is what
-        // lets the stage cache notice the pixels changed.
-        versions.push_back(m_palette[i].version);
-    }
+    RefreshSources(&names, &versions);
 
     // Any failure here leaves the last good result on screen and reports the
     // reason; the viewers are only replaced when a run succeeds.
@@ -824,7 +875,7 @@ void App::RunScript() {
                 m_stageGpuCapable.push_back(s.algo->HasGPU() && s.algo->GpuSource());
             }
 
-            m_pendingSeq = m_worker.Submit(std::move(built), std::move(sources),
+            m_pendingSeq = m_worker.Submit(std::move(built), m_sources,
                                            std::move(versions));
         }
     }
@@ -837,16 +888,9 @@ void App::RunScript() {
 // stage. Separate from the normal path because it is an explicit request, not
 // something a slider change triggers.
 void App::RequestCompare() {
-    std::vector<Data> sources;
     std::vector<SourceImage> names;
     std::vector<uint64_t> versions;
-    for (size_t i = 0; i < m_palette.size(); ++i) {
-        sources.push_back(CloneSource(m_palette[i].data));
-        names.push_back(DescribeSource(m_palette[i], int(i)));
-        // Bumped when a drop replaces the file behind this slot, which is what
-        // lets the stage cache notice the pixels changed.
-        versions.push_back(m_palette[i].version);
-    }
+    RefreshSources(&names, &versions);
 
     Program prog;
     std::string err;
@@ -856,7 +900,7 @@ void App::RequestCompare() {
     InterpResult r = Interpret(prog, names, &m_ui, &built);
     if (!r.ok) { m_error = r.error; return; }
 
-    m_worker.SubmitCompare(std::move(built), std::move(sources), m_compareStage);
+    m_worker.SubmitCompare(std::move(built), m_sources, m_compareStage);
     m_compareOpen = true;
 }
 
