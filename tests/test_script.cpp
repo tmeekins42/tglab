@@ -2437,7 +2437,7 @@ int main() {
             nm.push_back(gs);
 
             Program prog; std::string err;
-            if (!Parse("g = image(\"g\")\na = align(g)\ndisplay(a)\n", &prog, &err))
+            if (!Parse("g = image(\"g\")\na = align(g, min_shift = 0)\ndisplay(a)\n", &prog, &err))
                 return false;
             UiState ui; Pipeline pipe;
             if (!Interpret(prog, nm, &ui, &pipe).ok) return false;
@@ -2512,6 +2512,61 @@ int main() {
             plain.Alloc(d);
             Check(TransformOf(plain).IsIdentity(),
                   "an image with no transform reads as identity");
+        }
+
+        // A correction too small to be worth its resample is DROPPED.
+        //
+        // Tim's rule, from measuring that aligning his two brackets made the
+        // merged result 8% and 16% LESS sharp: bilinear at a fraction of a
+        // pixel is a mild low-pass, and below some displacement that softening
+        // costs more than the misalignment it removes.
+        //
+        // Checked at both ends, because a threshold that always fires is as
+        // wrong as one that never does.
+        {
+            auto SolvedShift = [&](float dx, float dy, float minShift) {
+                ImageSet set;
+                set.images.push_back(Textured(0.0f, 0.0f));
+                set.images.push_back(Textured(dx, dy));
+                set.shape = Shape::Of("frame", 2);
+
+                std::vector<SourceImage> nm{{"test", 0}};
+                SourceImage gs; gs.name = "g"; gs.index = 1;
+                gs.shape = Shape::Of("frame", 2);
+                nm.push_back(gs);
+
+                const std::string src =
+                    "g = image(\"g\")\na = align(g, min_shift = " +
+                    std::to_string(minShift) + ")\ndisplay(a)\n";
+
+                Program prog; std::string err;
+                Parse(src, &prog, &err);
+                UiState ui; Pipeline pipe;
+                Interpret(prog, nm, &ui, &pipe);
+                std::vector<Data> srcs;
+                srcs.push_back(Data{});
+                srcs.push_back(Data{std::move(set)});
+                if (!pipe.Execute(&srcs, nullptr, &err)) return Affine{};
+                const Data* o = pipe.Resolve(pipe.Viewers().back().source, &srcs);
+                const auto* os = o ? std::get_if<ImageSet>(o) : nullptr;
+                return (os && os->images.size() == 2) ? TransformOf(os->images[1])
+                                                      : Affine{};
+            };
+
+            // A third of a pixel, under the half-pixel default: dropped.
+            Check(SolvedShift(0.3f, 0.0f, 0.5f).IsIdentity(),
+                  "a sub-threshold shift is left unwarped rather than resampled");
+
+            // Three pixels, well over it: applied.
+            const Affine big = SolvedShift(3.0f, 0.0f, 0.5f);
+            Check(!big.IsIdentity() && std::abs(big.Dx() - 3.0f) < 0.1f,
+                  "and a shift worth correcting still is (" +
+                      std::to_string(big.Dx()) + ")");
+
+            // The threshold is a control, not a hard rule: min_shift = 0 warps
+            // everything, which is what the solver tests above rely on.
+            Check(!SolvedShift(0.3f, 0.0f, 0.0f).IsIdentity(),
+                  "min_shift = 0 applies every correction");
         }
 
         // ROUND TRIP: align then merge must be SHARPER than merging unaligned.

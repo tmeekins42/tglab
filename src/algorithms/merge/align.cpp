@@ -60,6 +60,24 @@ static bool AlignVerbose() {
     return on;
 }
 
+// The largest distance any CORNER of the frame moves under a transform.
+//
+// The right measure of "how much does this warp actually shift things",
+// because translation alone misses a rotation: a frame rotated about its centre
+// has zero translation and still moves its edges by several pixels. Corners are
+// where that is largest, so they bound it.
+inline float MaxCornerShift(const Affine& t, int w, int h) {
+    const float xs[4] = {0.0f, float(w - 1), 0.0f, float(w - 1)};
+    const float ys[4] = {0.0f, 0.0f, float(h - 1), float(h - 1)};
+    float worst = 0.0f;
+    for (int i = 0; i < 4; ++i) {
+        float mx, my;
+        t.MapPoint(xs[i], ys[i], &mx, &my);
+        worst = std::max(worst, std::hypot(mx - xs[i], my - ys[i]));
+    }
+    return worst;
+}
+
 // A luminance plane, which is all the solver reads.
 struct Plane {
     std::vector<float>   v;
@@ -354,6 +372,8 @@ public:
         // Solved transforms, held until every frame is done so a common-mode
         // component can be measured across all of them before any is attached.
         std::map<size_t, Affine> solvedT;
+        m_skipped = 0;
+        m_didNormalize = false;
         for (size_t i = 1; i < images->size(); ++i) {
             ImageView mv = (*images)[i].MapCpuRead();
             if (!mv.data) continue;
@@ -375,6 +395,17 @@ public:
             // is identity, which is the same as starting from scratch.
             Affine t = TransformOf((*images)[i]);
 
+            // Whether this frame was ALREADY going to be resampled.
+            //
+            // Tim's rule, and it is the one that decides whether a tiny
+            // correction is worth applying: if a coarse transform is already
+            // attached, the merge will resample this frame regardless, so
+            // folding a sub-pixel refinement into it costs nothing. It is only
+            // when the refinement is the ONLY transform that it also CAUSES the
+            // resample -- and then it has to be worth more than the softening
+            // that resample brings.
+            const bool hadPrior = !t.IsIdentity();
+
             // Coarse to fine. A transform solved at half resolution has its
             // translation in half-resolution pixels, so it is scaled on the way
             // down; the linear part is scale-free and carries over unchanged.
@@ -390,6 +421,29 @@ public:
                 t = lt;
                 t.m[2] *= s;
                 t.m[5] *= s;
+            }
+
+            // Drop a correction too small to be worth the resample it causes.
+            //
+            // Measured on Tim's two brackets, whose frames sit 0.12 to 2.1 px
+            // apart: aligning them made the merged result LESS sharp by 8% and
+            // 16% respectively. Bilinear at a fraction of a pixel is a mild
+            // low-pass, and below some displacement that softening costs more
+            // than the misalignment it removes.
+            //
+            // Only when there was no prior transform. With one attached the
+            // frame is being resampled either way, so refining it is free --
+            // which is the case that matters once a feature-matching aligner
+            // runs first and hands a coarse estimate to this one.
+            //
+            // Measured as the worst CORNER displacement rather than the
+            // translation alone, because a rotation with no translation still
+            // moves the edges of the frame. Half a pixel is the threshold: at
+            // that scale bilinear's softening and the residual misalignment are
+            // comparable, and below it the resample is the larger error.
+            if (!hadPrior && MaxCornerShift(t, ref0.w, ref0.h) < float(m_minShift)) {
+                ++m_skipped;
+                continue;
             }
 
             solvedT[i] = t;
@@ -466,19 +520,28 @@ public:
             }
         }
 
-        char buf[192];
+        char buf[160];
+        std::snprintf(buf, sizeof buf, "aligned %d frames, largest shift %.2f px",
+                      int(solvedT.size()), double(worst));
+        m_report = buf;
+
+        // Skipped frames are named, not just counted away. A user comparing an
+        // aligned and unaligned merge and seeing no difference deserves to be
+        // told the alignment decided the correction was not worth applying,
+        // rather than being left to wonder whether it ran.
+        if (m_skipped) {
+            m_report += ", " + std::to_string(m_skipped) +
+                        " under " + std::to_string(float(m_minShift)).substr(0, 4) +
+                        " px left unwarped";
+        }
         if (m_didNormalize) {
             std::snprintf(buf, sizeof buf,
-                          "aligned %d frames, largest shift %.2f px "
-                          "(removed %.3f deg / %.5f scale common to all)",
-                          solved, double(worst), double(m_removed.RotationDeg()),
+                          " (removed %.3f deg / %.5f scale common to all)",
+                          double(m_removed.RotationDeg()),
                           double(std::hypot(m_removed.m[0], m_removed.m[3])));
-        } else {
-            std::snprintf(buf, sizeof buf,
-                          "aligned %d frames, largest shift %.2f px",
-                          solved, double(worst));
+            m_report += buf;
         }
-        m_report = buf;
+        (void)solved;
         return true;
     }
 
@@ -646,9 +709,16 @@ private:
     // default and the answer is whichever measures sharper on real brackets.
     Param<int> m_normalize{this, "normalize", 0, 0, 1};
 
+    // Below this corner displacement, a frame with no prior transform is left
+    // alone: the resample would cost more than the misalignment. Exposed so the
+    // trade can be explored -- set it to 0 to warp everything, which is what
+    // the measurements above were taken with.
+    Param<float> m_minShift{this, "min_shift", 0.5f, 0.0f, 8.0f, {.step = 0.05}};
+
     std::string m_report;
     Affine      m_removed;              // the common part, when one was removed
     bool        m_didNormalize = false;
+    int         m_skipped = 0;      // frames left unwarped as not worth it
 };
 
 } // namespace
