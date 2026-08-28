@@ -49,6 +49,16 @@ BUGS / SMALL FEATURES
   this would be a good time to add an error icon on the thumbnail if the image failed to load
 
 NEW FEATURES / IDEAS
+- LOCAL TONEMAP (tonemap_local). The global operator is doing what a global
+  operator can: on hdrtest2 the sky keeps its ordering and 1.36 of its 1.89
+  stops through a full highlight recovery. It still READS flat, and that is not
+  a bug -- the sky spans 1.9 stops while the scene spans 5.8, so it occupies a
+  small slice of the range and sits next to much darker land.
+  A local operator is the fix: split base from detail with an edge-preserving
+  filter (guided_filter is already here), compress the BASE hard, keep the
+  detail. Registered separately so the two can be compared in one script, which
+  is the point. Watch for halos -- that is the failure mode, and why global is
+  worth keeping as the default.
 - add support for additional image channels, such as alpha channels and depth channels
 - channel merging. Astronomy images are captured single channel with colored filters. How to merge them?
 - image export
