@@ -138,6 +138,14 @@ void Image::AdoptDesc(const ImageDesc& d) {
 void Image::Alloc(const ImageDesc& d) {
     m_desc = d;
     m_gpu.reset();
+
+    // New pixels, so anything DERIVED from the old ones is stale. An alignment
+    // solved against an image that no longer exists would not error -- it would
+    // produce a subtly wrong merge, which is the failure mode worth being
+    // strict about. Intrinsic sidecars (a camera pose, a lens identifier)
+    // describe the capture and survive.
+    m_sidecars.DropDerived();
+
     if (!d.Valid()) {
         m_cpu.clear();
         m_res = Residency::None;
@@ -152,6 +160,7 @@ void Image::Reset() {
     m_cpu.clear();
     m_gpu.reset();
     m_res = Residency::None;
+    m_sidecars.Clear();
 }
 
 ImageView Image::MapCpuRead() {
@@ -216,6 +225,13 @@ Image Image::Clone() const {
     // alias it; one that copied it would cost VRAM for a copy usually made
     // just to hand pixels to the UI.
     out.m_res = HasCpu() ? Residency::Cpu : Residency::None;
+
+    // Sidecars come along, SHARED rather than copied. The pixels are identical,
+    // so anything derived from them is still valid -- and the entries are
+    // shared_ptr<const>, so carrying a feature set across a clone is a refcount
+    // rather than a deep copy. That is what keeps the palette's per-run clone
+    // cheap for an image with alignment data attached.
+    out.m_sidecars = m_sidecars;
     return out;
 }
 

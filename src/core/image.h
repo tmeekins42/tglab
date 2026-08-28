@@ -9,6 +9,8 @@
 #include <memory>
 #include <vector>
 
+#include "sidecar.h"
+
 namespace tglab {
 
 enum class Format : uint8_t {
@@ -248,6 +250,20 @@ public:
     // Deep copy of whatever is CPU-side (does not clone GPU memory).
     Image Clone() const;
 
+    // --- sidecars: non-pixel data attached to this image ---------------------
+    //
+    // See core/sidecar.h. An aligner attaches a transform here; a merge reads
+    // one if present and proceeds without it if not.
+    //
+    // The table is SHARED by a clone rather than copied, which is what keeps
+    // Clone() cheap for an image carrying a feature set: the entries are
+    // shared_ptr<const>, so sharing them is a refcount rather than a deep copy.
+    SidecarTable&       Sidecars()       { return m_sidecars; }
+    const SidecarTable& Sidecars() const { return m_sidecars; }
+
+    template <class T>
+    const T* Sidecar(const std::string& name) const { return m_sidecars.Get<T>(name); }
+
 private:
     void EnsureCpuStorage();
 
@@ -255,6 +271,7 @@ private:
     std::vector<uint8_t> m_cpu;
     Residency            m_res = Residency::None;
     std::unique_ptr<GpuResidency, GpuResidencyDeleter> m_gpu;
+    SidecarTable         m_sidecars;
 };
 
 // Makes a shareable GPU texture from an Image that is GPU-resident, or returns
