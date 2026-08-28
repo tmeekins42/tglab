@@ -131,6 +131,8 @@ static bool WriteExifFixture(const std::string& path) {
 }
 
 int main() {
+    // Unbuffered, so a crash does not swallow the output that would say where.
+    setvbuf(stdout, nullptr, _IONBF, 0);
     std::printf("registry: ");
     for (const std::string& n : Registry::Get().Names()) std::printf("%s ", n.c_str());
     std::printf("\n\n");
@@ -320,16 +322,31 @@ int main() {
             "out = brightness(src, gain = g)\n"
             "display(out)\n";
 
+        // Read through Resolve rather than reaching into Stages()[0].outputs.
+        //
+        // A stage can now be BYPASSED -- skipped because its settings would
+        // change nothing -- and a bypassed stage holds no image at all: its
+        // result is whatever its input resolves to. This script starts with
+        // gain = 1, which is exactly that case, so indexing the outputs
+        // directly reads an empty variant. Resolve() is the accessor that
+        // knows about the alias, and is what every non-test caller uses.
+        auto firstPixel = [&](Pipeline& p, std::vector<Data>& s) -> int {
+            const Data* d = p.Resolve({0, 0}, &s);
+            const auto* im = d ? std::get_if<Image>(d) : nullptr;
+            if (!im) return -1;
+            return int(const_cast<Image*>(im)->MapCpuRead().data[4]);
+        };
+
         Pipeline p1;
         RunScript(kScript, &ui, &p1, &err, &src);
-        const uint8_t before = std::get<Image>(p1.Stages()[0].outputs[0]).MapCpuRead().data[4];
+        const int before = firstPixel(p1, src);
 
         // Simulate the user dragging the slider.
         ui.Controls()[0].value = 3.0;
 
         Pipeline p2;
         RunScript(kScript, &ui, &p2, &err, &src);
-        const uint8_t after = std::get<Image>(p2.Stages()[0].outputs[0]).MapCpuRead().data[4];
+        const int after = firstPixel(p2, src);
 
         Check(before != after,
               "moving a slider changes the output pixels (" +
@@ -793,8 +810,19 @@ int main() {
             }
             return img;
         };
-        auto checksum = [](Pipeline& p) {
-            ImageView v = std::get<Image>(p.Stages()[0].outputs[0]).MapCpuRead();
+        // Through Resolve, not Stages()[0].outputs: gain = 1.0 with no offset
+        // is exactly the identity, so this stage is BYPASSED and holds no
+        // image of its own -- its result is the palette source it aliases.
+        //
+        // Which is exactly what this test needs to keep working: swapping the
+        // image behind the slot must still be seen, bypass or not. A bypassed
+        // stage aliasing a source that then changes is the one case where the
+        // alias could go stale, so it is worth exercising rather than avoiding.
+        auto checksum = [](Pipeline& p, std::vector<Data>& s) -> unsigned long long {
+            const Data* d = p.Resolve({0, 0}, &s);
+            const auto* im = d ? std::get_if<Image>(d) : nullptr;
+            if (!im) return 0ull;
+            ImageView v = const_cast<Image*>(im)->MapCpuRead();
             unsigned long long sum = 0;
             for (int i = 0; i < v.desc.width * v.desc.height * 4; ++i) sum += v.data[i];
             return sum;
@@ -816,7 +844,7 @@ int main() {
         Pipeline p1;
         Interpret(prog, names, &ui, &p1);
         p1.Execute(&s1, nullptr, &err, nullptr, ExecMode::Auto, &v1);
-        const unsigned long long before = checksum(p1);
+        const unsigned long long before = checksum(p1, s1);
 
         // Same image, same version: must still cache.
         std::vector<Data> s2;
@@ -834,7 +862,7 @@ int main() {
         Interpret(prog, names, &ui, &p3);
         p3.Execute(&s3, &p2, &err, nullptr, ExecMode::Auto, &v3);
         Check(p3.CachedStageCount() == 0, "a swapped source does not hit the cache");
-        Check(checksum(p3) != before,
+        Check(checksum(p3, s3) != before,
               "the output reflects the new image with no other change");
     }
 
@@ -3385,6 +3413,104 @@ int main() {
                 Check(false, "rebuilt the pipeline for the follow-up run");
             }
         }
+    }
+
+    // --- bypassing a stage that would do nothing -----------------------------
+    //
+    // For stacking. A script emulating a full develop pipeline wants twenty
+    // effects available and three of them used, and an unused effect must cost
+    // NOTHING -- not "one cheap pass", since twenty cheap passes over a 45 MP
+    // image is not cheap and each one also allocates a full-size intermediate.
+    {
+        UiState ui; Pipeline p; std::vector<Data> src; std::string err;
+        const bool ok = RunScript(
+            "src = image(\"test\")\n"
+            "out = src => gaussian_blur(sigma = 0)\n"
+            "          => gaussian_blur(sigma = 0)\n"
+            "          => brightness(brightness = 0.25)\n"
+            "display(out)\n", &ui, &p, &err, &src);
+
+        Check(ok && p.Stages().size() == 3,
+              "a stack with two disabled effects builds" + (ok ? "" : ": " + err));
+        Check(ok && p.BypassedStageCount() == 2,
+              "both zero-sigma blurs were bypassed (" +
+                  std::to_string(p.BypassedStageCount()) + ")");
+
+        // Free means FREE: a bypassed stage holds no image at all. Checking the
+        // output is empty is what distinguishes a real skip from a stage that
+        // ran and happened to copy its input.
+        Check(ok && !p.Stages()[0].outputs.empty() &&
+              TypeOf(p.Stages()[0].outputs[0]) == DataType::None,
+              "a bypassed stage allocates nothing");
+
+        // And the pixels must still be right. Two bypassed stages back to back
+        // means Resolve has to walk the chain, not just one link.
+        const Data* d = p.Resolve({2, 0}, &src);
+        const auto* got = d ? std::get_if<Image>(d) : nullptr;
+        Check(got && got->Valid(), "the stack still produces an image");
+
+        // Compare against the same script with the disabled stages removed
+        // entirely -- the bypass must be indistinguishable from not writing
+        // them.
+        UiState ui2; Pipeline p2; std::vector<Data> src2;
+        const bool ok2 = RunScript(
+            "src = image(\"test\")\n"
+            "out = src => brightness(brightness = 0.25)\n"
+            "display(out)\n", &ui2, &p2, &err, &src2);
+        const Data* d2 = ok2 ? p2.Resolve({0, 0}, &src2) : nullptr;
+        const auto* ref = d2 ? std::get_if<Image>(d2) : nullptr;
+
+        if (got && ref) {
+            ImageView a = const_cast<Image*>(got)->MapCpuRead();
+            ImageView b = const_cast<Image*>(ref)->MapCpuRead();
+            int worst = 0;
+            for (int y = 0; y < a.desc.height; ++y)
+                for (int x = 0; x < a.desc.width; ++x)
+                    for (int c = 0; c < 3; ++c)
+                        worst = std::max(worst,
+                            std::abs(int(a.At<uint8_t>(x, y)[c]) -
+                                     int(b.At<uint8_t>(x, y)[c])));
+            Check(worst == 0,
+                  "bypassing is identical to omitting the stage (worst " +
+                      std::to_string(worst) + ")");
+        } else {
+            Check(false, "both forms produced an image");
+        }
+    }
+
+    // Turning an effect back on re-runs it, because IsNoOp is derived from
+    // parameters and those are already in the stage hash.
+    {
+        UiState ui; Pipeline p; std::vector<Data> src; std::string err;
+        const char* kScript =
+            "src = image(\"test\")\n"
+            "s = slider(\"blur\", 0.0, 8.0, 0.0)\n"
+            "out = src => gaussian_blur(sigma = s)\n"
+            "display(out)\n";
+
+        RunScript(kScript, &ui, &p, &err, &src);
+        Check(p.BypassedStageCount() == 1, "the slider starts at zero and bypasses");
+
+        if (UiControl* c = ui.Find("blur")) c->value = 3.0;
+        Pipeline p2; std::vector<Data> src2;
+        RunScript(kScript, &ui, &p2, &err, &src2);
+        Check(p2.BypassedStageCount() == 0, "raising the slider runs the stage again");
+    }
+
+    // A stage whose output type differs from its input's must NOT be bypassed,
+    // whatever it claims. tonemap declares RGBA32F, so bypassing it on an RGBA8
+    // input would hand downstream a different format than the port promises.
+    // The pipeline refuses regardless of what the algorithm says.
+    {
+        UiState ui; Pipeline p; std::vector<Data> src; std::string err;
+        const bool ok = RunScript(
+            "src = image(\"test\")\n"
+            "out = src => params(tonemap_local, range = 12)()\n"
+            "display(out)\n", &ui, &p, &err, &src);
+        // range=12 makes it an identity in effect, but it does not claim
+        // IsNoOp, so this is really checking that nothing bypasses by accident.
+        Check(ok && p.BypassedStageCount() == 0,
+              "a format-changing stage is not bypassed" + (ok ? "" : ": " + err));
     }
 
     std::printf("\n%s\n", g_fail == 0 ? "all checks passed" : "FAILURES PRESENT");

@@ -121,6 +121,13 @@ public:
     // sigma 20 rather than 14,600, a 120x reduction that removes the reason for
     // any ceiling at all. The Gaussian is separable exactly, so this is the same
     // maths and not an approximation.
+    // Zero sigma is genuinely "no blur", so the stage is skipped outright --
+    // no allocation, no dispatch, no copy -- rather than convolving with a
+    // kernel that sums to the centre tap.
+    //
+    // The minimum used to be 0.1, so there was no way to express "off" at all.
+    bool IsNoOp() const override { return float(m_sigma) <= 0.0f; }
+
     bool HasGPU() const override { return true; }
     int  GpuIterations() const override { return 2; }
 
@@ -216,10 +223,10 @@ private:
     }
 
     Param<float> m_sigma{
-        this, "sigma", 2.0f, 0.1f, 20.0f,
+        this, "sigma", 2.0f, 0.0f, 20.0f,
         {.help = "Width of the Gaussian, in pixels. Higher blurs more. "
                  "The kernel reaches about 3x this far.",
-         .step = 0.1, .softMin = 0.1, .softMax = 5.0}};
+         .step = 0.1, .softMin = 0.0, .softMax = 5.0}};
 
     // Reused across runs to avoid reallocating on every slider drag.
     std::vector<float> m_scratch;

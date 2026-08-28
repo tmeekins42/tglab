@@ -135,6 +135,35 @@ public:
     // pipeline handles it directly. See algorithms/merge/align.cpp.
     virtual bool IsAligner() const { return false; }
 
+    // True when this stage's settings would leave the image unchanged, so the
+    // pipeline can skip it ENTIRELY -- no allocation, no dispatch, no copy.
+    //
+    // The point is stacking. A script emulating a full develop pipeline wants
+    // twenty effects available and three of them used, and an unused effect
+    // must cost nothing rather than "one cheap pass". Twenty cheap passes over
+    // a 45 MP image is not cheap, and every one of them also allocates a
+    // full-size intermediate.
+    //
+    // Skipping is safe because a bypassed stage ALIASES its input: Resolve()
+    // follows the PortRef through, so downstream reads the upstream image
+    // directly. That means no copy either -- the saving is the whole stage,
+    // not just its inner loop.
+    //
+    // Two things make it correct rather than merely fast:
+    //
+    //   - Only a stage whose output port would have the same FORMAT and SHAPE
+    //     as its input may be bypassed. A demosaic turning R32F into RGBA16F
+    //     cannot be, even at settings that "do nothing", because the type
+    //     changes. The pipeline checks this; an algorithm cannot opt out of it.
+    //   - IsNoOp is folded into the parameter hash, so toggling it re-runs the
+    //     stages downstream exactly as any other parameter change does.
+    //
+    // Default false: an algorithm that says nothing is always run, which is the
+    // safe answer. Override it where a setting genuinely means "off" -- amount
+    // at 0, a disabled toggle -- and be strict, since a wrong `true` silently
+    // drops the effect.
+    virtual bool IsNoOp() const { return false; }
+
     // Solves and attaches transforms across a whole group. Called only when
     // IsAligner() is true.
     virtual bool RunAlign(std::vector<Image>* /*images*/, std::string* /*err*/) { return true; }

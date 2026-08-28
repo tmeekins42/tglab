@@ -2882,6 +2882,13 @@ void App::Frame() {
             SplitLine(m_worker.LastRunMs(), m_worker.LastGpuMs());
         }
 
+        // Effects turned off. Said out loud, because the whole point of a
+        // stacked script is that a disabled effect costs nothing, and "did
+        // that actually skip?" is otherwise unanswerable from the outside.
+        if (const int off = m_worker.LastBypassedStages(); off > 0 && !m_worker.Busy())
+            ImGui::TextDisabled("   %d stage%s bypassed (settings do nothing)",
+                                off, off == 1 ? "" : "s");
+
         // Video memory. A 45 MP intermediate is ~340 MB in RGBA16F, so a
         // pipeline of several stages can approach the card's budget -- at which
         // point the driver starts paging and everything slows down for a reason

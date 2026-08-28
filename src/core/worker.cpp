@@ -258,6 +258,7 @@ void PipelineWorker::Run() {
             m_lastGpuStages.store(job->pipe.GpuStageCount(), std::memory_order_relaxed);
             m_lastCpuStages.store(job->pipe.CpuStageCount(), std::memory_order_relaxed);
             m_lastCachedStages.store(job->pipe.CachedStageCount(), std::memory_order_relaxed);
+            m_lastBypassed.store(job->pipe.BypassedStageCount(), std::memory_order_relaxed);
 
             // Whatever the stages have to say about what they just did.
             //

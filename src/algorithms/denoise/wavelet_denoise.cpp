@@ -189,6 +189,13 @@ public:
     // No custom scratch format: the output is SameAsInput, which for a
     // developed photograph is already four channels, so the default scratch is
     // the right shape.
+    // Both thresholds at zero shrinks nothing: every coefficient survives and
+    // the reconstruction returns the input. Worth skipping rather than running
+    // four levels of a-trous to arrive back where it started.
+    bool IsNoOp() const override {
+        return float(m_lumaStrength) <= 0.0f && float(m_chromaStrength) <= 0.0f;
+    }
+
     bool HasGPU() const override { return true; }
 
     int GpuIterations() const override { return std::clamp(int(m_levels), 1, 6); }

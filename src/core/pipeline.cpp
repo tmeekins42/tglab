@@ -35,6 +35,23 @@ static bool GpuPassTiming() {
 // Null in normal builds; set by tools/group_merge.
 std::function<void(int)> g_frameTrace;
 
+// Does a concrete format satisfy a port's declared FormatSpec?
+//
+// Only used by the bypass check, which must refuse a stage whose output type
+// differs from its input's. SameAsInput/Any are handled by the caller, since
+// those are trivially satisfiable and carry no format of their own.
+static bool MatchesSpec(FormatSpec spec, Format f) {
+    switch (spec) {
+        case FormatSpec::RGBA8:   return f == Format::RGBA8;
+        case FormatSpec::R32F:    return f == Format::R32F;
+        case FormatSpec::RGBA32F: return f == Format::RGBA32F;
+        case FormatSpec::RGBA16F: return f == Format::RGBA16F;
+        case FormatSpec::SameAsInput:
+        case FormatSpec::Any:     return true;
+    }
+    return false;
+}
+
 // Running tallies for the status line. See the declaration for why the GPU
 // number cannot come from timing individual stages.
 void Pipeline::PublishStats(Progress* progress, const ComputeContext* gpu) const {
@@ -78,6 +95,22 @@ void Pipeline::AddViewer(std::string name, PortRef src) {
 }
 
 const Data* Pipeline::Resolve(PortRef r, const std::vector<Data>* sources) const {
+    // Follow bypassed stages to whatever actually produced the pixels.
+    //
+    // A stage skipped as a no-op holds nothing; its result IS its input. The
+    // loop rather than a single step because several disabled effects can sit
+    // back to back, which is exactly what a stacked script looks like with most
+    // of its effects off. Bounded by the stage count so a cycle -- which the
+    // build order makes impossible, since a stage can only read earlier ones --
+    // could never hang the worker.
+    for (size_t guard = 0; guard <= m_stages.size(); ++guard) {
+        if (r.stage < 0) break;
+        if (size_t(r.stage) >= m_stages.size()) return nullptr;
+        const Stage& s = m_stages[size_t(r.stage)];
+        if (s.bypassOf.stage == -2) break;      // not bypassed
+        r = s.bypassOf;
+    }
+
     if (r.stage < 0) {
         if (!sources || r.port < 0 || size_t(r.port) >= sources->size()) return nullptr;
         return &(*sources)[size_t(r.port)];
@@ -614,6 +647,18 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
     m_gpuFallbacks.clear();
     m_cpuStages = 0;
     m_cachedStages = 0;
+    m_bypassedStages = 0;
+
+    // Clear every bypass link before anything resolves a port.
+    //
+    // Resolve() follows bypassOf, and a stage inherited from `prev` carries the
+    // link the PREVIOUS run set. Leaving it would make input gathering follow a
+    // stale alias -- to a stage that is about to run and hold different pixels,
+    // or, once a cached prefix shifts the indices, to nothing at all. Reset
+    // here rather than per stage in the loop, because a stage resolves inputs
+    // from stages that come after it in no case but resolves them from earlier
+    // ones always, so the whole array has to be clean before the first one.
+    for (Stage& s : m_stages) s.bypassOf = PortRef{-2, 0};
 
     // For the live elapsed time reported between stages. The worker times the
     // whole call for its own final figure; this one exists so the status line
@@ -653,6 +698,12 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
             m_stages[firstDirty].outputs = std::move(prev->m_stages[firstDirty].outputs);
             m_stages[firstDirty].kernel  = prev->m_stages[firstDirty].kernel;
             m_stages[firstDirty].valid   = true;
+
+            // A cached BYPASSED stage is valid and holds nothing: its result is
+            // whatever its input resolves to. The alias has to come across with
+            // it, or the next stage resolves this one to no data and the run
+            // fails with "has an input that produced no data".
+            m_stages[firstDirty].bypassOf = ps.bypassOf;
             ++m_cachedStages;
             ++firstDirty;
         }
@@ -786,6 +837,45 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
             }
             in.push_back(d);
         }
+        // A stage that says it would change nothing is skipped ENTIRELY: no
+        // allocation, no dispatch, no copy.
+        //
+        // The output ALIASES the input -- s.bypassOf records which port to
+        // follow, and Resolve() walks it -- so downstream reads the upstream
+        // image directly. That is what makes an unused effect cost nothing
+        // rather than "one cheap pass": a script stacking twenty effects with
+        // three enabled allocates three intermediates, not twenty.
+        //
+        // Refused unless the stage is genuinely shaped like a pass-through.
+        // One input, one output, and the declared output format must be the
+        // input's -- a demosaic widening R32F to RGBA16F cannot be bypassed
+        // even at settings that "do nothing", because the TYPE changes and
+        // downstream would receive a mosaic where it expects RGB. The
+        // algorithm does not get to opt out of this check.
+        if (s.algo->IsNoOp() && s.inputs.size() == 1 && s.outputs.size() == 1 &&
+            !s.algo->IsReduction() && !s.algo->IsReshape() && !s.algo->IsAligner()) {
+            const PortList outPorts = s.algo->Outputs();
+            const bool sameFormat =
+                outPorts.size() == 1 &&
+                (outPorts[0].format == FormatSpec::SameAsInput ||
+                 outPorts[0].format == FormatSpec::Any ||
+                 // An explicit format is fine when the input already has it.
+                 (TypeOf(*in[0]) == DataType::Image &&
+                  MatchesSpec(outPorts[0].format, std::get<Image>(*in[0]).Desc().format)));
+            const bool sameShape =
+                outPorts.size() == 1 && outPorts[0].shape != ShapeSpec::Reduced;
+
+            if (sameFormat && sameShape) {
+                s.outputs.clear();
+                s.outputs.resize(1);          // stays empty: nothing is produced
+                s.bypassOf = s.inputs[0];
+                s.valid    = true;
+                ++m_bypassedStages;
+                continue;
+            }
+        }
+        s.bypassOf = PortRef{-2, 0};          // not bypassed this run
+
         // An aligner annotates the whole set at once: every frame is solved
         // against a common reference, so it cannot run one frame at a time.
         // Handled here for the same reason as a reshape.

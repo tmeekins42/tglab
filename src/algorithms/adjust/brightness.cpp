@@ -58,6 +58,14 @@ public:
         m_out.PackInto(dst);
     }
 
+    // No offset and unit gain is exactly the identity, so the stage is skipped
+    // outright -- no allocation, no dispatch, no copy. This is the shape most
+    // adjustments take: a neutral setting a stacked script leaves alone most of
+    // the time, which is precisely when it should cost nothing.
+    bool IsNoOp() const override {
+        return float(m_brightness) == 0.0f && float(m_gain) == 1.0f;
+    }
+
     // --- GPU implementation -------------------------------------------------
     // One fetch, two operations, one store. Nothing here is interesting except
     // the units, which are the one place the two paths could disagree.

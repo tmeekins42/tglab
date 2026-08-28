@@ -49,6 +49,11 @@ struct Stage {
     // later lines can be checked against it at build time. Empty otherwise.
     Shape                reshapeTo;
 
+    // When this stage was skipped as a no-op, the port its output aliases.
+    // stage == -2 means "not bypassed"; -1 would be ambiguous with a palette
+    // source, which is a legitimate thing to alias.
+    PortRef              bypassOf{-2, 0};
+
     // When this stage was consumed by a fused reduction, the stage that owns
     // its result. -1 otherwise. The cache scan uses it to look past a stage
     // that legitimately holds nothing.
@@ -138,6 +143,11 @@ public:
     int CpuStageCount()    const { return m_cpuStages; }
     int CachedStageCount() const { return m_cachedStages; }
 
+    // Stages skipped because their settings would change nothing. Reported so a
+    // stacked script can show "12 stages, 9 bypassed" rather than leaving the
+    // user to wonder whether an effect they turned off is still costing them.
+    int BypassedStageCount() const { return m_bypassedStages; }
+
     // Index of the first stage that actually re-ran. Everything below it kept
     // its cached output, so a viewer reading from there shows the same pixels
     // it showed last run -- which is what lets the UI skip re-uploading it.
@@ -179,6 +189,7 @@ private:
     std::vector<std::string> m_gpuFallbacks;
     int                     m_cpuStages = 0;
     int                     m_cachedStages = 0;
+    int                     m_bypassedStages = 0;
     size_t                  m_firstDirty = 0;
 
     // When the current Execute() began, so the live tallies published to

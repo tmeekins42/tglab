@@ -45,10 +45,10 @@
 
 tonemap_op = choose("tonemapper", [tonemap, tonemap_local])
 
-a = image("group") => params( align )()
-                   => params( merge_hdr )()
-                   => display( "raw merged hdr" )
-                   => params( tonemap_op )()
-                   => params( basic_adjust, auto_exposure = 1 )()
-                   => params( wavelet_denoise )()
-                   => display( "final" )
+image("group") => params( align )()
+               => params( merge_hdr )()
+               => display( "raw merged hdr" )
+               => params( tonemap_op )()
+               => params( basic_adjust, auto_exposure = 1 )()
+               => params( wavelet_denoise )()
+               => display( "final" )

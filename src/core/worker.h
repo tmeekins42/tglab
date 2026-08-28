@@ -117,6 +117,9 @@ public:
     int LastGpuStages()    const { return m_lastGpuStages.load(std::memory_order_relaxed); }
     int LastCpuStages()    const { return m_lastCpuStages.load(std::memory_order_relaxed); }
     int LastCachedStages() const { return m_lastCachedStages.load(std::memory_order_relaxed); }
+
+    // Stages skipped because their settings would change nothing.
+    int LastBypassedStages() const { return m_lastBypassed.load(std::memory_order_relaxed); }
     double LastRunMs() const { return m_lastMs.load(std::memory_order_relaxed); }
 
     // Of the last run, how much was GPU submit-and-wait. The rest is CPU-side
@@ -214,6 +217,7 @@ private:
     std::atomic<int>      m_lastCachedStages{0};
     std::atomic<double>   m_lastMs{0.0};
     std::atomic<double>   m_lastGpuMs{0.0};
+    std::atomic<int>      m_lastBypassed{0};
 
     // Guarded by m_mtx rather than atomic: a vector of strings cannot be.
     std::vector<std::string> m_lastReports;

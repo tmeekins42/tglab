@@ -47,29 +47,10 @@ BUGS / SMALL FEATURES
   this would be a good time to add an error icon on the thumbnail if the image failed to load
 
 NEW FEATURES / IDEAS
-- LOCAL TONEMAP (tonemap_local). The global operator is doing what a global
-  operator can: on hdrtest2 the sky keeps its ordering and 1.36 of its 1.89
-  stops through a full highlight recovery. It still READS flat, and that is not
-  a bug -- the sky spans 1.9 stops while the scene spans 5.8, so it occupies a
-  small slice of the range and sits next to much darker land.
-  A local operator is the fix: split base from detail with an edge-preserving
-  filter (guided_filter is already here), compress the BASE hard, keep the
-  detail. Registered separately so the two can be compared in one script, which
-  is the point. Watch for halos -- that is the failure mode, and why global is
-  worth keeping as the default.
 - add support for additional image channels, such as alpha channels and depth channels
 - channel merging. Astronomy images are captured single channel with colored filters. How to merge them?
 - image export
 - batch processing
-- an option to visualize clipping regions in the image. can we visual crush as well?
-- the image palette is a collection of images. I would like the option to make a palette entry into a image group.
-  + in a group, dropping an image adds it to the list instead of replacing
-  + we'll need a remove image option (right-click)
-  + an image group/list is a new data type. Some algorithms take an image list as input (focus stacking, panorama merging, SfM...)
-  + a group has a hidden frame number and a play button can make us cycle the frame number. this does nothing for algorithms that take an image list
-  + algorithms that take a single image will use the image at the image index in the group. when the index changes if play is pressed, updates the dirty flag to re-process
-  + a video file can be dropped into a group as well
-  + for videos, we might need a way to set start/end frames as we probably don't need the entire video.
 - Focus stacking
 - feature tracking support, numerous algorithms
 - features should be associated with the image. Feature tracking is used for matching images, so every image in a group/image list will have a feature list.
@@ -91,6 +72,7 @@ NEW FEATURES / IDEAS
 - Glow - spreads light from bright areas, diffusion, bloom, halation, etc
 - Grain
 - alternare to scripts... visually drag and drop connections
+- hdr de-ghosting
 
 NOTES
 - if we need matrix functions, I suggest the Euler library and Ceres for bundle solving

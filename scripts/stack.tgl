@@ -1,0 +1,25 @@
+# Stacking effects, most of them off.
+#
+# The point of this script is what it does NOT cost. Every stage below is
+# available, and a stage whose settings would change nothing is skipped
+# entirely -- no allocation, no dispatch, no copy. Its output aliases its
+# input, so the pixels flow straight through.
+#
+# That is what makes a long stack practical. Twenty effects with three in use
+# allocates three intermediates, not twenty, and at 45 MP that is the
+# difference between a usable pipeline and one that pages.
+#
+# Watch the status line: it says how many stages were bypassed, so "did that
+# actually skip?" is answerable rather than a matter of faith.
+#
+# Set any of these to its neutral value and the stage disappears from the run:
+#   gaussian_blur   sigma  = 0
+#   brightness      brightness = 0 and gain = 1
+#   wavelet_denoise luma = 0 and chroma = 0
+
+src = image("test")
+
+src => params( gaussian_blur )()
+    => params( brightness )()
+    => params( wavelet_denoise )()
+    => display( "stacked" )
