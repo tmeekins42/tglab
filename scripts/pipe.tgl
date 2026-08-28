@@ -40,3 +40,8 @@ display(src => op(), "chosen blur")
 # failure -- pipes are for the linear stretches.
 gx, gy, mag = sobel(src => gaussian_blur(sigma = sigma))
 display(mag, "gradient magnitude")
+
+# display() takes its image first too, so a chain can just end in the viewer.
+# It is a builtin rather than a registered algorithm, but the pipe splices the
+# argument in before anything looks at the name, so it makes no difference.
+src => gaussian_blur(sigma = sigma) => grayscale() => display("chain to viewer")

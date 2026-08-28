@@ -2802,6 +2802,32 @@ int main() {
               "arithmetic evaluates before it is piped" + (ok ? "" : ": " + err));
     }
 
+    // Piping into display(). It is a builtin rather than a registered
+    // algorithm, but the pipe does not care: it splices into the argument list
+    // before anything looks at the name, and display() already takes its image
+    // first. So a whole chain can end in a viewer.
+    {
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        const bool ok = RunScript(
+            "src = image(\"test\")\n"
+            "src => gaussian_blur(sigma = 2) => display(\"piped view\")\n",
+            &ui, &p, &err, &src);
+        Check(ok && p.Viewers().size() == 1 && p.Stages().size() == 1,
+              "a chain can end in display()" + (ok ? "" : ": " + err));
+        Check(ok && !p.Viewers().empty() && p.Viewers()[0].name == "piped view",
+              "the piped display() keeps its name argument");
+    }
+
+    // The same, into a bare display with no arguments at all.
+    {
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        const bool ok = RunScript(
+            "src = image(\"test\")\n"
+            "src => grayscale() => display\n", &ui, &p, &err, &src);
+        Check(ok && p.Viewers().size() == 1,
+              "a chain can end in a bare display" + (ok ? "" : ": " + err));
+    }
+
     // '=>' must not confuse the assignment lookahead. This is the concrete
     // reason the lexer emits one token rather than '=' followed by '>': the
     // statement parser calls a line an assignment when it sees a bare '=' at
