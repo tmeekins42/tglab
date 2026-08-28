@@ -90,9 +90,6 @@ NEW FEATURES / IDEAS
 - algorithm to fix chromatic aberation. can it be detected and auto fixed without analysing the lens?
 - have an option to drag a splitter so we can see before/after on a single image.
 - create thousands of synthetic images, sample them like a raw sensor, then use deep learning to find a demosaic neural network
-- alternate form of nested script functions func1() => func2() => func3(). Many modern 
-  computer languages are adopting this as long as the main object we pass is the first argument.
-  I think this can be easier to read and understand by non-programmers than nested calls.
 - at some point i think we might need an interactive script editor in the app instead of depending
   on an external text editor. It could even be smart with pulldowns for commands and algorithms
   should also support syntax highlighting.
