@@ -5,6 +5,7 @@
 // changed, reusing cached outputs before that point.
 #pragma once
 
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <string>
@@ -179,6 +180,21 @@ private:
     int                     m_cpuStages = 0;
     int                     m_cachedStages = 0;
     size_t                  m_firstDirty = 0;
+
+    // When the current Execute() began, so the live tallies published to
+    // Progress can report elapsed time. A member rather than a local because
+    // the per-frame loops -- which is where a slow run actually spends its
+    // time -- publish from inside the helpers, not from Execute's own scope.
+    std::chrono::steady_clock::time_point m_runStart{};
+
+    // Publishes the running CPU/GPU/elapsed tallies, if anyone is listening.
+    // One place, so the several call sites cannot drift apart.
+    void PublishStats(Progress* progress) const {
+        if (!progress) return;
+        progress->SetStats(m_cpuStages, m_gpuStages,
+                           std::chrono::duration<double, std::milli>(
+                               std::chrono::steady_clock::now() - m_runStart).count());
+    }
 };
 
 } // namespace tglab

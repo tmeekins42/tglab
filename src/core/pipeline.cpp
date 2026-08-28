@@ -210,6 +210,10 @@ bool Pipeline::RunFusedReduction(int reduceStage, const std::vector<int>& chain,
             std::snprintf(what, sizeof what, "%s  frame %d/%d", red.algoName.c_str(),
                           int(f) + 1, int(set->images.size()));
             progress->Set(int(f), int(set->images.size()), what);
+            // Per frame as well as per stage: this loop IS the slow part of a
+            // multi-frame merge, so an elapsed time that only advanced between
+            // stages would sit frozen for the whole of it.
+            PublishStats(progress);
         }
 
         // Carry this one frame through every stage of the chain. `carried` owns
@@ -542,6 +546,7 @@ bool Pipeline::BroadcastStage(Stage& s, const std::vector<const Data*>& in,
             std::snprintf(what, sizeof what, "%s  frame %d/%d", s.algoName.c_str(),
                           int(f) + 1, int(src.images.size()));
             progress->Set(int(f), int(src.images.size()), what);
+            PublishStats(progress);   // same reason as the fused loop
         }
 
         // Swap this frame in for the set input; every other input is passed
@@ -599,6 +604,12 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
     m_gpuFallbacks.clear();
     m_cpuStages = 0;
     m_cachedStages = 0;
+
+    // For the live elapsed time reported between stages. The worker times the
+    // whole call for its own final figure; this one exists so the status line
+    // can count up during a slow run instead of sitting at the previous run's
+    // number until this one finishes.
+    m_runStart = std::chrono::steady_clock::now();
     // Find the first stage that differs from the previous run. Everything
     // before it can reuse its cached output. Comparing by hash means there is
     // no dirty flag to forget to set.
@@ -726,9 +737,16 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
         // Stage-level progress. Counted from firstDirty rather than from zero,
         // so a cache hit that skips most of the pipeline does not show a bar
         // crawling through work that is not happening.
-        if (progress)
+        if (progress) {
             progress->Set(int(i - firstDirty), int(m_stages.size() - firstDirty),
                           s.algoName.c_str());
+            // Tallies as of the stages ALREADY finished, so the numbers on
+            // screen always describe completed work rather than the stage
+            // currently running. Published here, before the stage runs, for
+            // exactly that reason: a count incremented mid-stage would claim
+            // work that has not happened yet.
+            PublishStats(progress);
+        }
 
         s.valid = false;
 
@@ -854,6 +872,13 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
             return false;
         }
     }
+
+    // The last stage's contribution. Every publish above describes the stages
+    // finished BEFORE it, so without this the final stage never appears in the
+    // live tally -- on a one-stage pipeline the counts would stay at zero for
+    // the entire run.
+    if (progress)
+        PublishStats(progress);
 
     return true;
 }

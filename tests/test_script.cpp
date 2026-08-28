@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <atomic>
 #include <thread>
 #include <string>
 #include <vector>
@@ -3101,6 +3102,71 @@ int main() {
         }
     }
 #endif
+
+    // --- live per-stage stats ------------------------------------------------
+    //
+    // The tallies must advance DURING a run, not only at the end. Checked by
+    // watching Progress from another thread while a multi-stage pipeline runs
+    // and recording whether the counts were ever seen part-way -- which is the
+    // only way to tell "updated per stage" from "updated once at the end", and
+    // the thing the todo item actually asked for.
+    {
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        const bool built = RunScript(
+            "src = image(\"test\")\n"
+            "out = src => gaussian_blur(sigma = 3)\n"
+            "          => gaussian_blur(sigma = 3)\n"
+            "          => gaussian_blur(sigma = 3)\n"
+            "          => gaussian_blur(sigma = 3)\n"
+            "display(out)\n", &ui, &p, &err, &src);
+        Check(built && p.Stages().size() == 4,
+              "built a four-stage pipeline to watch" + (built ? "" : ": " + err));
+
+        if (built) {
+            // Recorded from INSIDE the run, via the SetStats hook, rather than
+            // by polling from another thread.
+            //
+            // A watcher thread was the obvious approach and measured nothing:
+            // the test image is 4x4, so four blurs finish long before the
+            // watcher is scheduled. It failed every run while telling us only
+            // about thread startup. Overriding the publish point instead makes
+            // the sequence exact and the test deterministic.
+            struct Recording : Progress {
+                std::vector<std::pair<int, double>> seen;   // {stages, elapsedMs}
+                void SetStats(int cpu, int gpu, double ms) override {
+                    Progress::SetStats(cpu, gpu, ms);
+                    seen.emplace_back(cpu + gpu, ms);
+                }
+            } prog;
+
+            std::string rerr;
+            Pipeline fresh = std::move(p);
+            const bool ran = fresh.Execute(&src, nullptr, &rerr, nullptr,
+                                           ExecMode::ForceCPU, nullptr, nullptr, &prog);
+            Check(ran, "the watched pipeline ran" + (ran ? "" : ": " + rerr));
+
+            // Published more than once: that is the whole point of the change.
+            // One publish would mean the tallies still only appear at the end.
+            Check(prog.seen.size() >= 4,
+                  "stats are published per stage, not once at the end (" +
+                      std::to_string(prog.seen.size()) + " publishes)");
+
+            // And they climb: each publish reports the stages finished so far,
+            // so the sequence must be non-decreasing and must reach 4.
+            bool climbs = !prog.seen.empty();
+            for (size_t i = 1; i < prog.seen.size(); ++i)
+                if (prog.seen[i].first < prog.seen[i - 1].first) climbs = false;
+            Check(climbs, "the published stage count never goes backwards");
+
+            // The final tally accounts for every stage INCLUDING the last --
+            // publishes happen before each stage runs, so without the one after
+            // the loop the last stage would never be counted.
+            Check(!prog.seen.empty() && prog.seen.back().first >= 4,
+                  "the last stage is included in the final tally");
+            Check(prog.CpuStages() + prog.GpuStages() >= 4,
+                  "the published total matches the stage count");
+        }
+    }
 
     std::printf("\n%s\n", g_fail == 0 ? "all checks passed" : "FAILURES PRESENT");
     return g_fail == 0 ? 0 : 1;

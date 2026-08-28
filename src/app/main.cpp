@@ -2832,8 +2832,19 @@ void App::Frame() {
             ImGui::TextDisabled("| worst frame %.0f ms", g_worstFrameMs);
         }
 
-        const int cached = m_worker.LastCachedStages();
-        if (cached > 0) {
+        // While a run is in flight, these are THIS run's numbers as far as it
+        // has got, counting up between stages. Idle, they are the last
+        // completed run's.
+        //
+        // The live figures come from Progress rather than the worker's
+        // published totals, which are deliberately written only once a run
+        // finishes -- a cancelled run must not overwrite them, or a slider drag
+        // flickers between the real timing and a near-zero one.
+        if (m_worker.Busy()) {
+            const Progress& p = m_worker.GetProgress();
+            ImGui::TextDisabled("running  %.1f ms   %d CPU / %d GPU so far   [%s]",
+                                p.ElapsedMs(), p.CpuStages(), p.GpuStages(), modeName);
+        } else if (const int cached = m_worker.LastCachedStages(); cached > 0) {
             ImGui::TextDisabled("last run %.1f ms   %d CPU / %d GPU / %d cached   [%s]",
                                 m_worker.LastRunMs(), m_worker.LastCpuStages(),
                                 m_worker.LastGpuStages(), cached, modeName);
