@@ -321,14 +321,47 @@ private:
                 calleeName = it->second.AsAlgo().name;
             }
         } else if (e.lhs) {
+            // The ARGUMENTS are evaluated before the callee expression, and the
+            // order matters for more than tidiness.
+            //
+            // A pipe nests outward: `a => f() => g()` is g(f(a)), so the LAST
+            // stage in a chain is the outermost call. Resolving the callee
+            // first therefore ran g's params() before descending into f's, and
+            // the control panel came out in reverse -- denoise's sliders above
+            // the develop sliders that feed it. Nested calls always had this;
+            // the pipe form made it visible, because a chain reads in stage
+            // order and the panel plainly did not match.
+            //
+            // Evaluating arguments first puts control declaration in the order
+            // the stages run, which is what a reader expects. Cached here
+            // because each Call* handler evaluates arguments itself, and doing
+            // it twice would declare every control twice and record duplicate
+            // stages.
+            EvaledArgs pre;
+            if (!EvalArgs(e, &pre)) return false;
+
+            // Note m_preEvaled stays null across this Eval: the callee
+            // expression is `params(...)` or a variable, and it may contain
+            // calls of its own -- which must evaluate their OWN arguments, not
+            // inherit ours.
             Value v;
             if (!Eval(*e.lhs, &v)) return false;
             if (!v.IsAlgo())
                 return Fail(e.line, std::string("cannot call ") + v.TypeName());
             paramsKey  = v.AsAlgo().paramsKey;
             calleeName = v.AsAlgo().name;
+
+            m_preEvaled = &pre;
+            const bool r = Dispatch(calleeName, paramsKey, e, out, wantAll);
+            m_preEvaled = nullptr;
+            return r;
         }
 
+        return Dispatch(calleeName, paramsKey, e, out, wantAll);
+    }
+
+    bool Dispatch(const std::string& calleeName, const std::string& paramsKey,
+                  const Expr& e, std::vector<Value>* out, bool wantAll) {
         if (calleeName == "image")   return CallImage(e, out);
         if (calleeName == "mosaic")  return CallMosaic(e, out);
         if (calleeName == "shape")   return CallShape(e, out);
@@ -348,6 +381,15 @@ private:
     };
 
     bool EvalArgs(const Expr& e, EvaledArgs* out) {
+        // Reuse what EvalCall already evaluated for this call, when it had to
+        // evaluate the arguments before resolving a non-identifier callee. The
+        // arguments are the same expressions either way, and evaluating them a
+        // second time would record every stage twice.
+        if (m_preEvaled) {
+            *out = std::move(*m_preEvaled);
+            m_preEvaled = nullptr;
+            return true;
+        }
         for (const Arg& a : e.args) {
             Value v;
             if (!Eval(*a.value, &v)) return false;
@@ -918,6 +960,12 @@ private:
     // Keyed by algorithm name.
     struct ParamValues { std::vector<std::pair<std::string, double>> values; };
     std::unordered_map<std::string, ParamValues> m_pendingParams;
+
+    // Arguments EvalCall already evaluated for the call it is dispatching, so
+    // the Call* handler reuses them instead of evaluating a second time. Null
+    // except across a single Dispatch, and deliberately null while the callee
+    // expression itself is evaluated -- see EvalCall.
+    EvaledArgs* m_preEvaled = nullptr;
 
     // The demosaic image() inserts for a mosaic source, and the stage already
     // recorded for each one -- two image("x") calls should share a stage rather

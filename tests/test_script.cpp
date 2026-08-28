@@ -2969,6 +2969,63 @@ int main() {
         Check(samePort, "the returned port is the same one, not a copy");
     }
 
+    // Control order follows the order the stages run, which is denoise.tgl's
+    // shape: two params() calls in one pipe chain.
+    {
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        const bool ok = RunScript(
+            "image(\"test\") => params(basic_adjust, auto_exposure = 1)()\n"
+            "               => display(\"original\")\n"
+            "               => params(wavelet_denoise)()\n"
+            "               => display(\"denoised\")\n", &ui, &p, &err, &src);
+        Check(ok, "denoise.tgl's two-params chain runs" + (ok ? "" : ": " + err));
+
+        // basic_adjust runs first, so its sliders come first. Before, the
+        // callee was resolved before its arguments, so the LAST stage in a
+        // chain declared its controls first and the panel read backwards.
+        int firstAdjust = -1, firstDenoise = -1;
+        for (const UiControl& c : ui.Controls()) {
+            if (firstAdjust < 0 && c.label.rfind("basic_adjust.", 0) == 0)
+                firstAdjust = c.declOrder;
+            if (firstDenoise < 0 && c.label.rfind("wavelet_denoise.", 0) == 0)
+                firstDenoise = c.declOrder;
+        }
+        Check(firstAdjust >= 0 && firstDenoise >= 0 && firstAdjust < firstDenoise,
+              "controls appear in the order their stages run, not reversed");
+    }
+
+    // The same ordering for the nested spelling, which had the identical bug.
+    {
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        const bool ok = RunScript(
+            "src = image(\"test\")\n"
+            "out = params(wavelet_denoise)(params(basic_adjust)(src))\n"
+            "display(out)\n", &ui, &p, &err, &src);
+
+        int firstAdjust = -1, firstDenoise = -1;
+        for (const UiControl& c : ui.Controls()) {
+            if (firstAdjust < 0 && c.label.rfind("basic_adjust.", 0) == 0)
+                firstAdjust = c.declOrder;
+            if (firstDenoise < 0 && c.label.rfind("wavelet_denoise.", 0) == 0)
+                firstDenoise = c.declOrder;
+        }
+        Check(ok && firstAdjust >= 0 && firstDenoise >= 0 && firstAdjust < firstDenoise,
+              "nested calls order their controls the same way" + (ok ? "" : ": " + err));
+    }
+
+    // Evaluating arguments before the callee must not record a stage twice --
+    // the arguments are cached rather than evaluated again.
+    {
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        const bool ok = RunScript(
+            "src = image(\"test\")\n"
+            "out = src => params(gaussian_blur, sigma = 2)()\n"
+            "          => params(grayscale)()\n"
+            "display(out)\n", &ui, &p, &err, &src);
+        Check(ok && p.Stages().size() == 2,
+              "a piped params() chain records each stage once" + (ok ? "" : ": " + err));
+    }
+
     // '=>' must not confuse the assignment lookahead. This is the concrete
     // reason the lexer emits one token rather than '=' followed by '>': the
     // statement parser calls a line an assignment when it sees a bare '=' at
