@@ -264,6 +264,30 @@ int main(int argc, char** argv) {
                                 e += double(gx) * double(gx) + double(gy) * double(gy);
                             }
                         std::printf("sharpness: %.4g\n", e);
+
+                        // Scale-invariant local contrast: |gradient| relative
+                        // to the local value, averaged.
+                        //
+                        // Raw gradient energy is NOT comparable between two
+                        // renderings at different brightness -- scaling an
+                        // image by 2 quadruples it while changing no contrast
+                        // at all. That matters precisely here, because a tone
+                        // mapper's whole job is to change brightness, so the
+                        // plain figure would credit any operator that merely
+                        // brightened the frame. This ratio is what "local
+                        // contrast" actually means and it survives a rescale.
+                        double rel = 0.0;
+                        size_t relN = 0;
+                        for (int y = 8; y < sb.Height() - 8; y += 3)
+                            for (int x = 8; x < sb.Width() - 8; x += 3) {
+                                const float c = sb.At(x, y)[1];
+                                if (c < 1e-4f) continue;   // noise, not contrast
+                                const float gx = sb.At(x + 1, y)[1] - sb.At(x - 1, y)[1];
+                                const float gy = sb.At(x, y + 1)[1] - sb.At(x, y - 1)[1];
+                                rel += std::sqrt(double(gx) * gx + double(gy) * gy) / double(c);
+                                ++relN;
+                            }
+                        if (relN) std::printf("local contrast: %.4f\n", rel / double(relN));
                     }
                     std::printf("result: %dx%d  min %.5f  max %.4f  mean %.5f\n",
                                 im->Desc().width, im->Desc().height,

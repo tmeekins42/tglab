@@ -1,0 +1,22 @@
+# Global against local tone mapping, side by side.
+#
+# The global operator applies ONE curve to every pixel: no halos, trivially
+# fast, and structurally unable to give a bright region more of the display
+# without taking the same from everywhere else. On a merged bracket the sky
+# keeps its ordering and still reads flat.
+#
+# The local operator splits the image into ILLUMINATION (large scale, hugely
+# variable) and REFLECTANCE (small scale, bounded by what materials do),
+# compresses only the illumination, and puts the detail back untouched. The
+# split is in log space, which is what makes local contrast survive the
+# compression identically in bright and dark regions alike.
+#
+# params() gives each operator its own group of sliders, so both are tunable
+# in one panel. Watch for halos around strong edges -- a bright rim on the
+# dark side of a skyline is the failure mode, and the reason global stays
+# the default.
+
+src = image("test")
+
+src => params(tonemap)()       => display("1 global")
+src => params(tonemap_local)() => display("2 local")

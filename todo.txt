@@ -41,8 +41,6 @@ BUGS / SMALL FEATURES
 - add right-click sort by date in the groups, like sort by name. Use EXIF shot
   date, and fall back to file timestamp if there's no EXIF.
 - add drag/move to the image palette and group for re-ordering
-- demosaic chroma pass is 22ms of the entire ~45ms... worth optimizing this. I think
-  several demosaic algorithms use the chroma pass.
 - when an image is loading/processing, put a spinner over the thumbnail in the image palette
   if the image is cached, etc, maybe another icon over the thumbnail to show this
   this has no practical purpose, but I think it's nice for the user to watch the processing

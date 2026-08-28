@@ -3174,6 +3174,130 @@ int main() {
         }
     }
 
+    // --- tonemap_local -------------------------------------------------------
+    //
+    // Built on a synthetic scene with the structure the operator exists for: a
+    // large ILLUMINATION step (bright region beside dark) with fine TEXTURE of
+    // the same relative amplitude in both. A global curve cannot keep the
+    // texture in both halves while also closing the gap between them; that
+    // separation is exactly what is being tested.
+    {
+        constexpr int kW = 128, kH = 96;
+        auto scene = [&] {
+            Image img;
+            ImageDesc d{kW, kH, Format::RGBA32F};
+            d.linear = true;
+            img.Alloc(d);
+            ImageView v = img.MapCpuWrite();
+            for (int y = 0; y < kH; ++y)
+                for (int x = 0; x < kW; ++x) {
+                    // Four stops of illumination between the halves.
+                    const float illum = (x < kW / 2) ? 0.25f : 4.0f;
+                    // Multiplicative texture: the SAME local contrast ratio in
+                    // both halves, which is what the log split should preserve
+                    // identically on each side.
+                    const float tex = 1.0f + 0.25f * float(((x / 2 + y / 2) & 1) ? 1 : -1);
+                    float* p = v.At<float>(x, y);
+                    p[0] = p[1] = p[2] = illum * tex;
+                    p[3] = 1.0f;
+                }
+            return img;
+        };
+
+        // Mean |gradient| / value: local contrast, invariant to a rescale.
+        // Raw gradient energy would credit any operator that merely brightened
+        // the image, which is the one thing a tone mapper is guaranteed to do.
+        auto localContrast = [&](Image& im, int x0, int x1) {
+            ImageView v = im.MapCpuRead();
+            double acc = 0.0; size_t n = 0;
+            for (int y = 2; y < kH - 2; ++y)
+                for (int x = x0 + 2; x < x1 - 2; ++x) {
+                    const float c = v.At<float>(x, y)[1];
+                    if (c < 1e-5f) continue;
+                    const float gx = v.At<float>(x + 1, y)[1] - v.At<float>(x - 1, y)[1];
+                    const float gy = v.At<float>(x, y + 1)[1] - v.At<float>(x, y - 1)[1];
+                    acc += std::sqrt(double(gx) * gx + double(gy) * gy) / double(c);
+                    ++n;
+                }
+            return n ? acc / double(n) : 0.0;
+        };
+
+        auto runOp = [&](const std::string& call, Image* out) {
+            auto algo = Registry::Get().Create("tonemap_local");
+            if (!algo) return false;
+            Pipeline p;
+            std::vector<Data> srcs;
+            srcs.push_back(Data{scene()});
+            p.AddStage(std::move(algo), "tonemap_local", {{-1, 0}}, 1, 1);
+            std::string e;
+            if (!p.Execute(&srcs, nullptr, &e)) return false;
+            const Data* d = p.Resolve({0, 0}, &srcs);
+            const auto* im = d ? std::get_if<Image>(d) : nullptr;
+            if (!im) return false;
+            *out = const_cast<Image&>(*im).Clone();
+            (void)call;
+            return true;
+        };
+
+        Image src = scene();
+        const double refDark   = localContrast(src, 0, kW / 2);
+        const double refBright = localContrast(src, kW / 2, kW);
+
+        // The fixture must actually have equal relative contrast on both sides,
+        // or the comparison below proves nothing about the operator.
+        Check(refDark > 0.05 && std::fabs(refDark - refBright) / refDark < 0.05,
+              "fixture: both halves carry the same local contrast");
+
+        Image mapped;
+        if (runOp("tonemap_local(src)", &mapped)) {
+            const double gotDark   = localContrast(mapped, 0, kW / 2);
+            const double gotBright = localContrast(mapped, kW / 2, kW);
+
+            // The illumination step must shrink. This is the compression.
+            ImageView a = src.MapCpuRead();
+            ImageView b = mapped.MapCpuRead();
+            const double stepBefore =
+                std::log2(double(a.At<float>(kW - 8, kH / 2)[1]) /
+                          std::max(double(a.At<float>(8, kH / 2)[1]), 1e-9));
+            const double stepAfter =
+                std::log2(double(b.At<float>(kW - 8, kH / 2)[1]) /
+                          std::max(double(b.At<float>(8, kH / 2)[1]), 1e-9));
+            Check(std::fabs(stepAfter) < std::fabs(stepBefore) * 0.95,
+                  "the illumination step is compressed (" +
+                      std::to_string(stepBefore) + " -> " +
+                      std::to_string(stepAfter) + " stops)");
+
+            // And the texture must survive in BOTH halves, not just the one the
+            // curve happened to favour. A global operator squeezing this scene
+            // loses the bright half's texture; that is the failure this
+            // algorithm exists to avoid.
+            //
+            // The threshold is 0.9, not something looser, and that was
+            // calibrated rather than guessed: compressing in LINEAR space
+            // instead of log -- scaling the detail along with the base, the
+            // single most likely way to get this wrong -- leaves 0.629 against
+            // the reference 0.754, which is 83%. A 0.6 threshold passed that
+            // broken version happily. Verified by making the change and
+            // watching this check stay green before tightening it.
+            Check(gotDark > refDark * 0.9,
+                  "texture survives in the dark half (" + std::to_string(gotDark) +
+                      " vs " + std::to_string(refDark) + ")");
+            Check(gotBright > refBright * 0.9,
+                  "texture survives in the bright half (" + std::to_string(gotBright) +
+                      " vs " + std::to_string(refBright) + ")");
+
+            // Both halves must keep it to a SIMILAR degree. Preserving one and
+            // crushing the other is precisely what a global curve does, so this
+            // is the check that distinguishes local from global.
+            const double ratio = (gotBright > 0.0) ? gotDark / gotBright : 0.0;
+            Check(ratio > 0.7 && ratio < 1.4,
+                  "both halves keep their texture equally (ratio " +
+                      std::to_string(ratio) + ")");
+        } else {
+            Check(false, "tonemap_local ran");
+        }
+    }
+
     std::printf("\n%s\n", g_fail == 0 ? "all checks passed" : "FAILURES PRESENT");
     return g_fail == 0 ? 0 : 1;
 }
