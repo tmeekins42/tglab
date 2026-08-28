@@ -752,7 +752,21 @@ private:
 
         const PortHandle h = a.pos[0].AsPort();
         m_pipe->AddViewer(std::move(name), PortRef{h.stage, h.port});
-        (void)out;   // display() yields nothing
+
+        // display() hands its image back, so it can sit MID-chain as a tap:
+        //
+        //     out = src => blur(sigma = 2) => display("blurred") => grayscale()
+        //
+        // It is the same port, not a copy -- no stage is recorded and nothing
+        // is computed twice; the viewer and whatever comes next read the one
+        // result. Yielding nothing made a mid-chain display fail with
+        // "'grayscale' input 'src' expects an image, got nothing", which is
+        // honest but is a limit with no reason behind it.
+        //
+        // A bare `display(x)` statement is unaffected: a statement with no
+        // targets discards what it evaluates to (see ExecStmt), so this does
+        // not turn every existing display() line into an arity error.
+        out->push_back(a.pos[0]);
         return true;
     }
 

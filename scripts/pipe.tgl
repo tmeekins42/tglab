@@ -45,3 +45,10 @@ display(mag, "gradient magnitude")
 # It is a builtin rather than a registered algorithm, but the pipe splices the
 # argument in before anything looks at the name, so it makes no difference.
 src => gaussian_blur(sigma = sigma) => grayscale() => display("chain to viewer")
+
+# display() hands its image back, so it can sit mid-chain as a tap: watch an
+# intermediate without breaking the chain or recomputing anything. It is the
+# same port, not a copy, so no extra stage is recorded.
+tapped = src => display("a source")
+             => gaussian_blur(sigma = sigma) => display("b blurred")
+             => grayscale() => display("c gray")

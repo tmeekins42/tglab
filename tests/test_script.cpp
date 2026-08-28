@@ -2903,6 +2903,72 @@ int main() {
         Check(sigmas == 2, "piped params() instances keep separate controls");
     }
 
+    // display() mid-chain.
+    {
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        const bool ok = RunScript(
+            "src = image(\"test\")\n"
+            "out = src => gaussian_blur(sigma = 2) => display(\"mid\") => grayscale()\n"
+            "display(out, \"final\")\n", &ui, &p, &err, &src);
+        Check(ok, "display() can sit mid-chain" + (ok ? "" : ": " + err));
+        Check(ok && p.Stages().size() == 2 && p.Viewers().size() == 2,
+              "a mid-chain display taps without adding a stage");
+
+        // The tap must show the INTERMEDIATE, not the final result -- that is
+        // the entire point. The "mid" viewer should point at the blur, and
+        // "final" at the grayscale after it.
+        const ViewerDecl* mid   = nullptr;
+        const ViewerDecl* final = nullptr;
+        for (const ViewerDecl& v : p.Viewers()) {
+            if (v.name == "mid")   mid   = &v;
+            if (v.name == "final") final = &v;
+        }
+        Check(mid && final && mid->source.stage != final->source.stage,
+              "the tap and the final view show different stages");
+        Check(mid && p.Stages()[mid->source.stage].algoName == "gaussian_blur",
+              "the tap shows the stage it was placed after");
+    }
+
+    // Two taps in one chain, which is the case that makes it worth having.
+    {
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        const bool ok = RunScript(
+            "src = image(\"test\")\n"
+            "out = src => display(\"1 source\")\n"
+            "          => gaussian_blur(sigma = 2) => display(\"2 blurred\")\n"
+            "          => grayscale() => display(\"3 gray\")\n", &ui, &p, &err, &src);
+        Check(ok && p.Viewers().size() == 3 && p.Stages().size() == 2,
+              "a chain can be tapped at every step" + (ok ? "" : ": " + err));
+    }
+
+    // Returning a value must not break a bare display() statement, which has no
+    // targets. Every existing script is this shape.
+    {
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        const bool ok = RunScript(
+            "src = image(\"test\")\n"
+            "display(src, \"plain\")\n", &ui, &p, &err, &src);
+        Check(ok && p.Viewers().size() == 1,
+              "a bare display() statement still works" + (ok ? "" : ": " + err));
+    }
+
+    // And assigning from it gives back the same image, so `x = display(y)` is
+    // a pass-through rather than a surprise.
+    {
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        const bool ok = RunScript(
+            "src = image(\"test\")\n"
+            "a = src => gaussian_blur(sigma = 2)\n"
+            "b = display(a, \"tap\")\n"
+            "display(b, \"same\")\n", &ui, &p, &err, &src);
+        Check(ok && p.Stages().size() == 1 && p.Viewers().size() == 2,
+              "display() returns its input unchanged" + (ok ? "" : ": " + err));
+        bool samePort = ok && p.Viewers().size() == 2 &&
+                        p.Viewers()[0].source.stage == p.Viewers()[1].source.stage &&
+                        p.Viewers()[0].source.port  == p.Viewers()[1].source.port;
+        Check(samePort, "the returned port is the same one, not a copy");
+    }
+
     // '=>' must not confuse the assignment lookahead. This is the concrete
     // reason the lexer emits one token rather than '=' followed by '>': the
     // statement parser calls a line an assignment when it sees a bare '=' at
