@@ -822,6 +822,70 @@ int main() {
                                   " GPU matches CPU (worst " + std::to_string(worst) + ")");
                     }
                 }
+
+                // The chroma median, on a fixture with EDGES.
+                //
+                // MakeMosaic() above is a smooth gradient, where the median's
+                // edge gate never rejects a neighbour: every pixel takes all
+                // nine and the branch that decides WHICH survive is never
+                // exercised. So that comparison would pass even if the gate
+                // were wrong.
+                //
+                // This matters because the CPU implementation filters both
+                // colour-difference planes in one traversal against a cached
+                // luma plane, while the GPU filters them separately. They must
+                // still agree exactly, and only a fixture with real edges can
+                // say so.
+                {
+                    auto striped = [](CfaPattern cfa) {
+                        Image img;
+                        ImageDesc d{kW, kH, Format::R32F};
+                        d.cfa = cfa;
+                        d.blackLevel = 0.0f;
+                        d.whiteLevel = 1.0f;
+                        img.Alloc(d);
+                        ImageView v = img.MapCpuWrite();
+                        for (int y = 0; y < kH; ++y)
+                            for (int x = 0; x < kW; ++x) {
+                                // Strong colour edges at several widths, so the
+                                // gate rejects some neighbours and keeps others.
+                                const bool on = ((x / 3) & 1) != 0 || ((y / 5) & 1) != 0;
+                                const float rgb[3] = {on ? 0.80f : 0.15f,
+                                                      on ? 0.20f : 0.75f,
+                                                      on ? 0.70f : 0.10f};
+                                *v.At<float>(x, y) = rgb[CfaColorAt(cfa, x, y)];
+                            }
+                        return img;
+                    };
+
+                    Image cpuOut, gpuOut;
+                    std::string e1, e2;
+                    const bool okCpu = RunDemosaicMode("demosaic_consistent",
+                                                       striped(CfaPattern::RGGB),
+                                                       &cpuOut, &e1, nullptr,
+                                                       ExecMode::ForceCPU);
+                    const bool okGpu = RunDemosaicMode("demosaic_consistent",
+                                                       striped(CfaPattern::RGGB),
+                                                       &gpuOut, &e2, &gpu,
+                                                       ExecMode::ForceGPU);
+                    if (okCpu && okGpu) {
+                        ImageView a = cpuOut.MapCpuRead();
+                        ImageView b = gpuOut.MapCpuRead();
+                        double worst = 0.0;
+                        for (int y = 1; y < kH - 1; ++y)
+                            for (int x = 1; x < kW - 1; ++x)
+                                for (int c = 0; c < 3; ++c)
+                                    worst = std::max(worst,
+                                        std::abs(double(HalfToFloat(a.At<uint16_t>(x, y)[c])) -
+                                                 double(HalfToFloat(b.At<uint16_t>(x, y)[c]))));
+                        Check(worst < 0.005,
+                              "chroma median agrees CPU vs GPU across edges (worst " +
+                                  std::to_string(worst) + ")");
+                    } else {
+                        Check(false, std::string("striped fixture ran both ways: ") +
+                                         (okCpu ? e2 : e1));
+                    }
+                }
                 gpu.Shutdown();
             }
             dev->Release();

@@ -47,8 +47,6 @@ BUGS / SMALL FEATURES
   if the image is cached, etc, maybe another icon over the thumbnail to show this
   this has no practical purpose, but I think it's nice for the user to watch the processing
   this would be a good time to add an error icon on the thumbnail if the image failed to load
-- while processing, update the status on CPU/GPU usage and timing after each stage instead of 
-  at the end.
 
 NEW FEATURES / IDEAS
 - LOCAL TONEMAP (tonemap_local). The global operator is doing what a global
@@ -79,8 +77,6 @@ NEW FEATURES / IDEAS
 - features should be associated with the image. Feature tracking is used for matching images, so every image in a group/image list will have a feature list.
 - photo alignment from features
 - panorama photo merging, multiple projections
-- Job system: future algorithms could become much slower and broken into multiple stages, some with dependencies on other stages, some that can run in parallel. A job system can make this faster
-- progress bar for job system
 - are there any public lens correction databases we could take advantage of?
 - can we run a script (develop?) on every image in a group, then run an algorithm, like panorama that works on the entire group? 
   Maybe we can have image/image group in the palette that is the output from another script?
@@ -93,6 +89,10 @@ NEW FEATURES / IDEAS
 - at some point i think we might need an interactive script editor in the app instead of depending
   on an external text editor. It could even be smart with pulldowns for commands and algorithms
   should also support syntax highlighting.
+- Orton effect
+- Glow - spreads light from bright areas, diffusion, bloom, halation, etc
+- Grain
+- alternare to scripts... visually drag and drop connections
 
 NOTES
 - if we need matrix functions, I suggest the Euler library and Ceres for bundle solving

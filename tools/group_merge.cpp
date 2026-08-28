@@ -172,10 +172,15 @@ int main(int argc, char** argv) {
     std::vector<Data> sources;
     sources.push_back(std::move(group));
 
+    // TGLAB_CPU=1 forces the CPU path, for comparing it against the GPU one and
+    // for profiling CPU algorithms without the GPU quietly taking the work.
+    const bool forceCpu = GetEnvironmentVariableA("TGLAB_CPU", nullptr, 0) > 0;
+
     const double t1 = Now();
     std::string xerr;
-    const bool ok = pipe.Execute(&sources, nullptr, &xerr, gpu.Ready() ? &gpu : nullptr,
-                                 ExecMode::Auto);
+    const bool ok = pipe.Execute(&sources, nullptr, &xerr,
+                                 (gpu.Ready() && !forceCpu) ? &gpu : nullptr,
+                                 forceCpu ? ExecMode::ForceCPU : ExecMode::Auto);
     if (adapter) {
         DXGI_QUERY_VIDEO_MEMORY_INFO info{};
         if (SUCCEEDED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info)))

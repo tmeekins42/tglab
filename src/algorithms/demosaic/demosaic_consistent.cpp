@@ -455,8 +455,7 @@ public:
             }
             for (int p = 0; p < chromaPasses; ++p) {
                 if (ctx.Cancelled()) return;
-                ChromaMedian(m_dr, w, h);
-                ChromaMedian(m_db, w, h);
+                ChromaMedianPair(m_dr, m_db, w, h);
             }
             // Put the filtered colour back, keeping green -- and therefore
             // luminance detail -- exactly as reconstructed.
@@ -503,34 +502,91 @@ private:
     // feature with the background's colour -- which on AHD showed as bright
     // green streaks along every twig. Pooling only samples of similar
     // brightness keeps the filter on one side of an edge.
-    void ChromaMedian(std::vector<float>& d, int w, int h) {
-        m_tmp.assign(d.size(), 0.0f);
-        for (int y = 0; y < h; ++y) {
-            for (int x = 0; x < w; ++x) {
-                const size_t i  = size_t(y) * size_t(w) + size_t(x);
-                const float  lc = Luma(m_r[i], m_g[i], m_b[i]);
-                const float  tol = kEdgeFloor + lc * kEdgeRel;
+    // Medians BOTH colour-difference planes in one traversal, against a luma
+    // plane computed once.
+    //
+    // Three redundancies removed, all of them the same mistake -- recomputing
+    // something that cannot have changed:
+    //
+    //  - Luma() was evaluated for the centre and all nine neighbours, per
+    //    pixel, per plane, per pass. m_r/m_g/m_b are not written inside the
+    //    pass loop, so every one of those values is identical across the R-G
+    //    call, the B-G call, and every iteration. It is now computed once for
+    //    the whole image: ten luma evaluations per pixel become one.
+    //
+    //  - The neighbourhood was gathered twice, once per plane, applying the
+    //    SAME edge test to decide the same survivors both times. Now gathered
+    //    once, with both planes' values collected together.
+    //
+    //  - std::clamp ran on every neighbour of every pixel, though only the
+    //    one-pixel border can actually fall outside. The interior is split
+    //    out and indexes directly.
+    //
+    // Identical output, which is the point: this is arithmetic the old code
+    // was already doing, not a different filter. Verified against the previous
+    // implementation over the full image before the old one was deleted.
+    void ChromaMedianPair(std::vector<float>& da, std::vector<float>& db, int w, int h) {
+        const size_t n = da.size();
+        m_luma.resize(n);
+        for (size_t i = 0; i < n; ++i) m_luma[i] = Luma(m_r[i], m_g[i], m_b[i]);
 
-                float v[9];
-                int   k = 0;
-                for (int dy = -1; dy <= 1; ++dy)
-                    for (int dx = -1; dx <= 1; ++dx) {
-                        const int sx = std::clamp(x + dx, 0, w - 1);
-                        const int sy = std::clamp(y + dy, 0, h - 1);
-                        const size_t j = size_t(sy) * size_t(w) + size_t(sx);
-                        if (std::fabs(Luma(m_r[j], m_g[j], m_b[j]) - lc) > tol) continue;
-                        v[k++] = d[j];
-                    }
-                // Fewer than three survivors is not a median; pass through.
-                if (k >= 3) {
-                    std::nth_element(v, v + k / 2, v + k);
-                    m_tmp[i] = v[k / 2];
+        m_tmp.resize(n);
+        m_tmp2.resize(n);
+
+        // One pixel's worth of work, shared by the interior and border paths so
+        // the two cannot drift apart. `gather` yields each neighbour's index.
+        auto filter = [&](size_t i, auto&& gather) {
+            const float lc  = m_luma[i];
+            const float tol = kEdgeFloor + lc * kEdgeRel;
+
+            float va[9], vb[9];
+            int   k = 0;
+            gather([&](size_t j) {
+                if (std::fabs(m_luma[j] - lc) > tol) return;
+                va[k] = da[j];
+                vb[k] = db[j];
+                ++k;
+            });
+
+            // Fewer than three survivors is not a median; pass through.
+            if (k >= 3) {
+                std::nth_element(va, va + k / 2, va + k);
+                std::nth_element(vb, vb + k / 2, vb + k);
+                m_tmp[i]  = va[k / 2];
+                m_tmp2[i] = vb[k / 2];
+            } else {
+                m_tmp[i]  = da[i];
+                m_tmp2[i] = db[i];
+            }
+        };
+
+        for (int y = 0; y < h; ++y) {
+            const bool edgeRow = (y == 0 || y == h - 1);
+            for (int x = 0; x < w; ++x) {
+                const size_t i = size_t(y) * size_t(w) + size_t(x);
+                if (edgeRow || x == 0 || x == w - 1) {
+                    filter(i, [&](auto&& take) {
+                        for (int dy = -1; dy <= 1; ++dy)
+                            for (int dx = -1; dx <= 1; ++dx) {
+                                const int sx = std::clamp(x + dx, 0, w - 1);
+                                const int sy = std::clamp(y + dy, 0, h - 1);
+                                take(size_t(sy) * size_t(w) + size_t(sx));
+                            }
+                    });
                 } else {
-                    m_tmp[i] = d[i];
+                    filter(i, [&](auto&& take) {
+                        for (int dy = -1; dy <= 1; ++dy) {
+                            const size_t row = i + size_t(dy) * size_t(w);
+                            take(row - 1);
+                            take(row);
+                            take(row + 1);
+                        }
+                    });
                 }
             }
         }
-        d.swap(m_tmp);
+        da.swap(m_tmp);
+        db.swap(m_tmp2);
     }
 
     void PassThrough(ImageView& dst, int w, int h) {
@@ -680,6 +736,12 @@ private:
 
     PixelBuffer        m_in;
     std::vector<float> m_s, m_r, m_g, m_b, m_delta, m_tmp, m_dr, m_db;
+
+    // Chroma median scratch: the luma plane computed once per pass, and a
+    // second output buffer so both colour-difference planes are filtered in
+    // one traversal. Members rather than locals so a slider drag does not
+    // reallocate three full-size planes per tick.
+    std::vector<float> m_luma, m_tmp2;
 };
 
 // Shared prologue: constants, the CFA lookup, and the normalised sample fetch.
