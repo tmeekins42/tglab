@@ -251,6 +251,10 @@ void PipelineWorker::Run() {
         // one run's output was ever displayed.
         if (!cancelled) {
             m_lastMs.store(elapsedMs, std::memory_order_relaxed);
+            // Taken from Progress rather than from the context directly: the
+            // pipeline has already published the run's final figure there, and
+            // reading the context here would race with a job that has started.
+            m_lastGpuMs.store(m_progress.GpuMs(), std::memory_order_relaxed);
             m_lastGpuStages.store(job->pipe.GpuStageCount(), std::memory_order_relaxed);
             m_lastCpuStages.store(job->pipe.CpuStageCount(), std::memory_order_relaxed);
             m_lastCachedStages.store(job->pipe.CachedStageCount(), std::memory_order_relaxed);

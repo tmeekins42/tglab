@@ -1,6 +1,7 @@
 #include <cstdlib>
 #include "compute.h"
 
+#include <chrono>
 #include <cstring>
 
 #include "device.h"
@@ -599,6 +600,15 @@ bool ComputeContext::Flush(std::string* err) {
     m_pendingWork = false;
     m_batchPixels = 0;
 
+    // The one place GPU time can honestly be measured.
+    //
+    // Dispatch() only RECORDS into the batch -- the device does nothing until
+    // the list is submitted here and waited on below. So wall-clock measured
+    // around a "GPU stage" is recording time, essentially zero, and the real
+    // cost lands in whichever stage happens to trigger the flush. Timing it
+    // here attributes it to the submit instead of to an arbitrary stage.
+    const auto tSubmit = std::chrono::steady_clock::now();
+
     if (FAILED(m_list->Close())) { *err = "could not close command list"; return false; }
 
     ID3D12CommandList* lists[] = {m_list};
@@ -633,6 +643,9 @@ bool ComputeContext::Flush(std::string* err) {
     // Staging buffers are only safe to free once the GPU is done with them.
     for (ID3D12Resource* r : m_staging) if (r) r->Release();
     m_staging.clear();
+
+    m_gpuMs += std::chrono::duration<double, std::milli>(
+                   std::chrono::steady_clock::now() - tSubmit).count();
     return true;
 }
 

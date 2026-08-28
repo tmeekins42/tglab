@@ -2619,6 +2619,31 @@ void App::DrawAlgorithmsPanel() {
 // machine that is not the developer's.
 static double g_worstFrameMs = 0.0;
 
+// Where a run's time actually went: GPU submit-and-wait against everything
+// else.
+//
+// "Everything else" is deliberately called CPU rather than something more
+// precise, but it is worth knowing what is in it: algorithm loops on the CPU,
+// allocation, and the RECORDING of GPU commands. A dispatch only builds a
+// command list; the device does nothing until a flush submits it and waits,
+// which is the only point where GPU time can be measured at all. So a stage
+// that "runs on the GPU" still spends CPU time here, and a GPU-heavy pipeline
+// with one flush at the end attributes its whole cost to that flush.
+//
+// Drawn only when there is GPU time to report: on a CPU-only run the split
+// would be "100% CPU", which the existing line already implies.
+static void SplitLine(double totalMs, double gpuMs) {
+    if (gpuMs <= 0.0 || totalMs <= 0.0) return;
+
+    // Clamped because the two are measured by different clocks over slightly
+    // different spans -- the GPU accumulator can round just past the wall clock
+    // on a run that is almost entirely one flush, and "104% GPU" reads as a bug.
+    const double gpu = std::min(gpuMs, totalMs);
+    const double cpu = std::max(0.0, totalMs - gpu);
+    ImGui::TextDisabled("   %.1f ms CPU / %.1f ms GPU  (%.0f%% GPU)",
+                        cpu, gpu, 100.0 * gpu / totalMs);
+}
+
 void App::Frame() {
     // TGLAB_FRAMEDBG=1 reports slow frames. A frame is ~16 ms; anything much
     // over that is UI-thread work that should not be there, and a run of them
@@ -2844,14 +2869,17 @@ void App::Frame() {
             const Progress& p = m_worker.GetProgress();
             ImGui::TextDisabled("running  %.1f ms   %d CPU / %d GPU so far   [%s]",
                                 p.ElapsedMs(), p.CpuStages(), p.GpuStages(), modeName);
+            SplitLine(p.ElapsedMs(), p.GpuMs());
         } else if (const int cached = m_worker.LastCachedStages(); cached > 0) {
             ImGui::TextDisabled("last run %.1f ms   %d CPU / %d GPU / %d cached   [%s]",
                                 m_worker.LastRunMs(), m_worker.LastCpuStages(),
                                 m_worker.LastGpuStages(), cached, modeName);
+            SplitLine(m_worker.LastRunMs(), m_worker.LastGpuMs());
         } else {
             ImGui::TextDisabled("last run %.1f ms   %d CPU / %d GPU stage(s)   [%s]",
                                 m_worker.LastRunMs(), m_worker.LastCpuStages(),
                                 m_worker.LastGpuStages(), modeName);
+            SplitLine(m_worker.LastRunMs(), m_worker.LastGpuMs());
         }
 
         // Video memory. A 45 MP intermediate is ~340 MB in RGBA16F, so a

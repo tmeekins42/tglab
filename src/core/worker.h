@@ -119,6 +119,10 @@ public:
     int LastCachedStages() const { return m_lastCachedStages.load(std::memory_order_relaxed); }
     double LastRunMs() const { return m_lastMs.load(std::memory_order_relaxed); }
 
+    // Of the last run, how much was GPU submit-and-wait. The rest is CPU-side
+    // work -- algorithm loops, allocation, and recording the GPU commands.
+    double LastGpuMs() const { return m_lastGpuMs.load(std::memory_order_relaxed); }
+
     // What the stages reported about the last completed run -- see
     // AlgorithmBase::RunReport. One short line each, in stage order; usually
     // empty, since most algorithms have nothing to add.
@@ -209,6 +213,7 @@ private:
     std::atomic<int>      m_lastCpuStages{0};
     std::atomic<int>      m_lastCachedStages{0};
     std::atomic<double>   m_lastMs{0.0};
+    std::atomic<double>   m_lastGpuMs{0.0};
 
     // Guarded by m_mtx rather than atomic: a vector of strings cannot be.
     std::vector<std::string> m_lastReports;

@@ -3133,8 +3133,8 @@ int main() {
             // the sequence exact and the test deterministic.
             struct Recording : Progress {
                 std::vector<std::pair<int, double>> seen;   // {stages, elapsedMs}
-                void SetStats(int cpu, int gpu, double ms) override {
-                    Progress::SetStats(cpu, gpu, ms);
+                void SetStats(int cpu, int gpu, double ms, double gpuMs = 0.0) override {
+                    Progress::SetStats(cpu, gpu, ms, gpuMs);
                     seen.emplace_back(cpu + gpu, ms);
                 }
             } prog;
@@ -3165,6 +3165,12 @@ int main() {
                   "the last stage is included in the final tally");
             Check(prog.CpuStages() + prog.GpuStages() >= 4,
                   "the published total matches the stage count");
+
+            // No GPU context, so the GPU share must be exactly zero rather
+            // than some small leaked number. The status line divides by the
+            // total to show a percentage, and a stray value would render a
+            // CPU-only run as partly GPU.
+            Check(prog.GpuMs() == 0.0, "a CPU-only run reports no GPU time");
         }
     }
 

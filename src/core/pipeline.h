@@ -189,12 +189,13 @@ private:
 
     // Publishes the running CPU/GPU/elapsed tallies, if anyone is listening.
     // One place, so the several call sites cannot drift apart.
-    void PublishStats(Progress* progress) const {
-        if (!progress) return;
-        progress->SetStats(m_cpuStages, m_gpuStages,
-                           std::chrono::duration<double, std::milli>(
-                               std::chrono::steady_clock::now() - m_runStart).count());
-    }
+    //
+    // The GPU figure comes from the compute context rather than from timing
+    // stages: a "GPU stage" only RECORDS commands, and the device does not
+    // start until a flush submits them. Wall clock around such a stage measures
+    // recording -- near zero -- so a split derived that way would report almost
+    // all of a GPU-heavy run as CPU time.
+    void PublishStats(Progress* progress, const ComputeContext* gpu) const;
 };
 
 } // namespace tglab

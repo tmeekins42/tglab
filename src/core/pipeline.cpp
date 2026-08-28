@@ -35,6 +35,16 @@ static bool GpuPassTiming() {
 // Null in normal builds; set by tools/group_merge.
 std::function<void(int)> g_frameTrace;
 
+// Running tallies for the status line. See the declaration for why the GPU
+// number cannot come from timing individual stages.
+void Pipeline::PublishStats(Progress* progress, const ComputeContext* gpu) const {
+    if (!progress) return;
+    progress->SetStats(m_cpuStages, m_gpuStages,
+                       std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - m_runStart).count(),
+                       gpu ? gpu->GpuMs() : 0.0);
+}
+
 void Pipeline::Clear() {
     m_stages.clear();
     m_viewers.clear();
@@ -213,7 +223,7 @@ bool Pipeline::RunFusedReduction(int reduceStage, const std::vector<int>& chain,
             // Per frame as well as per stage: this loop IS the slow part of a
             // multi-frame merge, so an elapsed time that only advanced between
             // stages would sit frozen for the whole of it.
-            PublishStats(progress);
+            PublishStats(progress, gpu);
         }
 
         // Carry this one frame through every stage of the chain. `carried` owns
@@ -546,7 +556,7 @@ bool Pipeline::BroadcastStage(Stage& s, const std::vector<const Data*>& in,
             std::snprintf(what, sizeof what, "%s  frame %d/%d", s.algoName.c_str(),
                           int(f) + 1, int(src.images.size()));
             progress->Set(int(f), int(src.images.size()), what);
-            PublishStats(progress);   // same reason as the fused loop
+            PublishStats(progress, gpu);   // same reason as the fused loop
         }
 
         // Swap this frame in for the set input; every other input is passed
@@ -610,6 +620,9 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
     // can count up during a slow run instead of sitting at the previous run's
     // number until this one finishes.
     m_runStart = std::chrono::steady_clock::now();
+    // The context outlives a single run, so its accumulator has to be zeroed
+    // here or the GPU figure would be the total since the app started.
+    if (gpu) gpu->ResetGpuMs();
     // Find the first stage that differs from the previous run. Everything
     // before it can reuse its cached output. Comparing by hash means there is
     // no dirty flag to forget to set.
@@ -745,7 +758,7 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
             // currently running. Published here, before the stage runs, for
             // exactly that reason: a count incremented mid-stage would claim
             // work that has not happened yet.
-            PublishStats(progress);
+            PublishStats(progress, gpu);
         }
 
         s.valid = false;
@@ -878,7 +891,7 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
     // live tally -- on a one-stage pipeline the counts would stay at zero for
     // the entire run.
     if (progress)
-        PublishStats(progress);
+        PublishStats(progress, gpu);
 
     return true;
 }

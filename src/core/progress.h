@@ -51,10 +51,12 @@ public:
     // they happen per stage rather than once at the end. The atomic reads below
     // are unaffected -- they are still plain loads, and this is called a handful
     // of times per run, not per pixel.
-    virtual void SetStats(int cpuStages, int gpuStages, double elapsedMs) {
+    virtual void SetStats(int cpuStages, int gpuStages, double elapsedMs,
+                          double gpuMs = 0.0) {
         m_cpuStages.store(cpuStages, std::memory_order_relaxed);
         m_gpuStages.store(gpuStages, std::memory_order_relaxed);
         m_elapsedMs.store(elapsedMs, std::memory_order_relaxed);
+        m_gpuMs.store(gpuMs, std::memory_order_relaxed);
     }
 
     void Clear() {
@@ -73,6 +75,11 @@ public:
     int    GpuStages() const { return m_gpuStages.load(std::memory_order_relaxed); }
     double ElapsedMs() const { return m_elapsedMs.load(std::memory_order_relaxed); }
 
+    // Of the elapsed time, how much was spent submitting GPU work and waiting
+    // for it. The remainder is CPU-side: algorithm loops, allocation, and the
+    // recording of the GPU commands themselves.
+    double GpuMs() const { return m_gpuMs.load(std::memory_order_relaxed); }
+
     // A copy, because the buffer can change under the caller. Cheap: 64 bytes.
     std::string Label() const {
         char buf[kLabel];
@@ -89,6 +96,7 @@ private:
     std::atomic<int>      m_cpuStages{0};
     std::atomic<int>      m_gpuStages{0};
     std::atomic<double>   m_elapsedMs{0.0};
+    std::atomic<double>   m_gpuMs{0.0};
     std::atomic<unsigned> m_labelVersion{0};
     char                  m_label[kLabel] = {};
 };

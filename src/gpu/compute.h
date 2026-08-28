@@ -162,6 +162,17 @@ public:
     // for its own sake, such as before tearing down resources.
     bool Flush(std::string* err);
 
+    // Milliseconds spent submitting batches and waiting for them, accumulated
+    // since the last ResetGpuMs().
+    //
+    // This is the only number that can honestly be called "GPU time". Dispatch
+    // merely records into a batch; the device does no work until Flush submits
+    // and waits. Timing a stage's wall clock therefore measures RECORDING and
+    // reads as near-zero, with the real cost landing on whichever stage happens
+    // to trigger the flush.
+    double GpuMs() const { return m_gpuMs; }
+    void   ResetGpuMs() { m_gpuMs = 0.0; }
+
 private:
     // Opens the command list, reusing an in-progress batch rather than
     // discarding it. See the definition for why this matters.
@@ -188,6 +199,7 @@ private:
     // True when work is recorded but not yet submitted, so BeginRecording()
     // knows not to reset the list out from under it.
     bool                       m_pendingWork = false;
+    double                     m_gpuMs = 0.0;   // submit+wait, see GpuMs()
     uint64_t                   m_batchPixels = 0;
     static uint64_t            BatchPixelBudget();
 

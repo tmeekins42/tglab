@@ -183,6 +183,16 @@ int main(int argc, char** argv) {
     }
     std::printf("stages run: %d cpu, %d gpu\n", pipe.CpuStageCount(), pipe.GpuStageCount());
 
+    // Where the time went. GpuMs is submit-and-wait, the only point at which
+    // the device does anything: a dispatch merely records into a batch. The
+    // remainder is CPU-side, and includes the recording itself.
+    if (gpu.Ready()) {
+        const double total = (Now() - t1) * 1000.0;   // Now() is in seconds
+        const double g     = std::min(gpu.GpuMs(), total);
+        std::printf("time: %.0f ms total, %.0f ms cpu, %.0f ms gpu (%.0f%% gpu)\n",
+                    total, total - g, g, total > 0.0 ? 100.0 * g / total : 0.0);
+    }
+
     // What the merge actually produced. For an HDR merge the headroom is the
     // whole point -- a maximum at or below 1.0 would mean the extra range the
     // bracket captured was thrown away somewhere.
