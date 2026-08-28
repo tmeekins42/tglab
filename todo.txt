@@ -47,6 +47,8 @@ BUGS / SMALL FEATURES
   if the image is cached, etc, maybe another icon over the thumbnail to show this
   this has no practical purpose, but I think it's nice for the user to watch the processing
   this would be a good time to add an error icon on the thumbnail if the image failed to load
+- while processing, update the status on CPU/GPU usage and timing after each stage instead of 
+  at the end.
 
 NEW FEATURES / IDEAS
 - LOCAL TONEMAP (tonemap_local). The global operator is doing what a global

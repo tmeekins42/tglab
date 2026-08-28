@@ -79,11 +79,12 @@ public:
         // reasoning as merge_hdr: the sidecar is read if present and ignored if
         // not, so an align stage upstream helps this merge without this merge
         // knowing anything about alignment.
+        // Applied DIRECTLY: T maps a reference coordinate to the position in
+        // this frame, which is the question a loop over the reference grid
+        // asks. See transform.h.
         const Affine t = TransformOf(img);
-        bool invOk = false;
-        const Affine inv = t.Inverse(&invOk);
 
-        if (!invOk || t.IsIdentity()) {
+        if (t.IsIdentity()) {
             for (size_t i = 0; i < px.size(); ++i) m_sum[i] += double(px[i]);
         } else {
             ++m_warped;
@@ -92,7 +93,7 @@ public:
             for (int y = 0; y < h; ++y)
                 for (int x = 0; x < w; ++x) {
                     float sx, sy;
-                    inv.MapPoint(float(x), float(y), &sx, &sy);
+                    t.MapPoint(float(x), float(y), &sx, &sy);
                     SampleBilinear(buf, sx, sy, sm);
                     const size_t base = (size_t(y) * size_t(w) + size_t(x)) * size_t(ch);
                     for (int c = 0; c < ch; ++c) m_sum[base + size_t(c)] += double(sm[c]);

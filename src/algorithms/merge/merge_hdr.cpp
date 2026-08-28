@@ -79,7 +79,6 @@ public:
         m_minEv = 0.0f;
         m_maxEv = 0.0f;
         m_warped = 0;
-        m_badTransforms = 0;
         return true;
     }
 
@@ -133,14 +132,13 @@ public:
         // transform it did not ask for and may not find. With an align stage
         // upstream the frames are sampled into register; without one they are
         // read exactly as before. No dependency, no failure, no parameter.
-        const Affine t = TransformOf(img);
-        bool invOk = false;
-        m_inv = t.Inverse(&invOk);
-        // A singular transform means the solve produced nonsense. Merging the
-        // frame unwarped is the safe answer: slightly misaligned beats warped
-        // by a garbage matrix, which would merge as noise.
-        const bool warp = invOk && !t.IsIdentity();
-        if (!invOk) ++m_badTransforms;
+        // Applied DIRECTLY, not inverted: T maps a reference coordinate to the
+        // position in this frame, which is precisely the question a loop over
+        // the reference grid asks. See transform.h -- inverting it here negated
+        // the correction and made an aligned merge blurrier than an unaligned
+        // one.
+        m_warp = TransformOf(img);
+        const bool warp = !m_warp.IsIdentity();
         if (warp)   ++m_warped;
 
         // Accumulate one sample into the running estimate.
@@ -170,11 +168,9 @@ public:
             float sm[4] = {0, 0, 0, 0};
             for (int y = 0; y < h; ++y) {
                 for (int x = 0; x < w; ++x) {
-                    // The transform maps THIS frame to the reference, so
-                    // reading the reference position (x, y) from this frame
-                    // means going the other way.
+                    // Where in THIS frame the reference position (x, y) lands.
                     float sx, sy;
-                    m_inv.MapPoint(float(x), float(y), &sx, &sy);
+                    m_warp.MapPoint(float(x), float(y), &sx, &sy);
                     SampleBilinear(buf, sx, sy, sm);
                     const size_t base = (size_t(y) * size_t(w) + size_t(x)) * size_t(ch);
                     for (int c = 0; c < ch; ++c) add(base + size_t(c), sm[c]);
@@ -253,8 +249,6 @@ public:
         // consumer has to be the one that says whether it found anything.
         r += m_warped ? (", " + std::to_string(m_warped) + " frames aligned")
                       : ", not aligned";
-        if (m_badTransforms)
-            r += " (" + std::to_string(m_badTransforms) + " unusable transforms)";
         return r;
     }
 
@@ -274,13 +268,12 @@ private:
     int       m_unexposed  = 0;
     float     m_minEv = 0.0f, m_maxEv = 0.0f;
 
-    // Alignment. m_inv is this frame's inverse transform, computed once per
-    // frame rather than per pixel; the counts are for the run report, because
-    // "did the alignment actually apply" is exactly the question a user has
-    // when an aligned and unaligned merge look identical.
-    Affine    m_inv;
+    // Alignment. m_warp maps a reference coordinate into this frame, computed
+    // once per frame rather than per pixel. The count is for the run report,
+    // because "did the alignment actually apply" is exactly the question a user
+    // has when an aligned and unaligned merge look identical.
+    Affine    m_warp;             // reference coords -> this frame
     int       m_warped = 0;
-    int       m_badTransforms = 0;
 };
 
 } // namespace

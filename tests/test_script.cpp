@@ -2513,6 +2513,93 @@ int main() {
             Check(TransformOf(plain).IsIdentity(),
                   "an image with no transform reads as identity");
         }
+
+        // ROUND TRIP: align then merge must be SHARPER than merging unaligned.
+        //
+        // This is the check that was missing, and its absence let a real bug
+        // ship. The tests above verify the solver reports the right shift, and
+        // it did -- but merge_hdr then applied the transform's INVERSE, which
+        // negated the correction: instead of removing a displacement of d it
+        // applied -d, leaving 2d of error. Tim saw it immediately as an aligned
+        // merge blurrier than an unaligned one.
+        //
+        // No test of the solver alone can catch that, because the solver was
+        // right. Only measuring the END of the chain can -- and sharpness is the
+        // measure, because a wrong-magnitude warp blurs while a wrong-DIRECTION
+        // warp blurs WORSE THAN DOING NOTHING. That asymmetry is what makes this
+        // check able to tell them apart.
+        {
+            // Gradient energy: high for a sharp image, low for a blurred one.
+            // Summed over the interior so the edge clamp does not contribute.
+            auto Sharpness = [](const Image& im) {
+                ImageView v = const_cast<Image&>(im).MapCpuRead();
+                if (!v.data) return 0.0;
+                PixelBuffer pb;
+                pb.Unpack(v);
+                double e = 0.0;
+                for (int y = 4; y < pb.Height() - 4; ++y)
+                    for (int x = 4; x < pb.Width() - 4; ++x) {
+                        const float gx = pb.At(x + 1, y)[0] - pb.At(x - 1, y)[0];
+                        const float gy = pb.At(x, y + 1)[0] - pb.At(x, y - 1)[0];
+                        e += double(gx) * double(gx) + double(gy) * double(gy);
+                    }
+                return e;
+            };
+
+            auto MergeShifted = [&](bool withAlign, double* sharp) {
+                ImageSet set;
+                set.images.push_back(Textured(0.0f, 0.0f));
+                set.images.push_back(Textured(1.7f, -1.3f));
+                set.images.push_back(Textured(-0.9f, 2.1f));
+                set.shape = Shape::Of("frame", 3);
+
+                std::vector<SourceImage> nm{{"test", 0}};
+                SourceImage gs; gs.name = "g"; gs.index = 1;
+                gs.shape = Shape::Of("frame", 3);
+                nm.push_back(gs);
+
+                const char* src = withAlign
+                    ? "g = image(\"g\")\na = align(g)\nm = merge_mean(a)\ndisplay(m)\n"
+                    : "g = image(\"g\")\nm = merge_mean(g)\ndisplay(m)\n";
+
+                Program prog; std::string err;
+                if (!Parse(src, &prog, &err)) return false;
+                UiState ui; Pipeline pipe;
+                if (!Interpret(prog, nm, &ui, &pipe).ok) return false;
+
+                std::vector<Data> srcs;
+                srcs.push_back(Data{});
+                srcs.push_back(Data{std::move(set)});
+                if (!pipe.Execute(&srcs, nullptr, &err)) return false;
+
+                const Data* o = pipe.Resolve(pipe.Viewers().back().source, &srcs);
+                const auto* im = o ? std::get_if<Image>(o) : nullptr;
+                if (!im) return false;
+                *sharp = Sharpness(*im);
+                return true;
+            };
+
+            double plain = 0.0, aligned = 0.0;
+            if (MergeShifted(false, &plain) && MergeShifted(true, &aligned)) {
+                // The threshold is set from measurement, not taste. On this
+                // fixture the correct direction gives 1.03x and the inverted
+                // one -- the bug that shipped -- gives 0.61x. Anything above 1
+                // separates them cleanly; 1.01 leaves room for the bilinear
+                // softening that any resample costs while still failing hard on
+                // a wrong direction.
+                //
+                // The gain looks modest because a mean of three frames is
+                // forgiving: two of them shift in different directions, so the
+                // unaligned average is blurred but not catastrophically. The
+                // asymmetry is the signal -- a wrong-direction warp lands at
+                // 0.61, well below merging nothing at all.
+                Check(aligned > plain * 1.01,
+                      "align then merge is SHARPER than merging unaligned (" +
+                          std::to_string(aligned / std::max(plain, 1e-9)) + "x)");
+            } else {
+                Check(false, "the align-then-merge round trip runs");
+            }
+        }
     }
                 }
             }

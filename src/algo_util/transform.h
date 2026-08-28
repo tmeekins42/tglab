@@ -26,8 +26,22 @@ namespace tglab {
 // like a merge that simply did not align well.
 inline constexpr const char* kTransformSidecar = "transform";
 
-// A 2D affine warp, stored as the 2x3 matrix that maps THIS image's coordinates
-// to the reference's:
+// A 2D affine warp, stored as the 2x3 matrix that maps a REFERENCE coordinate
+// to the corresponding position in THIS image:
+//
+//     this_pos = T * reference_pos
+//
+// That direction is the useful one, and it is worth being explicit because
+// getting it backwards is invisible: a consumer walks the reference grid and
+// asks "where in this frame do I read?", which is exactly what T answers, with
+// no inverse needed.
+//
+// The first version of merge_hdr documented it the other way round and applied
+// T.Inverse(). Both halves were wrong, so the warp came out NEGATED: instead of
+// removing a displacement of d it applied -d, leaving 2d of error. The symptom
+// was an aligned merge blurrier than an unaligned one, which is the right clue
+// -- a wrong-magnitude warp would blur, but only a wrong-DIRECTION one blurs
+// worse than doing nothing.
 //
 //     [ a b c ]   x
 //     [ d e f ]   y
