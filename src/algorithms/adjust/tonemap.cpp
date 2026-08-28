@@ -40,6 +40,7 @@ namespace {
 // at 22 MP a full sort costs far more than the answer is worth, and a few
 // hundred thousand samples pin a percentile down.
 struct Levels {
+    float low    = 0.0f;   // the darkest real detail, not the darkest pixel
     float median = 0.0f;
     float high   = 0.0f;   // the brightest real detail, not the brightest pixel
     bool  valid  = false;
@@ -75,13 +76,13 @@ Levels Measure(const PixelBuffer& pb) {
         return lum[i];
     };
 
+    // Percentiles rather than min/max at BOTH ends. The darkest pixel in a
+    // photograph is read noise and the brightest is a specular glint; anchoring
+    // to either would let a handful of pixels decide the whole rendering.
+    out.low    = pct(0.01);
     out.median = pct(0.50);
-    // p99.5 rather than the maximum: the brightest pixel in a photograph is a
-    // specular glint or a light source, and anchoring the shoulder to it would
-    // compress the whole picture to protect something that should simply be
-    // white.
-    out.high  = std::max(pct(0.995), out.median * 1.0001f);
-    out.valid = out.median > 0.0f;
+    out.high   = std::max(pct(0.995), out.median * 1.0001f);
+    out.valid  = out.median > 0.0f;
     return out;
 }
 
@@ -109,16 +110,59 @@ public:
 
         const Levels lv = Measure(src);
 
-        // Scale so the measured median lands on middle grey.
+        // Place the curve from BOTH ends of the scene, not from its midpoint.
         //
-        // This is the whole trick, and it is why the operator has to measure:
-        // a merge's absolute scale is arbitrary, so the only meaningful anchor
-        // is where the picture's own midtones sit. After this the image is in
-        // the range every other algorithm and the display curve already assume.
+        // Anchoring the median to middle grey and hoping the ends land well is
+        // what the first version did, and it cannot work: where the ends sit
+        // relative to the median is a property of the SCENE, and it varies
+        // enormously. Measured on two of Tim's brackets:
+        //
+        //   a sunlit building   3.8 stops below the median, 1.5 above
+        //   a valley and sky    2.1 stops below,            3.7 above
+        //
+        // Fixing the midpoint threw the long end off the display in each case
+        // -- the building's shadows to 0.013 linear (black, nothing for the
+        // shadow slider to recover), the valley's sky to 2.3 (flat, needing
+        // heavy manual contrast). Same operator, opposite failures, because the
+        // anchor ignored the thing that differed.
+        //
+        // So: put the shadows at a visible black point and the highlights near
+        // white, and let the median land where the scene puts it. That is what
+        // a photographer does by eye with the black and white points, and it is
+        // what SuggestExposure already does for raws.
         float scale = 1.0f;
         if (lv.valid) {
-            const float target = kGreyIn * m_exposure;
-            scale = target / lv.median;
+            // Where the ends should land, in linear light before the display
+            // curve. kBlackAim renders around 0.10 display -- dark, but with
+            // detail visible rather than crushed. kWhiteAim is the top of what
+            // the display shoulder resolves without flattening.
+            constexpr float kBlackAim = 0.004f;
+            constexpr float kWhiteAim = 8.0f;
+
+            // The scale that would satisfy each end alone.
+            const float byLow  = kBlackAim / std::max(lv.low,  1e-6f);
+            const float byHigh = kWhiteAim / std::max(lv.high, 1e-6f);
+
+            // Both cannot generally be satisfied: a scene wider than the range
+            // between the aims has to give somewhere. The GEOMETRIC MEAN splits
+            // the difference evenly in stops, which is the right currency here
+            // -- an arithmetic mean would be dominated by whichever end has the
+            // larger number and would drift with the merge's arbitrary scale.
+            scale = std::sqrt(byLow * byHigh);
+
+            // Keep the midtones from drifting somewhere absurd on a scene whose
+            // ends are lopsided. Nothing in the fit constrains the median, and
+            // a frame that is almost all sky or almost all shadow can put it
+            // far from grey; bounding it to a couple of stops either side keeps
+            // the result recognisable without overriding the fit in the normal
+            // case.
+            const float midAfter = lv.median * scale;
+            const float lo = kGreyIn * 0.25f;   // 2 stops below grey
+            const float hi = kGreyIn * 4.0f;    // 2 stops above
+            if (midAfter < lo) scale *= lo / midAfter;
+            else if (midAfter > hi) scale *= hi / midAfter;
+
+            scale *= m_exposure;
         }
         m_scale = scale;
 
@@ -127,6 +171,8 @@ public:
         // it is the number that says whether the compression is doing anything.
         m_stopsAbove = (lv.valid && lv.high > 0.0f)
             ? std::log2(std::max(lv.high * scale, 1e-6f) / kGreyIn) : 0.0f;
+        m_stopsBelow = (lv.valid && lv.low > 0.0f)
+            ? std::log2(kGreyIn / std::max(lv.low * scale, 1e-6f)) : 0.0f;
 
         const float shoulder = std::max(0.1f, float(m_shoulder));
         const int   n  = src.Width() * src.Height();
@@ -152,8 +198,9 @@ public:
     std::string RunReport() const override {
         if (m_scale <= 0.0f) return {};
         char buf[96];
-        std::snprintf(buf, sizeof buf, "scaled %.4gx, highlights %.1f stops above grey",
-                      double(m_scale), double(m_stopsAbove));
+        std::snprintf(buf, sizeof buf,
+                      "scaled %.4gx, %.1f stops below grey / %.1f above",
+                      double(m_scale), double(m_stopsBelow), double(m_stopsAbove));
         return buf;
     }
 
@@ -214,6 +261,7 @@ private:
 
     mutable float m_scale      = 0.0f;
     mutable float m_stopsAbove = 0.0f;
+    mutable float m_stopsBelow = 0.0f;
 };
 
 } // namespace

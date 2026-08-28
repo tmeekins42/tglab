@@ -2234,10 +2234,21 @@ int main() {
         float med = 0.0f, hi = 0.0f;
         Check(Stats(d1, &med, &hi), e1.empty() ? "tonemap runs" : ("failed: " + e1).c_str());
 
-        // The median should land on middle grey. That is the measurement doing
-        // its job -- the input median is about 5.0, some 4.8 stops above grey.
-        Check(std::abs(med - 0.18f) < 0.02f,
-              "the measured median lands on middle grey");
+        // The median lands NEAR middle grey rather than exactly on it.
+        //
+        // The operator no longer pins the median: it fits both ENDS of the
+        // scene and lets the midpoint fall where the scene puts it, because
+        // where the ends sit relative to the median is a property of the scene
+        // and varies enormously. Measured on two of Tim's brackets, one is 3.8
+        // stops below the median and 1.5 above, the other 2.1 below and 3.7
+        // above -- fixing the midpoint threw the long end off the display in
+        // each case, in opposite directions.
+        //
+        // A clamp keeps the median within two stops of grey, so the bound here
+        // is that rather than an equality.
+        Check(med > 0.18f * 0.25f && med < 0.18f * 4.0f,
+              "the midtones land within a couple of stops of middle grey (" +
+                  std::to_string(med) + ")");
 
         // The top must be bounded, and bounded IN DISPLAY UNITS.
         //
@@ -2289,6 +2300,92 @@ int main() {
                           "an image already at middle grey passes through unchanged");
                 }
             }
+        }
+
+        // Two scenes with OPPOSITE shapes must both land usably.
+        //
+        // This is the check the median anchor could not pass, and the reason it
+        // was replaced. Tim's brackets measured 3.8 stops below the median and
+        // 1.5 above (a sunlit building) versus 2.1 below and 3.7 above (a
+        // valley and sky). Pinning the midpoint sent the long end off the
+        // display in each case -- the building's shadows to 0.013 linear, black
+        // with nothing to recover; the sky to 2.3, flat and needing heavy
+        // manual contrast.
+        //
+        // Checked in DISPLAY units at both ends, because that is where the
+        // failure showed. A linear bound would pass on values that render as
+        // black or as flat white.
+        {
+            // `dark` is the FRACTION of the frame that is shadow, and it is what
+            // makes this fixture able to fail.
+            //
+            // My first attempt used three equal bands, which put the median in
+            // the middle band by construction -- so the old median anchor
+            // happened to land it correctly and the test passed against the very
+            // bug it was written for. A real scene is not balanced: a shadow-
+            // heavy frame is MOSTLY shadow, which drags the median down toward
+            // one end, and that skew is exactly what the median anchor cannot
+            // see. Weighting the areas reproduces it.
+            auto Skewed = [](float lowStops, float highStops, float dark) {
+                Image img;
+                ImageDesc d;
+                d.width = 48; d.height = 48; d.format = Format::RGBA32F;
+                d.linear = true;
+                img.Alloc(d);
+                ImageView v = img.MapCpuWrite();
+                float* p = reinterpret_cast<float*>(v.data);
+                const float mid = 5.0f;   // arbitrary merge scale
+                const float lo  = mid / std::pow(2.0f, lowStops);
+                const float hi  = mid * std::pow(2.0f, highStops);
+                const int darkRows = int(48.0f * dark);
+                const int midRows  = (48 - darkRows) / 2;
+                for (int y = 0; y < 48; ++y)
+                    for (int x = 0; x < 48; ++x) {
+                        const float val = (y < darkRows) ? lo
+                                        : (y < darkRows + midRows ? mid : hi);
+                        const int i = y * 48 + x;
+                        for (int c = 0; c < 3; ++c) p[i * 4 + c] = val;
+                        p[i * 4 + 3] = 1.0f;
+                    }
+                return img;
+            };
+
+            auto CheckScene = [&](float lowStops, float highStops, float dark,
+                                  const char* what) {
+                Program prog; std::string err;
+                Parse("s = image(\"test\")\nt = tonemap(s)\ndisplay(t)\n", &prog, &err);
+                std::vector<SourceImage> nm{{"test", 0}};
+                UiState ui; Pipeline pipe;
+                if (!Interpret(prog, nm, &ui, &pipe).ok) { Check(false, "interpret"); return; }
+                std::vector<Data> srcs;
+                srcs.push_back(Data{Skewed(lowStops, highStops, dark)});
+                if (!pipe.Execute(&srcs, nullptr, &err)) { Check(false, err); return; }
+
+                const Data* o = pipe.Resolve(pipe.Viewers().back().source, &srcs);
+                const auto* im = o ? std::get_if<Image>(o) : nullptr;
+                if (!im) { Check(false, "no result"); return; }
+                ImageView v = const_cast<Image&>(*im).MapCpuRead();
+                const float* p = reinterpret_cast<const float*>(v.data);
+
+                // Row 0 is the shadow band, row 40 the highlight band.
+                const float shadow = ToneCurve(p[0]);
+                const float high   = ToneCurve(p[(40 * 48) * 4]);
+
+                Check(shadow > 0.04f,
+                      std::string(what) + ": the shadows stay off the floor (" +
+                          std::to_string(shadow) + ")");
+                Check(high < 0.999f,
+                      std::string(what) + ": the highlights do not clip (" +
+                          std::to_string(high) + ")");
+                Check(high - shadow > 0.45f,
+                      std::string(what) + ": and the picture keeps real range (" +
+                          std::to_string(high - shadow) + ")");
+            };
+
+            // 70% shadow and 70% highlight respectively, which is what drags
+            // the median toward one end the way a real scene does.
+            CheckScene(3.8f, 1.5f, 0.70f, "shadow-heavy scene");
+            CheckScene(2.1f, 3.7f, 0.15f, "highlight-heavy scene");
         }
     }
                 }

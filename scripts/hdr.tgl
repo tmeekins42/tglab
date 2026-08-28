@@ -16,7 +16,7 @@
 # scene-linear image can need it, and swapping in a different operator should
 # be a one-line change.
 
-frames = image("bracket")
+frames = image("group")
 merged = merge_hdr(frames)
 
 # exposure moves the midtones (1.0 = middle grey), shoulder sets how much
