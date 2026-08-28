@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "../../algo_util/pixel_buffer.h"
+#include "../../algo_util/transform.h"
 #include "../../core/algorithm.h"
 
 namespace tglab {
@@ -42,6 +43,7 @@ public:
     bool Begin(int count, const std::string&, std::string* err) override {
         if (count <= 0) { *err = "merge_mean: nothing to merge"; return false; }
         m_seen = 0;
+        m_warped = 0;
         m_sum.clear();
         m_desc = ImageDesc{};
         return true;
@@ -73,7 +75,29 @@ public:
             m_desc = d;
             m_sum.assign(px.size(), 0.0);
         }
-        for (size_t i = 0; i < px.size(); ++i) m_sum[i] += double(px[i]);
+        // Sample through an attached transform when there is one. Same
+        // reasoning as merge_hdr: the sidecar is read if present and ignored if
+        // not, so an align stage upstream helps this merge without this merge
+        // knowing anything about alignment.
+        const Affine t = TransformOf(img);
+        bool invOk = false;
+        const Affine inv = t.Inverse(&invOk);
+
+        if (!invOk || t.IsIdentity()) {
+            for (size_t i = 0; i < px.size(); ++i) m_sum[i] += double(px[i]);
+        } else {
+            ++m_warped;
+            const int w = buf.Width(), h = buf.Height(), ch = buf.Channels();
+            float sm[4] = {0, 0, 0, 0};
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x) {
+                    float sx, sy;
+                    inv.MapPoint(float(x), float(y), &sx, &sy);
+                    SampleBilinear(buf, sx, sy, sm);
+                    const size_t base = (size_t(y) * size_t(w) + size_t(x)) * size_t(ch);
+                    for (int c = 0; c < ch; ++c) m_sum[base + size_t(c)] += double(sm[c]);
+                }
+        }
 
         ++m_seen;
         return true;
@@ -106,13 +130,16 @@ public:
 
     std::string RunReport() const override {
         if (m_seen == 0) return {};
-        return "averaged " + std::to_string(m_seen) + " frames";
+        std::string r = "averaged " + std::to_string(m_seen) + " frames";
+        r += m_warped ? (", " + std::to_string(m_warped) + " aligned") : ", not aligned";
+        return r;
     }
 
 private:
     std::vector<double> m_sum;    // one accumulator, regardless of frame count
     ImageDesc           m_desc{};
     int                 m_seen = 0;
+    int                 m_warped = 0;
 };
 
 } // namespace

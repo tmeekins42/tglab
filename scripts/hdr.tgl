@@ -17,7 +17,10 @@
 # be a one-line change.
 
 frames = image("group")
-merged = merge_hdr(frames)
+merged = merge_hdr(align(frames))
+
+# create an unaligned version for comparison
+unaligned = tonemap(merge_hdr(frames))
 
 # exposure moves the midtones (1.0 = middle grey), shoulder sets how much
 # highlight headroom is kept above them. Watch the status line: it reports the
@@ -28,6 +31,7 @@ shown = tonemap(merged)
 # mean what they mean on a raw.
 final = params(basic_adjust)(shown)
 
-display(merged, "linear")
-display(shown,  "tonemapped")
-display(final,  "developed")
+#display(merged    , "linear")
+display(unaligned , "unaligned")
+display(shown     ,  "tonemapped")
+display(final     ,  "developed")

@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "../../algo_util/pixel_buffer.h"
+#include "../../algo_util/transform.h"
 #include "../../core/algorithm.h"
 
 namespace tglab {
@@ -77,6 +78,8 @@ public:
         m_unexposed  = 0;
         m_minEv = 0.0f;
         m_maxEv = 0.0f;
+        m_warped = 0;
+        m_badTransforms = 0;
         return true;
     }
 
@@ -123,8 +126,25 @@ public:
         if (px.size() != m_num.size()) { *err = "merge_hdr: frame size changed"; return false; }
 
         const float inv = 1.0f / e;
-        for (size_t i = 0; i < px.size(); ++i) {
-            const float s = px[i];
+
+        // The transform an aligner attached, or identity when none did.
+        //
+        // This is the whole point of the sidecar mechanism: merge_hdr reads a
+        // transform it did not ask for and may not find. With an align stage
+        // upstream the frames are sampled into register; without one they are
+        // read exactly as before. No dependency, no failure, no parameter.
+        const Affine t = TransformOf(img);
+        bool invOk = false;
+        m_inv = t.Inverse(&invOk);
+        // A singular transform means the solve produced nonsense. Merging the
+        // frame unwarped is the safe answer: slightly misaligned beats warped
+        // by a garbage matrix, which would merge as noise.
+        const bool warp = invOk && !t.IsIdentity();
+        if (!invOk) ++m_badTransforms;
+        if (warp)   ++m_warped;
+
+        // Accumulate one sample into the running estimate.
+        auto add = [&](size_t i, float s) {
             const float w = Weight(s);
             m_num[i] += double(w) * double(s) * double(inv);
             m_den[i] += double(w);
@@ -136,6 +156,30 @@ public:
             // bounded, and beats leaving a hole in the image.
             const float score = 1.0f - std::abs(2.0f * s - 1.0f);
             if (score > m_bestScore[i]) { m_bestScore[i] = score; m_best[i] = s * inv; }
+        };
+
+        if (!warp) {
+            // Straight walk of the buffer. Kept as its own path rather than
+            // folded into the warped one: an unaligned merge should touch the
+            // pixels exactly as it did before alignment existed, and going
+            // through a sampler -- even one that returns them verbatim -- would
+            // cost a coordinate transform per pixel for nothing.
+            for (size_t i = 0; i < px.size(); ++i) add(i, px[i]);
+        } else {
+            const int w = buf.Width(), h = buf.Height(), ch = buf.Channels();
+            float sm[4] = {0, 0, 0, 0};
+            for (int y = 0; y < h; ++y) {
+                for (int x = 0; x < w; ++x) {
+                    // The transform maps THIS frame to the reference, so
+                    // reading the reference position (x, y) from this frame
+                    // means going the other way.
+                    float sx, sy;
+                    m_inv.MapPoint(float(x), float(y), &sx, &sy);
+                    SampleBilinear(buf, sx, sy, sm);
+                    const size_t base = (size_t(y) * size_t(w) + size_t(x)) * size_t(ch);
+                    for (int c = 0; c < ch; ++c) add(base + size_t(c), sm[c]);
+                }
+            }
         }
 
         ++m_seen;
@@ -200,6 +244,17 @@ public:
             r += ", " + std::to_string(m_unexposed) +
                  " pixels outside every exposure";
         }
+
+        // Whether alignment applied, ALWAYS said out loud.
+        //
+        // Tim compared an aligned and an unaligned merge and got identical
+        // images, because merge_hdr did not read the transform at all. The
+        // sidecar being optional means its absence is silent by design, so the
+        // consumer has to be the one that says whether it found anything.
+        r += m_warped ? (", " + std::to_string(m_warped) + " frames aligned")
+                      : ", not aligned";
+        if (m_badTransforms)
+            r += " (" + std::to_string(m_badTransforms) + " unusable transforms)";
         return r;
     }
 
@@ -218,6 +273,14 @@ private:
     bool      m_noExposure = false;
     int       m_unexposed  = 0;
     float     m_minEv = 0.0f, m_maxEv = 0.0f;
+
+    // Alignment. m_inv is this frame's inverse transform, computed once per
+    // frame rather than per pixel; the counts are for the run report, because
+    // "did the alignment actually apply" is exactly the question a user has
+    // when an aligned and unaligned merge look identical.
+    Affine    m_inv;
+    int       m_warped = 0;
+    int       m_badTransforms = 0;
 };
 
 } // namespace
