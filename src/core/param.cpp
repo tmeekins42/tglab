@@ -170,7 +170,13 @@ bool Param<float>::DescribeControl(UiControl* out) const {
     out->lo    = double(m_lo);
     out->hi    = double(m_hi);
     out->def   = double(m_def);
-    out->value = double(m_def);
+    // The CURRENT value, not the declared default. params(op, sigma = 3) sets
+    // it on a probe instance and then builds the control from that probe, so
+    // reporting m_def here silently discarded whatever the script asked for --
+    // the stage ran at the algorithm default and the slider opened there too.
+    // `def` stays m_def: it is where double-click resets to, and what
+    // FindOrAdd compares against to decide a control is untouched.
+    out->value = double(m_v);
     out->step   = m_opts.step;
     out->softLo = m_opts.softMin;
     out->softHi = m_opts.softMax;
@@ -184,7 +190,13 @@ bool Param<int>::DescribeControl(UiControl* out) const {
     out->lo    = double(m_lo);
     out->hi    = double(m_hi);
     out->def   = double(m_def);
-    out->value = double(m_def);
+    // The CURRENT value, not the declared default. params(op, sigma = 3) sets
+    // it on a probe instance and then builds the control from that probe, so
+    // reporting m_def here silently discarded whatever the script asked for --
+    // the stage ran at the algorithm default and the slider opened there too.
+    // `def` stays m_def: it is where double-click resets to, and what
+    // FindOrAdd compares against to decide a control is untouched.
+    out->value = double(m_v);
     out->step   = m_opts.step;
     out->softLo = m_opts.softMin;
     out->softHi = m_opts.softMax;
@@ -196,7 +208,7 @@ bool Param<bool>::DescribeControl(UiControl* out) const {
     out->lo    = 0.0;
     out->hi    = 1.0;
     out->def   = m_def ? 1.0 : 0.0;
-    out->value = out->def;
+    out->value = m_v ? 1.0 : 0.0;   // current, not default -- see Param<float>
     return true;
 }
 

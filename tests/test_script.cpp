@@ -2828,6 +2828,81 @@ int main() {
               "a chain can end in a bare display" + (ok ? "" : ": " + err));
     }
 
+    // Piping into params(). This is the shape autodevelop.tgl uses:
+    //
+    //     developed = params(basic_adjust, auto_exposure = 1)(src)
+    //
+    // params() returns an algorithm handle and the trailing (src) calls it, so
+    // the piped form just moves src to the front of that call. Nothing about
+    // params() had to change -- it was already an expression in call position,
+    // which is the same generality that made choose() work.
+    {
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        const bool ok = RunScript(
+            "src = image(\"test\")\n"
+            "out = src => params(gaussian_blur, sigma = 3)()\n"
+            "display(out)\n", &ui, &p, &err, &src);
+        Check(ok && p.Stages().size() == 1 && p.Stages()[0].algoName == "gaussian_blur",
+              "a pipe into params() runs" + (ok ? "" : ": " + err));
+
+        // The value params() set must survive the splice -- the whole point of
+        // params() is that it seeds the control, so a pipe that dropped it
+        // would still run and still be wrong.
+        // Compared against the nested form rather than against a hardcoded 3.0:
+        // what matters is that the pipe changes nothing, and if params()
+        // seeding works differently than I assume, this still tests the pipe.
+        UiState ui2; Pipeline p2; std::vector<Data> src2;
+        RunScript("src = image(\"test\")\n"
+                  "out = params(gaussian_blur, sigma = 3)(src)\n"
+                  "display(out)\n", &ui2, &p2, &err, &src2);
+
+        bool same = ui.Controls().size() == ui2.Controls().size();
+        if (same)
+            for (size_t i = 0; i < ui.Controls().size(); ++i)
+                if (ui.Controls()[i].label != ui2.Controls()[i].label ||
+                    std::abs(ui.Controls()[i].value - ui2.Controls()[i].value) > 1e-9)
+                    same = false;
+        Check(same, "params() through a pipe declares the same controls as nested");
+
+        // And the value params() set is actually in there. Checked on `def`
+        // rather than `value`: params() seeds the DEFAULT -- that is its whole
+        // job, "where the controls start" -- and a fresh control opens on it.
+        // The value params() set must actually be there. This was NOT true
+        // before -- DescribeControl reported the declared default rather than
+        // the probe's current value, so `params(op, sigma = 3)` opened the
+        // slider at 2 and ran the stage at 2, silently. Found while testing
+        // pipes; the nested form was equally affected.
+        //
+        // `def` stays the declared default, because that is where double-click
+        // resets to and what marks a control untouched.
+        for (const UiControl& c : ui.Controls())
+            if (c.label == "gaussian_blur.sigma") {
+                Check(std::abs(c.value - 3.0) < 1e-6,
+                      "params() sets the control's value, not just its default");
+                Check(std::abs(c.def - 2.0) < 1e-6,
+                      "params() leaves the declared default alone, so reset still works");
+            }
+    }
+
+    // The same, with two instances kept apart by name. If the pipe interfered
+    // with the instance key, these would collapse onto one set of controls.
+    {
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        const bool ok = RunScript(
+            "src = image(\"test\")\n"
+            "a = src => params(gaussian_blur, \"soft\", sigma = 1)()\n"
+            "b = src => params(gaussian_blur, \"hard\", sigma = 8)()\n"
+            "display(a)\n"
+            "display(b)\n", &ui, &p, &err, &src);
+        Check(ok && p.Stages().size() == 2,
+              "two piped params() instances both run" + (ok ? "" : ": " + err));
+
+        int sigmas = 0;
+        for (const UiControl& c : ui.Controls())
+            if (c.label.find("sigma") != std::string::npos) ++sigmas;
+        Check(sigmas == 2, "piped params() instances keep separate controls");
+    }
+
     // '=>' must not confuse the assignment lookahead. This is the concrete
     // reason the lexer emits one token rather than '=' followed by '>': the
     // statement parser calls a line an assignment when it sees a bare '=' at
