@@ -90,7 +90,9 @@ int main(int argc, char** argv) {
         // TGLAB_PRE inserts a stage BEFORE the merge -- align, in practice --
         // so a solve can be measured against the same bracket in one run.
         (GetEnvironmentVariableA("TGLAB_PRE", nullptr, 0) > 0
-             ? std::string("frames = ") + PreAlgo() + "(frames)\n"
+             ? std::string("frames = ") + PreAlgo() + "(frames" +
+               (GetEnvironmentVariableA("TGLAB_NORM", nullptr, 0) > 0
+                    ? ", normalize = 1" : "") + ")\n"
              : std::string()) +
         "merged = " + algo + "(frames)\n" +
         // TGLAB_POST appends a stage after the merge, so the tone mapper can be
@@ -231,6 +233,22 @@ int main(int argc, char** argv) {
                             std::printf("dynamic range p1..p99: %.1f stops\n",
                                         std::log2(double(P(0.99)) / std::max(double(P(0.01)), 1e-9)));
                         }
+                    }
+                    // Gradient energy: the sharpness measure. Higher is
+                    // sharper, and comparing two runs of the same bracket is
+                    // what says whether an alignment choice actually helped
+                    // rather than merely changed the numbers.
+                    {
+                        PixelBuffer sb;
+                        sb.Unpack(v);
+                        double e = 0.0;
+                        for (int y = 8; y < sb.Height() - 8; y += 3)
+                            for (int x = 8; x < sb.Width() - 8; x += 3) {
+                                const float gx = sb.At(x + 1, y)[1] - sb.At(x - 1, y)[1];
+                                const float gy = sb.At(x, y + 1)[1] - sb.At(x, y - 1)[1];
+                                e += double(gx) * double(gx) + double(gy) * double(gy);
+                            }
+                        std::printf("sharpness: %.4g\n", e);
                     }
                     std::printf("result: %dx%d  min %.5f  max %.4f  mean %.5f\n",
                                 im->Desc().width, im->Desc().height,

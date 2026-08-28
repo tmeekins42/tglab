@@ -39,6 +39,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -350,6 +351,9 @@ public:
 
         float worst = 0.0f;
         int   solved = 0;
+        // Solved transforms, held until every frame is done so a common-mode
+        // component can be measured across all of them before any is attached.
+        std::map<size_t, Affine> solvedT;
         for (size_t i = 1; i < images->size(); ++i) {
             ImageView mv = (*images)[i].MapCpuRead();
             if (!mv.data) continue;
@@ -388,8 +392,64 @@ public:
                 t.m[5] *= s;
             }
 
-            AttachTransform(&(*images)[i], t);
+            solvedT[i] = t;
             ++solved;
+        }
+
+        // Optionally remove the COMMON-MODE component of the solve.
+        //
+        // Tim's observation: on hdrtest2 every frame came back with the same
+        // -0.053 degrees of rotation and the same 1.0003 scale. If that part is
+        // shared by all of them, warping every frame by it resamples all of them
+        // to no purpose -- and a resample costs sharpness.
+        //
+        // Whether it SHOULD be removed depends on what the shared component is,
+        // and the numbers alone do not say. Two readings fit them:
+        //
+        //   the rotation is a solve artefact, and frame 0 -- the only unwarped
+        //   one -- is correct. Removing the mean then improves seven frames.
+        //
+        //   the rotation is real: the tripod settled between frame 0 and frame
+        //   1 and then held. Removing the mean would MISALIGN seven good frames
+        //   to make one outlier agree.
+        //
+        // The 0.014 degrees of scatter across seven frames argues for the second
+        // -- a numerical artefact would repeat exactly -- but not decisively. So
+        // this is a parameter, defaulting OFF, and the answer is whichever makes
+        // the merged result measurably sharper on real brackets.
+        if (m_normalize && solved > 1) {
+            // Mean of the linear parts, which is where rotation and scale live.
+            // Averaging the matrix entries rather than decomposed angles: at
+            // these magnitudes the two agree to far beyond what matters, and
+            // averaging angles needs care about wrapping that buys nothing here.
+            float mean[4] = {0, 0, 0, 0};
+            int n = 0;
+            for (size_t i = 1; i < images->size(); ++i) {
+                if (!solvedT.count(i)) continue;
+                const Affine& a = solvedT[i];
+                mean[0] += a.m[0]; mean[1] += a.m[1];
+                mean[2] += a.m[3]; mean[3] += a.m[4];
+                ++n;
+            }
+            if (n > 0) {
+                Affine common;
+                common.m[0] = mean[0] / float(n);
+                common.m[1] = mean[1] / float(n);
+                common.m[3] = mean[2] / float(n);
+                common.m[4] = mean[3] / float(n);
+
+                bool ok = false;
+                const Affine undo = common.Inverse(&ok);
+                if (ok) {
+                    for (auto& [idx, a] : solvedT) a = undo.Then(a);
+                    m_removed = common;
+                    m_didNormalize = true;
+                }
+            }
+        }
+
+        for (auto& [i, t] : solvedT) {
+            AttachTransform(&(*images)[i], t);
             worst = std::max(worst, std::hypot(t.Dx(), t.Dy()));
 
             // Per-frame, because a maximum hides the shape of the answer. A
@@ -406,9 +466,18 @@ public:
             }
         }
 
-        char buf[128];
-        std::snprintf(buf, sizeof buf,
-                      "aligned %d frames, largest shift %.2f px", solved, double(worst));
+        char buf[192];
+        if (m_didNormalize) {
+            std::snprintf(buf, sizeof buf,
+                          "aligned %d frames, largest shift %.2f px "
+                          "(removed %.3f deg / %.5f scale common to all)",
+                          solved, double(worst), double(m_removed.RotationDeg()),
+                          double(std::hypot(m_removed.m[0], m_removed.m[3])));
+        } else {
+            std::snprintf(buf, sizeof buf,
+                          "aligned %d frames, largest shift %.2f px",
+                          solved, double(worst));
+        }
         m_report = buf;
         return true;
     }
@@ -565,7 +634,21 @@ private:
     // rather than seconds -- which is the whole reason for sampling.
     Param<int> m_samples{this, "samples", 20000, 500, 200000, {.step = 500}};
 
+    // Remove the rotation and scale common to every frame.
+    //
+    // Tim's question: if all seven frames come back with the same -0.05 degrees
+    // and the same 1.0003 scale, warping every one of them by that shared part
+    // resamples all of them for nothing -- and a resample costs sharpness.
+    //
+    // Correct only if the shared part is spurious. If the tripod genuinely
+    // settled after the first frame, removing it misaligns seven good frames to
+    // match one outlier. The numbers do not settle it, so this is off by
+    // default and the answer is whichever measures sharper on real brackets.
+    Param<int> m_normalize{this, "normalize", 0, 0, 1};
+
     std::string m_report;
+    Affine      m_removed;              // the common part, when one was removed
+    bool        m_didNormalize = false;
 };
 
 } // namespace
