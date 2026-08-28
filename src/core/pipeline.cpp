@@ -130,6 +130,12 @@ std::vector<int> Pipeline::FusableChain(int reduceStage, PortRef* srcPort) const
         // flat shape -- the chain has to stop here.
         if (s.algo->IsReshape()) break;
 
+        // An aligner is not a per-frame operation either: it solves every frame
+        // against a common reference, so it cannot be carried one frame at a
+        // time. Fusing it away meant it silently never ran -- the same failure
+        // the reshape check above exists to prevent.
+        if (s.algo->IsAligner()) break;
+
         // Exactly one input, so the frame identity is unambiguous. A stage
         // combining a set with a second image is legitimate but needs the
         // scalar input held across frames, which is a further step.
@@ -749,6 +755,38 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
             }
             in.push_back(d);
         }
+        // An aligner annotates the whole set at once: every frame is solved
+        // against a common reference, so it cannot run one frame at a time.
+        // Handled here for the same reason as a reshape.
+        //
+        // It copies the group and attaches transforms to the copy rather than
+        // warping anything. Nothing downstream is obliged to use them -- a merge
+        // that samples through TransformOf() gets aligned pixels, and one that
+        // does not behaves exactly as before.
+        if (s.algo->IsAligner()) {
+            const auto* src = std::get_if<ImageSet>(in[0]);
+            if (!src) {
+                *err = "line " + std::to_string(s.line) +
+                       ": align() needs a group, not a single image";
+                return false;
+            }
+            ImageSet out;
+            out.shape = src->shape;
+            out.images.reserve(src->images.size());
+            for (const Image& im : src->images) out.images.push_back(im.Clone());
+
+            std::string aerr;
+            if (!s.algo->RunAlign(&out.images, &aerr)) {
+                *err = "line " + std::to_string(s.line) + ": " + aerr;
+                return false;
+            }
+            s.outputs.clear();
+            s.outputs.resize(1);
+            s.outputs[0] = Data{std::move(out)};
+            s.valid = true;
+            continue;
+        }
+
 
         // A reshape moves no pixels: it hands its input through with a
         // different shape. Done here rather than in RunCPU because that gets a

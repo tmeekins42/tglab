@@ -11,6 +11,7 @@
 // disagree about what a transform means.
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 #include <string>
 
@@ -144,6 +145,26 @@ inline void SampleBilinear(const PixelBuffer& src, float x, float y, float* out)
     const int   x1 = std::min(x0 + 1, w - 1);
     const int   y1 = std::min(y0 + 1, h - 1);
     const float fx = cx - float(x0), fy = cy - float(y0);
+
+    // An exact pixel centre returns that pixel VERBATIM, not a weighted sum
+    // that happens to reduce to it.
+    //
+    // Tim asked for this explicitly, and it is worth being deliberate about:
+    // with an identity transform every sample lands on an integer, and the
+    // arithmetic below would return p00 * 1 + others * 0. That is bit-exact for
+    // ordinary values, but it is exact by ACCIDENT rather than by construction
+    // -- and it stops being exact for an infinity or a NaN, where 0 * inf is
+    // NaN and one bad pixel would spread to its neighbours.
+    //
+    // Taking the early exit means an unaligned merge reads exactly the pixels
+    // it would have read with no sampler at all, which is the property that
+    // makes "attach a transform" strictly better than "warp the pixels": with
+    // no transform, nothing is resampled.
+    if (fx == 0.0f && fy == 0.0f) {
+        const float* p = src.At(x0, y0);
+        for (int c = 0; c < ch; ++c) out[c] = p[c];
+        return;
+    }
 
     const float* p00 = src.At(x0, y0);
     const float* p10 = src.At(x1, y0);

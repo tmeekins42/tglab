@@ -130,6 +130,15 @@ public:
     // per-image view RunCPU gets. See algorithms/merge/reshape.cpp.
     virtual bool IsReshape() const { return false; }
 
+    // Annotates a whole group at once -- it solves every frame against a common
+    // reference, so it cannot be run one frame at a time. Like a reshape, the
+    // pipeline handles it directly. See algorithms/merge/align.cpp.
+    virtual bool IsAligner() const { return false; }
+
+    // Solves and attaches transforms across a whole group. Called only when
+    // IsAligner() is true.
+    virtual bool RunAlign(std::vector<Image>* /*images*/, std::string* /*err*/) { return true; }
+
     // The streaming accumulator. See core/reduction.h for why it is Begin /
     // Accept / Finish rather than "here are all N images".
     virtual Reducer* AsReducer() { return nullptr; }

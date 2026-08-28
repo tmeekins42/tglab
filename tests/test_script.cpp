@@ -13,6 +13,7 @@
 #include "../src/core/exif.h"
 #include "../src/algo_util/pixel_buffer.h"
 #include "../src/algo_util/tone_curve.h"
+#include "../src/algo_util/transform.h"
 #include "../src/core/image_group.h"
 #include "../src/core/image_loader.h"
 #include "../src/core/image_io.h"
@@ -2386,6 +2387,131 @@ int main() {
             // the median toward one end the way a real scene does.
             CheckScene(3.8f, 1.5f, 0.70f, "shadow-heavy scene");
             CheckScene(2.1f, 3.7f, 0.15f, "highlight-heavy scene");
+        }
+    }
+
+    // --- align ---------------------------------------------------------------
+    //
+    // A KNOWN shift must come back. The whole value of a sub-pixel solver is
+    // that it recovers a displacement more precisely than a pixel, so the test
+    // shifts a synthetic frame by a fractional amount and checks the solved
+    // transform against it -- not merely that the solve ran.
+    {
+        // Textured noise, because a solver needs gradients. A smooth gradient
+        // would leave the fit under-constrained along its own direction, which
+        // is the aperture problem and would make this pass for the wrong reason.
+        auto Textured = [](float dx, float dy) {
+            Image img;
+            ImageDesc d;
+            d.width = 256; d.height = 256; d.format = Format::RGBA32F;
+            d.linear = true;
+            d.shutter = 0.01f; d.aperture = 4.0f; d.iso = 100.0f;
+            img.Alloc(d);
+            ImageView v = img.MapCpuWrite();
+            float* p = reinterpret_cast<float*>(v.data);
+            for (int y = 0; y < 256; ++y)
+                for (int x = 0; x < 256; ++x) {
+                    // Sampled at (x - dx), so the CONTENT moves by +dx: a
+                    // deterministic pattern with detail at several scales.
+                    const float sx = float(x) - dx, sy = float(y) - dy;
+                    const float val =
+                        0.30f + 0.20f * std::sin(sx * 0.21f) * std::cos(sy * 0.17f)
+                              + 0.10f * std::sin(sx * 0.73f + sy * 0.41f)
+                              + 0.05f * std::cos(sx * 1.9f) * std::sin(sy * 1.7f);
+                    const int i = y * 256 + x;
+                    for (int c = 0; c < 3; ++c) p[i * 4 + c] = val;
+                    p[i * 4 + 3] = 1.0f;
+                }
+            return img;
+        };
+
+        auto SolveShift = [&](float dx, float dy, float* gotX, float* gotY) {
+            ImageSet set;
+            set.images.push_back(Textured(0.0f, 0.0f));
+            set.images.push_back(Textured(dx, dy));
+            set.shape = Shape::Of("frame", 2);
+
+            std::vector<SourceImage> nm{{"test", 0}};
+            SourceImage gs; gs.name = "g"; gs.index = 1;
+            gs.shape = Shape::Of("frame", 2);
+            nm.push_back(gs);
+
+            Program prog; std::string err;
+            if (!Parse("g = image(\"g\")\na = align(g)\ndisplay(a)\n", &prog, &err))
+                return false;
+            UiState ui; Pipeline pipe;
+            if (!Interpret(prog, nm, &ui, &pipe).ok) return false;
+
+            std::vector<Data> srcs;
+            srcs.push_back(Data{});
+            srcs.push_back(Data{std::move(set)});
+            if (!pipe.Execute(&srcs, nullptr, &err)) return false;
+
+            const Data* o = pipe.Resolve(pipe.Viewers().back().source, &srcs);
+            const auto* os = o ? std::get_if<ImageSet>(o) : nullptr;
+            if (!os || os->images.size() != 2) return false;
+
+            const Affine t = TransformOf(os->images[1]);
+            *gotX = t.Dx();
+            *gotY = t.Dy();
+            return true;
+        };
+
+        // A whole-pixel shift first, which is the easy case.
+        float gx = 0.0f, gy = 0.0f;
+        if (SolveShift(2.0f, -1.0f, &gx, &gy)) {
+            Check(std::abs(gx - 2.0f) < 0.02f && std::abs(gy + 1.0f) < 0.02f,
+                  "align recovers a whole-pixel shift (" + std::to_string(gx) +
+                      ", " + std::to_string(gy) + " for 2, -1)");
+        } else {
+            Check(false, "align runs on a two-frame group");
+        }
+
+        // And a SUB-pixel one, which is the point of the algorithm. A solver
+        // that only found whole pixels would pass the check above and fail
+        // here, which is why both are tested.
+        if (SolveShift(0.4f, 0.25f, &gx, &gy)) {
+            Check(std::abs(gx - 0.4f) < 0.05f && std::abs(gy - 0.25f) < 0.05f,
+                  "and a SUB-pixel shift (" + std::to_string(gx) + ", " +
+                      std::to_string(gy) + " for 0.4, 0.25)");
+        }
+
+        // The reference frame keeps identity, so a merge that samples through
+        // the transform reads it verbatim.
+        {
+            ImageSet set;
+            set.images.push_back(Textured(0.0f, 0.0f));
+            set.images.push_back(Textured(1.0f, 0.0f));
+            set.shape = Shape::Of("frame", 2);
+            std::vector<SourceImage> nm{{"test", 0}};
+            SourceImage gs; gs.name = "g"; gs.index = 1;
+            gs.shape = Shape::Of("frame", 2);
+            nm.push_back(gs);
+
+            Program prog; std::string err;
+            Parse("g = image(\"g\")\na = align(g)\ndisplay(a)\n", &prog, &err);
+            UiState ui; Pipeline pipe;
+            Interpret(prog, nm, &ui, &pipe);
+            std::vector<Data> srcs;
+            srcs.push_back(Data{});
+            srcs.push_back(Data{std::move(set)});
+            if (pipe.Execute(&srcs, nullptr, &err)) {
+                const Data* o = pipe.Resolve(pipe.Viewers().back().source, &srcs);
+                if (const auto* os = o ? std::get_if<ImageSet>(o) : nullptr) {
+                    Check(TransformOf(os->images[0]).IsIdentity(),
+                          "the reference frame keeps the identity transform");
+                }
+            }
+        }
+
+        // An image with no transform attached reads as identity, so a consumer
+        // needs no branch and an unaligned merge resamples nothing.
+        {
+            Image plain;
+            ImageDesc d{4, 4, Format::RGBA32F};
+            plain.Alloc(d);
+            Check(TransformOf(plain).IsIdentity(),
+                  "an image with no transform reads as identity");
         }
     }
                 }

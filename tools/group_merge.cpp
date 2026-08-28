@@ -35,6 +35,13 @@ static double Now() {
     return duration<double>(steady_clock::now().time_since_epoch()).count();
 }
 
+// Stage to insert before the merge, from TGLAB_PRE.
+static std::string PreAlgo() {
+    char buf[64] = {};
+    GetEnvironmentVariableA("TGLAB_PRE", buf, sizeof buf);
+    return buf[0] ? std::string(buf) : std::string("align");
+}
+
 // Stage to append after the merge, from TGLAB_POST.
 static std::string PostAlgo() {
     char buf[64] = {};
@@ -79,8 +86,13 @@ int main(int argc, char** argv) {
     char algo[64] = "merge_mean";
     GetEnvironmentVariableA("TGLAB_MERGE", algo, sizeof algo);
     const std::string srcStr =
-        std::string("frames = image(\"group\")\nmerged = ") + algo +
-        "(frames)\n" +
+        std::string("frames = image(\"group\")\n") +
+        // TGLAB_PRE inserts a stage BEFORE the merge -- align, in practice --
+        // so a solve can be measured against the same bracket in one run.
+        (GetEnvironmentVariableA("TGLAB_PRE", nullptr, 0) > 0
+             ? std::string("frames = ") + PreAlgo() + "(frames)\n"
+             : std::string()) +
+        "merged = " + algo + "(frames)\n" +
         // TGLAB_POST appends a stage after the merge, so the tone mapper can be
         // measured against the raw merge output in the same run.
         (GetEnvironmentVariableA("TGLAB_POST", nullptr, 0) > 0
