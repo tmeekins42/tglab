@@ -3080,6 +3080,25 @@ int main() {
                           (ok ? "" : ": " + err));
         }
         Check(seen > 0, "found scripts to check (" + std::to_string(seen) + ")");
+
+        // The two scripts written in pipe form get run, not just parsed: they
+        // are the ones exercising params() inside a chain, which is where the
+        // control-order and dropped-value bugs lived. Parsing would not have
+        // caught either.
+        //
+        // Only these two, and only against the stock test image: most scripts
+        // want a raw file that is not in the repo.
+        for (const char* name : {"autodevelop.tgl", "denoise.tgl"}) {
+            std::ifstream in(dir / name);
+            std::stringstream ss;
+            ss << in.rdbuf();
+
+            UiState ui; Pipeline p; std::string err; std::vector<Data> psrc;
+            const bool ok = RunScript(ss.str(), &ui, &p, &err, &psrc);
+            Check(ok, std::string("scripts/") + name + " runs" + (ok ? "" : ": " + err));
+            Check(ok && !p.Stages().empty() && !p.Viewers().empty(),
+                  std::string("scripts/") + name + " records stages and viewers");
+        }
     }
 #endif
 

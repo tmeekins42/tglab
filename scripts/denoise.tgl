@@ -9,10 +9,6 @@
 # is compressed into a tiny range. On an under-exposed ARW pushed 1.85 stops,
 # denoising first kept 6% of the detail against 88% for denoising after.
 
-src = image("test")
-
-developed = params(basic_adjust, auto_exposure = 1)(src)
-
 # The luma range is deliberately much smaller than chroma's.
 #
 # On a Bayer sensor green is sampled at half of all sites while red and blue
@@ -21,7 +17,8 @@ developed = params(basic_adjust, auto_exposure = 1)(src)
 # whole luma detail of a developed photo measures around 0.02, so a threshold
 # anywhere near that erases the picture rather than the noise.
 
-clean = params(wavelet_denoise)(developed)
+image("test") => params( basic_adjust, auto_exposure = 1 )()
+              => display( "original" )
+              => params( wavelet_denoise )()
+              => display( "denoised" )
 
-display(developed, "original")
-display(clean,     "denoised")

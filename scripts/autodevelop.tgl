@@ -14,11 +14,8 @@
 # a finished image has already had a tone curve applied, so its midtone says
 # nothing about how the sensor was exposed.
 
-src = image("test")
-
 # auto_exposure is an option of params(), not a slider. It decides where the
 # controls START; everything after that is an ordinary control you can drag.
-developed = params(basic_adjust, auto_exposure = 1)(src)
-
-display(src,       "1 original")
-display(developed, "2 auto-developed")
+image( "test" ) => display( "original" )
+                => params( basic_adjust , auto_exposure = 1)()
+                => display( "auto-developed" )
