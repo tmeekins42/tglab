@@ -1,37 +1,54 @@
-# Merging an exposure bracket, then fitting it onto a display.
+# Merging an exposure bracket, then developing it.
 #
 # Drop your bracket on one palette row -- hold ALT while dropping to make them
 # a group in one go -- then right-click the group and "Sort by filename" so the
 # order is what you expect.
 #
-# merge_hdr reads each frame's shutter, aperture and ISO from its EXIF and
-# divides them out, so every frame contributes the same radiance where it is
-# well exposed. The result is scene-linear with real headroom: on a seven-frame
-# bracket it reaches 900-odd, with the midtones near 2.0.
+# The chain reads in the order the work happens:
 #
-# tonemap is what makes that displayable. It MEASURES the image -- a merge's
-# absolute scale depends on the shutter speeds used, so no fixed anchor could
-# be right -- puts the median on middle grey, and rolls the highlights off. It
-# is a separate stage rather than part of the merge on purpose: any
-# scene-linear image can need it, and swapping in a different operator should
-# be a one-line change.
+#   align       solves each frame against a common reference and attaches the
+#               transform as a sidecar. It warps nothing itself; the merge
+#               samples through it. A correction below half a pixel is skipped
+#               when there is no other transform to fold into, because the
+#               resample would cost more than the alignment gains.
+#
+#   merge_hdr   reads each frame's shutter, aperture and ISO from EXIF and
+#               divides them out, so every frame contributes the same radiance
+#               where it is well exposed. The result is scene-linear with real
+#               headroom: a seven-frame bracket reaches 900-odd with the
+#               midtones near 2.0. That is why it is displayed raw as well --
+#               it is the data worth keeping, not yet a picture.
+#
+#   tonemap     brings that arbitrary scale into the range the display curve
+#               expects. A separate stage on purpose: any scene-linear image
+#               can need it, and swapping the operator should be one word.
+#
+#   basic_adjust and wavelet_denoise are the ordinary develop controls, after
+#               the tone mapping rather than before it. Denoise runs last
+#               because a shrinkage threshold is a fixed distance in the value
+#               domain, so ahead of a tone curve it thresholds in linear scene
+#               space where shadow detail is compressed into almost nothing.
+#
+# The dropdown picks between the two tone mappers, which is the comparison
+# worth having in front of you:
+#
+#   tonemap        one curve for every pixel. No halos, trivially fast, and
+#                  structurally unable to give the sky more of the display
+#                  without taking the same from the land.
+#   tonemap_local  splits illumination from detail, compresses only the
+#                  illumination. Recovers local contrast the global operator
+#                  cannot -- watch strong edges for halos, which is its own
+#                  failure mode.
+#
+# params() gives every stage its own group of sliders, so the whole pipeline
+# is tunable from one panel.
 
-frames = image("group")
-merged = merge_hdr(align(frames))
+tonemap_op = choose("tonemapper", [tonemap, tonemap_local])
 
-# create an unaligned version for comparison
-unaligned = tonemap(merge_hdr(frames))
-
-# exposure moves the midtones (1.0 = middle grey), shoulder sets how much
-# highlight headroom is kept above them. Watch the status line: it reports the
-# scale it chose and how far the highlights reach.
-shown = tonemap(merged)
-
-# Ordinary develop on top, now that the data is in a sane range. The sliders
-# mean what they mean on a raw.
-final = params(basic_adjust)(shown)
-
-#display(merged    , "linear")
-display(unaligned , "unaligned")
-display(shown     ,  "tonemapped")
-display(final     ,  "developed")
+a = image("group") => params( align )()
+                   => params( merge_hdr )()
+                   => display( "raw merged hdr" )
+                   => params( tonemap_op )()
+                   => params( basic_adjust, auto_exposure = 1 )()
+                   => params( wavelet_denoise )()
+                   => display( "final" )

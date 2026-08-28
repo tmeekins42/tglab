@@ -23,7 +23,9 @@ class Progress {
 public:
     // `done` of `total` units finished. A total of 0 means "no useful count" --
     // a single-image run, where a bar would be a lie.
-    void Set(int done, int total, const char* what) {
+    // Virtual for the same reason SetStats is: a test overrides it to act at a
+    // chosen stage boundary. The class already has a vtable, so this is free.
+    virtual void Set(int done, int total, const char* what) {
         m_done.store(done, std::memory_order_relaxed);
         m_total.store(total, std::memory_order_relaxed);
         if (what) {

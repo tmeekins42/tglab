@@ -125,6 +125,75 @@ static void TestWorker() {
         Check(newest == lastSeq, "the newest request is the one that wins");
     }
 
+    // A cancelled run must not throw away the cache.
+    //
+    // Tim's report: dragging a develop slider far enough to cancel a run made
+    // the whole pipeline re-run -- demosaic, hot-pixel repair, HDR merge --
+    // rather than only the stage whose parameter moved. The worker was
+    // dropping the entire stage cache on cancellation, so the next run started
+    // from nothing.
+    //
+    // Measured by stage counts rather than by timing, which would be flaky:
+    // after a burst that certainly cancels runs, a final submit that changes
+    // ONLY the last stage's parameter must report cached stages. Zero cached
+    // is exactly the bug.
+    {
+        // Two slow stages then a cheap one, so there is something worth
+        // caching and the last stage is the one being "dragged".
+        auto script = [](double bright) {
+            char buf[256];
+            std::snprintf(buf, sizeof buf,
+                          "src = image(\"test\")\n"
+                          "a = gaussian_blur(src, sigma = 8)\n"
+                          "b = box_blur(a, radius = 6)\n"
+                          "c = brightness(b, brightness = %.4f)\n"
+                          "display(c, \"out\")\n", bright);
+            return std::string(buf);
+        };
+
+        // Settle first: one complete run establishes the cache.
+        {
+            UiState ui; Pipeline pipe; std::vector<Data> src; std::string err;
+            if (BuildPipeline(script(0.0).c_str(), dim, &ui, &pipe, &src, &err)) {
+                worker.Submit(std::move(pipe), std::move(src));
+                PipelineOutcome out;
+                const auto dl = clockt::now() + std::chrono::seconds(30);
+                while (clockt::now() < dl && !worker.TryFetch(&out))
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        }
+
+        // A burst on the LAST stage's parameter. Every one supersedes the one
+        // before it, so runs are cancelled in flight -- exactly the situation
+        // that used to wipe the cache.
+        uint64_t lastSeq = 0;
+        for (int i = 1; i <= 12; ++i) {
+            UiState ui; Pipeline pipe; std::vector<Data> src; std::string err;
+            if (!BuildPipeline(script(0.01 * i).c_str(), dim, &ui, &pipe, &src, &err)) return;
+            lastSeq = worker.Submit(std::move(pipe), std::move(src));
+        }
+
+        PipelineOutcome out;
+        bool got = false;
+        const auto deadline = clockt::now() + std::chrono::seconds(30);
+        while (clockt::now() < deadline) {
+            if (worker.TryFetch(&out) && out.seq == lastSeq) { got = true; break; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+
+        Check(got, "the final request of a cancelling burst completed");
+        if (got) {
+            // Only `brightness` changed, so both blurs should have come from
+            // the cache. Before the fix a cancelled run cleared it and this
+            // reported 0.
+            const int cached = worker.LastCachedStages();
+            std::printf("       cached after a cancelling burst: %d\n", cached);
+            Check(cached >= 2,
+                  "a cancelled run keeps its finished prefix (" +
+                      std::to_string(cached) + " cached)");
+        }
+    }
+
     worker.Stop();
 }
 

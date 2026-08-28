@@ -23,6 +23,7 @@
 #include "../src/core/image_io.h"
 #include "../src/core/image_stats.h"
 #include "../src/core/raw_io.h"
+#include "../src/core/cancel.h"
 #include "../src/core/pipeline.h"
 #include "../src/script/interp.h"
 #include "../src/script/parser.h"
@@ -3295,6 +3296,94 @@ int main() {
                       std::to_string(ratio) + ")");
         } else {
             Check(false, "tonemap_local ran");
+        }
+    }
+
+    // --- a cancelled run keeps its finished prefix ---------------------------
+    //
+    // Tim's report: dragging a develop slider far enough to cancel a run made
+    // the ENTIRE pipeline re-run -- demosaic, hot-pixel repair, the HDR merge,
+    // everything -- rather than just the stage whose parameter moved.
+    //
+    // The cause was the worker dropping the whole stage cache on cancellation.
+    // The invariant that makes keeping it safe was already in place: Execute()
+    // marks a stage invalid BEFORE running it and valid only on success, and
+    // the cache scan stops at the first invalid stage. So the completed prefix
+    // of an abandoned run is exactly as reusable as any other prev.
+    //
+    // Tested at the Pipeline level rather than through the worker, because the
+    // worker's cancellation is driven by a second job arriving and that race
+    // cannot be made deterministic. Cancelling from the progress hook at a
+    // chosen stage boundary reproduces the same state exactly.
+    {
+        // Cancels the run once a named stage is reached, which is the same
+        // thing a newer job does mid-drag.
+        struct CancelAt : Progress {
+            std::string   target;
+            CancelToken*  token = nullptr;
+            int           reached = 0;
+            void Set(int done, int total, const char* what) override {
+                Progress::Set(done, total, what);
+                if (what && target == what && token) { ++reached; token->Cancel(); }
+            }
+        };
+
+        auto build = [&](Pipeline* p, std::vector<Data>* srcs, UiState* ui,
+                         const char* script, std::string* err) {
+            return RunScript(script, ui, p, err, srcs);
+        };
+
+        // Four stages, so there is a meaningful prefix to preserve.
+        const char* kScript =
+            "src = image(\"test\")\n"
+            "out = src => gaussian_blur(sigma = 2)\n"
+            "          => grayscale()\n"
+            "          => box_blur(radius = 2)\n"
+            "          => brightness(brightness = 0.1)\n"
+            "display(out)\n";
+
+        UiState ui1; Pipeline first; std::vector<Data> src1; std::string err;
+        const bool built = build(&first, &src1, &ui1, kScript, &err);
+        Check(built && first.Stages().size() == 4,
+              "built a four-stage pipeline to cancel" + (built ? "" : ": " + err));
+
+        if (built) {
+            CancelToken tok;
+            CancelAt prog;
+            prog.target = "box_blur";     // cancel at stage 2 of 4
+            prog.token  = &tok;
+
+            std::string cerr;
+            const bool ran = first.Execute(&src1, nullptr, &cerr, nullptr,
+                                           ExecMode::ForceCPU, nullptr, &tok, &prog);
+            Check(!ran && cerr == Pipeline::kCancelled,
+                  "the run was cancelled part-way");
+            Check(prog.reached == 1, "cancellation happened at the chosen stage");
+
+            // The stages BEFORE the cancellation point completed and must still
+            // be valid; the one it stopped at must not be.
+            Check(first.Stages()[0].valid && first.Stages()[1].valid,
+                  "stages finished before the cancel stay valid");
+            Check(!first.Stages()[2].valid,
+                  "the cancelled stage is marked invalid");
+
+            // Now re-run with the abandoned pipeline as prev, exactly as the
+            // worker now does. The finished prefix must be REUSED rather than
+            // recomputed -- that is the whole fix.
+            UiState ui2; Pipeline second; std::vector<Data> src2;
+            if (build(&second, &src2, &ui2, kScript, &err)) {
+                std::string rerr;
+                const bool ok2 = second.Execute(&src2, &first, &rerr, nullptr,
+                                                ExecMode::ForceCPU);
+                Check(ok2, "the follow-up run completed" + (ok2 ? "" : ": " + rerr));
+                Check(ok2 && second.CachedStageCount() == 2,
+                      "the finished prefix was reused, not recomputed (" +
+                          std::to_string(second.CachedStageCount()) + " cached)");
+                Check(ok2 && second.FirstDirtyStage() == 2,
+                      "the re-run starts at the stage that was cancelled");
+            } else {
+                Check(false, "rebuilt the pipeline for the follow-up run");
+            }
         }
     }
 

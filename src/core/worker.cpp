@@ -287,12 +287,29 @@ void PipelineWorker::Run() {
             }
         }
         if (cancelled) {
-            // The abandoned pipeline's stage cache is half-finished, so it
-            // cannot seed the next run -- a cancelled stage is marked invalid,
-            // but dropping the whole thing is simpler than reasoning about
-            // which prefix survived.
-            havePrev = false;
-            prev.Clear();
+            // KEEP the abandoned pipeline as the cache for the next run.
+            //
+            // This used to drop it, on the reasoning that a half-finished cache
+            // "cannot seed the next run" and that reasoning about which prefix
+            // survived was not worth it. Both halves of that were wrong, and
+            // the cost was severe: dragging a develop slider far enough to
+            // cancel a run threw away the demosaic, the hot-pixel repair and
+            // the whole HDR merge, so a one-parameter change re-ran seven raws.
+            //
+            // Nothing needs to be reasoned about, because the invariant already
+            // holds. Execute() sets s.valid = false BEFORE running each stage
+            // and true only on success, so a cancelled stage is already marked
+            // invalid; and the cache scan stops at the first invalid stage
+            // (`if (!ps.valid) break;`). A half-finished pipeline is therefore
+            // exactly a pipeline whose completed prefix is valid -- which is
+            // the same shape as any other prev, and is handled by the same
+            // code path.
+            //
+            // The stages after the cancellation point are not merely unused:
+            // they are marked invalid, so the scan cannot reach past them even
+            // if a later run's hashes happen to match.
+            prev = std::move(job->pipe);
+            havePrev = true;
             {
                 std::lock_guard<std::mutex> lock(m_mtx);
                 m_running.reset();
