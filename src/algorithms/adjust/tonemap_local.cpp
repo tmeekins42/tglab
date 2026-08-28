@@ -54,6 +54,7 @@
 // real detail into the base and leaves nothing to protect.
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -102,6 +103,142 @@ LogLevels MeasureLog(const std::vector<float>& logLum, int w, int h) {
     out.valid  = out.high > out.low;
     return out;
 }
+
+// --- GPU shaders -------------------------------------------------------------
+//
+// Shared prologue. The box passes are written once and used for both the
+// log/log-squared plane and the a/b plane, since both are "smooth two channels
+// separably" -- the only difference is which plane is bound.
+const char* const kTlCommon = R"(
+Texture2D<float4>   T0 : register(t0);
+Texture2D<float4>   T1 : register(t1);
+Texture2D<float4>   T2 : register(t2);
+Texture2D<float4>   T3 : register(t3);
+RWTexture2D<float4> U0 : register(u0);
+
+cbuffer Params : register(b0) {
+    uint Width;
+    uint Height;
+    uint Radius;
+    uint CompressBits;   // k: how much the base is scaled
+    uint OffsetBits;     // where the compressed median lands, in log2
+    uint EpsBits;        // guided-filter eps, already squared (a variance)
+    uint SatBits;
+    uint Valid;          // 0 = measurement failed; pass the image through
+};
+
+int2 ClampXY(int x, int y) {
+    return int2(clamp(x, 0, int(Width) - 1), clamp(y, 0, int(Height) - 1));
+}
+
+// Same floor as the CPU path, and for the same reason: a merged bracket
+// contains real negatives from the demosaic's undershoot, and log is undefined
+// there.
+static const float kFloor = 1e-6;
+)";
+
+// P0: log luminance, and its square, in one plane.
+//
+// Carrying both means the separable box that follows produces mean AND meanSq
+// in a single traversal. The variance the guided filter needs is then one
+// subtraction rather than a second pair of box passes.
+const char* const kTlLogHlsl = R"(
+[numthreads(8, 8, 1)]
+void main(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= Width || tid.y >= Height) return;
+    float4 c = T0[int2(tid.xy)];
+    float lum = dot(c.rgb, float3(0.2126, 0.7152, 0.0722));
+    float l = log2(max(lum, kFloor));
+    U0[tid.xy] = float4(l, l * l, 0, 1);
+}
+)";
+
+// P1/P4: separable box, horizontal. Gathers 2r+1 along one axis.
+//
+// A running sum would be O(1) per pixel as on the CPU, but a compute thread
+// has no cheap way to carry state along a row. Two separable gathers are
+// O(2r) rather than O(r^2), which is what makes a 300-pixel radius practical:
+// 600 fetches per pixel instead of 360,000.
+const char* const kTlBoxHHlsl = R"(
+[numthreads(8, 8, 1)]
+void main(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= Width || tid.y >= Height) return;
+    int r = int(Radius);
+    float2 sum = 0.0;
+    for (int i = -r; i <= r; ++i)
+        sum += T0[ClampXY(int(tid.x) + i, int(tid.y))].xy;
+    U0[tid.xy] = float4(sum / float(2 * r + 1), 0, 1);
+}
+)";
+
+// P2/P5: separable box, vertical.
+const char* const kTlBoxVHlsl = R"(
+[numthreads(8, 8, 1)]
+void main(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= Width || tid.y >= Height) return;
+    int r = int(Radius);
+    float2 sum = 0.0;
+    for (int i = -r; i <= r; ++i)
+        sum += T0[ClampXY(int(tid.x), int(tid.y) + i)].xy;
+    U0[tid.xy] = float4(sum / float(2 * r + 1), 0, 1);
+}
+)";
+
+// P3: the guided filter's local linear model.
+//
+// Self-guided, so cov(I, p) == var(I) and the algebra collapses to
+// a = var / (var + eps), b = (1 - a) * mean. a and b share one plane so the
+// box passes that smooth them cost the same as the ones above.
+const char* const kTlAbHlsl = R"(
+[numthreads(8, 8, 1)]
+void main(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= Width || tid.y >= Height) return;
+    float2 ms = T0[int2(tid.xy)].xy;       // mean, meanSq
+    float var = max(0.0, ms.y - ms.x * ms.x);
+    float eps = asfloat(EpsBits);
+    float a = var / (var + eps);
+    U0[tid.xy] = float4(a, (1.0 - a) * ms.x, 0, 1);
+}
+)";
+
+// P6: base = a*log + b, then compress the base and put the detail back.
+//
+// The one line that matters is `k * base + detail`: because these are logs,
+// leaving detail unscaled preserves every local RATIO exactly while k rescales
+// only the slow illumination underneath. See the file header.
+const char* const kTlCombineHlsl = R"(
+[numthreads(8, 8, 1)]
+void main(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= Width || tid.y >= Height) return;
+    float4 src = T0[int2(tid.xy)];
+
+    // A failed measurement passes the image through rather than guessing.
+    if (Valid == 0) { U0[tid.xy] = float4(src.rgb, 1); return; }
+
+    float  l  = T1[int2(tid.xy)].x;        // log luminance
+    float2 ab = T2[int2(tid.xy)].xy;       // smoothed a, b
+
+    float base   = ab.x * l + ab.y;
+    float detail = l - base;
+
+    float k      = asfloat(CompressBits);
+    float outLog = k * base + detail + asfloat(OffsetBits);
+
+    float newLum = exp2(outLog);
+    float oldLum = exp2(l);
+    float gain   = newLum / max(oldLum, kFloor);
+
+    float3 rgb = src.rgb * gain;
+
+    // Compressing luminance reads as desaturated even though the channel
+    // ratios are preserved; this pushes them away from the new luminance to
+    // compensate, and at 1.0 does nothing.
+    float sat = asfloat(SatBits);
+    if (sat != 1.0) rgb = newLum + (rgb - newLum) * sat;
+
+    U0[tid.xy] = float4(rgb, 1);
+}
+)";
 
 class TonemapLocal : public AlgorithmBase {
 public:
@@ -255,7 +392,117 @@ public:
         return buf;
     }
 
-    bool HasGPU() const override { return false; }
+    // --- GPU path ------------------------------------------------------------
+    //
+    // Seven passes over four RGBA32F scratch planes. The structure follows the
+    // CPU path exactly, with one economy: log and log-squared travel together
+    // in .x and .y of a single plane, so ONE separable box pass produces both
+    // mean and meanSq. Doing them as separate planes would double the box work,
+    // which is the expensive part.
+    //
+    //   P0  log luminance and its square           -> plane 0 (.x, .y)
+    //   P1  box, horizontal                        -> plane 1
+    //   P2  box, vertical  => mean, meanSq         -> plane 2
+    //   P3  a, b from the local variance           -> plane 1 (.x, .y)
+    //   P4  box a and b, horizontal                -> plane 3
+    //   P5  box a and b, vertical                  -> plane 1
+    //   P6  recombine with the original colour     -> output
+    //
+    // The box is separable and gathers 2r+1 samples per axis. That matters more
+    // here than anywhere else in the codebase: the base layer's radius is a
+    // PERCENTAGE of the image -- ~300 px at 45 MP -- so the O(r^2) gather the
+    // small filters use would be 360,000 fetches per pixel.
+    bool HasGPU() const override { return true; }
+
+    // The scene percentiles that place the compression cannot be derived from a
+    // descriptor: they are a property of the CONTENT, and a merged bracket's
+    // scale is arbitrary. So this measures on the CPU first. See
+    // GpuNeedsInputPixels for what that costs and why it is opt-in.
+    bool GpuNeedsInputPixels() const override { return true; }
+
+    void MeasureForGpu(const std::vector<const Image*>& inputs) override {
+        m_gpuValid = false;
+        if (inputs.empty() || !inputs[0]) return;
+
+        ImageView v = const_cast<Image*>(inputs[0])->MapCpuRead();
+        if (!v.data) return;
+
+        PixelBuffer pb;
+        pb.Unpack(v);
+        if (!pb.Valid()) return;
+
+        const int w = pb.Width(), h = pb.Height(), ch = pb.Channels();
+        if (w <= 0 || h <= 0) return;
+
+        // Strided, like the CPU path's own measurement: a few hundred thousand
+        // samples pin a percentile down, and a full sort at 45 MP would cost
+        // more than every pass below put together.
+        std::vector<float> s;
+        s.reserve(400000);
+        const int stride = std::max(1, std::min(w, h) / 700);
+        const std::vector<float>& sp = pb.Data();
+        for (int y = 0; y < h; y += stride)
+            for (int x = 0; x < w; x += stride) {
+                const float* p = &sp[(size_t(y) * size_t(w) + size_t(x)) * size_t(ch)];
+                const float lum = (ch >= 3)
+                    ? 0.2126f * p[0] + 0.7152f * p[1] + 0.0722f * p[2] : p[0];
+                s.push_back(std::log2(std::max(lum, kFloor)));
+            }
+        if (s.size() < 1000) return;
+
+        std::sort(s.begin(), s.end());
+        auto pct = [&](double f) {
+            return s[std::min(s.size() - 1, size_t(f * double(s.size() - 1) + 0.5))];
+        };
+        const float low = pct(0.01), median = pct(0.50), high = pct(0.995);
+        if (!(high > low)) return;
+
+        // Same fit as the CPU path, computed here so the shader receives two
+        // plain numbers rather than repeating the reasoning.
+        const float spanBefore = high - low;
+        const float target     = float(m_range);
+        m_compression = (spanBefore > target) ? (target / spanBefore) : 1.0f;
+        m_spanBefore  = spanBefore;
+        m_gpuOffset   = std::log2(kGreyIn) - m_compression * median + float(m_exposure);
+        m_gpuRadius   = std::max(2, int(float(m_radius) * 0.01f * float(std::min(w, h))));
+        m_gpuValid    = true;
+    }
+
+    int        GpuScratchCount()  const override { return 4; }
+    FormatSpec GpuScratchPlanes() const override { return FormatSpec::RGBA32F; }
+
+    std::vector<GpuPass> GpuPasses() const override {
+        // Assembled once: GpuPasses returns raw pointers, and rebuilding the
+        // strings per call would dangle them the moment the vector went away.
+        static const std::string logp = std::string(kTlCommon) + kTlLogHlsl;
+        static const std::string boxh = std::string(kTlCommon) + kTlBoxHHlsl;
+        static const std::string boxv = std::string(kTlCommon) + kTlBoxVHlsl;
+        static const std::string ab   = std::string(kTlCommon) + kTlAbHlsl;
+        static const std::string comb = std::string(kTlCommon) + kTlCombineHlsl;
+
+        std::vector<GpuPass> p;
+        p.push_back({logp.c_str(), "log",     {-1},        {0}});
+        p.push_back({boxh.c_str(), "boxH",    {0},         {1}});
+        p.push_back({boxv.c_str(), "boxV",    {1},         {2}});
+        p.push_back({ab.c_str(),   "ab",      {2},         {1}});
+        p.push_back({boxh.c_str(), "boxABH",  {1},         {3}});
+        p.push_back({boxv.c_str(), "boxABV",  {3},         {1}});
+        // The combine needs the original image, the log plane and the smoothed
+        // a/b. Four reads, which is the SRV limit and the reason a and b share
+        // one plane rather than taking two.
+        p.push_back({comb.c_str(), "combine", {-1, 0, 1},  {-1}});
+        return p;
+    }
+
+    std::vector<uint32_t> GpuPassConstants(int) const override {
+        auto bits = [](float f) { uint32_t u; std::memcpy(&u, &f, sizeof u); return u; };
+        return {uint32_t(m_gpuRadius),
+                bits(m_gpuValid ? m_compression : 1.0f),
+                bits(m_gpuValid ? m_gpuOffset   : 0.0f),
+                bits(float(m_detail) * float(m_detail)),   // eps, a variance
+                bits(float(m_saturation)),
+                uint32_t(m_gpuValid ? 1u : 0u)};
+    }
 
 private:
     // Below any real scene value, and only there to keep log() defined on the
@@ -393,6 +640,13 @@ private:
 
     float m_compression = 1.0f;
     float m_spanBefore  = 0.0f;
+
+    // Measured in MeasureForGpu and handed to the shader as root constants.
+    // Separate from the CPU path's locals because the GPU path never runs
+    // RunCPU, so there is nothing on the stack to carry them.
+    bool  m_gpuValid  = false;
+    float m_gpuOffset = 0.0f;
+    int   m_gpuRadius = 8;
 };
 
 } // namespace

@@ -164,6 +164,27 @@ public:
     // calls RunCPU, so without this the shader would use stale values.
     virtual void PrepareGpu(const std::vector<ImageDesc>& inputs) { (void)inputs; }
 
+    // True if this algorithm must MEASURE its input before the GPU path runs.
+    //
+    // Separate from PrepareGpu, and opt-in, because it costs something real: it
+    // forces the input's pixels to the CPU, which on a GPU-resident
+    // intermediate means a readback -- ~86 ms at 21 MP. Every algorithm whose
+    // constants come from parameters or from the descriptor should leave this
+    // false and pay nothing.
+    //
+    // What needs it: an operator whose shader constants depend on the CONTENT
+    // rather than on the format. A tone mapper is the case -- where it places
+    // its curve depends on the scene's own percentiles, and a merged bracket's
+    // scale is arbitrary, so no fixed anchor can be right. Without this the
+    // choice is a CPU-only operator or a shader working from numbers that do
+    // not describe the image in front of it.
+    virtual bool GpuNeedsInputPixels() const { return false; }
+
+    // Called with the input pixels when GpuNeedsInputPixels() is true, before
+    // any pass is dispatched. Whatever is measured here is expected to reach
+    // the shader through GpuConstants/GpuPassConstants.
+    virtual void MeasureForGpu(const std::vector<const Image*>& inputs) { (void)inputs; }
+
     // Lets an algorithm set parameter DEFAULTS from the source it will run on,
     // before the script declares its controls.
     //

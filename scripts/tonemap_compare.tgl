@@ -16,7 +16,8 @@
 # dark side of a skyline is the failure mode, and the reason global stays
 # the default.
 
-src = image("test")
+frames = image("group")
+src = merge_hdr(align(frames))
 
 src => params(tonemap)()       => display("1 global")
 src => params(tonemap_local)() => display("2 local")

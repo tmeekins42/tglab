@@ -886,6 +886,82 @@ int main() {
                                          (okCpu ? e2 : e1));
                     }
                 }
+                // tonemap_local, CPU against GPU.
+                //
+                // Here rather than in test_script because this file already
+                // stands up a device, and the check is the same kind: seven
+                // passes over four shared planes, where a wrong binding -- a
+                // pass reading the plane it writes, or a and b swapped --
+                // still produces a plausible image with plausible statistics.
+                // Only a per-pixel comparison against the CPU says the wiring
+                // is right.
+                {
+                    constexpr int kTW = 96, kTH = 72;
+                    auto hdrScene = [&] {
+                        Image img;
+                        ImageDesc d{kTW, kTH, Format::RGBA32F};
+                        d.linear = true;
+                        img.Alloc(d);
+                        ImageView v = img.MapCpuWrite();
+                        for (int y = 0; y < kTH; ++y)
+                            for (int x = 0; x < kTW; ++x) {
+                                // A wide illumination step with texture on both
+                                // sides: the structure the operator is for, and
+                                // enough range that a mis-bound plane is off by
+                                // whole units rather than thousandths.
+                                const float illum = (x < kTW / 2) ? 0.25f : 6.0f;
+                                const float tex = 1.0f + 0.3f * float(((x / 2 + y / 3) & 1) ? 1 : -1);
+                                float* p = v.At<float>(x, y);
+                                p[0] = illum * tex * 0.9f;
+                                p[1] = illum * tex;
+                                p[2] = illum * tex * 1.1f;
+                                p[3] = 1.0f;
+                            }
+                        return img;
+                    };
+
+                    auto runTl = [&](ExecMode mode, ComputeContext* g, Image* out) {
+                        auto algo = Registry::Get().Create("tonemap_local");
+                        if (!algo) return false;
+                        Pipeline p;
+                        std::vector<Data> srcs;
+                        srcs.push_back(Data{hdrScene()});
+                        p.AddStage(std::move(algo), "tonemap_local", {{-1, 0}}, 1, 1);
+                        std::string e;
+                        if (!p.Execute(&srcs, nullptr, &e, g, mode)) return false;
+                        const Data* d = p.Resolve({0, 0}, &srcs);
+                        const auto* im = d ? std::get_if<Image>(d) : nullptr;
+                        if (!im) return false;
+                        *out = const_cast<Image&>(*im).Clone();
+                        return true;
+                    };
+
+                    Image cpuOut, gpuOut;
+                    const bool okCpu = runTl(ExecMode::ForceCPU, nullptr, &cpuOut);
+                    const bool okGpu = runTl(ExecMode::ForceGPU, &gpu, &gpuOut);
+                    if (okCpu && okGpu) {
+                        ImageView a = cpuOut.MapCpuRead();
+                        ImageView b = gpuOut.MapCpuRead();
+                        double worst = 0.0;
+                        for (int y = 1; y < kTH - 1; ++y)
+                            for (int x = 1; x < kTW - 1; ++x)
+                                for (int c = 0; c < 3; ++c)
+                                    worst = std::max(worst,
+                                        std::abs(double(a.At<float>(x, y)[c]) -
+                                                 double(b.At<float>(x, y)[c])));
+                        // Loose enough for float order-of-operations -- the CPU
+                        // slides a running sum along a row while the shader
+                        // gathers 2r+1 samples, so the two accumulate in
+                        // different orders -- and far tighter than any wiring
+                        // mistake could survive.
+                        Check(worst < 0.02,
+                              "tonemap_local GPU matches CPU (worst " +
+                                  std::to_string(worst) + ")");
+                    } else {
+                        Check(false, "tonemap_local ran both ways");
+                    }
+                }
+
                 gpu.Shutdown();
             }
             dev->Release();

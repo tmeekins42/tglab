@@ -917,6 +917,17 @@ bool Pipeline::RunStageGpu(Stage& s, const std::vector<const Data*>& in,
         s.algo->PrepareGpu(inDescs);
     }
 
+    // An algorithm whose shader constants depend on the image CONTENT gets to
+    // look at the pixels first. Opt-in, because reaching them can force a
+    // readback of a GPU-resident intermediate -- and the algorithms that do not
+    // need it must not pay for that. See GpuNeedsInputPixels.
+    if (s.algo->GpuNeedsInputPixels()) {
+        std::vector<const Image*> inImages;
+        inImages.reserve(in.size());
+        for (const Data* d : in) inImages.push_back(&std::get<Image>(*d));
+        s.algo->MeasureForGpu(inImages);
+    }
+
     // Kernels are compiled once per stage and cached on the stage, so dragging
     // a slider does not recompile HLSL every frame.
     const std::vector<AlgorithmBase::GpuPass> passes = s.algo->GpuPasses();
