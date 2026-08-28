@@ -67,6 +67,11 @@ struct Plane {
     std::vector<uint8_t> ok;
     int w = 0, h = 0;
 
+    // The pivot for rotation and scale, and the origin the solve measures from.
+    // See PickPoints: anchoring at the corner makes any scale error walk the
+    // image centre, which is a visible global shift.
+    float cx = 0.0f, cy = 0.0f;
+
     bool Ok(int x, int y) const {
         if (ok.empty()) return true;
         x = std::clamp(x, 0, w - 1);
@@ -105,6 +110,8 @@ Plane MakeLuma(const PixelBuffer& pb, float exposure) {
     p.h = pb.Height();
     p.v.resize(size_t(p.w) * size_t(p.h));
     p.ok.resize(size_t(p.w) * size_t(p.h), 1);
+    p.cx = 0.5f * float(p.w - 1);
+    p.cy = 0.5f * float(p.h - 1);
     const int ch = pb.Channels();
     const float inv = (exposure > 0.0f) ? 1.0f / exposure : 1.0f;
     for (int y = 0; y < p.h; ++y)
@@ -150,6 +157,8 @@ Plane Downsample(const Plane& in) {
     o.h = std::max(1, in.h / 2);
     o.v.resize(size_t(o.w) * size_t(o.h));
     o.ok.resize(size_t(o.w) * size_t(o.h), 1);
+    o.cx = 0.5f * float(o.w - 1);
+    o.cy = 0.5f * float(o.h - 1);
     for (int y = 0; y < o.h; ++y)
         for (int x = 0; x < o.w; ++x) {
             const float s = in.At(x * 2, y * 2) + in.At(x * 2 + 1, y * 2) +
@@ -231,11 +240,34 @@ std::vector<Point> PickPoints(const Plane& ref, int want) {
             //   x' = (1+p0)x + p1 y + p2
             //   y' = p3 x + (1+p4) y + p5
             // so d(x')/dp = [x, y, 1, 0, 0, 0] and d(y')/dp = [0, 0, 0, x, y, 1].
-            p.j[0] = gx * float(x);
-            p.j[1] = gx * float(y);
+            //
+            // COORDINATES ARE MEASURED FROM THE IMAGE CENTRE, not the corner,
+            // and the reason is numerical rather than aesthetic.
+            //
+            // With raw pixel coordinates the linear columns reach 5796 while
+            // the translation columns are 1, so the normal equations carry a
+            // 5796:1 conditioning ratio and the linear terms dominate the fit.
+            // The solve then prefers to explain a displacement with a tiny
+            // scale or rotation rather than a translation -- and since those
+            // are anchored at the ORIGIN, a scale of 1.0003 walks the image
+            // centre by 0.78 px right and 0.52 px down.
+            //
+            // That is exactly what Tim saw: hdrtest2's merge shifted down and
+            // right by about a pixel even though the reference frame has the
+            // identity transform. The seven solves all reported the same sign
+            // of rotation and the same above-unity scale, which is the
+            // signature of a bias rather than seven independent answers.
+            //
+            // Centring makes the columns comparable in magnitude and puts the
+            // rotation and scale pivot where a camera actually rotates about --
+            // the middle of the frame -- so neither displaces the centre.
+            const float cx = float(x) - ref.cx;
+            const float cy = float(y) - ref.cy;
+            p.j[0] = gx * cx;
+            p.j[1] = gx * cy;
             p.j[2] = gx;
-            p.j[3] = gy * float(x);
-            p.j[4] = gy * float(y);
+            p.j[3] = gy * cx;
+            p.j[4] = gy * cy;
             p.j[5] = gy;
             pts.push_back(p);
         }
@@ -416,9 +448,38 @@ private:
     }
 
     // One Lucas-Kanade solve at one pyramid level.
+    // The transform is STORED in corner coordinates -- that is what a consumer
+    // walking the image grid wants -- but SOLVED in centred ones, because the
+    // conditioning and the pivot both demand it. The conversion happens here,
+    // at the boundary, so neither the caller nor the merge has to know.
+    //
+    //   centred:  p_c = p - c
+    //   corner:   T(p) = c + Tc(p - c)
+    static Affine ToCentred(const Affine& t, float cx, float cy) {
+        Affine o = t;
+        // Translation in centred space is where the centre goes, relative to
+        // itself: T(c) - c.
+        float mx, my;
+        t.MapPoint(cx, cy, &mx, &my);
+        o.m[2] = mx - cx;
+        o.m[5] = my - cy;
+        return o;
+    }
+
+    static Affine ToCorner(const Affine& t, float cx, float cy) {
+        Affine o = t;
+        // Undo the centring: T(p) = c + Tc(p - c) expands to a linear part
+        // unchanged and a translation of c + tc - Tc*c.
+        o.m[2] = cx + t.m[2] - (t.m[0] * cx + t.m[1] * cy);
+        o.m[5] = cy + t.m[5] - (t.m[3] * cx + t.m[4] * cy);
+        return o;
+    }
+
     Affine SolveLevel(const Plane& ref, const Plane& mov,
-                      const std::vector<Point>& pts, Affine t) const {
-        if (pts.size() < 12) return t;   // too few to constrain six parameters
+                      const std::vector<Point>& pts, Affine tCorner) const {
+        if (pts.size() < 12) return tCorner;   // too few to constrain six params
+
+        Affine t = ToCentred(tCorner, ref.cx, ref.cy);
 
         for (int iter = 0; iter < kIters; ++iter) {
             double A[6][6] = {};
@@ -427,7 +488,12 @@ private:
 
             for (const Point& p : pts) {
                 float wx, wy;
-                t.MapPoint(p.x, p.y, &wx, &wy);
+                // Points carry CORNER coordinates; the solve works in centred
+                // space, so map the centred point and add the centre back to
+                // get a sampling position.
+                t.MapPoint(p.x - ref.cx, p.y - ref.cy, &wx, &wy);
+                wx += mov.cx;
+                wy += mov.cy;
                 // Points that warp outside the moving frame carry no
                 // information and would pull the fit toward the edge clamp.
                 if (wx < 1.0f || wy < 1.0f ||
@@ -488,7 +554,7 @@ private:
             // Converged once the step is far below a pixel.
             if (std::abs(d[2]) < 1e-3 && std::abs(d[5]) < 1e-3) break;
         }
-        return t;
+        return ToCorner(t, ref.cx, ref.cy);
     }
 
     static constexpr int    kIters   = 12;
