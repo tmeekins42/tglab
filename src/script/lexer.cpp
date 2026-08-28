@@ -17,6 +17,7 @@ const char* TokName(Tok t) {
         case Tok::RBracket: return "']'";
         case Tok::Comma:    return "','";
         case Tok::Assign:   return "'='";
+        case Tok::Arrow:    return "'=>'";
         case Tok::Dot:      return "'.'";
         case Tok::Plus:     return "'+'";
         case Tok::Minus:    return "'-'";
@@ -166,7 +167,18 @@ bool Lex(std::string_view src, std::vector<Token>* out, std::string* err) {
             case '[': k = Tok::LBracket; break;
             case ']': k = Tok::RBracket; break;
             case ',': k = Tok::Comma;    break;
-            case '=': k = Tok::Assign;   break;
+            case '=':
+                // '=>' is ONE token, not '=' followed by '>'. The statement parser
+                // decides whether a line is an assignment by scanning for a bare
+                // '=' at bracket depth zero, so lexing the pipe as two tokens
+                // would make `a => f(b)` look like an assignment to `a`.
+                if (i + 1 < src.size() && src[i + 1] == '>') {
+                    push(Tok::Arrow, i);
+                    i += 2;
+                    continue;
+                }
+                k = Tok::Assign;
+                break;
             case '.': k = Tok::Dot;      break;
             case '+': k = Tok::Plus;     break;
             case '-': k = Tok::Minus;    break;

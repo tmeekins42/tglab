@@ -15,6 +15,7 @@ enum class Tok {
     LBracket, RBracket,
     Comma,
     Assign,
+    Arrow,      // '=>', the pipe operator
     Dot,
     Plus, Minus, Star, Slash, Percent,
     Newline,

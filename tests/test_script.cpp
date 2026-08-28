@@ -4,6 +4,9 @@
 #include <cstdio>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <thread>
 #include <string>
 #include <vector>
@@ -2660,6 +2663,201 @@ int main() {
             }
         }
     }
+
+    // --- the pipe operator ---------------------------------------------------
+    //
+    // `=>` is sugar, so the test that matters is EQUIVALENCE: a piped script and
+    // its nested twin must build the same pipeline. If that holds, everything
+    // downstream -- caching, the stage list, error messages -- needs no separate
+    // coverage, because it cannot tell the two apart.
+    {
+        UiState ui; Pipeline pPipe, pNest; std::string err; std::vector<Data> src;
+
+        const bool okPipe = RunScript(
+            "src = image(\"test\")\n"
+            "out = src => gaussian_blur(sigma = 2) => brightness(brightness = 0.1)\n"
+            "display(out)\n", &ui, &pPipe, &err, &src);
+        Check(okPipe, "a pipe chain runs" + (okPipe ? "" : ": " + err));
+
+        UiState ui2; std::vector<Data> src2;
+        const bool okNest = RunScript(
+            "src = image(\"test\")\n"
+            "out = brightness(gaussian_blur(src, sigma = 2), brightness = 0.1)\n"
+            "display(out)\n", &ui2, &pNest, &err, &src2);
+        Check(okNest, "the nested twin runs" + (okNest ? "" : ": " + err));
+
+        bool same = okPipe && okNest && pPipe.Stages().size() == pNest.Stages().size();
+        if (same)
+            for (size_t i = 0; i < pPipe.Stages().size(); ++i)
+                if (pPipe.Stages()[i].algoName != pNest.Stages()[i].algoName) same = false;
+        Check(same, "a pipe chain builds the same pipeline as the nested form");
+
+        // Order matters: the pipe must read left to right. Reversed, this would
+        // still be two stages and still "pass" a count-only check.
+        Check(pPipe.Stages().size() == 2 &&
+              pPipe.Stages()[0].algoName == "gaussian_blur" &&
+              pPipe.Stages()[1].algoName == "brightness",
+              "the pipe applies left to right, not inside out");
+    }
+
+    // The piped value lands FIRST, ahead of arguments already written.
+    {
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        const bool ok = RunScript(
+            "src = image(\"test\")\n"
+            "out = src => brightness(brightness = 0.25)\n"
+            "display(out)\n", &ui, &p, &err, &src);
+        Check(ok && p.Stages().size() == 1,
+              "a pipe splices ahead of named arguments" + (ok ? "" : ": " + err));
+    }
+
+    // Bare callee: `x => f` with no argument list means f(x).
+    {
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        const bool ok = RunScript(
+            "src = image(\"test\")\n"
+            "out = src => grayscale\n"
+            "display(out)\n", &ui, &p, &err, &src);
+        Check(ok && p.Stages().size() == 1 && p.Stages()[0].algoName == "grayscale",
+              "a pipe into a bare name needs no empty parens" + (ok ? "" : ": " + err));
+    }
+
+    // The question that prompted the feature: does a pipe work when the
+    // algorithm is a VARIABLE returned by choose()? It does, and for a reason
+    // worth stating -- the parser desugars into the same Call node `f(src)`
+    // builds, and call position was already general enough to hold a variable.
+    {
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        const char* kScript =
+            "src = image(\"test\")\n"
+            "f = choose(\"op\", [brightness, grayscale])\n"
+            "out = src => f()\n"
+            "display(out)\n";
+
+        const bool ok = RunScript(kScript, &ui, &p, &err, &src);
+        Check(ok && p.Stages().size() == 1 && p.Stages()[0].algoName == "brightness",
+              "a pipe into a choose() variable runs" + (ok ? "" : ": " + err));
+
+        if (UiControl* c = ui.Find("op")) c->selected = 1;
+        Pipeline p2;
+        RunScript(kScript, &ui, &p2, &err, &src);
+        Check(p2.Stages().size() == 1 && p2.Stages()[0].algoName == "grayscale",
+              "switching the dropdown swaps the piped algorithm too");
+    }
+
+    // A pipe with no parens into a choose() variable: `src => f`.
+    {
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        const bool ok = RunScript(
+            "src = image(\"test\")\n"
+            "f = choose(\"op\", [grayscale, brightness])\n"
+            "out = src => f\n"
+            "display(out)\n", &ui, &p, &err, &src);
+        Check(ok && p.Stages().size() == 1 && p.Stages()[0].algoName == "grayscale",
+              "a bare pipe into a choose() variable runs" + (ok ? "" : ": " + err));
+    }
+
+    // A chain broken across lines after the arrow, which is how a long one
+    // wants to be written.
+    {
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        const bool ok = RunScript(
+            "src = image(\"test\")\n"
+            "out = src =>\n"
+            "      gaussian_blur(sigma = 1) =>\n"
+            "      grayscale()\n"
+            "display(out)\n", &ui, &p, &err, &src);
+        Check(ok && p.Stages().size() == 2,
+              "a pipe chain may break across lines" + (ok ? "" : ": " + err));
+    }
+
+    // The other line-break style: the arrow LEADING the continuation line,
+    // which is how these chains are usually written when each stage gets its
+    // own line. Worth supporting because it is the more common convention, and
+    // the one a reader is most likely to try.
+    {
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        const bool ok = RunScript(
+            "src = image(\"test\")\n"
+            "out = src\n"
+            "    => gaussian_blur(sigma = 1)\n"
+            "    => grayscale()\n"
+            "display(out)\n", &ui, &p, &err, &src);
+        Check(ok && p.Stages().size() == 2,
+              "a chain may lead its continuation lines with '=>'" + (ok ? "" : ": " + err));
+    }
+
+    // Precedence against arithmetic, in both directions. Pipes bind loosest, so
+    // the left side may be a full expression while the right side is only the
+    // callee -- `2 + 3 => f()` pipes 5, and trailing arithmetic after a piped
+    // call is NOT folded into the pipe.
+    {
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        const bool ok = RunScript(
+            "src = image(\"test\")\n"
+            "n = 1 + 1\n"
+            "out = src => gaussian_blur(sigma = n)\n"
+            "display(out)\n", &ui, &p, &err, &src);
+        Check(ok && p.Stages().size() == 1,
+              "arithmetic evaluates before it is piped" + (ok ? "" : ": " + err));
+    }
+
+    // '=>' must not confuse the assignment lookahead. This is the concrete
+    // reason the lexer emits one token rather than '=' followed by '>': the
+    // statement parser calls a line an assignment when it sees a bare '=' at
+    // depth zero, so a two-token pipe would make this an assignment to `src`
+    // and then fail on the '>'.
+    {
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        const bool ok = RunScript(
+            "src = image(\"test\")\n"
+            "display(src => grayscale())\n", &ui, &p, &err, &src);
+        Check(ok && p.Stages().size() == 1,
+              "a pipe in expression position is not read as an assignment" +
+                  (ok ? "" : ": " + err));
+    }
+
+    // Piping into something that is not callable must say so clearly, naming
+    // what it actually got.
+    {
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        RunScript("src = image(\"test\")\n"
+                  "n = 5\n"
+                  "out = src => n()\n", &ui, &p, &err, &src);
+        Check(!err.empty(), "piping into a number is an error: \"" + err + "\"");
+    }
+
+    // --- every shipped script parses ----------------------------------------
+    //
+    // The scripts in scripts/ are what the app opens and what a new user reads
+    // first, so a syntax error in one is a broken front door. Nothing else
+    // covered them: the tests all use inline source, so a stale script could
+    // ship indefinitely without a single test noticing.
+    //
+    // Parse only, not run: running needs images and a GPU, but a typo is a
+    // parse error, and that is the failure this is guarding against.
+#ifdef TGLAB_SOURCE_DIR
+    {
+        namespace fs = std::filesystem;
+        const fs::path dir = fs::path(TGLAB_SOURCE_DIR) / "scripts";
+        int seen = 0;
+        std::error_code ec;
+        for (const fs::directory_entry& f : fs::directory_iterator(dir, ec)) {
+            if (f.path().extension() != ".tgl") continue;
+            ++seen;
+            std::ifstream in(f.path());
+            std::stringstream ss;
+            ss << in.rdbuf();
+
+            Program prog;
+            std::string err;
+            const bool ok = Parse(ss.str(), &prog, &err);
+            Check(ok, "scripts/" + f.path().filename().string() + " parses" +
+                          (ok ? "" : ": " + err));
+        }
+        Check(seen > 0, "found scripts to check (" + std::to_string(seen) + ")");
+    }
+#endif
 
     std::printf("\n%s\n", g_fail == 0 ? "all checks passed" : "FAILURES PRESENT");
     return g_fail == 0 ? 0 : 1;

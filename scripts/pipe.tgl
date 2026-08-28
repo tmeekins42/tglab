@@ -1,0 +1,42 @@
+# The pipe operator — the same pipeline written two ways.
+#
+#     src => gaussian_blur(sigma = 2) => grayscale()
+#
+# means exactly
+#
+#     grayscale(gaussian_blur(src, sigma = 2))
+#
+# The piped value becomes the FIRST argument, which works because every
+# algorithm here takes its subject first. Nothing else changes: pipes are
+# sugar the parser expands, so stages, caching and errors are identical.
+
+src = image("test")
+
+sigma = slider("blur sigma", 0.1, 6.0, 1.4)
+amount = slider("brightness", -0.5, 0.5, 0.1)
+
+# Read left to right, in the order the work happens.
+piped = src
+    => gaussian_blur(sigma = sigma)
+    => brightness(brightness = amount)
+    => grayscale()
+
+# The same thing nested. Read inside out, in reverse.
+nested = grayscale(brightness(gaussian_blur(src, sigma = sigma),
+                              brightness = amount))
+
+display(piped,  "piped")
+display(nested, "nested — identical")
+
+# A pipe works when the algorithm is a variable from a dropdown, too. The
+# parser builds the same call node either way, so it never needs to know
+# whether the name is a registry entry or a variable.
+op = choose("blur", [box_blur, median_blur])
+display(src => op(), "chosen blur")
+
+# Where pipes DO NOT help: a multi-output algorithm. sobel returns three
+# values, and a pipe carries one, so the chain has to stop here and the
+# ordinary form takes over. Mixing the two is expected rather than a
+# failure -- pipes are for the linear stretches.
+gx, gy, mag = sobel(src => gaussian_blur(sigma = sigma))
+display(mag, "gradient magnitude")

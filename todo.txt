@@ -74,17 +74,14 @@ NEW FEATURES / IDEAS
   + algorithms that take a single image will use the image at the image index in the group. when the index changes if play is pressed, updates the dirty flag to re-process
   + a video file can be dropped into a group as well
   + for videos, we might need a way to set start/end frames as we probably don't need the entire video.
-- Exposure stacking -> HDR
 - Focus stacking
 - feature tracking support, numerous algorithms
 - features should be associated with the image. Feature tracking is used for matching images, so every image in a group/image list will have a feature list.
 - photo alignment from features
-- fine photo alignment from optimizing solver?
 - panorama photo merging, multiple projections
 - Job system: future algorithms could become much slower and broken into multiple stages, some with dependencies on other stages, some that can run in parallel. A job system can make this faster
 - progress bar for job system
 - are there any public lens correction databases we could take advantage of?
-- denoising algorithms
 - can we run a script (develop?) on every image in a group, then run an algorithm, like panorama that works on the entire group? 
   Maybe we can have image/image group in the palette that is the output from another script?
   Or is it better to expand our scripting? so we need iteration?

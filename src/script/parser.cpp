@@ -114,7 +114,85 @@ private:
 
     // --- expressions --------------------------------------------------------
 
-    ExprPtr ParseExpr() { return ParseAddSub(); }
+    ExprPtr ParseExpr() { return ParsePipe(); }
+
+    // pipe = addSub { "=>" postfix }
+    //
+    //     src => gaussian_blur(sigma = 2) => threshold(level = 0.3)
+    //
+    // is exactly threshold(gaussian_blur(src, sigma = 2), level = 0.3). The
+    // piped value becomes the FIRST positional argument, which works because
+    // every algorithm here takes its subject first -- the same convention that
+    // makes this readable in other languages.
+    //
+    // Desugared here, in the parser, into an ordinary Call node. That is the
+    // whole trick: the interpreter, the stage recorder, the cache and the error
+    // messages never learn that pipes exist. In particular it costs nothing to
+    // pipe into an algorithm held in a VARIABLE -- one returned by choose() --
+    // because the Call node it builds is the same one `f(x)` builds, and call
+    // position was already general.
+    //
+    // Loosest of the expression operators, so `a + b => f()` pipes the sum
+    // rather than adding b to a function. Piping a bare sum is odd, but the
+    // alternative -- binding tighter than '+' -- would silently mean something
+    // other than it reads.
+    ExprPtr ParsePipe() {
+        ExprPtr e = ParseAddSub();
+        if (!e) return nullptr;
+
+        for (;;) {
+            // Both line-break styles, because both are natural and a reader
+            // should not have to guess which one this parser wanted:
+            //
+            //     out = src =>            out = src
+            //         blur() =>               => blur()
+            //         grayscale()             => grayscale()
+            //
+            // The first falls out of skipping newlines after the arrow. The
+            // second needs this lookahead: the statement would otherwise end at
+            // the newline, and the next line would start with a stray '=>'.
+            // Newlines are only consumed once an arrow is actually found, so a
+            // line that merely ENDS in a complete expression still ends there.
+            if (!At(Tok::Arrow)) {
+                size_t j = m_i;
+                while (j < m_toks.size() && m_toks[j].kind == Tok::Newline) ++j;
+                if (j == m_i || j >= m_toks.size() || m_toks[j].kind != Tok::Arrow) break;
+                m_i = j;
+            }
+
+            auto pipe = Make(ExprKind::Call);
+            Advance();
+            SkipNewlines();   // a long chain reads better broken across lines
+
+            // The right side is a postfix expression, not a full one, so the
+            // pipe takes a CALLEE rather than an arbitrary expression. `x =>
+            // f() + 1` is therefore a parse error rather than quietly meaning
+            // one of the two things it could mean. The left side stays a full
+            // expression -- `2 + 3 => f()` pipes 5 -- because there the reading
+            // is unambiguous.
+            ExprPtr rhs = ParsePostfix();
+            if (!rhs) return nullptr;
+
+            if (rhs->kind == ExprKind::Call) {
+                // `x => f(a = 1)` -- splice the piped value in front of the
+                // arguments already written.
+                Arg first;
+                first.value = std::move(e);
+                rhs->args.insert(rhs->args.begin(), std::move(first));
+                e = std::move(rhs);
+            } else {
+                // `x => f` with no argument list. Allowed, and means f(x):
+                // requiring empty parens on a call that takes no other
+                // arguments would be noise in the common case.
+                Arg first;
+                first.value = std::move(e);
+                pipe->args.push_back(std::move(first));
+                pipe->lhs = std::move(rhs);
+                e = std::move(pipe);
+            }
+        }
+        return e;
+    }
 
     ExprPtr ParseAddSub() {
         ExprPtr lhs = ParseMulDiv();

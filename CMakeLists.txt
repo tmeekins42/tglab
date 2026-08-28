@@ -154,6 +154,8 @@ add_executable(tglab_tests
     $<TARGET_OBJECTS:tglab_algorithms>
 )
 target_link_libraries(tglab_tests PRIVATE tglab_core imgui d3d12 dxgi)
+# So the tests can parse the shipped scripts/ wherever ctest runs them from.
+target_compile_definitions(tglab_tests PRIVATE TGLAB_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 if(MSVC)
     target_compile_definitions(tglab_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
