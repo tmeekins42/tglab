@@ -130,12 +130,30 @@ constexpr float kLinearShoulder = 0.70f;
 // a shadow control at all, it was a global brightener with the highlights
 // masked out.
 //
-// 0.18 is middle grey, so the band now runs from black to the midtones and
-// fades out there -- which is what "shadows" means. Chosen for the same reason
-// kLinearShoulder is a constant rather than per-image: a band pitched off the
-// image's own statistics would make the same slider position mean something
-// different on every frame.
-constexpr float kLinearShadowTop = 0.18f;
+// 0.09 -- a stop BELOW middle grey, not at it.
+//
+// Topping the band at middle grey was the first correction, and it was still
+// too generous. Middle grey is the middle of the picture, so a band reaching it
+// covers everything darker than the midtones -- which on a dark scene is most
+// of the frame. Tim's second report, after that change: "the shadow slider
+// seems to have reverted back boosting the entire scene". It had not reverted;
+// the scene had moved. His valley merge has a median of 0.098, so the median
+// itself sat inside the band and took 43% of the lift.
+//
+// A stop below grey is what "shadows" means to a photographer: the tones under
+// the midtones, not the lower half of everything. Middle grey now gets zero
+// lift rather than 43%, and the deep shadows still get essentially all of it.
+//
+// Symmetry with the highlight band is worth noting, since the two were pitched
+// independently and by different reasoning: kLinearShoulder sits at 0.70, about
+// two stops ABOVE grey, and this sits one stop below. They are not mirror
+// images because the tonal ranges are not -- there is far more room above
+// middle grey in linear light than below it.
+//
+// Constant rather than per-image, for the same reason kLinearShoulder is: a
+// band pitched off the image's own statistics would make the same slider
+// position mean something different on every frame.
+constexpr float kLinearShadowTop = 0.09f;
 
 // A smooth 0..1 window used to target a tonal band without a hard edge, which
 // would show as banding on a gradient.

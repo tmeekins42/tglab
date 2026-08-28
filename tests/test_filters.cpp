@@ -1045,7 +1045,17 @@ int main() {
                     for (int x = 0; x < 32; ++x) {
                         // A shadow (0.02), a midtone (0.18 = middle grey), and
                         // a highlight (0.60).
-                        const float lum = (y < 11) ? 0.02f : (y < 22 ? 0.18f : 0.60f);
+                        // The middle band is 0.10, NOT middle grey.
+                        //
+                        // 0.18 was the first choice and it could not fail: the
+                        // band topped out there, so a midtone at exactly 0.18
+                        // got zero lift by construction and the check passed
+                        // against a band that was still far too wide. 0.10 is
+                        // where Tim's valley merge actually puts its median --
+                        // just under a stop below grey -- which is the tone that
+                        // decides whether this reads as a shadow control or as a
+                        // global brightener.
+                        const float lum = (y < 11) ? 0.02f : (y < 22 ? 0.10f : 0.60f);
                         uint16_t* p = v.At<uint16_t>(x, y);
                         for (int c = 0; c < 3; ++c) p[c] = FloatToHalf(lum);
                         p[3] = FloatToHalf(1.0f);
@@ -1061,7 +1071,7 @@ int main() {
                 const double hl  = bandMax(lifted, 22, 32);   // 0.60 in
 
                 const double shGain  = sh  / 0.02;
-                const double midGain = mid / 0.18;
+                const double midGain = mid / 0.10;
                 const double hlGain  = hl  / 0.60;
 
                 Check(shGain > midGain * 1.5,

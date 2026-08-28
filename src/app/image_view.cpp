@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 
+#include "../algo_util/tone_curve.h"
 #include "../gpu/device.h"
 #include "imgui.h"
 
@@ -300,9 +301,23 @@ void ImageViewPanel::DrawLoupe(Device& dev, Image& img, const ImVec2& mouse,
             float rgb[3];
             SampleRgb(v, sx, sy, rgb);
 
-            const ImU32 col = IM_COL32(int(std::clamp(rgb[0], 0.0f, 1.0f) * 255.0f),
-                                       int(std::clamp(rgb[1], 0.0f, 1.0f) * 255.0f),
-                                       int(std::clamp(rgb[2], 0.0f, 1.0f) * 255.0f), 255);
+            // The same transfer function the main view applies.
+            //
+            // SampleRgb returns LINEAR values, and writing those straight to
+            // 8-bit is what made the loupe darker than the image beside it:
+            // middle grey at 0.18 linear became 46/255 instead of the 117/255
+            // the tone curve puts it at. The loupe is for judging pixels
+            // against what is on screen, so it has to agree with the screen.
+            //
+            // Only for linear data. A gamma-encoded image is already display
+            // referred, and running the curve over it would double-encode.
+            const bool linear = v.desc.linear;
+            const auto toDisplay = [&](float c) {
+                return linear ? ToneCurve(c) : std::clamp(c, 0.0f, 1.0f);
+            };
+            const ImU32 col = IM_COL32(int(toDisplay(rgb[0]) * 255.0f),
+                                       int(toDisplay(rgb[1]) * 255.0f),
+                                       int(toDisplay(rgb[2]) * 255.0f), 255);
             const ImVec2 a(lx + i * kCell, ly + j * kCell);
             dl->AddRectFilled(a, ImVec2(a.x + kCell, a.y + kCell), col);
         }
