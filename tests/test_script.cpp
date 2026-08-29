@@ -4190,6 +4190,131 @@ int main() {
         }
     }
 
+    // --- every detector, through the same checks -------------------------------
+    //
+    // The interface is the thing being tested here, not any one algorithm: each
+    // detector must attach a sidecar, agree with itself about how many
+    // descriptors it produced, declare a kind the matcher can act on, and find
+    // features that repeat under a translation.
+    //
+    // Repeatability is the property that matters and the one a count cannot
+    // show. Measured on a real photograph rather than the synthetic fixture,
+    // because the fixture's texture is the thing that misled me once already.
+    {
+        // Through TGLAB_SOURCE_DIR rather than a relative path: ctest runs from
+        // build/, where "assets/test.png" does not exist. The suite passed
+        // standalone and failed under ctest until this used the same absolute
+        // path the script-parsing checks already do.
+        Image photo;
+        std::string perr;
+#ifdef TGLAB_SOURCE_DIR
+        const std::string photoPath =
+            (std::filesystem::path(TGLAB_SOURCE_DIR) / "assets" / "test.png").string();
+#else
+        const std::string photoPath = "assets/test.png";
+#endif
+        const bool haveFile = LoadImageFile(photoPath, &photo, &perr);
+        Check(haveFile, "loaded a real photograph to detect on" +
+              (haveFile ? "" : ": " + perr));
+
+        auto shift = [](Image& src, int dx, int dy) {
+            ImageView v = src.MapCpuRead();
+            PixelBuffer in;
+            in.Unpack(v);
+            Image out;
+            out.Alloc(v.desc);
+            ImageView ov = out.MapCpuWrite();
+            PixelBuffer ob;
+            ob.Unpack(ov);
+            const int w = in.Width(), h = in.Height(), ch = in.Channels();
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x) {
+                    const float* p = in.At(std::clamp(x - dx, 0, w - 1),
+                                           std::clamp(y - dy, 0, h - 1));
+                    float* o = ob.At(x, y);
+                    for (int c = 0; c < ch; ++c) o[c] = p[c];
+                }
+            ob.PackInto(ov);
+            return out;
+        };
+
+        auto run = [](const char* name, Image&& in, const FeatureSidecar** fs,
+                      Pipeline* keep, std::vector<Data>* keepSrc) {
+            auto algo = Registry::Get().Create(name);
+            if (!algo) return false;
+            keepSrc->clear();
+            keepSrc->push_back(Data{std::move(in)});
+            keep->AddStage(std::move(algo), name, {{-1, 0}}, 1, 1);
+            std::string e;
+            if (!keep->Execute(keepSrc, nullptr, &e)) return false;
+            const Data* d = keep->Resolve({0, 0}, keepSrc);
+            const auto* im = d ? std::get_if<Image>(d) : nullptr;
+            if (!im) return false;
+            *fs = FeaturesOf(*im);
+            return *fs != nullptr;
+        };
+
+        if (haveFile) {
+            for (const char* name : {"detect_sift", "detect_surf", "detect_akaze"}) {
+                Image a = photo.Clone();
+                Image b = shift(photo, 11, -6);
+
+                Pipeline pa, pb;
+                std::vector<Data> sa, sb;
+                const FeatureSidecar* fa = nullptr;
+                const FeatureSidecar* fb = nullptr;
+
+                const bool ok = run(name, std::move(a), &fa, &pa, &sa) &&
+                                run(name, std::move(b), &fb, &pb, &sb);
+                Check(ok, std::string(name) + " attaches a sidecar");
+                if (!ok) continue;
+
+                Check(!fa->keypoints.empty(),
+                      std::string(name) + " finds features (" +
+                          std::to_string(fa->keypoints.size()) + ")");
+
+                // The two arrays must agree, or a matcher reads one feature's
+                // descriptor as another's -- which produces matches rather than
+                // an error, and they are wrong.
+                Check(fa->descriptors.Count() == fa->keypoints.size(),
+                      std::string(name) + ": one descriptor per keypoint (" +
+                          std::to_string(fa->descriptors.Count()) + " vs " +
+                          std::to_string(fa->keypoints.size()) + ")");
+
+                Check(fa->descriptors.kind != DescriptorKind::None &&
+                      fa->descriptors.dim > 0,
+                      std::string(name) + " declares a usable descriptor kind");
+
+                Check(!fa->detector.empty(),
+                      std::string(name) + " names itself in the sidecar");
+
+                // REPEATABILITY. Counted over features that stayed in frame:
+                // a feature shifted off the edge is not a failure.
+                int matched = 0, eligible = 0;
+                ImageView pv = photo.MapCpuRead();
+                const float W = float(pv.desc.width), H = float(pv.desc.height);
+                for (const Keypoint& ka : fa->keypoints) {
+                    const float sx = ka.x + 11.0f, sy = ka.y - 6.0f;
+                    if (sx < 16.0f || sy < 16.0f || sx > W - 16.0f || sy > H - 16.0f)
+                        continue;
+                    ++eligible;
+                    for (const Keypoint& kb : fb->keypoints) {
+                        const float dx = (kb.x - 11.0f) - ka.x;
+                        const float dy = (kb.y + 6.0f) - ka.y;
+                        if (std::sqrt(dx * dx + dy * dy) < 2.0f) { ++matched; break; }
+                    }
+                }
+                // Half is a floor, not a target. Measured on this image: SIFT
+                // 70%, SURF 62%, AKAZE 96% -- AKAZE highest because its
+                // edge-preserving diffusion is precisely what stops features
+                // drifting with scale, which is the reason to have it.
+                Check(eligible > 0 && matched * 2 >= eligible,
+                      std::string(name) + " features repeat under a shift (" +
+                          std::to_string(matched) + "/" + std::to_string(eligible) + ")");
+            }
+        }
+    }
+
     // draw_features marks the image where the features are, and says so when
     // there are none to draw.
     {

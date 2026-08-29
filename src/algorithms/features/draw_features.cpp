@@ -127,15 +127,22 @@ public:
     bool HasGPU() const override { return false; }
 
 private:
-    // Colour from strength: cool for weak, warm for strong.
+    // Colour from strength: green for weak, yellow through red for strong.
     //
     // A ramp rather than one colour because the interesting question when
-    // tuning a threshold is "what am I about to lose", and that is the weak end.
+    // tuning a threshold is "what am I about to lose", and that is the weak
+    // end -- so the weak end has to be the READABLE one.
+    //
+    // The first version ran blue -> red with green only in the middle, which
+    // put the weakest features in pale blue: the hardest colour to see against
+    // a photograph, and exactly the ones being judged. Green is the channel the
+    // eye is most sensitive to (it is 0.72 of luma), so every feature here
+    // carries a lot of it and the ramp varies red instead.
     static void Ramp(float t, float* rgb) {
         t = std::clamp(t, 0.0f, 1.0f);
-        rgb[0] = t;                       // red rises with strength
-        rgb[1] = 0.4f + 0.6f * t;         // green always present, for visibility
-        rgb[2] = 1.0f - t;                // blue falls
+        rgb[0] = t;                 // red rises with strength: green -> yellow -> red
+        rgb[1] = 1.0f - 0.35f * t;  // green never drops far; it is what makes them visible
+        rgb[2] = 0.0f;
     }
 
     void DrawOne(PixelBuffer& buf, const Keypoint& k, float strength, float scale) const {

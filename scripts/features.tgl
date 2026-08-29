@@ -1,34 +1,51 @@
-# Feature detection, and looking at what it found.
+# Feature detection: three detectors, side by side.
 #
 # A detector's output is a SIDECAR -- keypoints and descriptors attached to the
 # image -- rather than pixels. That is what lets a detector sit anywhere in a
 # chain: the image passes through unchanged, and whatever comes later reads the
 # features if it wants them and ignores them if it does not.
 #
-# draw_features is how you see them. Each circle's RADIUS is the keypoint's
-# scale, which is the region its descriptor was measured over, and the line is
-# its orientation -- the frame the descriptor is measured in. Both matter: an
-# orientation that jitters between frames is a matching failure you can see
-# here rather than discover later in an alignment that will not converge.
+# WHAT THE THREE DO DIFFERENTLY, which is the reason to have all of them:
 #
-# WHAT TO TUNE, and what to watch:
+#   detect_sift    Gaussian scale space, difference-of-Gaussian extrema.
+#                  128-float descriptor. The reference implementation everything
+#                  else is measured against. Patent expired 2020.
 #
-#   contrast    the main control. Too low and most of what is found is noise in
-#               flat regions; those features do not repeat, so they cost time
-#               and give nothing. Raise it until the marks sit on things you
-#               would call features.
-#   edge_ratio  rejects points on edges. An edge point slides along its own
-#               edge between frames, so it matches the wrong place.
-#   octaves     how many resolutions to search. More finds larger blobs.
+#   detect_surf    Box filters on an integral image, so every filter size costs
+#                  the same and the image is never downsampled. 64 or 128
+#                  floats -- the one detector here that genuinely offers a
+#                  descriptor choice, via `extended`.
+#                  PATENTED (ETH Zurich). Fine for research; check your
+#                  position before shipping a product on it.
 #
-# On the stock test image this finds around 270 features that repeat about 70%
-# of the time under a small translation, which is the number that matters --
-# a detector finding thousands that do not repeat is worse than one finding
-# hundreds that do.
+#   detect_akaze   NONLINEAR diffusion: blurring that stops at edges instead of
+#                  smoothing across them. Features therefore do not drift as
+#                  the scale grows, and it measures the most repeatable of the
+#                  three because of it. 486-bit binary descriptor, compared by
+#                  Hamming rather than L2. BSD.
+#
+# Measured on the stock test image, shifting it 11 pixels and asking how many
+# features come back in the right place:
+#
+#   detect_sift    275 features, 70% repeat
+#   detect_surf    363 features, 62% repeat
+#   detect_akaze   255 features, 96% repeat
+#
+# Repeatability is the number that matters. A detector finding thousands of
+# features that do not repeat is worse than one finding hundreds that do --
+# everything downstream, matching and alignment both, depends on the same point
+# being found again in the next frame.
+#
+# draw_features shows them: circle RADIUS is the keypoint's scale, which is the
+# region its descriptor was measured over, and the line is its orientation --
+# the frame the descriptor is measured in. An orientation that jitters between
+# frames is a matching failure you can see here rather than discover later.
 
 src = image("test")
 
+op = choose("detector", [detect_sift, detect_surf, detect_akaze])
+
 src => display("1 source")
-    => params( detect_sift )()
+    => params( op )()
     => params( draw_features )()
     => display("2 features")

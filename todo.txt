@@ -23,6 +23,7 @@ BUGS / SMALL FEATURES
   if the image is cached, etc, maybe another icon over the thumbnail to show this
   this has no practical purpose, but I think it's nice for the user to watch the processing
   this would be a good time to add an error icon on the thumbnail if the image failed to load
+- ORB and BRISK feature detectors
 
 NEW FEATURES / IDEAS
 - add support for additional image channels, such as alpha channels and depth channels
