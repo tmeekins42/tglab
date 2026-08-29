@@ -3513,6 +3513,99 @@ int main() {
               "a format-changing stage is not bypassed" + (ok ? "" : ": " + err));
     }
 
+    // --- the enabled switch --------------------------------------------------
+    //
+    // Tim's ask, and it is a different thing from IsNoOp: he wants to get the
+    // sliders right and THEN toggle the stage, without neutralising the
+    // settings to disable it. So `enabled` is a real parameter that every
+    // algorithm has, and turning it off bypasses the stage while leaving every
+    // other control exactly where it was.
+    {
+        UiState ui; Pipeline p; std::vector<Data> src; std::string err;
+        const char* kScript =
+            "src = image(\"test\")\n"
+            "out = src => params(gaussian_blur, sigma = 6)()\n"
+            "display(out)\n";
+
+        const bool ok = RunScript(kScript, &ui, &p, &err, &src);
+        Check(ok && p.BypassedStageCount() == 0,
+              "an enabled stage runs" + (ok ? "" : ": " + err));
+
+        // Every algorithm has the control, without declaring it.
+        UiControl* en = nullptr;
+        for (UiControl& c : ui.Controls())
+            if (c.label == "gaussian_blur.enabled") en = &c;
+        Check(en != nullptr, "every algorithm has an `enabled` control");
+        Check(en && en->kind == UiControl::Kind::Check,
+              "`enabled` is a checkbox, not a slider");
+
+        // First in the panel, above the controls it governs. That falls out of
+        // base members being constructed before derived ones, so it is worth an
+        // assertion -- a reordering elsewhere would move it silently.
+        Check(!ui.Controls().empty() &&
+              ui.Controls()[0].label == "gaussian_blur.enabled",
+              "`enabled` sits above the controls it governs");
+
+        // Switch it off: the stage is bypassed...
+        if (en) en->value = 0.0;
+        Pipeline p2; std::vector<Data> src2;
+        RunScript(kScript, &ui, &p2, &err, &src2);
+        Check(p2.BypassedStageCount() == 1, "switching it off bypasses the stage");
+
+        // ...and sigma is STILL 6. This is the whole point: disabling by
+        // neutralising would have lost it.
+        bool kept = false;
+        for (const UiControl& c : ui.Controls())
+            if (c.label == "gaussian_blur.sigma") {
+                // `value`, not `def`. params() seeds the DEFAULT, and once the
+                // control exists a re-run preserves the user's value while def
+                // stays the algorithm's own 2.0. The setting that must survive
+                // being switched off is the one in effect.
+                kept = std::abs(c.value - 6.0) < 1e-6;
+            }
+        Check(kept, "the settings survive being switched off");
+
+        // Switch it back on and the stage runs again, at the settings it had.
+        for (UiControl& c : ui.Controls())
+            if (c.label == "gaussian_blur.enabled") c.value = 1.0;
+        Pipeline p3; std::vector<Data> src3;
+        RunScript(kScript, &ui, &p3, &err, &src3);
+        Check(p3.BypassedStageCount() == 0, "switching it back on runs the stage");
+    }
+
+    // A disabled stage passes its input through unchanged -- the same guarantee
+    // IsNoOp gives, reached the other way.
+    {
+        UiState ui; Pipeline p; std::vector<Data> src; std::string err;
+        RunScript("src = image(\"test\")\n"
+                  "out = src => params(gaussian_blur, sigma = 6)()\n"
+                  "display(out)\n", &ui, &p, &err, &src);
+        for (UiControl& c : ui.Controls())
+            if (c.label == "gaussian_blur.enabled") c.value = 0.0;
+
+        Pipeline off; std::vector<Data> srcOff;
+        RunScript("src = image(\"test\")\n"
+                  "out = src => params(gaussian_blur, sigma = 6)()\n"
+                  "display(out)\n", &ui, &off, &err, &srcOff);
+
+        // Against the source itself, which is what a disabled stage must equal.
+        const Data* got = off.Resolve({0, 0}, &srcOff);
+        const auto* im = got ? std::get_if<Image>(got) : nullptr;
+        Check(im && im->Valid(), "a disabled stage still resolves to an image");
+        if (im) {
+            ImageView a = const_cast<Image*>(im)->MapCpuRead();
+            ImageView b = std::get<Image>(srcOff[0]).MapCpuRead();
+            int worst = 0;
+            for (int y = 0; y < a.desc.height; ++y)
+                for (int x = 0; x < a.desc.width; ++x)
+                    for (int c = 0; c < 3; ++c)
+                        worst = std::max(worst,
+                            std::abs(int(a.At<uint8_t>(x, y)[c]) -
+                                     int(b.At<uint8_t>(x, y)[c])));
+            Check(worst == 0, "a disabled stage passes its input through untouched");
+        }
+    }
+
     std::printf("\n%s\n", g_fail == 0 ? "all checks passed" : "FAILURES PRESENT");
     return g_fail == 0 ? 0 : 1;
 }

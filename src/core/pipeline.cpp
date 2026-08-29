@@ -265,6 +265,20 @@ bool Pipeline::RunFusedReduction(int reduceStage, const std::vector<int>& chain,
         Data carried{set->images[f].Clone()};
         for (int si : chain) {
             Stage& cs = m_stages[size_t(si)];
+
+            // A disabled stage inside a fused chain is simply not run: the
+            // frame carries on untouched to the next one. No alias is needed
+            // here -- unlike the ordinary path, `carried` already IS the value
+            // being threaded through, so skipping the call is the whole of it.
+            //
+            // Counted once per chain rather than once per frame, or a
+            // seven-frame merge would report the same disabled stage seven
+            // times.
+            if (cs.algo->ShouldBypass()) {
+                if (f == 0) ++m_bypassedStages;
+                continue;
+            }
+
             const Data* one = &carried;
             std::vector<const Data*> csIn{one};
             if (!RunStageOnce(cs, csIn, gpu, mode, cancel, err)) return false;
@@ -852,7 +866,7 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
         // even at settings that "do nothing", because the TYPE changes and
         // downstream would receive a mosaic where it expects RGB. The
         // algorithm does not get to opt out of this check.
-        if (s.algo->IsNoOp() && s.inputs.size() == 1 && s.outputs.size() == 1 &&
+        if (s.algo->ShouldBypass() && s.inputs.size() == 1 && s.outputs.size() == 1 &&
             !s.algo->IsReduction() && !s.algo->IsReshape() && !s.algo->IsAligner()) {
             const PortList outPorts = s.algo->Outputs();
             const bool sameFormat =

@@ -91,6 +91,22 @@ struct SourceFacts {
 };
 
 class AlgorithmBase {
+    // FIRST, before any Param member -- including m_enabled below and every
+    // one a derived class declares.
+    //
+    // A Param registers itself with its owner from its constructor, and
+    // members are constructed in DECLARATION order. With this at the bottom of
+    // the class, as it used to be, m_enabled pushed into the vector and the
+    // vector was then default-constructed on top of it -- so the base's own
+    // parameter silently vanished while every derived one survived. The panel
+    // showed sigma and no `enabled`, with nothing reported.
+    //
+    // Derived params are unaffected either way: a derived class's members are
+    // constructed after the whole base, vector included. It is only the base's
+    // own that needs this.
+    std::vector<ParamBase*> m_params;
+    friend class ParamBase;
+
 public:
     AlgorithmBase()          = default;
     virtual ~AlgorithmBase() = default;
@@ -333,15 +349,40 @@ public:
     // separately is what makes those algorithms expressible.
     virtual FormatSpec GpuScratchFormat() const { return FormatSpec::SameAsInput; }
 
+    // Every algorithm gets an on/off switch, declared here rather than in each
+    // one so there is no algorithm that forgot to have it.
+    //
+    // Distinct from IsNoOp(), and both are worth having. IsNoOp says "these
+    // settings happen to change nothing", which is free but requires
+    // NEUTRALISING the controls -- and that loses the settings you spent time
+    // getting right. This is the switch you flip to compare with and without,
+    // and flip back to exactly what you had.
+    //
+    // First in the panel because it is declared before any derived member: a
+    // Param registers with its owner at construction, and base members are
+    // constructed first. That ordering is load-bearing rather than incidental,
+    // so a stage's switch always sits above the controls it governs.
+    //
+    // Named `enabled` rather than `bypass` so the checked state is the active
+    // one -- a control that has to be OFF for the effect to happen reads
+    // backwards on every panel it appears in.
+    Param<bool> m_enabled{this, "enabled", true,
+        "Turn this stage off without losing its settings. A disabled stage is "
+        "skipped entirely -- no allocation, no dispatch, no copy -- and passes "
+        "its input straight through."};
+
+    // True when the stage should not run at all: switched off, or at settings
+    // that would change nothing. The pipeline asks this rather than IsNoOp
+    // directly, so an algorithm overriding IsNoOp never has to remember the
+    // switch.
+    bool ShouldBypass() const { return !bool(m_enabled) || IsNoOp(); }
+
     std::span<ParamBase* const> Params() const { return m_params; }
     ParamBase* FindParam(std::string_view name) const;
 
     // Folds every parameter value into one hash for dirty detection.
     uint64_t ParamHash() const;
 
-private:
-    friend class ParamBase;
-    std::vector<ParamBase*> m_params;
 };
 
 // ---------------------------------------------------------------------------

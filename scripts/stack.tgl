@@ -1,21 +1,28 @@
 # Stacking effects, most of them off.
 #
 # The point of this script is what it does NOT cost. Every stage below is
-# available, and a stage whose settings would change nothing is skipped
-# entirely -- no allocation, no dispatch, no copy. Its output aliases its
-# input, so the pixels flow straight through.
+# available, and a stage that is switched off -- or whose settings would change
+# nothing -- is skipped entirely: no allocation, no dispatch, no copy. Its
+# output aliases its input, so the pixels flow straight through.
 #
 # That is what makes a long stack practical. Twenty effects with three in use
 # allocates three intermediates, not twenty, and at 45 MP that is the
 # difference between a usable pipeline and one that pages.
 #
-# Watch the status line: it says how many stages were bypassed, so "did that
-# actually skip?" is answerable rather than a matter of faith.
+# TWO WAYS TO TURN A STAGE OFF, and they are for different moments:
 #
-# Set any of these to its neutral value and the stage disappears from the run:
-#   gaussian_blur   sigma  = 0
-#   brightness      brightness = 0 and gain = 1
-#   wavelet_denoise luma = 0 and chroma = 0
+#   enabled        every algorithm has this checkbox, first in its group. Use
+#                  it once the sliders are where you want them: it switches the
+#                  stage out and leaves every other setting exactly as it was,
+#                  so switching back on returns to what you had.
+#
+#   neutral values a stage whose settings do nothing is skipped anyway --
+#                  gaussian_blur at sigma 0, brightness at 0 gain 1,
+#                  wavelet_denoise at luma 0 chroma 0. This costs nothing to
+#                  use but means giving up the settings.
+#
+# The status line says how many stages were bypassed, so "did that actually
+# skip?" is answerable rather than a matter of faith.
 
 src = image("test")
 
