@@ -32,6 +32,55 @@ namespace {
 // bands hold little aliasing, short enough to stay cheap.
 constexpr float kB3[5] = {1.0f / 16, 4.0f / 16, 6.0f / 16, 4.0f / 16, 1.0f / 16};
 
+// How much to scale the threshold for a neighbourhood at this brightness.
+//
+// One fixed threshold assumes the noise is the same everywhere, and MEASURED on
+// developed images that is roughly true for most frames and badly wrong for a
+// pushed high-ISO one. tools/noise_profile.exe reports sigma per brightness
+// band; on three frames it found:
+//
+//   _DSC0037  ISO 6400, pushed +1.8   0.0031 .. 0.0292   9.6x
+//   _MG_9673  ISO 1000                0.0024 .. 0.0075   3.1x
+//   _DSC0162  ISO 125                 0.0017 .. 0.0045   2.7x
+//
+// So the shadows want a much lower threshold than the highlights on a noisy
+// frame, and about the same one on a clean frame. `amount` at 0 is the old
+// behaviour exactly, which is what makes this comparable rather than a silent
+// change to everything.
+//
+// The relationship is sigma ~ L^0.5 -- shot noise, which the tone curve
+// flattens but does not remove. Measured on the same three frames: raising
+// every band's sigma to L^-0.5 takes _DSC0037's 9.6x spread to 2.1x, while
+// L^-0.75 leaves 4.5x and L^-0.25 leaves 6.6x. So the exponent is 0.5, and
+// `amount` interpolates toward it rather than picking a different one.
+//
+// (An earlier note in todo.txt reasoned the opposite -- that develop had
+// already stabilised the noise and L^0.75 was the better exponent, quoting
+// 1.2x against sqrt's 2.0x. Re-measured with an estimator that self-tests
+// against injected noise of known sigma, sqrt wins on every frame. The tool is
+// checked in so the disagreement can be settled by running it.)
+// `mid` is middle grey IN THE BUFFER'S UNITS, which is why it is passed in
+// rather than being a constant here. On an RGBA8 image PixelBuffer holds
+// 0..255 and on a float image 0..1, so a hardcoded 0.18 means middle grey on
+// one and near-black on the other -- the CPU/GPU parity test caught exactly
+// that, reporting a max difference of 78 against the usual 8. The thresholds
+// above already scale for this reason; this has to as well.
+inline float LevelScale(float level, float amount, float mid) {
+    if (amount <= 0.0f) return 1.0f;
+
+    // Normalised to middle grey, so `amount` scales the threshold DOWN in the
+    // shadows and UP in the highlights while leaving midtones alone -- the
+    // existing luma/chroma defaults keep meaning what they meant.
+    const float rel = std::sqrt(std::max(level, 1e-4f * mid) / mid);
+
+    // Bounded. A near-black neighbourhood would otherwise drive the threshold
+    // to nearly zero and denoise nothing there, which is the opposite of what
+    // a noisy shadow needs; and a specular highlight would drive it up until it
+    // erased real texture.
+    const float scaled = std::clamp(rel, 0.35f, 2.5f);
+    return 1.0f + amount * (scaled - 1.0f);
+}
+
 // One a-trous level: convolve with the B3 kernel dilated by `step`, separably.
 void ATrousBlur(const std::vector<float>& src, std::vector<float>& dst,
                 int w, int h, int ch, int step, std::vector<float>& tmp) {
@@ -108,6 +157,8 @@ public:
         // same units trap that made brightness apply its offset 255x over.
         const float lumaT   = float(m_lumaStrength)   * scale;
         const float chromaT = float(m_chromaStrength) * scale;
+        const float levelDep = float(m_levelDep);
+        const float midGrey  = 0.18f * scale;   // middle grey in the buffer's units
 
         std::vector<float> cur = buf.Data();
         std::vector<float> blurred, tmp;
@@ -151,10 +202,21 @@ public:
             for (int y = 0; y < h; ++y) {
                 for (int x = 0; x < w; ++x) {
                     const size_t i = (size_t(y) * size_t(w) + size_t(x)) * size_t(ch);
+
+                    // How bright this neighbourhood is, from the BLURRED value
+                    // rather than the pixel's own: a noisy pixel would
+                    // otherwise scale its own threshold by its own noise.
+                    //
+                    // Channel 0 is luma after the rotation, and the plain value
+                    // when there is no rotation -- either way it is the level
+                    // that matters. Chroma is a signed difference around zero
+                    // and says nothing about brightness.
+                    const float lvlScale = LevelScale(blurred[i], levelDep, midGrey);
+
                     for (int c = 0; c < ch; ++c) {
                         if (c == 3) continue;                 // leave alpha alone
                         const bool isChroma = colour && c > 0;
-                        const float t = (isChroma ? chromaT : lumaT) * falloff;
+                        const float t = (isChroma ? chromaT : lumaT) * falloff * lvlScale;
                         if (t <= 0.0f) continue;
                         residual[i + size_t(c)] = Shrink(residual[i + size_t(c)], t);
                     }
@@ -213,6 +275,7 @@ cbuffer Params : register(b0) {
     uint  ChromaBits;
     uint  Level;        // which scale this pass is working at
     uint  LastLevel;    // so the final pass can rotate back to RGB
+    uint  LevelDepBits;
     uint  Colour;       // 1 when there are three channels to rotate
 };
 
@@ -276,8 +339,26 @@ void main(uint3 tid : SV_DispatchThreadID) {
     // falls as the scale grows -- matching how a noise field's energy
     // distributes across an a-trous pyramid.
     float falloff = 1.0 / float(1 << Level);
-    float lt = asfloat(LumaBits)   * falloff;
-    float ct = (Colour != 0 ? asfloat(ChromaBits) : asfloat(LumaBits)) * falloff;
+    // Threshold scaled by how bright this neighbourhood is, from the BLURRED
+    // value rather than the pixel's own -- a noisy pixel would otherwise scale
+    // its own threshold by its own noise. Matches LevelScale() on the CPU; the
+    // agreement test is what keeps them the same.
+    //
+    // 0.18 literally, unlike the CPU which scales it. A UNORM texture reads as
+    // 0..1 here whatever its storage, which is the same reason the thresholds
+    // need no 255 -- see GpuConstants. The CPU's PixelBuffer does NOT do that:
+    // it holds 0..255 for an 8-bit image, so its midpoint is scaled and this
+    // one is not. Getting that backwards is what the parity test caught,
+    // reporting a max difference of 78 against the usual 8.
+    float lvl = 1.0;
+    float amt = asfloat(LevelDepBits);
+    if (amt > 0.0) {
+        float rel = sqrt(max(blur.x, 1.8e-5) / 0.18);
+        lvl = 1.0 + amt * (clamp(rel, 0.35, 2.5) - 1.0);
+    }
+
+    float lt = asfloat(LumaBits)   * falloff * lvl;
+    float ct = (Colour != 0 ? asfloat(ChromaBits) : asfloat(LumaBits)) * falloff * lvl;
 
     detail.x = Shrink(detail.x, lt);
     detail.y = Shrink(detail.y, ct);
@@ -303,10 +384,13 @@ void main(uint3 tid : SV_DispatchThreadID) {
         // float image reaches the shader in its own units and ValueScale() is
         // 1, so unlike the RGBA8 kernels there is no 255 to divide out -- and
         // the CPU/GPU agreement test is what catches getting that backwards.
+        // Order must match the cbuffer declaration exactly -- LevelDepBits
+        // sits before Colour, so it goes here rather than appended.
         return {bits(float(m_lumaStrength)),
                 bits(float(m_chromaStrength)),
                 uint32_t(iteration),
                 uint32_t(levels - 1),
+                bits(float(m_levelDep)),
                 1u};
     }
 
@@ -348,6 +432,13 @@ private:
             p[2] = c2 + g;
         }
     }
+
+    Param<float> m_levelDep{this, "level_dep", 0.0f, 0.0f, 1.0f,
+        {.help = "How much the threshold follows local brightness. Sensor "
+                 "noise grows with signal, so on a pushed high-ISO frame the "
+                 "shadows need a much lower threshold than the highlights. 0 "
+                 "is one fixed threshold everywhere; 1 follows sqrt(level).",
+         .step = 0.05}};
 
     Param<int> m_levels{this, "levels", 4, 1, 6,
         {.help = "How many scales to process. Each level is twice as coarse as "

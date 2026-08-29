@@ -322,6 +322,15 @@ add_test(NAME tone COMMAND tglab_tone_tests)
 # on real photographs at high-frequency sites. Written to decide whether a
 # learned demosaic is worth building:
 #   build/Release/headroom.exe <raw> [raw...]
+# noise_profile: how sigma varies with brightness on the DEVELOPED image, which
+# is where wavelet_denoise runs. Says whether one fixed threshold can be right.
+#   build/Release/noise_profile.exe <raw>...
+add_executable(noise_profile tools/noise_profile.cpp $<TARGET_OBJECTS:tglab_algorithms>)
+target_link_libraries(noise_profile PRIVATE tglab_core)
+if(MSVC)
+    target_compile_definitions(noise_profile PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
 add_executable(headroom tools/headroom.cpp $<TARGET_OBJECTS:tglab_algorithms>)
 target_link_libraries(headroom PRIVATE tglab_core)
 if(MSVC)

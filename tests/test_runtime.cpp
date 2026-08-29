@@ -1151,6 +1151,25 @@ static void TestGpuAgreement(ID3D12Device* dev) {
          "o = wavelet_denoise(src, luma = 0.03, chroma = 0.09, levels = 4)\n"
          "display(o)\n", 10.0, 1.0},
 
+        // The same, with level_dep ON. A separate entry because the default is
+        // 0, so the row above exercises none of the level-dependent path -- the
+        // two implementations of LevelScale could disagree completely and every
+        // existing check would still pass. It did not merely test the untested:
+        // it immediately reported max 78 on a units mismatch, since PixelBuffer
+        // holds 0..255 for an 8-bit image while a UNORM texture reads as 0..1,
+        // so middle grey is 45.9 on one side and 0.18 on the other.
+        //
+        // Max tolerance 16 rather than 10 for the reason above: level_dep gives
+        // each pixel its own threshold, so the 8-bit rounding between levels
+        // lands differently per pixel instead of uniformly. The MEAN is the
+        // check that says the paths agree, and it is held to the same 1.0 as
+        // its neighbour -- it measures 0.46.
+        {"wavelet_denoise",
+         "src = image(\"test\")\n"
+         "o = wavelet_denoise(src, luma = 0.03, chroma = 0.09, levels = 4, "
+         "level_dep = 1.0)\n"
+         "display(o)\n", 16.0, 1.0},
+
         {"threshold_bernsen",
          "src = image(\"test\")\n"
          "o = threshold_bernsen(src, window = 15, contrast_min = 15, "
