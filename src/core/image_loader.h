@@ -14,6 +14,7 @@
 #include <thread>
 #include <vector>
 
+#include "exif.h"
 #include "image.h"
 
 namespace tglab {
@@ -31,6 +32,15 @@ struct LoadResult {
     bool        ok = false;
     std::string error;
     uint64_t    seq = 0;
+
+    // Capture settings, read on the worker alongside the pixels.
+    //
+    // Free here and not free later: the file is already open and being read,
+    // and the EXIF block is a few hundred bytes against a 45 MP decode. Read
+    // lazily instead -- which is what the info panel used to do -- it is a
+    // fresh open, seek and parse on the UI THREAD, once per selection change,
+    // for a file that was just fully read.
+    ExifData    exif;
 };
 
 class ImageLoader {

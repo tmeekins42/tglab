@@ -954,6 +954,34 @@ int main() {
         // A SHORT stored inline in the offset field rather than at an offset.
         Check(e.iso == "ISO 800", "iso: " + e.iso);
 
+        // The loader reads EXIF alongside the pixels, so the info panel does not
+        // have to open the file again on the UI thread.
+        //
+        // Checked through the loader rather than by calling ReadExif twice: the
+        // point is that the DELIVERED result carries it, and a LoadResult that
+        // quietly left the field default would look identical from outside.
+        {
+            ImageLoader loader;
+            loader.Start();
+            loader.Request(path, "");
+
+            LoadResult got;
+            bool have = false;
+            for (int i = 0; i < 2000 && !have; ++i) {
+                have = loader.TryFetch(&got);
+                if (!have) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            loader.Stop();
+
+            Check(have, "the loader delivered the fixture");
+            // The fixture is a JPEG carrying only an EXIF block, so the decode
+            // itself is expected to fail -- which is the interesting case:
+            // metadata must survive a file whose pixels do not.
+            Check(have && got.exif.present, "the load carries EXIF with it");
+            Check(have && got.exif.iso == "ISO 800",
+                  "the delivered EXIF is the right file's: " + got.exif.iso);
+        }
+
         std::remove(path.c_str());
     }
     {

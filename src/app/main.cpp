@@ -238,6 +238,7 @@ struct PaletteMember {
     GpuTexture  thumb;        // its own preview -- a group is N images, not one
     Image       thumbImage;
     bool        thumbBuilt = false;
+    ExifData    exif;         // read when the file loaded, not on demand
 };
 
 struct PaletteEntry {
@@ -248,6 +249,13 @@ struct PaletteEntry {
     Image       thumbImage;  // downsampled copy the texture is built from
     uint64_t    thumbVersion = 0;   // version thumbImage was built at
     uint64_t    version = 1;   // bumped on reload so the thumbnail refreshes
+
+    // Capture settings, carried from the load rather than read on demand.
+    //
+    // For a group this is the FIRST member's, since that is what the slot as a
+    // whole is shown as; each member keeps its own in PaletteMember, which is
+    // what a per-member panel or a sort-by-date would want.
+    ExifData    exif;
 
     // One per image in a group, in the same order. Empty for a single image.
     std::vector<PaletteMember> members;
@@ -294,7 +302,8 @@ public:
     void OnResize(UINT w, UINT h) { if (m_dev.Ready()) m_dev.OnResize(w, h); }
 
     void LoadImageIntoPalette(const std::string& path, const std::string& targetSlot = "");
-    void AppendToGroup(PaletteEntry& e, Image&& img, const std::string& path);
+    void AppendToGroup(PaletteEntry& e, Image&& img, const std::string& path,
+                       ExifData exif = {});
     void RefreshMembers(PaletteEntry& e);
     std::string UniqueSlotName(const std::string& base) const;
     std::string NewGroupSlot();
@@ -690,7 +699,8 @@ void App::LoadImageIntoPalette(const std::string& path, const std::string& targe
 // core/image_group so it can be tested; these add what only the app knows --
 // bumping the version so the thumbnail rebuilds, and the path shown under the
 // name, which stops describing the entry once several files are behind it.
-void App::AppendToGroup(PaletteEntry& e, Image&& img, const std::string& path) {
+void App::AppendToGroup(PaletteEntry& e, Image&& img, const std::string& path,
+                        ExifData exif) {
     tglab::AppendToGroup(&e.data, std::move(img), e.axis);
     const auto& set = std::get<ImageSet>(e.data);
     e.path = set.images.size() == 1 ? path : "";
@@ -698,7 +708,14 @@ void App::AppendToGroup(PaletteEntry& e, Image&& img, const std::string& path) {
     // Record where this member came from, so the expanded row can name it and
     // its thumbnail can use the embedded JPEG preview for a raw.
     RefreshMembers(e);
-    if (!e.members.empty()) e.members.back().path = path;
+    if (!e.members.empty()) {
+        e.members.back().path = path;
+        e.members.back().exif = exif;
+    }
+
+    // The slot as a whole shows the FIRST member's capture settings, since
+    // that is the frame its thumbnail and name come from.
+    if (set.images.size() == 1) e.exif = std::move(exif);
 }
 
 void App::MakeGroup(PaletteEntry& e) {
@@ -727,10 +744,11 @@ void App::InstallLoadedImage(LoadResult&& r) {
     if (!r.targetSlot.empty()) {
         for (PaletteEntry& e : m_palette) {
             if (e.name == r.targetSlot) {
-                if (e.isGroup) AppendToGroup(e, std::move(r.image), r.path);
+                if (e.isGroup) AppendToGroup(e, std::move(r.image), r.path, r.exif);
                 else {
                     e.path = r.path;
                     e.data = Data{std::move(r.image)};
+                    e.exif = std::move(r.exif);
                 }
                 ++e.version;            // makes the thumbnail rebuild
                 m_dirty = true;
@@ -748,6 +766,7 @@ void App::InstallLoadedImage(LoadResult&& r) {
         if (e.name == name) {           // reloading the same name replaces it
             e.path = r.path;
             e.data = Data{std::move(r.image)};
+            e.exif = std::move(r.exif);
             ++e.version;
             m_dirty = true;
             return;
@@ -758,6 +777,7 @@ void App::InstallLoadedImage(LoadResult&& r) {
     e.name = std::move(name);
     e.path = r.path;
     e.data = Data{std::move(r.image)};
+    e.exif = std::move(r.exif);
     m_palette.push_back(std::move(e));
     m_dirty = true;
 }
@@ -1652,6 +1672,7 @@ void App::DrawInfoPanel() {
     Image*      shown = nullptr;
     std::string shownName;
     std::string filePath;
+    const ExifData* fileExif = nullptr;
 
     // Clicking a viewer selects it explicitly.
     for (auto& v : m_views)
@@ -1701,14 +1722,26 @@ void App::DrawInfoPanel() {
             shown     = &img;
             shownName = e.name;
             filePath  = e.path;
+            fileExif  = &e.exif;
             break;
         }
     } else {
         // A viewer shows a processed result, so its EXIF is that of whichever
         // palette image fed the pipeline -- there is only one source in
         // practice, and claiming otherwise would be worse than saying nothing.
-        for (PaletteEntry& e : m_palette)
-            if (std::holds_alternative<Image>(e.data)) { filePath = e.path; break; }
+        //
+        // A GROUP counts: it holds an ImageSet rather than an Image, and the
+        // entry carries its first member's settings. Skipping it would leave an
+        // HDR script -- where the only source IS a group -- reporting no EXIF
+        // at all, which is the case most likely to want it.
+        for (PaletteEntry& e : m_palette) {
+            const bool usable = std::holds_alternative<Image>(e.data) ||
+                                std::holds_alternative<ImageSet>(e.data);
+            if (!usable) continue;
+            filePath = e.path;
+            fileExif = &e.exif;
+            break;
+        }
     }
 
     if (!shown) {
@@ -1891,7 +1924,19 @@ void App::DrawInfoPanel() {
     }
 
     // --- capture settings ---------------------------------------------------
-    if (!filePath.empty() && filePath != m_infoExifPath) {
+    //
+    // Taken from the palette entry, which read it on the LOADER thread when the
+    // file came in. This used to call ReadExif() here: a fresh open, seek and
+    // parse on the UI thread, once per selection change, for a file that had
+    // just been fully read a moment earlier.
+    //
+    // The fallback still reads from disk, and is not dead code: a group's entry
+    // holds an ImageSet rather than an Image, so neither loop above matches it,
+    // and a file loaded before this change carries no cached EXIF.
+    if (fileExif && fileExif->present) {
+        m_infoExifPath = filePath;
+        m_infoExif     = *fileExif;
+    } else if (!filePath.empty() && filePath != m_infoExifPath) {
         m_infoExifPath = filePath;
         m_infoExif     = ReadExif(filePath);
     }

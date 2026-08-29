@@ -75,6 +75,12 @@ void ImageLoader::Run() {
         res.seq        = req.seq;
         res.ok         = LoadImageFile(req.path, &res.image, &res.error);
 
+        // EXIF on the worker too, for the same reason the pixels are here. Read
+        // even when the decode failed: a file can be an unsupported format and
+        // still carry readable metadata, and reporting the camera settings of
+        // something that would not load is more useful than reporting nothing.
+        res.exif = ReadExif(req.path);
+
         {
             std::lock_guard<std::mutex> lock(m_mtx);
             m_done.push_back(std::move(res));
