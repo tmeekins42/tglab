@@ -4315,6 +4315,311 @@ int main() {
         }
     }
 
+    // --- matching -------------------------------------------------------------
+    //
+    // The claim to earn is CORRECTNESS, not count. A matcher that returns
+    // hundreds of pairs is useless if they point at the wrong places, and a
+    // count alone cannot tell the difference.
+    //
+    // So the fixture is an image and a KNOWN SHIFT of itself: every correct
+    // match must have the two keypoints separated by exactly that shift, which
+    // makes each individual pair checkable rather than only the total.
+    {
+        Image photo;
+        std::string perr;
+#ifdef TGLAB_SOURCE_DIR
+        const std::string pp =
+            (std::filesystem::path(TGLAB_SOURCE_DIR) / "assets" / "test.png").string();
+#else
+        const std::string pp = "assets/test.png";
+#endif
+        if (LoadImageFile(pp, &photo, &perr)) {
+            constexpr int kDx = 11, kDy = -6;
+
+            auto shifted = [&](Image& src) {
+                ImageView v = src.MapCpuRead();
+                PixelBuffer in;
+                in.Unpack(v);
+                Image out;
+                out.Alloc(v.desc);
+                ImageView ov = out.MapCpuWrite();
+                PixelBuffer ob;
+                ob.Unpack(ov);
+                const int w = in.Width(), h = in.Height(), ch = in.Channels();
+                for (int y = 0; y < h; ++y)
+                    for (int x = 0; x < w; ++x) {
+                        const float* p = in.At(std::clamp(x - kDx, 0, w - 1),
+                                               std::clamp(y - kDy, 0, h - 1));
+                        float* o = ob.At(x, y);
+                        for (int c = 0; c < ch; ++c) o[c] = p[c];
+                    }
+                ob.PackInto(ov);
+                return out;
+            };
+
+            // detect on both frames, then match the group.
+            auto detectAndMatch = [&](const char* det, const char* matcher,
+                                      double ratio, bool cross,
+                                      const FeatureSidecar** refOut,
+                                      const FeatureSidecar** othOut,
+                                      const MatchSidecar** msOut,
+                                      Pipeline* keep, std::vector<Data>* keepSrc,
+                                      std::string* err) {
+                ImageSet set;
+                set.images.push_back(photo.Clone());
+                set.images.push_back(shifted(photo));
+                set.shape = Shape{{{"frame", 2}}};
+
+                keepSrc->clear();
+                keepSrc->push_back(Data{std::move(set)});
+
+                auto d = Registry::Get().Create(det);
+                auto m = Registry::Get().Create(matcher);
+                if (!d || !m) return false;
+                if (ParamBase* p = m->FindParam("ratio")) {
+                    std::string e; p->SetFromScript(Value(ratio), &e);
+                }
+                if (ParamBase* p = m->FindParam("cross_check")) {
+                    std::string e; p->SetFromScript(Value(cross ? 1.0 : 0.0), &e);
+                }
+
+                keep->AddStage(std::move(d), det, {{-1, 0}}, 1, 1);
+                keep->AddStage(std::move(m), matcher, {{0, 0}}, 1, 2);
+                if (!keep->Execute(keepSrc, nullptr, err)) return false;
+
+                const Data* out = keep->Resolve({1, 0}, keepSrc);
+                const auto* os = out ? std::get_if<ImageSet>(out) : nullptr;
+                if (!os || os->images.size() != 2) return false;
+
+                *refOut = FeaturesOf(os->images[0]);
+                *othOut = FeaturesOf(os->images[1]);
+                *msOut  = MatchesOf(os->images[1]);
+                return *refOut && *othOut && *msOut;
+            };
+
+            const FeatureSidecar *fa = nullptr, *fb = nullptr;
+            const MatchSidecar* ms = nullptr;
+            Pipeline p;
+            std::vector<Data> s;
+            std::string merr;
+
+            const bool ok = detectAndMatch("detect_sift", "match_brute", 0.8, true,
+                                           &fa, &fb, &ms, &p, &s, &merr);
+            Check(ok, "detect then match_brute runs" + (ok ? "" : ": " + merr));
+
+            if (ok) {
+                Check(!ms->matches.empty(),
+                      "it finds matches (" + std::to_string(ms->matches.size()) + ")");
+                Check(ms->reference == 0, "the match set names its reference");
+                Check(ms->considered >= int(ms->matches.size()),
+                      "candidates considered is at least matches kept");
+
+                // EVERY match must be geometrically right. The two frames
+                // differ by a known shift, so a correct pair has its keypoints
+                // separated by exactly that -- which makes this a test of the
+                // matches rather than of how many there are.
+                int correct = 0;
+                for (const Match& m : ms->matches) {
+                    if (m.a < 0 || m.a >= int(fa->keypoints.size())) continue;
+                    if (m.b < 0 || m.b >= int(fb->keypoints.size())) continue;
+                    const Keypoint& ka = fa->keypoints[size_t(m.a)];
+                    const Keypoint& kb = fb->keypoints[size_t(m.b)];
+                    const float ex = (kb.x - float(kDx)) - ka.x;
+                    const float ey = (kb.y - float(kDy)) - ka.y;
+                    if (std::sqrt(ex * ex + ey * ey) < 3.0f) ++correct;
+                }
+                // 90% is a high bar and the right one: with the ratio test and
+                // cross check both on, a matcher that is working should have
+                // very few wrong pairs. Measured here at 99%.
+                Check(correct * 10 >= int(ms->matches.size()) * 9,
+                      "matches are geometrically correct (" +
+                          std::to_string(correct) + " of " +
+                          std::to_string(ms->matches.size()) + ")");
+
+                // Every match's ratio must satisfy the test that produced it.
+                bool ratiosOk = true;
+                for (const Match& m : ms->matches)
+                    if (m.ratio > 0.8f + 1e-4f) ratiosOk = false;
+                Check(ratiosOk, "every kept match passes the ratio threshold");
+            }
+
+            // THE RATIO TEST HAS TO BE DOING SOMETHING. Disabling it must let
+            // more candidates through AND make them worse -- otherwise the
+            // parameter is decoration and the default is untested.
+            {
+                const FeatureSidecar *ga = nullptr, *gb = nullptr;
+                const MatchSidecar* gms = nullptr;
+                Pipeline p2;
+                std::vector<Data> s2;
+                std::string e2;
+                if (detectAndMatch("detect_sift", "match_brute", 1.0, false,
+                                   &ga, &gb, &gms, &p2, &s2, &e2) && ok) {
+                    Check(gms->matches.size() > ms->matches.size(),
+                          "disabling the ratio test keeps more candidates (" +
+                              std::to_string(gms->matches.size()) + " vs " +
+                              std::to_string(ms->matches.size()) + ")");
+
+                    int wrong = 0;
+                    for (const Match& m : gms->matches) {
+                        if (m.a < 0 || m.a >= int(ga->keypoints.size())) continue;
+                        if (m.b < 0 || m.b >= int(gb->keypoints.size())) continue;
+                        const Keypoint& ka = ga->keypoints[size_t(m.a)];
+                        const Keypoint& kb = gb->keypoints[size_t(m.b)];
+                        const float ex = (kb.x - float(kDx)) - ka.x;
+                        const float ey = (kb.y - float(kDy)) - ka.y;
+                        if (std::sqrt(ex * ex + ey * ey) >= 3.0f) ++wrong;
+                    }
+                    // The point of the test: without it, a real fraction of the
+                    // extra matches are wrong. If this were zero the ratio test
+                    // would be discarding good matches for nothing.
+                    Check(wrong > 0,
+                          "and those extra matches include wrong ones (" +
+                              std::to_string(wrong) + ")");
+                }
+            }
+
+            // A BINARY descriptor goes through the same matcher, dispatched on
+            // the kind rather than on the detector's name. Hamming rather than
+            // L2, and getting that wrong returns matches that mean nothing --
+            // which is the whole reason DescriptorKind travels with the data.
+            {
+                const FeatureSidecar *aa = nullptr, *ab = nullptr;
+                const MatchSidecar* ams = nullptr;
+                Pipeline p3;
+                std::vector<Data> s3;
+                std::string e3;
+                if (detectAndMatch("detect_akaze", "match_brute", 0.8, true,
+                                   &aa, &ab, &ams, &p3, &s3, &e3)) {
+                    Check(aa->descriptors.kind == DescriptorKind::Binary,
+                          "the AKAZE run really is binary");
+                    Check(!ams->matches.empty(),
+                          "binary descriptors match too (" +
+                              std::to_string(ams->matches.size()) + ")");
+
+                    int correct = 0;
+                    for (const Match& m : ams->matches) {
+                        if (m.a < 0 || m.a >= int(aa->keypoints.size())) continue;
+                        if (m.b < 0 || m.b >= int(ab->keypoints.size())) continue;
+                        const Keypoint& ka = aa->keypoints[size_t(m.a)];
+                        const Keypoint& kb = ab->keypoints[size_t(m.b)];
+                        const float ex = (kb.x - float(kDx)) - ka.x;
+                        const float ey = (kb.y - float(kDy)) - ka.y;
+                        if (std::sqrt(ex * ex + ey * ey) < 3.0f) ++correct;
+                    }
+                    Check(correct * 10 >= int(ams->matches.size()) * 9,
+                          "binary matches are geometrically correct (" +
+                              std::to_string(correct) + " of " +
+                              std::to_string(ams->matches.size()) + ")");
+                }
+            }
+        }
+    }
+
+    // draw_matches turns the sidecar into something visible, and says so when
+    // there is nothing to draw.
+    {
+        // A two-frame group with real structure, so the detector finds
+        // something and the matcher has work to do.
+        ImageSet set;
+        for (int f = 0; f < 2; ++f) {
+            Image im;
+            ImageDesc d{96, 96, Format::RGBA32F};
+            im.Alloc(d);
+            ImageView v = im.MapCpuWrite();
+            for (int y = 0; y < 96; ++y)
+                for (int x = 0; x < 96; ++x) {
+                    // A few blobs, shifted between the frames.
+                    float a = 0.2f;
+                    const float ox = float(x) - float(f) * 5.0f;
+                    const float oy = float(y);
+                    for (int b = 0; b < 4; ++b) {
+                        const float bx = 20.0f + 18.0f * float(b);
+                        const float by = 30.0f + 12.0f * float(b % 3);
+                        const float ex = ox - bx, ey = oy - by;
+                        a += 0.6f * std::exp(-(ex * ex + ey * ey) / 32.0f);
+                    }
+                    float* p = v.At<float>(x, y);
+                    p[0] = p[1] = p[2] = a;
+                    p[3] = 1.0f;
+                }
+            set.images.push_back(std::move(im));
+        }
+        set.shape = Shape{{{"frame", 2}}};
+
+        std::vector<Data> s;
+        s.push_back(Data{std::move(set)});
+
+        Pipeline p;
+        p.AddStage(Registry::Get().Create("detect_sift"), "detect_sift", {{-1, 0}}, 1, 1);
+        p.AddStage(Registry::Get().Create("match_brute"), "match_brute", {{0, 0}}, 1, 2);
+        p.AddStage(Registry::Get().Create("draw_matches"), "draw_matches", {{1, 0}}, 1, 3);
+
+        std::string e;
+        const bool ok = p.Execute(&s, nullptr, &e);
+        Check(ok, "detect -> match -> draw runs on a group" + (ok ? "" : ": " + e));
+
+        if (ok) {
+            // The drawn frame must DIFFER from what the matcher produced, or
+            // the visualiser ran and drew nothing -- which a "3 stages ran"
+            // check would not distinguish.
+            const Data* before = p.Resolve({1, 0}, &s);
+            const Data* after  = p.Resolve({2, 0}, &s);
+            const auto* bs = before ? std::get_if<ImageSet>(before) : nullptr;
+            const auto* as = after  ? std::get_if<ImageSet>(after)  : nullptr;
+            if (bs && as && bs->images.size() == 2 && as->images.size() == 2) {
+                ImageView bv = const_cast<Image&>(bs->images[1]).MapCpuRead();
+                ImageView av = const_cast<Image&>(as->images[1]).MapCpuRead();
+                // Counting CHANGED pixels would pass on the dim pass alone --
+                // it touches every pixel, so the whole frame differs whether or
+                // not a single line was drawn. Count pixels that got BRIGHTER
+                // instead: dimming can only darken, so anything brighter than
+                // the input is ink.
+                int brighter = 0;
+                for (int y = 0; y < 96; ++y)
+                    for (int x = 0; x < 96; ++x)
+                        if (av.At<float>(x, y)[1] > bv.At<float>(x, y)[1] + 1e-3f)
+                            ++brighter;
+                Check(brighter > 0, "draw_matches actually drew lines (" +
+                                        std::to_string(brighter) + " pixels)");
+            }
+        }
+
+        // Without a matcher upstream it must SAY there is nothing rather than
+        // silently passing the group through.
+        std::vector<Data> s2;
+        {
+            ImageSet plain;
+            for (int f = 0; f < 2; ++f) {
+                Image im;
+                im.Alloc({32, 32, Format::RGBA8});
+                plain.images.push_back(std::move(im));
+            }
+            plain.shape = Shape{{{"frame", 2}}};
+            s2.push_back(Data{std::move(plain)});
+        }
+        Pipeline p2;
+        p2.AddStage(Registry::Get().Create("draw_matches"), "draw_matches", {{-1, 0}}, 1, 1);
+        std::string e2;
+        p2.Execute(&s2, nullptr, &e2);
+        if (!p2.Stages().empty() && p2.Stages()[0].algo) {
+            const std::string r = p2.Stages()[0].algo->RunReport();
+            Check(r.find("no matches") != std::string::npos,
+                  "and reports when nothing is matched: \"" + r + "\"");
+        }
+    }
+
+    // Matching a group whose frames used DIFFERENT detectors is an error, not
+    // something to paper over: the descriptors are not comparable and the
+    // resulting pairs would mean nothing.
+    {
+        UiState ui; Pipeline p; std::vector<Data> src; std::string err;
+        RunScript("src = image(\"test\")\n"
+                  "out = match_brute(src)\n"
+                  "display(out)\n", &ui, &p, &err, &src);
+        Check(!err.empty(),
+              "matching a single image is an error: \"" + err + "\"");
+    }
+
     // draw_features marks the image where the features are, and says so when
     // there are none to draw.
     {

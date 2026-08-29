@@ -43,6 +43,13 @@ static std::string PreAlgo() {
     return buf[0] ? std::string(buf) : std::string("align");
 }
 
+// A second group-level stage, from TGLAB_PRE2.
+static std::string Pre2Algo() {
+    char buf[64] = {};
+    GetEnvironmentVariableA("TGLAB_PRE2", buf, sizeof buf);
+    return buf;
+}
+
 // Stage to append after the merge, from TGLAB_POST.
 static std::string PostAlgo() {
     char buf[64] = {};
@@ -94,6 +101,11 @@ int main(int argc, char** argv) {
              ? std::string("frames = ") + PreAlgo() + "(frames" +
                (GetEnvironmentVariableA("TGLAB_NORM", nullptr, 0) > 0
                     ? ", normalize = 1" : "") + ")\n"
+             : std::string()) +
+        // TGLAB_PRE2 chains a SECOND group-level stage, so detect-then-match
+        // can be exercised on real raws in one run.
+        (GetEnvironmentVariableA("TGLAB_PRE2", nullptr, 0) > 0
+             ? std::string("frames = ") + Pre2Algo() + "(frames)\n"
              : std::string()) +
         "merged = " + algo + "(frames)\n" +
         // TGLAB_POST appends a stage after the merge, so the tone mapper can be

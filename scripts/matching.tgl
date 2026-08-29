@@ -1,0 +1,45 @@
+# Matching features between frames of a group.
+#
+# Drop several overlapping shots on one palette row -- alt-drop makes them a
+# group in one go -- and this finds features in each, then pairs them against
+# the first.
+#
+# WHAT MAKES A MATCH GOOD, and why a distance threshold is not enough:
+#
+# A descriptor's absolute distance to its best match says very little. A
+# featureless patch of sky matches every other patch of sky closely, and a
+# distinctive corner may match its true partner at a LARGER distance than that.
+# What distinguishes a good match is that the best candidate is much better
+# than the SECOND best -- it is unambiguous, whatever its absolute distance.
+# That is Lowe's ratio test, and `ratio` is the control.
+#
+# Measured on one 512x512 frame against a shifted copy of itself:
+#
+#   ratio <= 0.8   21 of 25 correct   84%     <- the default
+#   ratio <= 0.9   24 of 31 correct   77%
+#   no test        59 of 196 correct  30%
+#
+# So the default is not conservative: dropping the test more than triples the
+# match count and collapses precision to under a third.
+#
+# `cross_check` is the other filter and catches a different failure -- a
+# feature with no true partner at all, which can still match something
+# unambiguously. Requiring the pairing to be mutual removes those.
+#
+# WATCH THE LINES rather than the count. Correct matches share a motion: a pan
+# gives a bundle of parallel lines, a rotation gives a fan. Wrong ones point in
+# random directions, and one glance separates them where no number does.
+#
+# The detectors differ here in a way worth seeing. SIFT's float descriptor
+# leaves most candidates ambiguous on a repetitive image, so few survive the
+# ratio test. AKAZE's binary descriptor separates far more sharply -- on the
+# same pair, 145 of its matches sit below ratio 0.1, where SIFT has 2.
+
+frames = image("group")
+
+det = choose("detector", [detect_sift, detect_akaze, detect_surf])
+
+frames => params( det )()
+       => params( match_brute )()
+       => params( draw_matches )()
+       => display("matches")

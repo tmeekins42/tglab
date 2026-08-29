@@ -143,6 +143,47 @@ public:
     bool DerivedFromPixels() const override { return true; }
 };
 
+// The name matches are filed under.
+inline constexpr const char* kMatchSidecar = "matches";
+
+// One correspondence: feature `a` in the reference image is feature `b` here.
+struct Match {
+    int   a = 0;          // index into the REFERENCE image's keypoints
+    int   b = 0;          // index into THIS image's keypoints
+    float distance = 0.0f;// descriptor distance; lower is a closer match
+    float ratio = 0.0f;   // best/second-best, the confidence measure
+};
+
+// Matches attached to an image, pairing its features against a reference.
+//
+// ATTACHED TO THE NON-REFERENCE IMAGE, and that asymmetry is deliberate. A
+// group of N frames matched against frame 0 produces N-1 sets of
+// correspondences, and each belongs with the frame it describes -- the same
+// arrangement the transform sidecar uses, and for the same reason: whatever
+// consumes it is walking the frames, not the pairs.
+class MatchSidecar : public SidecarBase {
+public:
+    std::vector<Match> matches;
+
+    // Which image the `a` indices refer to. -1 when unset.
+    int reference = -1;
+
+    // What produced these, for the report.
+    std::string matcher;
+
+    // How many candidate pairs were considered and how many survived. The
+    // difference is the useful number: a matcher that keeps 90% of its
+    // candidates has a threshold doing nothing, and one that keeps 2% has a
+    // threshold that is probably discarding real matches too.
+    int considered = 0;
+
+    bool DerivedFromPixels() const override { return true; }
+};
+
+inline const MatchSidecar* MatchesOf(const Image& img) {
+    return img.Sidecars().Get<MatchSidecar>(kMatchSidecar);
+}
+
 // Reads the features attached to an image, or null when there are none.
 //
 // Null rather than an empty set, so "no detector ran" is distinguishable from
