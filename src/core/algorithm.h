@@ -56,6 +56,26 @@ public:
     // into a sub-algorithm (see canny.cpp).
     const Data* InData(size_t i) const { return i < m_in.size() ? m_in[i] : nullptr; }
 
+    // The output as an Image, for attaching a SIDECAR.
+    //
+    // Out() hands back an ImageView, which is pixels and a descriptor -- enough
+    // for anything that writes pixels, and not enough for an algorithm whose
+    // product is a sidecar. A feature detector's output IS its sidecar: it
+    // passes the image through unchanged and attaches what it found.
+    //
+    // Null when the port does not hold an Image, so a caller that gets one is
+    // holding something it can write to.
+    Image* OutImage(size_t i) {
+        if (i >= m_out.size()) return nullptr;
+        return std::get_if<Image>(&m_out[i]);
+    }
+
+    // The input as an Image, for READING a sidecar an earlier stage attached.
+    const Image* InImage(size_t i) const {
+        if (i >= m_in.size() || !m_in[i]) return nullptr;
+        return std::get_if<Image>(m_in[i]);
+    }
+
     size_t NumIn()  const { return m_in.size(); }
     size_t NumOut() const { return m_out.size(); }
 

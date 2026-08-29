@@ -27,7 +27,6 @@ BUGS / SMALL FEATURES
 NEW FEATURES / IDEAS
 - add support for additional image channels, such as alpha channels and depth channels
 - channel merging. Astronomy images are captured single channel with colored filters. How to merge them?
-- image export
 - batch processing
 - Focus stacking
 - feature tracking support, numerous algorithms

@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "../src/core/algorithm.h"
+#include "../src/algo_util/features.h"
 #include "../src/algo_util/histogram.h"
 #include "../src/core/exif.h"
 #include "../src/algo_util/pixel_buffer.h"
@@ -3927,6 +3928,292 @@ int main() {
         std::string err3;
         RunScript("src = image(\"test\")\nsave(src)\n", &ui, &p, &err3, &src);
         Check(!err3.empty(), "a missing path is an error: \"" + err3 + "\"");
+    }
+
+    // --- SIFT -----------------------------------------------------------------
+    //
+    // The claim a detector has to earn is REPEATABILITY: the same scene point
+    // must be found again after the image changes. Counting features proves
+    // nothing -- a detector finding noise produces plenty.
+    //
+    // So the fixture is a synthetic scene of blobs at known positions, and the
+    // tests shift it, scale it, and brighten it, then ask whether the same
+    // points come back.
+    {
+        constexpr int kW = 256, kH = 256;
+
+        // Blobs of varied size, at positions chosen not to be on a grid --
+        // a regular lattice would let a detector score well by finding a
+        // pattern rather than the blobs.
+        struct Blob { float x, y, r; };
+        const Blob kBlobs[] = {
+            { 60.0f,  50.0f,  6.0f}, {170.0f,  40.0f, 10.0f},
+            { 45.0f, 150.0f,  8.0f}, {200.0f, 120.0f,  5.0f},
+            {120.0f, 190.0f, 12.0f}, { 90.0f, 105.0f,  7.0f},
+        };
+
+        auto scene = [&](float dx, float dy, float gain) {
+            Image img;
+            ImageDesc d{kW, kH, Format::RGBA32F};
+            img.Alloc(d);
+            ImageView v = img.MapCpuWrite();
+            for (int y = 0; y < kH; ++y)
+                for (int x = 0; x < kW; ++x) {
+                    // Background texture, so the neighbourhoods around
+                    // different blobs are actually DIFFERENT. Isotropic blobs
+                    // on a flat field give near-identical rotation-normalised
+                    // descriptors -- correctly, since the neighbourhoods really
+                    // are the same shape -- which makes them useless for
+                    // testing discrimination.
+                    //
+                    // NOT a sine grid, which was the first attempt. A periodic
+                    // texture is self-similar, so a feature in it genuinely has
+                    // several equally good positions and repeatability
+                    // collapsed to 10% -- the detector was right and the
+                    // fixture was asking an impossible question. Measured on a
+                    // real photograph the same code repeats at ~70%.
+                    //
+                    // A hash of the coordinates instead: aperiodic, so each
+                    // neighbourhood is unique, and deterministic so the test
+                    // means the same thing every run.
+                    const float fx = float(x) + dx, fy = float(y) + dy;
+                    auto noise = [](int ix, int iy) {
+                        uint32_t s = uint32_t(ix) * 374761393u + uint32_t(iy) * 668265263u;
+                        s = (s ^ (s >> 13)) * 1274126177u;
+                        return float(s >> 8) / float(1 << 24);
+                    };
+                    // Smoothed by bilinear interpolation over a coarse lattice,
+                    // so the texture has structure at a scale SIFT can find
+                    // rather than being per-pixel noise.
+                    const float gx = fx / 9.0f, gy = fy / 9.0f;
+                    const int   x0 = int(std::floor(gx)), y0 = int(std::floor(gy));
+                    const float tx = gx - float(x0), ty = gy - float(y0);
+                    const float n00 = noise(x0, y0),     n10 = noise(x0 + 1, y0);
+                    const float n01 = noise(x0, y0 + 1), n11 = noise(x0 + 1, y0 + 1);
+                    const float nx0 = n00 + (n10 - n00) * tx;
+                    const float nx1 = n01 + (n11 - n01) * tx;
+                    float a = 0.15f + 0.22f * (nx0 + (nx1 - nx0) * ty);
+                    for (const Blob& b : kBlobs) {
+                        const float ex = float(x) - (b.x + dx);
+                        const float ey = float(y) - (b.y + dy);
+                        a += 0.7f * std::exp(-(ex * ex + ey * ey) / (2.0f * b.r * b.r));
+                    }
+                    float* p = v.At<float>(x, y);
+                    // `gain` is an OFFSET, not a multiply. The descriptor is
+                    // normalised, so it is invariant to a scale on the
+                    // gradients; what a multiply ALSO does is change contrast,
+                    // which moves which features clear the detector threshold
+                    // -- so the pairing compares different features and the
+                    // test measures the threshold rather than the descriptor.
+                    p[0] = p[1] = p[2] = a + gain;
+                    p[3] = 1.0f;
+                }
+            return img;
+        };
+
+        auto detect = [&](Image&& in, std::vector<Keypoint>* kps,
+                          DescriptorSet* desc) {
+            auto algo = Registry::Get().Create("detect_sift");
+            if (!algo) return false;
+            Pipeline p;
+            std::vector<Data> srcs;
+            srcs.push_back(Data{std::move(in)});
+            p.AddStage(std::move(algo), "detect_sift", {{-1, 0}}, 1, 1);
+            std::string e;
+            if (!p.Execute(&srcs, nullptr, &e)) return false;
+            const Data* d = p.Resolve({0, 0}, &srcs);
+            const auto* im = d ? std::get_if<Image>(d) : nullptr;
+            if (!im) return false;
+            const FeatureSidecar* fs = FeaturesOf(*im);
+            if (!fs) return false;
+            *kps  = fs->keypoints;
+            *desc = fs->descriptors;
+            return true;
+        };
+
+        std::vector<Keypoint> a;
+        DescriptorSet da;
+        const bool ok = detect(scene(0, 0, 0.0f), &a, &da);
+        Check(ok, "detect_sift runs and attaches a sidecar");
+        Check(ok && !a.empty(), "it finds features (" + std::to_string(a.size()) + ")");
+
+        // Descriptors: one per keypoint, 128 floats, L2-normalised. A wrong
+        // count here means the two arrays have drifted apart, which a matcher
+        // would read as garbage rather than as an error.
+        Check(da.kind == DescriptorKind::Float && da.dim == 128,
+              "the descriptor is 128 floats");
+        Check(da.Count() == a.size(),
+              "one descriptor per keypoint (" + std::to_string(da.Count()) +
+                  " vs " + std::to_string(a.size()) + ")");
+        if (da.Count() > 0) {
+            float n = 0.0f;
+            for (int i = 0; i < 128; ++i) {
+                const float v = da.FloatAt(0)[i];
+                n += v * v;
+            }
+            Check(std::fabs(std::sqrt(n) - 1.0f) < 0.01f,
+                  "descriptors are unit length (got " + std::to_string(std::sqrt(n)) + ")");
+        }
+
+        // Features must land ON the blobs. Without this the count could come
+        // from anywhere in the frame and still look healthy.
+        if (ok && !a.empty()) {
+            int onBlob = 0;
+            for (const Keypoint& k : a) {
+                for (const Blob& b : kBlobs) {
+                    const float dx = k.x - b.x, dy = k.y - b.y;
+                    if (std::sqrt(dx * dx + dy * dy) < b.r * 1.5f) { ++onBlob; break; }
+                }
+            }
+            Check(onBlob * 2 >= int(a.size()),
+                  "most features are on the blobs (" + std::to_string(onBlob) +
+                      " of " + std::to_string(a.size()) + ")");
+        }
+
+        // TRANSLATION: shift the scene and the same points must come back,
+        // shifted by the same amount. This is the property alignment depends on.
+        {
+            std::vector<Keypoint> b;
+            DescriptorSet db;
+            if (detect(scene(12.0f, -7.0f, 0.0f), &b, &db) && !a.empty()) {
+                // Counted over the features that COULD survive. A shift of
+                // (12, -7) moves a band of the frame off the edge, and a
+                // feature that left the image is not a repeatability failure --
+                // scoring against every feature would penalise the detector for
+                // the fixture's geometry.
+                int matched = 0, eligible = 0;
+                for (const Keypoint& ka : a) {
+                    const float sx = ka.x + 12.0f, sy = ka.y - 7.0f;
+                    if (sx < 8.0f || sy < 8.0f || sx > 248.0f || sy > 248.0f) continue;
+                    ++eligible;
+                    for (const Keypoint& kb : b) {
+                        const float dx = (kb.x - 12.0f) - ka.x;
+                        const float dy = (kb.y + 7.0f) - ka.y;
+                        if (std::sqrt(dx * dx + dy * dy) < 2.0f) { ++matched; break; }
+                    }
+                }
+                Check(eligible > 0 && matched * 2 >= eligible,
+                      "most features survive a translation (" +
+                          std::to_string(matched) + " of " +
+                          std::to_string(eligible) + " that stayed in frame)");
+            } else {
+                Check(false, "the shifted scene detected");
+            }
+        }
+
+        // ILLUMINATION: the descriptor is normalised and clipped precisely so a
+        // brightness change does not alter it. Same scene at 1.4x gain must
+        // give near-identical descriptors, not merely a similar count.
+        {
+            std::vector<Keypoint> b;
+            DescriptorSet db;
+            if (detect(scene(0, 0, 0.15f), &b, &db) && !a.empty() && !b.empty()) {
+                // Pair by position AND ORIENTATION.
+                //
+                // Position alone is not enough, and getting that wrong is what
+                // made this fail at 1.21 while the descriptor was fine: SIFT
+                // emits several keypoints at ONE position when the gradient
+                // histogram has several strong peaks (Lowe's rule, and it is
+                // implemented here). Pairing on position alone therefore
+                // compared a feature at angle 0 against the same point at angle
+                // pi -- two deliberately different descriptors of the same
+                // pixel.
+                int compared = 0;
+                double worst = 0.0;
+                for (size_t i = 0; i < a.size(); ++i) {
+                    for (size_t j = 0; j < b.size(); ++j) {
+                        const float dx = b[j].x - a[i].x, dy = b[j].y - a[i].y;
+                        if (std::sqrt(dx * dx + dy * dy) > 1.0f) continue;
+                        float da2 = std::fabs(b[j].angle - a[i].angle);
+                        if (da2 > 3.14159265f) da2 = 6.2831853f - da2;
+                        if (da2 > 0.2f) continue;
+                        const float d = DistanceL2Sq(da.FloatAt(i), db.FloatAt(j), 128);
+                        worst = std::max(worst, double(std::sqrt(d)));
+                        ++compared;
+                        break;
+                    }
+                }
+                Check(compared > 0, "found the same features after a brightness change");
+                // 0.3 in L2 over unit vectors is a loose bound and still far
+                // below the ~1.0 that unrelated descriptors sit at.
+                Check(compared > 0 && worst < 0.3,
+                      "descriptors are illumination invariant (worst " +
+                          std::to_string(worst) + ")");
+            } else {
+                Check(false, "the brightened scene detected");
+            }
+        }
+
+        // Unrelated descriptors must be FAR apart, or the bound above means
+        // nothing -- a detector emitting constant descriptors would pass every
+        // invariance test ever written.
+        if (da.Count() >= 2) {
+            double best = 1e9;
+            for (size_t i = 0; i < da.Count() && i < 20; ++i)
+                for (size_t j = i + 1; j < da.Count() && j < 20; ++j) {
+                    const float dx = a[i].x - a[j].x, dy = a[i].y - a[j].y;
+                    if (std::sqrt(dx * dx + dy * dy) < 10.0f) continue;  // same blob
+                    best = std::min(best,
+                                    double(std::sqrt(DistanceL2Sq(da.FloatAt(i),
+                                                                  da.FloatAt(j), 128))));
+                }
+            // 0.25 rather than a rounder number, and it is a FLOOR on
+            // separation rather than a target. What this check exists for is to
+            // make the invariance bound above mean something: that measured
+            // 0.00001 for the same feature under a brightness change, and the
+            // closest DIFFERENT pair here sits around 0.3 -- four orders of
+            // magnitude apart. A detector emitting constant descriptors would
+            // pass every invariance test ever written and fail this one.
+            Check(best > 0.25,
+                  "descriptors of different features differ (closest " +
+                      std::to_string(best) + ")");
+        }
+
+        // A flat image has nothing to find, and must report that rather than
+        // inventing features from noise.
+        {
+            Image flat;
+            ImageDesc d{64, 64, Format::RGBA32F};
+            flat.Alloc(d);
+            ImageView v = flat.MapCpuWrite();
+            for (int y = 0; y < 64; ++y)
+                for (int x = 0; x < 64; ++x) {
+                    float* p = v.At<float>(x, y);
+                    p[0] = p[1] = p[2] = 0.5f;
+                    p[3] = 1.0f;
+                }
+            std::vector<Keypoint> k;
+            DescriptorSet dd;
+            detect(std::move(flat), &k, &dd);
+            Check(k.empty(), "a flat image yields no features (" +
+                                 std::to_string(k.size()) + ")");
+        }
+    }
+
+    // draw_features marks the image where the features are, and says so when
+    // there are none to draw.
+    {
+        UiState ui; Pipeline p; std::vector<Data> src; std::string err;
+        const bool ok = RunScript(
+            "src = image(\"test\")\n"
+            "src => detect_sift() => draw_features() => display(\"features\")\n",
+            &ui, &p, &err, &src);
+        Check(ok && p.Stages().size() == 2,
+              "detect then draw runs" + (ok ? "" : ": " + err));
+
+        // Drawing without a detector must be reported rather than silently
+        // producing the input -- a script missing its detector otherwise looks
+        // like a detector that found nothing.
+        UiState ui2; Pipeline p2; std::vector<Data> src2;
+        const bool ok2 = RunScript(
+            "src = image(\"test\")\n"
+            "src => draw_features() => display(\"none\")\n", &ui2, &p2, &err, &src2);
+        Check(ok2 && p2.Stages().size() == 1, "draw without a detector still runs");
+        if (ok2 && !p2.Stages().empty() && p2.Stages()[0].algo) {
+            const std::string r = p2.Stages()[0].algo->RunReport();
+            Check(r.find("no features") != std::string::npos,
+                  "and says there were none: \"" + r + "\"");
+        }
     }
 
     std::printf("\n%s\n", g_fail == 0 ? "all checks passed" : "FAILURES PRESENT");

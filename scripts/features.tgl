@@ -1,0 +1,34 @@
+# Feature detection, and looking at what it found.
+#
+# A detector's output is a SIDECAR -- keypoints and descriptors attached to the
+# image -- rather than pixels. That is what lets a detector sit anywhere in a
+# chain: the image passes through unchanged, and whatever comes later reads the
+# features if it wants them and ignores them if it does not.
+#
+# draw_features is how you see them. Each circle's RADIUS is the keypoint's
+# scale, which is the region its descriptor was measured over, and the line is
+# its orientation -- the frame the descriptor is measured in. Both matter: an
+# orientation that jitters between frames is a matching failure you can see
+# here rather than discover later in an alignment that will not converge.
+#
+# WHAT TO TUNE, and what to watch:
+#
+#   contrast    the main control. Too low and most of what is found is noise in
+#               flat regions; those features do not repeat, so they cost time
+#               and give nothing. Raise it until the marks sit on things you
+#               would call features.
+#   edge_ratio  rejects points on edges. An edge point slides along its own
+#               edge between frames, so it matches the wrong place.
+#   octaves     how many resolutions to search. More finds larger blobs.
+#
+# On the stock test image this finds around 270 features that repeat about 70%
+# of the time under a small translation, which is the number that matters --
+# a detector finding thousands that do not repeat is worse than one finding
+# hundreds that do.
+
+src = image("test")
+
+src => display("1 source")
+    => params( detect_sift )()
+    => params( draw_features )()
+    => display("2 features")
