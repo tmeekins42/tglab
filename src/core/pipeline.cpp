@@ -65,6 +65,7 @@ void Pipeline::PublishStats(Progress* progress, const ComputeContext* gpu) const
 void Pipeline::Clear() {
     m_stages.clear();
     m_viewers.clear();
+    m_saves.clear();
 }
 
 int Pipeline::AddStage(std::unique_ptr<AlgorithmBase> algo, std::string name,
@@ -81,6 +82,81 @@ int Pipeline::AddStage(std::unique_ptr<AlgorithmBase> algo, std::string name,
     s.reshapeTo  = std::move(reshapeTo);
     m_stages.push_back(std::move(s));
     return int(m_stages.size()) - 1;
+}
+
+void Pipeline::AddSave(SaveDecl s) { m_saves.push_back(std::move(s)); }
+
+// Inserts "_N" before the extension: out.png -> out_3.png.
+static std::string NumberedPath(const std::string& path, int n) {
+    const auto dot   = path.find_last_of('.');
+    const auto slash = path.find_last_of("/\\");
+    const bool hasExt = dot != std::string::npos &&
+                        (slash == std::string::npos || dot > slash);
+    const std::string stem = hasExt ? path.substr(0, dot) : path;
+    const std::string ext  = hasExt ? path.substr(dot) : "";
+
+    // Zero padded so a directory listing sorts the frames in order -- the same
+    // reason a camera writes IMG_0001 rather than IMG_1.
+    char buf[16];
+    std::snprintf(buf, sizeof buf, "_%03d", n);
+    return stem + buf + ext;
+}
+
+bool Pipeline::RunSaves(std::vector<Data>* sources, std::string* err,
+                        std::vector<std::string>* written) {
+    bool allOk = true;
+
+    for (const SaveDecl& s : m_saves) {
+        const Data* d = Resolve(s.source, sources);
+        if (!d) {
+            if (allOk) *err = "save('" + s.path + "'): nothing to save";
+            allOk = false;
+            continue;
+        }
+
+        // One image, or one file per frame of a group. Collected first so both
+        // cases go through the same write loop.
+        std::vector<Image*> frames;
+        if (const auto* img = std::get_if<Image>(d)) {
+            frames.push_back(const_cast<Image*>(img));
+        } else if (const auto* set = std::get_if<ImageSet>(d)) {
+            for (const Image& im : set->images) frames.push_back(const_cast<Image*>(&im));
+        }
+        if (frames.empty()) {
+            if (allOk) *err = "save('" + s.path + "'): nothing to save";
+            allOk = false;
+            continue;
+        }
+
+        for (size_t i = 0; i < frames.size(); ++i) {
+            // A group numbers from 1; a single image keeps the path as written.
+            std::string path = (frames.size() == 1) ? s.path
+                                                    : NumberedPath(s.path, int(i) + 1);
+
+            switch (s.existing) {
+                case SaveDecl::Existing::Increment:
+                    path = NextFreePath(path);
+                    break;
+                case SaveDecl::Existing::Skip:
+                    if (GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES)
+                        continue;
+                    break;
+                case SaveDecl::Existing::Overwrite:
+                    break;
+            }
+
+            std::string werr;
+            if (SaveImage(path, *frames[i], s.format, s.quality, &werr)) {
+                if (written) written->push_back(path);
+            } else {
+                // Keep going: a failure on one frame is not a reason to skip
+                // the rest, and the first message is the one worth reporting.
+                if (allOk) *err = werr;
+                allOk = false;
+            }
+        }
+    }
+    return allOk;
 }
 
 void Pipeline::AddViewer(std::string name, PortRef src) {

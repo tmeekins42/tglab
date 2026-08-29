@@ -13,6 +13,7 @@
 
 #include "algorithm.h"
 #include "data.h"
+#include "image_io.h"
 #include "progress.h"
 
 namespace tglab {
@@ -90,6 +91,28 @@ struct ViewerDecl {
     PortRef     source;
 };
 
+// A save() the script declared. Recorded during the build like a viewer, and
+// acted on after the run rather than during it -- writing a file from inside
+// Execute would put disk IO on the worker's critical path and would happen
+// again on every slider tick.
+struct SaveDecl {
+    std::string path;        // as written; a group gets a number appended
+    PortRef     source;
+    SaveFormat  format = SaveFormat::Png;
+    int         quality = 92;
+
+    // What to do when the file already exists.
+    //
+    //   Increment  out.png -> out_1.png. The default, because a script that
+    //              silently overwrote the result of the last run would be a
+    //              bad surprise in a tool built around re-running.
+    //   Overwrite  write over it, for the "export the current state" case
+    //              where accumulating numbered copies is the surprise.
+    //   Skip       leave the existing file and do nothing.
+    enum class Existing { Increment, Overwrite, Skip };
+    Existing existing = Existing::Increment;
+};
+
 // Which implementation to run. Auto prefers the GPU when the algorithm has
 // one; the explicit modes exist for correctness comparison and benchmarking.
 enum class ExecMode : uint8_t { Auto, ForceCPU, ForceGPU };
@@ -104,6 +127,7 @@ public:
                   std::vector<PortRef> inputs, size_t numOutputs, int line,
                   std::string reduceAxis = {}, Shape reshapeTo = {});
     void AddViewer(std::string name, PortRef src);
+    void AddSave(SaveDecl s);
 
     // --- execution (phase 2) ---
     // `sources` are the palette images, indexed by PortRef::port when stage==-1.
@@ -158,6 +182,20 @@ public:
     std::vector<Stage>&       Stages()       { return m_stages; }
     const std::vector<Stage>& Stages() const { return m_stages; }
     const std::vector<ViewerDecl>& Viewers() const { return m_viewers; }
+    const std::vector<SaveDecl>&   Saves()   const { return m_saves; }
+
+    // Writes everything the script's save() calls asked for, AFTER a run.
+    //
+    // Separate from Execute rather than folded into it: a save is disk IO on
+    // the worker's critical path, and Execute runs on every slider tick while
+    // a save should happen when the caller decides it should.
+    //
+    // A group writes one file per frame with a number appended, since a single
+    // path cannot name N images. Returns false if any write failed, with `err`
+    // naming the first -- and keeps going, because a full disk on frame 3 is
+    // not a reason to skip frames 4 through 8.
+    bool RunSaves(std::vector<Data>* sources, std::string* err,
+                  std::vector<std::string>* written = nullptr);
 
 private:
     // True if `a` and `b` are the same algorithm with the same wiring/params.
@@ -185,6 +223,7 @@ private:
 
     std::vector<Stage>      m_stages;
     std::vector<ViewerDecl> m_viewers;
+    std::vector<SaveDecl>   m_saves;
     int                     m_gpuStages = 0;
     std::vector<std::string> m_gpuFallbacks;
     int                     m_cpuStages = 0;

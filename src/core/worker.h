@@ -49,6 +49,15 @@ struct PipelineJob {
     std::vector<uint64_t> sourceVersions;
     bool              compare    = false;
     int               compareStage = -1;   // -1 = last stage
+
+    // Run the script's save() declarations after this job.
+    //
+    // A one-shot request rather than something every run does: a save is a
+    // disk write, and doing it per run would write a file on every slider
+    // tick. The UI sets it when the user asks (File -> Run saves) or when the
+    // script changes, so a save() line means "write when I say", not "write
+    // continuously".
+    bool              runSaves   = false;
 };
 
 // What the UI actually needs to draw: one image per declared viewer. The
@@ -82,6 +91,11 @@ struct PipelineOutcome {
     std::string              error;
     std::vector<ViewerImage> viewers;
 
+    // Files the run's save() declarations wrote, and why it stopped if it
+    // did not. Empty on a job that did not ask for saves.
+    std::vector<std::string> saved;
+    std::string              saveError;
+
     // Set when the job was a comparison rather than a normal run.
     bool                           isCompare = false;
     std::shared_ptr<CompareResult> compare;
@@ -109,6 +123,12 @@ public:
     // thread, so no D3D12 object is shared with the UI thread's submission.
     void Start(ID3D12Device* device = nullptr);
     void Stop();
+
+    // Ask that the NEXT run perform the script's save() declarations.
+    //
+    // A request rather than a call: the pipeline and its pixels live on the
+    // worker, so the save has to happen there, and the UI can only say when.
+    void RequestSaves() { m_saveRequested.store(true, std::memory_order_relaxed); }
 
     void SetExecMode(ExecMode m) { m_mode.store(m, std::memory_order_relaxed); }
     ExecMode GetExecMode() const { return m_mode.load(std::memory_order_relaxed); }
@@ -218,6 +238,7 @@ private:
     std::atomic<double>   m_lastMs{0.0};
     std::atomic<double>   m_lastGpuMs{0.0};
     std::atomic<int>      m_lastBypassed{0};
+    std::atomic<bool>     m_saveRequested{false};
 
     // Guarded by m_mtx rather than atomic: a vector of strings cannot be.
     std::vector<std::string> m_lastReports;

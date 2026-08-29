@@ -4,6 +4,7 @@
 // slider-driven parameters, display the result. Everything on the UI thread.
 #include <windows.h>
 #include <shellapi.h>   // DragAcceptFiles / DragQueryFile
+#include <commdlg.h>    // GetSaveFileName
 #include <dbghelp.h>    // stack trace in the crash handler
 
 #include <algorithm>
@@ -370,6 +371,7 @@ private:
     void ReleaseRetiredViews();
     void ReportError(const std::string& prevError);
     void PollWorker();
+    void SaveViewer(const std::string& viewer);
     void PollLoader();
     void PollStats();
     void InstallLoadedImage(LoadResult&& r);
@@ -434,6 +436,11 @@ private:
     bool       m_syncCameras = true;
 
     std::string m_error;        // last script/run error, empty when fine
+
+    // What the last requested save wrote, shown in the status strip. Cleared
+    // when the script changes, since it then describes a previous script.
+    std::string m_saveReport;
+    int         m_saveCount = 0;   // save() lines in the current script
     std::string m_loadError;    // script file could not be read (survives a re-run)
     bool        m_dirty = true; // re-run requested
     bool        m_rebuildLayout = false;   // explicit "Reset layout" request
@@ -788,6 +795,58 @@ void App::InstallLoadedImage(LoadResult&& r) {
 }
 
 // Picks up finished loads. Called once per frame.
+// Saves what a viewer is showing, after asking where.
+//
+// The pixels come from m_viewerImages rather than from the panel: the panel
+// holds a texture, and for a GPU-resident result those pixels are on the
+// device. The worker already copies each visible viewer's result back for the
+// UI to draw, so the CPU copy is here for free.
+void App::SaveViewer(const std::string& viewer) {
+    ViewerImage* found = nullptr;
+    for (ViewerImage& v : m_viewerImages)
+        if (v.name == viewer) { found = &v; break; }
+
+    if (!found || !found->image.Valid()) {
+        m_saveReport = "save: '" + viewer + "' has no pixels on the CPU to write";
+        return;
+    }
+
+    // A sensible default name: the viewer's, which is what the script called
+    // it, with anything awkward for a filename replaced.
+    std::string suggested = viewer;
+    for (char& c : suggested)
+        if (std::strchr("\\/:*?\"<>|", c)) c = '_';
+    suggested += ".png";
+
+    char path[MAX_PATH];
+    std::snprintf(path, sizeof path, "%s", suggested.c_str());
+
+    OPENFILENAMEA ofn = {};
+    ofn.lStructSize = sizeof ofn;
+    ofn.hwndOwner   = m_hwnd;
+    // The formats SaveImage can write. PNG first because it is lossless and
+    // opens everywhere; .hdr last because it is the specialist answer, for a
+    // merged bracket whose range cannot survive 8 bits.
+    ofn.lpstrFilter = "PNG\0*.png\0JPEG\0*.jpg\0BMP\0*.bmp\0TGA\0*.tga\0"
+                      "Radiance HDR\0*.hdr\0All files\0*.*\0";
+    ofn.lpstrFile   = path;
+    ofn.nMaxFile    = sizeof path;
+    ofn.lpstrTitle  = "Save image";
+    // OVERWRITEPROMPT because this is an explicit, one-off save: the user
+    // named the file, so asking is right where the script's default of
+    // incrementing is right for something that re-runs.
+    ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    ofn.lpstrDefExt = "png";
+
+    if (!GetSaveFileNameA(&ofn)) return;      // cancelled
+
+    std::string err;
+    if (SaveImage(path, found->image, &err))
+        m_saveReport = std::string("saved ") + path;
+    else
+        m_saveReport = "save failed: " + err;
+}
+
 void App::PollLoader() {
     LoadResult r;
     while (m_loader.TryFetch(&r)) InstallLoadedImage(std::move(r));
@@ -982,6 +1041,10 @@ void App::RunScript() {
                 m_stageGpuCapable.push_back(s.algo->HasGPU() && s.algo->GpuSource());
             }
 
+            m_saveCount = int(built.Saves().size());
+            // The old report describes a script that is no longer running.
+            if (m_saveCount == 0) m_saveReport.clear();
+
             m_pendingSeq = m_worker.Submit(std::move(built), m_sources,
                                            std::move(versions));
         }
@@ -1030,6 +1093,25 @@ void App::PollWorker() {
         ReportError(prevError);
         UpdateWindowTitle();
         return;
+    }
+
+    // What the script's save() lines wrote, when this run was asked to.
+    //
+    // Reported rather than silent: a save that quietly went to a path other
+    // than the one written -- which is what "increment" does by design -- would
+    // otherwise leave the user looking for a file that is not there.
+    if (!out.saved.empty() || !out.saveError.empty()) {
+        m_saveReport.clear();
+        if (!out.saved.empty()) {
+            m_saveReport = "saved " + std::to_string(out.saved.size()) +
+                           (out.saved.size() == 1 ? " file: " : " files: ") +
+                           out.saved.front();
+            if (out.saved.size() > 1) m_saveReport += " ...";
+        }
+        if (!out.saveError.empty()) {
+            if (!m_saveReport.empty()) m_saveReport += "  ";
+            m_saveReport += "save failed: " + out.saveError;
+        }
     }
 
     if (!out.ok) {
@@ -1115,6 +1197,10 @@ void App::SyncViews() {
             if (v && v->Name() == name) { panel = std::move(v); break; }
         }
         if (!panel) panel = std::make_unique<ImageViewPanel>(name);
+        // Rebound every time, since a panel reused from the previous script
+        // still holds a handler capturing `this` -- harmless today, and exactly
+        // the kind of thing that stops being harmless later.
+        panel->SetSaveHandler([this](const std::string& viewer) { SaveViewer(viewer); });
         next.push_back(std::move(panel));
     }
 
@@ -1312,6 +1398,21 @@ void App::DrawMenuBar() {
         if (ImGui::MenuItem("Reset all controls", nullptr, false, !m_ui.Controls().empty())) {
             for (UiControl& c : m_ui.Controls()) ResetControl(c);
             m_dirty = true;
+        }
+        ImGui::Separator();
+        // Runs the script's save() lines, once, now.
+        //
+        // Deliberately a command rather than something every run does: a save()
+        // that fired on every slider tick would fill a directory while you were
+        // still deciding what the picture should look like.
+        {
+            const bool any = m_saveCount > 0;
+            if (ImGui::MenuItem("Run script saves", nullptr, false, any)) {
+                m_worker.RequestSaves();
+                m_dirty = true;      // a run has to happen for the save to ride on
+            }
+            if (!any && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("The script has no save() lines.");
         }
         ImGui::Separator();
         if (ImGui::MenuItem("Exit")) PostQuitMessage(0);
@@ -2998,6 +3099,17 @@ void App::Frame() {
         if (const int off = m_worker.LastBypassedStages(); off > 0 && !m_worker.Busy())
             ImGui::TextDisabled("   %d stage%s bypassed (settings do nothing)",
                                 off, off == 1 ? "" : "s");
+
+        // Where the last save went. Worth saying out loud: a script save
+        // defaults to incrementing, so the file written is often NOT the path
+        // the script names, and silently writing out_3.png would leave the user
+        // looking for out.png.
+        if (!m_saveReport.empty()) {
+            const bool failed = m_saveReport.find("failed") != std::string::npos;
+            ImGui::TextColored(failed ? ImVec4(1.0f, 0.45f, 0.45f, 1.0f)
+                                      : ImVec4(0.5f, 0.9f, 0.5f, 1.0f),
+                               "%s", m_saveReport.c_str());
+        }
 
         // Video memory. A 45 MP intermediate is ~340 MB in RGBA16F, so a
         // pipeline of several stages can approach the card's budget -- at which

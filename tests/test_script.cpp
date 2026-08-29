@@ -3688,6 +3688,247 @@ int main() {
         }
     }
 
+    // --- saving ---------------------------------------------------------------
+    {
+        Check(SaveFormatFromPath("a.png") == SaveFormat::Png, "png by extension");
+        Check(SaveFormatFromPath("a.JPG") == SaveFormat::Jpg, "extensions are case-insensitive");
+        Check(SaveFormatFromPath("a.jpeg") == SaveFormat::Jpg, "jpeg is jpg");
+        Check(SaveFormatFromPath("a.hdr") == SaveFormat::Hdr, "hdr by extension");
+        Check(SaveFormatFromPath("noext") == SaveFormat::Png, "png when there is nothing to go on");
+
+        // A LINEAR image written to 8 bits must go through the display curve,
+        // or the file does not match what the app showed. Middle grey is the
+        // case worth pinning: 0.18 linear is 46/255 written raw and ~117/255
+        // through the curve, which is the difference between a correct export
+        // and a very dark one.
+        {
+            Image img;
+            ImageDesc d{4, 4, Format::RGBA32F};
+            d.linear = true;
+            img.Alloc(d);
+            ImageView v = img.MapCpuWrite();
+            for (int y = 0; y < 4; ++y)
+                for (int x = 0; x < 4; ++x) {
+                    float* p = v.At<float>(x, y);
+                    p[0] = p[1] = p[2] = 0.18f;
+                    p[3] = 1.0f;
+                }
+
+            const std::string path = "save_test_linear.png";
+            std::string err;
+            Check(SaveImage(path, img, &err), "a linear float image saves" +
+                  (err.empty() ? "" : ": " + err));
+
+            Image back;
+            if (LoadImageFile(path, &back, &err)) {
+                ImageView bv = back.MapCpuRead();
+                const int g = bv.At<uint8_t>(2, 2)[1];
+                Check(g > 100 && g < 135,
+                      "middle grey survives the round trip as " + std::to_string(g) +
+                          "/255, not 46");
+            } else {
+                Check(false, "the saved PNG reads back: " + err);
+            }
+            std::remove(path.c_str());
+        }
+
+        // A GAMMA-encoded image is already display referred and must only be
+        // clamped -- running the curve again would lighten it a second time.
+        {
+            Image img;
+            img.Alloc({4, 4, Format::RGBA8});
+            ImageView v = img.MapCpuWrite();
+            for (int i = 0; i < 4 * 4 * 4; ++i) v.data[i] = 117;
+
+            const std::string path = "save_test_gamma.png";
+            std::string err;
+            Check(SaveImage(path, img, &err), "an 8-bit image saves");
+
+            Image back;
+            if (LoadImageFile(path, &back, &err)) {
+                ImageView bv = back.MapCpuRead();
+                const int g = bv.At<uint8_t>(2, 2)[1];
+                Check(g == 117, "8-bit values pass through untouched (got " +
+                                    std::to_string(g) + ")");
+            } else {
+                Check(false, "the saved PNG reads back");
+            }
+            std::remove(path.c_str());
+        }
+
+        // .hdr keeps the linear values, which is the whole reason to offer it:
+        // a merged bracket reaching far above 1.0 cannot survive 8 bits, and
+        // clipping it silently would discard the headroom the merge captured.
+        {
+            Image img;
+            ImageDesc d{8, 8, Format::RGBA32F};
+            d.linear = true;
+            img.Alloc(d);
+            ImageView v = img.MapCpuWrite();
+            for (int y = 0; y < 8; ++y)
+                for (int x = 0; x < 8; ++x) {
+                    float* p = v.At<float>(x, y);
+                    p[0] = p[1] = p[2] = 40.0f;    // far above any 8-bit range
+                    p[3] = 1.0f;
+                }
+
+            const std::string path = "save_test.hdr";
+            std::string err;
+            Check(SaveImage(path, img, SaveFormat::Hdr, 92, &err),
+                  "a high-range image saves as .hdr" + (err.empty() ? "" : ": " + err));
+
+            // Read back through stb, which returns .hdr as float.
+            Image back;
+            if (LoadImageFile(path, &back, &err)) {
+                // LoadImageFile gives RGBA8, so it cannot show the headroom --
+                // what matters here is that the file exists and is a valid HDR.
+                Check(back.Valid(), "the .hdr reads back as an image");
+            } else {
+                Check(false, "the .hdr reads back: " + err);
+            }
+            std::remove(path.c_str());
+        }
+
+        // Auto-increment, for a script saving a group without clobbering.
+        {
+            const std::string base = "save_test_seq.png";
+            Check(NextFreePath(base) == base, "a free name is returned unchanged");
+
+            Image img;
+            img.Alloc({2, 2, Format::RGBA8});
+            std::string err;
+            SaveImage(base, img, &err);
+
+            const std::string next = NextFreePath(base);
+            Check(next == "save_test_seq_1.png",
+                  "an occupied name increments before the extension (got " + next + ")");
+
+            SaveImage(next, img, &err);
+            Check(NextFreePath(base) == "save_test_seq_2.png",
+                  "and keeps counting past the first");
+
+            std::remove(base.c_str());
+            std::remove(next.c_str());
+            std::remove("save_test_seq_2.png");
+        }
+
+        // A path whose only dot is in a DIRECTORY name has no extension, so the
+        // counter must not split there and produce "a_1.b/out".
+        Check(NextFreePath("no_such_dir.d/out") == "no_such_dir.d/out",
+              "a dot in a directory name is not an extension");
+    }
+
+    // --- save() from a script -------------------------------------------------
+    {
+        UiState ui; Pipeline p; std::vector<Data> src; std::string err;
+        const bool ok = RunScript(
+            "src = image(\"test\")\n"
+            "src => brightness(brightness = 0.1) => save(\"save_script.png\")\n",
+            &ui, &p, &err, &src);
+        Check(ok, "a script save() runs" + (ok ? "" : ": " + err));
+        Check(ok && p.Saves().size() == 1, "the save was recorded");
+
+        // Nothing is written until RunSaves: a save must not happen on every
+        // slider tick, so Execute deliberately does not do it.
+        Check(!std::filesystem::exists("save_script.png"),
+              "Execute alone writes nothing");
+
+        std::vector<std::string> wrote;
+        const bool sok = p.RunSaves(&src, &err, &wrote);
+        Check(sok && wrote.size() == 1, "RunSaves writes the file" +
+              (sok ? "" : ": " + err));
+        Check(!wrote.empty() && wrote[0] == "save_script.png",
+              "at the path the script asked for");
+
+        // Saving again must not clobber, since re-running a script is the
+        // normal thing to do in this app.
+        std::vector<std::string> again;
+        p.RunSaves(&src, &err, &again);
+        Check(!again.empty() && again[0] == "save_script_1.png",
+              "a second run increments rather than overwriting (got " +
+                  (again.empty() ? "nothing" : again[0]) + ")");
+
+        for (const std::string& f : wrote) std::remove(f.c_str());
+        for (const std::string& f : again) std::remove(f.c_str());
+    }
+
+    // existing = "overwrite" is the opposite choice, for exporting the current
+    // state rather than accumulating copies.
+    {
+        UiState ui; Pipeline p; std::vector<Data> src; std::string err;
+        const char* kScript =
+            "src = image(\"test\")\n"
+            "save(src, \"save_over.png\", existing = \"overwrite\")\n";
+        RunScript(kScript, &ui, &p, &err, &src);
+
+        std::vector<std::string> a, b;
+        p.RunSaves(&src, &err, &a);
+        p.RunSaves(&src, &err, &b);
+        Check(!b.empty() && b[0] == "save_over.png",
+              "overwrite keeps writing the same path");
+        std::remove("save_over.png");
+    }
+
+    // A GROUP writes one file per frame, numbered -- a single path cannot name
+    // N images, and a reduction consumes them in order so the numbering has to
+    // match that order.
+    {
+        UiState ui; Pipeline p; std::string err;
+        std::vector<Data> src;
+
+        ImageSet set;
+        for (int i = 0; i < 3; ++i) {
+            Image im;
+            im.Alloc({2, 2, Format::RGBA8});
+            ImageView v = im.MapCpuWrite();
+            for (int k = 0; k < 2 * 2 * 4; ++k) v.data[k] = uint8_t(40 * (i + 1));
+            set.images.push_back(std::move(im));
+        }
+        set.shape = Shape{{{"frame", 3}}};
+        src.push_back(Data{std::move(set)});
+
+        std::vector<SourceImage> names;
+        { SourceImage s; s.name = "g"; s.index = 0; s.shape = ShapeOf(src[0]); names.push_back(s); }
+
+        Program prog;
+        Check(Parse("g = image(\"g\")\nsave(g, \"save_grp.png\")\n", &prog, &err),
+              "a group save parses");
+        const auto r = Interpret(prog, names, &ui, &p);
+        Check(r.ok, "and interprets" + (r.ok ? "" : ": " + r.error));
+
+        if (r.ok && p.Execute(&src, nullptr, &err)) {
+            std::vector<std::string> wrote;
+            const bool sok = p.RunSaves(&src, &err, &wrote);
+            Check(sok && wrote.size() == 3,
+                  "a group writes one file per frame (" +
+                      std::to_string(wrote.size()) + ")");
+            // Zero padded so a directory listing sorts them in frame order.
+            Check(wrote.size() == 3 && wrote[0] == "save_grp_001.png" &&
+                  wrote[2] == "save_grp_003.png",
+                  "numbered in frame order, zero padded");
+            for (const std::string& f : wrote) std::remove(f.c_str());
+        } else {
+            Check(false, "the group pipeline ran: " + err);
+        }
+    }
+
+    // Bad options are reported rather than silently ignored.
+    {
+        UiState ui; Pipeline p; std::vector<Data> src; std::string err;
+        RunScript("src = image(\"test\")\nsave(src, \"x.png\", existing = \"maybe\")\n",
+                  &ui, &p, &err, &src);
+        Check(!err.empty(), "an unknown existing mode is an error: \"" + err + "\"");
+
+        std::string err2;
+        RunScript("src = image(\"test\")\nsave(src, \"x.png\", nonsense = 1)\n",
+                  &ui, &p, &err2, &src);
+        Check(!err2.empty(), "an unknown option is an error: \"" + err2 + "\"");
+
+        std::string err3;
+        RunScript("src = image(\"test\")\nsave(src)\n", &ui, &p, &err3, &src);
+        Check(!err3.empty(), "a missing path is an error: \"" + err3 + "\"");
+    }
+
     std::printf("\n%s\n", g_fail == 0 ? "all checks passed" : "FAILURES PRESENT");
     return g_fail == 0 ? 0 : 1;
 }

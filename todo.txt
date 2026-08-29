@@ -56,11 +56,6 @@ NOTES
 - if we need matrix functions, I suggest the Euler library and Ceres for bundle solving
 
 FROM CLAUDE (raised in conversation, not yet in the list above)
-- TEST BRACKET FOR THE FINE ALIGNMENT SOLVER: D:\lrwork\TEST\hdrtest2 shows
-  visible fringing from roughly 1-pixel frame-to-frame movement. Tim spotted it
-  in the merge. That is the sub-pixel solver's case exactly -- too small for
-  feature matching to be worth it, large enough to see. Keep this bracket as the
-  reference for that work.
 - basic_adjust ranges scaling with bit depth. Different raws have different bit
   depths and the controls do not currently know.
 - exposure does not visibly stretch the histogram. Suspected to be the SDR

@@ -1,0 +1,34 @@
+# Saving what the pipeline produced.
+#
+# TWO WAYS, for two different moments:
+#
+#   Right-click any viewer -> "Save image..." picks a file and writes what that
+#   panel is showing, once. For "I like this, keep it."
+#
+#   save() in a script declares an export. Nothing is written while you tune --
+#   a save that fired on every slider tick would fill a directory. File -> Run
+#   script saves writes them when you say so.
+#
+# FORMAT comes from the extension, or from format= if you would rather say it.
+# PNG and BMP are lossless 8-bit; JPEG takes quality=1..100; .hdr keeps the
+# LINEAR values and is the one to use for a merged bracket, whose range cannot
+# survive 8 bits.
+#
+# An 8-bit save goes through the same display curve the viewer draws with, so
+# the file matches the screen rather than coming out dark.
+#
+# EXISTING FILES: "increment" by default (out.png, then out_1.png), since
+# re-running a script is the normal thing to do here and silently overwriting
+# the last result would be a bad surprise. "overwrite" and "skip" are the other
+# two.
+#
+# A GROUP writes one numbered file per frame: out_001.png, out_002.png, ...
+
+src = image("test")
+
+src => brightness(brightness = 0.1)
+    => save("export/adjusted.png")
+    => display("adjusted")
+
+# The same image as a JPEG, overwriting rather than accumulating copies.
+src => save("export/preview.jpg", quality = 85, existing = "overwrite")

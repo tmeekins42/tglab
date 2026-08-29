@@ -1,5 +1,8 @@
 #pragma once
 
+#include <functional>
+#include <string>
+
 #include "imgui.h"
 
 #include "../gpu/texture.h"
@@ -34,6 +37,14 @@ public:
 
     void SetSharedCamera(ViewCamera* cam) { m_shared = cam; }
 
+    // Called when the user picks "Save image..." from this panel's right-click
+    // menu. A callback rather than a save here: the panel has a texture and a
+    // name, while the pixels, the file dialog and the error reporting all live
+    // in the app.
+    void SetSaveHandler(std::function<void(const std::string&)> f) {
+        m_onSave = std::move(f);
+    }
+
     // Bumped by the app whenever the pipeline produced new pixels, so the
     // texture re-uploads only then rather than every frame.
     void SetContentVersion(uint64_t v) override { m_version = v; }
@@ -60,6 +71,7 @@ private:
     // Kept alive for as long as this view might draw from it -- the worker can
     // free the pipeline's outputs on its own thread at any point.
     std::shared_ptr<SharedGpuTexture> m_gpuSrc;
+    std::function<void(const std::string&)> m_onSave;
     ViewCamera  m_own;
     ViewCamera* m_shared  = nullptr;
     uint64_t    m_version = 0;

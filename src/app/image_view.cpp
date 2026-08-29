@@ -219,6 +219,17 @@ void ImageViewPanel::Draw(Device& dev, Image* img) {
     if (m_loupe && ImGui::IsItemHovered())
         DrawLoupe(dev, *img, ImGui::GetIO().MousePos, p0, cam.zoom, dl);
 
+    // Right-click to save what this panel is showing.
+    //
+    // Bound to the image item rather than the window, so it does not fire over
+    // the panel's empty margin -- and the panel's own name is what the handler
+    // uses to find the pixels, since the viewer holds a texture rather than the
+    // Data the pipeline produced.
+    if (ImGui::BeginPopupContextItem("view")) {
+        if (ImGui::MenuItem("Save image...") && m_onSave) m_onSave(m_name);
+        ImGui::EndPopup();
+    }
+
     ImGui::End();
 }
 

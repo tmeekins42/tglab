@@ -21,6 +21,7 @@
 #include "../src/algo_util/pixel_buffer.h"
 #include "../src/algo_util/white_balance.h"
 #include "../src/core/image_group.h"
+#include "../src/core/image_io.h"
 #include "../src/core/pipeline.h"
 #include "../src/core/raw_io.h"
 #include "../src/script/interp.h"
@@ -181,6 +182,22 @@ int main(int argc, char** argv) {
     const bool ok = pipe.Execute(&sources, nullptr, &xerr,
                                  (gpu.Ready() && !forceCpu) ? &gpu : nullptr,
                                  forceCpu ? ExecMode::ForceCPU : ExecMode::Auto);
+    // TGLAB_SAVE=<path> writes the result, exercising the save path on real
+    // pixels rather than only on test fixtures.
+    {
+        char sbuf[512] = {};
+        if (GetEnvironmentVariableA("TGLAB_SAVE", sbuf, sizeof sbuf) > 0 && ok) {
+            const Data* d = pipe.Resolve(pipe.Viewers().back().source, &sources);
+            if (const auto* im = d ? std::get_if<Image>(d) : nullptr) {
+                std::string serr;
+                if (SaveImage(sbuf, const_cast<Image&>(*im), &serr))
+                    std::printf("saved: %s\n", sbuf);
+                else
+                    std::printf("save failed: %s\n", serr.c_str());
+            }
+        }
+    }
+
     if (adapter) {
         DXGI_QUERY_VIDEO_MEMORY_INFO info{};
         if (SUCCEEDED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info)))

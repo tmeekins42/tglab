@@ -370,6 +370,7 @@ private:
         if (calleeName == "choose")  return CallChoose(e, out);
         if (calleeName == "params")  return CallParams(e, out);
         if (calleeName == "display") return CallDisplay(e, out);
+        if (calleeName == "save")    return CallSave(e, out);
 
         return CallAlgorithm(calleeName, paramsKey, e, out, wantAll);
     }
@@ -775,6 +776,61 @@ private:
         AlgoHandle h = a.pos[0].AsAlgo();
         h.paramsKey = key;
         out->push_back(Value(h));
+        return true;
+    }
+
+    // save(img, "out.png") -- and the options that make it usable on a group.
+    //
+    // Declared here and written after the run, like display(): a save is a
+    // property of the script rather than a step in the pipeline, and doing the
+    // IO inside Execute would put a disk write on the worker's critical path
+    // and repeat it on every slider tick.
+    //
+    // Returns its input, so it chains: src => tonemap() => save("out.png") =>
+    // display("result"). Same reasoning as display().
+    bool CallSave(const Expr& e, std::vector<Value>* out) {
+        EvaledArgs a;
+        if (!EvalArgs(e, &a)) return false;
+
+        if (a.pos.size() < 2 || !a.pos[0].IsPort() || !a.pos[1].IsString())
+            return Fail(e.line,
+                        "save() takes an image and a path: save(img, \"out.png\")");
+
+        SaveDecl s;
+        const PortHandle h = a.pos[0].AsPort();
+        s.source = PortRef{h.stage, h.port};
+        s.path   = a.pos[1].AsString();
+        s.format = SaveFormatFromPath(s.path);
+
+        for (const auto& [pname, pval] : a.named) {
+            if (pname == "format") {
+                if (!pval.IsString())
+                    return Fail(e.line, "save()'s format expects a name like \"png\"");
+                // Through the same mapping the extension uses, so "jpeg" and
+                // ".jpeg" cannot disagree about what they mean.
+                s.format = SaveFormatFromPath("x." + pval.AsString());
+            } else if (pname == "quality") {
+                if (!pval.IsNumber())
+                    return Fail(e.line, "save()'s quality expects a number 1..100");
+                s.quality = int(pval.AsNumber());
+            } else if (pname == "existing") {
+                if (!pval.IsString())
+                    return Fail(e.line,
+                                "save()'s existing expects \"increment\", "
+                                "\"overwrite\" or \"skip\"");
+                const std::string& v = pval.AsString();
+                if      (v == "increment") s.existing = SaveDecl::Existing::Increment;
+                else if (v == "overwrite") s.existing = SaveDecl::Existing::Overwrite;
+                else if (v == "skip")      s.existing = SaveDecl::Existing::Skip;
+                else return Fail(e.line, "save(): unknown existing mode '" + v +
+                                             "' (increment, overwrite or skip)");
+            } else {
+                return Fail(e.line, "save() has no option '" + pname + "'");
+            }
+        }
+
+        m_pipe->AddSave(std::move(s));
+        out->push_back(a.pos[0]);
         return true;
     }
 

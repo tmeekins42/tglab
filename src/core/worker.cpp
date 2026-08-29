@@ -113,6 +113,13 @@ uint64_t PipelineWorker::Submit(Pipeline pipe, std::shared_ptr<std::vector<Data>
         job->pipe    = std::move(pipe);
         job->sources = std::move(sources);
         job->sourceVersions = std::move(sourceVersions);
+
+        // A pending save request is consumed by the next job rather than being
+        // a parameter, because the UI asks for it at a moment (a menu click)
+        // and the run happens later. Latched so a request made mid-run is not
+        // lost when that run is cancelled by this one.
+        job->runSaves = m_saveRequested.exchange(false, std::memory_order_relaxed);
+
         m_pending    = std::move(job);   // drops any older pending job
         // Abandon whatever is running: this newer job supersedes it, and for a
         // slow filter the old value would otherwise have to finish first.
@@ -324,6 +331,19 @@ void PipelineWorker::Run() {
 
         outcome->ok    = ok;
         outcome->error = err;
+
+        // The script's save() declarations, when this job asked for them.
+        //
+        // Here rather than inside Execute, and only on request: a save is a
+        // disk write, and doing it per run would write a file on every slider
+        // tick. Done on the worker rather than the UI thread because that is
+        // where the pixels are -- reaching them from the UI would mean a
+        // readback of a GPU-resident result.
+        if (ok && job->runSaves) {
+            std::string serr;
+            if (!job->pipe.RunSaves(job->sources.get(), &serr, &outcome->saved))
+                outcome->saveError = serr;
+        }
 
         if (ok) {
             // Copy out only what the UI draws. The pipeline (and its stage
