@@ -20,7 +20,10 @@
 // noise it removed.
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <vector>
+
+#include <windows.h>
 
 #include "../../algo_util/pixel_buffer.h"
 #include "../../core/algorithm.h"
@@ -31,6 +34,19 @@ namespace {
 // B3-spline kernel, the usual a-trous choice: smooth enough that the residual
 // bands hold little aliasing, short enough to stay cheap.
 constexpr float kB3[5] = {1.0f / 16, 4.0f / 16, 6.0f / 16, 4.0f / 16, 1.0f / 16};
+
+// Clamp bounds for the level-dependent threshold, overridable so they can be
+// swept without a rebuild between runs. Diagnostic only -- the defaults are
+// what ship, and TGLAB_LEVELDEP_CLAMP exists so the choice can be re-measured
+// rather than taken on trust.
+inline float ClampEnv(const char* name, float def) {
+    char buf[32] = {};
+    if (GetEnvironmentVariableA(name, buf, sizeof buf) == 0) return def;
+    const float v = float(std::atof(buf));
+    return (v > 0.0f) ? v : def;
+}
+inline float ClampLo() { static const float v = ClampEnv("TGLAB_CLAMP_LO", 0.20f); return v; }
+inline float ClampHi() { static const float v = ClampEnv("TGLAB_CLAMP_HI", 4.0f);  return v; }
 
 // How much to scale the threshold for a neighbourhood at this brightness.
 //
@@ -73,11 +89,25 @@ inline float LevelScale(float level, float amount, float mid) {
     // existing luma/chroma defaults keep meaning what they meant.
     const float rel = std::sqrt(std::max(level, 1e-4f * mid) / mid);
 
-    // Bounded. A near-black neighbourhood would otherwise drive the threshold
-    // to nearly zero and denoise nothing there, which is the opposite of what
-    // a noisy shadow needs; and a specular highlight would drive it up until it
-    // erased real texture.
-    const float scaled = std::clamp(rel, 0.35f, 2.5f);
+    // Bounded, so a near-black neighbourhood cannot drive the threshold to
+    // nearly zero (denoising nothing exactly where a noisy shadow needs it)
+    // and a specular highlight cannot drive it up until it erases texture.
+    //
+    // 0.20/4.0 from a sweep rather than from reasoning. Denoised spread on
+    // _DSC0037, the pushed ISO 6400 frame:
+    //
+    //   1.00/1.0  31.1x    (clamped shut: level_dep does nothing)
+    //   0.60/1.7  17.4x
+    //   0.35/2.5  14.5x
+    //   0.20/4.0  13.7x    <- default
+    //   0.10/8.0  13.5x
+    //
+    // So the bound matters until about 0.2/4.0 and is flat after -- loosening
+    // to 0.10/8.0 buys 0.2x. The clean frames agree: _MG_9673 improves 3.2x ->
+    // 2.6x and then stops, _DSC0162 does not move at all. The first value here
+    // was 0.35/2.5, chosen as "roughly where a photograph stops having usable
+    // detail" -- reasonable, and slightly too tight.
+    const float scaled = std::clamp(rel, ClampLo(), ClampHi());
     return 1.0f + amount * (scaled - 1.0f);
 }
 
@@ -354,7 +384,11 @@ void main(uint3 tid : SV_DispatchThreadID) {
     float amt = asfloat(LevelDepBits);
     if (amt > 0.0) {
         float rel = sqrt(max(blur.x, 1.8e-5) / 0.18);
-        lvl = 1.0 + amt * (clamp(rel, 0.35, 2.5) - 1.0);
+        // 0.20/4.0, matching ClampLo/ClampHi on the CPU. Literal here because a
+        // shader cannot read the environment -- the override exists for
+        // sweeping, which is done on the CPU path, and the parity test is what
+        // catches these two drifting apart.
+        lvl = 1.0 + amt * (clamp(rel, 0.20, 4.0) - 1.0);
     }
 
     float lt = asfloat(LumaBits)   * falloff * lvl;
