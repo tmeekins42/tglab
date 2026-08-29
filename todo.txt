@@ -33,15 +33,26 @@ BUGS / SMALL FEATURES
   gives 4.5x. sqrt wins on every frame, so `level_dep` uses sqrt.
   What it does, denoised sigma across the range:
       _DSC0037   level_dep=0  31.1x spread, mean 0.0088
-                 level_dep=1  14.5x spread, mean 0.0073   <- both better
+                 level_dep=1  13.7x spread, mean 0.0072   <- both better
       _MG_9673   level_dep=0  38.5x, mean 0.0007
-                 level_dep=1   3.2x, mean 0.0011          <- flatter, denoises less
+                 level_dep=1   2.6x, mean 0.0011          <- flatter, denoises less
       _DSC0162   level_dep=0   9.4x, mean 0.0007
-                 level_dep=1  13.6x, mean 0.0007          <- a wash
+                 level_dep=1  13.7x, mean 0.0007          <- spread worse, mean same
   So it clearly helps the pushed high-ISO frame and is neutral-to-slightly-
   negative on clean ones, which is why the default is 0 rather than on.
-  Still open: whether an automatic setting from a measured noise estimate beats
-  a manual one, and whether the 0.35/2.5 clamp is the right bound.
+  Clamp settled at 0.20/4.0 by sweeping: it matters until about there and is
+  flat after (0.10/8.0 buys another 0.2x on the worst frame). Not a knob that
+  needs tuning per image.
+  AUTO-SETTING: measured and decided against. Sweeping level_dep 0->1 flattens
+  the spread monotonically on every frame, so there is no optimum to find, and
+  the frames disagree about whether flatter is BETTER:
+      _DSC0037  31.1x -> 13.7x, mean sigma 0.0088 -> 0.0072   clear win
+      _MG_9673  38.5x ->  2.6x, mean sigma 0.0007 -> 0.0011   flatter, noisier
+      _DSC0162   9.4x -> 13.7x, mean sigma unchanged          mild loss
+  An auto-setter would have to choose between "uniform noise" and "least noise",
+  which is a preference rather than a measurement -- so it stays a slider. If
+  this is revisited, the thing to measure is DETAIL retained, not sigma: every
+  number above says how much noise is left and none says what it cost.
 - when adding images to the palette/group, maybe we should pre-load the EXIF
   as well as the thumbnail. EXIF loading should be simple compared to the JPEG.
 - add right-click sort by date in the groups, like sort by name. Use EXIF shot
