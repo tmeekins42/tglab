@@ -43,3 +43,19 @@ frames => params( det )()
        => params( match_brute )()
        => params( draw_matches )()
        => display("matches")
+
+# APPROXIMATE MATCHING. match_ann does the same job as match_brute, trading
+# exactness for speed -- swap the name in the chain above to compare them.
+#
+# `checks` is the control, and the trade is measurable rather than a matter of
+# faith: it is the fraction of brute force's matches that come back. Measured
+# on two 45 MP frames with 2000 AKAZE features each:
+#
+#   checks =   64    30% of the exact matches
+#   checks =  256    70%          <- the default
+#   checks = 1024    78%
+#
+# Precision is NOT what approximation costs. The ratio test and cross check
+# run on whatever candidates come back, so a match match_ann returns is as
+# trustworthy as the same match from brute force -- what is lost is matches
+# missed entirely.

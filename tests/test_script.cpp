@@ -4515,6 +4515,197 @@ int main() {
         }
     }
 
+    // --- approximate matching -------------------------------------------------
+    //
+    // The claim an approximate matcher has to earn is RECALL: what fraction of
+    // the exact answer it reproduces. That is only measurable against an exact
+    // answer, which is why match_brute was built first.
+    //
+    // Precision is NOT at risk here and it is worth being clear why: the
+    // approximation is in which candidates are considered, not in how they are
+    // judged, so a match match_ann returns passed the same ratio test. What
+    // approximation costs is matches missed entirely.
+    {
+        Image photo;
+        std::string perr;
+#ifdef TGLAB_SOURCE_DIR
+        const std::string ap =
+            (std::filesystem::path(TGLAB_SOURCE_DIR) / "assets" / "test.png").string();
+#else
+        const std::string ap = "assets/test.png";
+#endif
+        if (LoadImageFile(ap, &photo, &perr)) {
+            constexpr int kDx = 11, kDy = -6;
+
+            auto shifted = [&](Image& src) {
+                ImageView v = src.MapCpuRead();
+                PixelBuffer in;
+                in.Unpack(v);
+                Image out;
+                out.Alloc(v.desc);
+                ImageView ov = out.MapCpuWrite();
+                PixelBuffer ob;
+                ob.Unpack(ov);
+                const int w = in.Width(), h = in.Height(), ch = in.Channels();
+                for (int y = 0; y < h; ++y)
+                    for (int x = 0; x < w; ++x) {
+                        const float* p = in.At(std::clamp(x - kDx, 0, w - 1),
+                                               std::clamp(y - kDy, 0, h - 1));
+                        float* o = ob.At(x, y);
+                        for (int c = 0; c < ch; ++c) o[c] = p[c];
+                    }
+                ob.PackInto(ov);
+                return out;
+            };
+
+            // Runs a detector then a named matcher over a two-frame group.
+            auto pipeline = [&](const char* det, const char* matcher, int checks,
+                                const FeatureSidecar** fa, const FeatureSidecar** fb,
+                                const MatchSidecar** ms, Pipeline* keep,
+                                std::vector<Data>* keepSrc, std::string* err) {
+                ImageSet set;
+                set.images.push_back(photo.Clone());
+                set.images.push_back(shifted(photo));
+                set.shape = Shape{{{"frame", 2}}};
+                keepSrc->clear();
+                keepSrc->push_back(Data{std::move(set)});
+
+                auto d = Registry::Get().Create(det);
+                auto m = Registry::Get().Create(matcher);
+                if (!d || !m) return false;
+                if (checks > 0)
+                    if (ParamBase* p = m->FindParam("checks")) {
+                        std::string e; p->SetFromScript(Value(double(checks)), &e);
+                    }
+
+                keep->AddStage(std::move(d), det, {{-1, 0}}, 1, 1);
+                keep->AddStage(std::move(m), matcher, {{0, 0}}, 1, 2);
+                if (!keep->Execute(keepSrc, nullptr, err)) return false;
+
+                const Data* out = keep->Resolve({1, 0}, keepSrc);
+                const auto* os = out ? std::get_if<ImageSet>(out) : nullptr;
+                if (!os || os->images.size() != 2) return false;
+                *fa = FeaturesOf(os->images[0]);
+                *fb = FeaturesOf(os->images[1]);
+                *ms = MatchesOf(os->images[1]);
+                return *fa && *fb && *ms;
+            };
+
+            // Fraction of `exact`'s pairs that `approx` also found. Compared as
+            // PAIRS rather than counts: two matchers can return the same number
+            // of matches and disagree about every one.
+            auto recall = [](const MatchSidecar& exact, const MatchSidecar& approx) {
+                if (exact.matches.empty()) return 1.0;
+                int found = 0;
+                for (const Match& e : exact.matches)
+                    for (const Match& a : approx.matches)
+                        if (a.a == e.a && a.b == e.b) { ++found; break; }
+                return double(found) / double(exact.matches.size());
+            };
+
+            // FLOAT: the k-d forest.
+            {
+                const FeatureSidecar *ea = nullptr, *eb = nullptr;
+                const MatchSidecar* ems = nullptr;
+                Pipeline pe; std::vector<Data> se; std::string e1;
+                const bool okE = pipeline("detect_sift", "match_brute", 0,
+                                          &ea, &eb, &ems, &pe, &se, &e1);
+                Check(okE, "exact matching ran for the comparison" +
+                      (okE ? "" : ": " + e1));
+
+                const FeatureSidecar *aa = nullptr, *ab = nullptr;
+                const MatchSidecar* ams = nullptr;
+                Pipeline pa; std::vector<Data> sa; std::string e2;
+                const bool okA = pipeline("detect_sift", "match_ann", 512,
+                                          &aa, &ab, &ams, &pa, &sa, &e2);
+                Check(okA, "match_ann runs on float descriptors" +
+                      (okA ? "" : ": " + e2));
+
+                if (okE && okA) {
+                    const double r = recall(*ems, *ams);
+                    Check(r >= 0.7,
+                          "the k-d forest recovers most exact matches (" +
+                              std::to_string(int(r * 100)) + "%)");
+
+                    // Its matches must be as CORRECT as brute force's -- the
+                    // approximation costs recall, not precision, and if this
+                    // failed the ratio test would be being applied wrongly.
+                    int correct = 0;
+                    for (const Match& m : ams->matches) {
+                        if (m.a < 0 || m.a >= int(aa->keypoints.size())) continue;
+                        if (m.b < 0 || m.b >= int(ab->keypoints.size())) continue;
+                        const Keypoint& ka = aa->keypoints[size_t(m.a)];
+                        const Keypoint& kb = ab->keypoints[size_t(m.b)];
+                        const float ex = (kb.x - float(kDx)) - ka.x;
+                        const float ey = (kb.y - float(kDy)) - ka.y;
+                        if (std::sqrt(ex * ex + ey * ey) < 3.0f) ++correct;
+                    }
+                    Check(ams->matches.empty() ||
+                          correct * 10 >= int(ams->matches.size()) * 8,
+                          "and they are geometrically correct (" +
+                              std::to_string(correct) + " of " +
+                              std::to_string(ams->matches.size()) + ")");
+                }
+
+                // MORE CHECKS MUST FIND MORE. If recall did not climb with the
+                // budget, `checks` would be decoration and the whole
+                // speed/accuracy trade would be unavailable.
+                const FeatureSidecar *la = nullptr, *lb = nullptr;
+                const MatchSidecar* lms = nullptr;
+                Pipeline pl; std::vector<Data> sl; std::string e3;
+                if (okE && pipeline("detect_sift", "match_ann", 8,
+                                    &la, &lb, &lms, &pl, &sl, &e3)) {
+                    const double low  = recall(*ems, *lms);
+                    const double high = okA ? recall(*ems, *ams) : 0.0;
+                    Check(high >= low,
+                          "raising checks does not lower recall (" +
+                              std::to_string(int(low * 100)) + "% -> " +
+                              std::to_string(int(high * 100)) + "%)");
+                }
+            }
+
+            // BINARY: LSH. A k-d tree cannot be built over Hamming space at
+            // all, so this is a genuinely different path rather than the same
+            // code with a different distance.
+            {
+                const FeatureSidecar *ea = nullptr, *eb = nullptr;
+                const MatchSidecar* ems = nullptr;
+                Pipeline pe; std::vector<Data> se; std::string e1;
+                const bool okE = pipeline("detect_akaze", "match_brute", 0,
+                                          &ea, &eb, &ems, &pe, &se, &e1);
+
+                const FeatureSidecar *aa = nullptr, *ab = nullptr;
+                const MatchSidecar* ams = nullptr;
+                Pipeline pa; std::vector<Data> sa; std::string e2;
+                const bool okA = pipeline("detect_akaze", "match_ann", 512,
+                                          &aa, &ab, &ams, &pa, &sa, &e2);
+                Check(okA, "match_ann runs on binary descriptors" +
+                      (okA ? "" : ": " + e2));
+
+                if (okE && okA) {
+                    Check(!ams->matches.empty(),
+                          "LSH finds matches (" +
+                              std::to_string(ams->matches.size()) + ")");
+
+                    int correct = 0;
+                    for (const Match& m : ams->matches) {
+                        if (m.a < 0 || m.a >= int(aa->keypoints.size())) continue;
+                        if (m.b < 0 || m.b >= int(ab->keypoints.size())) continue;
+                        const Keypoint& ka = aa->keypoints[size_t(m.a)];
+                        const Keypoint& kb = ab->keypoints[size_t(m.b)];
+                        const float ex = (kb.x - float(kDx)) - ka.x;
+                        const float ey = (kb.y - float(kDy)) - ka.y;
+                        if (std::sqrt(ex * ex + ey * ey) < 3.0f) ++correct;
+                    }
+                    Check(correct * 10 >= int(ams->matches.size()) * 8,
+                          "LSH matches are geometrically correct (" +
+                              std::to_string(correct) + " of " +
+                              std::to_string(ams->matches.size()) + ")");
+                }
+            }
+        }
+    }
+
     // draw_matches turns the sidecar into something visible, and says so when
     // there is nothing to draw.
     {
