@@ -4706,6 +4706,256 @@ int main() {
         }
     }
 
+    // --- feature alignment ----------------------------------------------------
+    //
+    // The claim: recover a transform from matches, accurately enough to warp
+    // by. So the fixture applies a KNOWN transform and the test asks how close
+    // the recovered one is -- against ground truth rather than against the
+    // eye, and measured where it matters, at the corners.
+    {
+        Image photo;
+        std::string perr;
+#ifdef TGLAB_SOURCE_DIR
+        const std::string lp =
+            (std::filesystem::path(TGLAB_SOURCE_DIR) / "assets" / "test.png").string();
+#else
+        const std::string lp = "assets/test.png";
+#endif
+        if (LoadImageFile(lp, &photo, &perr)) {
+            // Warps `src` by the INVERSE of `t`, so that the aligner solving
+            // for t is solving for the transform the fixture applied.
+            auto warpBy = [&](Image& src, const Affine& t) {
+                ImageView v = src.MapCpuRead();
+                PixelBuffer in;
+                in.Unpack(v);
+                Image out;
+                out.Alloc(v.desc);
+                ImageView ov = out.MapCpuWrite();
+                PixelBuffer ob;
+                ob.Unpack(ov);
+                const int w = in.Width(), h = in.Height(), ch = in.Channels();
+
+                bool ok = false;
+                const Affine inv = t.Inverse(&ok);
+                for (int y = 0; y < h; ++y)
+                    for (int x = 0; x < w; ++x) {
+                        float sx, sy;
+                        inv.MapPoint(float(x), float(y), &sx, &sy);
+                        float sm[4] = {0, 0, 0, 0};
+                        SampleBilinear(in, sx, sy, sm);
+                        float* o = ob.At(x, y);
+                        for (int c = 0; c < ch; ++c) o[c] = sm[c];
+                    }
+                ob.PackInto(ov);
+                return out;
+            };
+
+            // The detector is a parameter of the fixture because the two differ
+            // sharply under rotation, which is worth recording rather than
+            // working around: measured on this fixture, SIFT keeps 89% of its
+            // matches as inliers under a 3-degree rotation while AKAZE keeps
+            // 14-20%. AKAZE's edge-preserving scale space makes it the more
+            // repeatable detector under translation and its orientation
+            // estimate is the weaker of the two.
+            auto solve = [&](const Affine& truth, int model, const char* det,
+                             Affine* got, int* inliers, std::string* err) {
+                ImageSet set;
+                set.images.push_back(photo.Clone());
+                set.images.push_back(warpBy(photo, truth));
+                set.shape = Shape{{{"frame", 2}}};
+
+                std::vector<Data> s;
+                s.push_back(Data{std::move(set)});
+
+                Pipeline p;
+                // A LOW threshold on purpose: a homography has eight
+                // parameters, and fitting eight from twenty noisy matches is
+                // the textbook overfitting case rather than a test of the
+                // solver. With the stock threshold this fixture yielded 19
+                // matches and the corner error ran 1.0 px for the 4-parameter
+                // similarity, 2.8 for affine and 60 for the homography --
+                // exactly the curve too few points per parameter produces.
+                p.AddStage(Registry::Get().Create(det), det, {{-1, 0}}, 1, 1);
+                p.AddStage(Registry::Get().Create("match_brute"), "match_brute",
+                           {{0, 0}}, 1, 2);
+                auto a = Registry::Get().Create("align_features");
+                if (ParamBase* pb = a->FindParam("model")) {
+                    std::string e; pb->SetFromScript(Value(double(model)), &e);
+                }
+                p.AddStage(std::move(a), "align_features", {{1, 0}}, 1, 3);
+
+                if (!p.Execute(&s, nullptr, err)) return false;
+                const Data* out = p.Resolve({2, 0}, &s);
+                const auto* os = out ? std::get_if<ImageSet>(out) : nullptr;
+                if (!os || os->images.size() != 2) return false;
+                *got = TransformOf(os->images[1]);
+                const MatchSidecar* ms = MatchesOf(os->images[1]);
+                *inliers = ms ? int(ms->matches.size()) : 0;
+                if (p.Stages().size() > 2 && p.Stages()[2].algo)
+                    std::printf("        [dbg] %s\n",
+                                p.Stages()[2].algo->RunReport().c_str());
+                return true;
+            };
+
+            // Corner error against ground truth: the number that says whether
+            // the transform is usable. An error in the linear part shows at the
+            // corners and barely at the centre, so a centre-only check would
+            // pass a visibly wrong warp.
+            auto cornerError = [&](const Affine& a, const Affine& b) {
+                ImageView v = photo.MapCpuRead();
+                const float w = float(v.desc.width), h = float(v.desc.height);
+                const float cx[4] = {0, w, 0, w};
+                const float cy[4] = {0, 0, h, h};
+                float worst = 0.0f;
+                for (int i = 0; i < 4; ++i) {
+                    float ax, ay, bx, by;
+                    a.MapPoint(cx[i], cy[i], &ax, &ay);
+                    b.MapPoint(cx[i], cy[i], &bx, &by);
+                    const float dx = ax - bx, dy = ay - by;
+                    worst = std::max(worst, std::sqrt(dx * dx + dy * dy));
+                }
+                return worst;
+            };
+
+            // TRANSLATION, recovered by every model. The easiest case, and the
+            // one that would catch a sign error or a transposed matrix.
+            {
+                Affine truth;
+                truth.m[2] = 9.0f;
+                truth.m[5] = -5.0f;
+
+                for (int model = 0; model <= 2; ++model) {
+                    Affine got;
+                    int inliers = 0;
+                    std::string e;
+                    const char* names[] = {"similarity", "affine", "homography"};
+                    if (solve(truth, model, "detect_akaze", &got, &inliers, &e)) {
+                        const float err = cornerError(truth, got);
+                        Check(err < 1.0f,
+                              std::string(names[model]) +
+                                  " recovers a translation (corner error " +
+                                  std::to_string(err) + " px)");
+                    } else {
+                        Check(false, std::string(names[model]) + " solved: " + e);
+                    }
+                }
+            }
+
+            // ROTATION AND SCALE. A similarity, so all three models can express
+            // it -- and each should, since a model with spare parameters must
+            // not use them to fit noise.
+            {
+                Affine truth;
+                const float a = 0.05f;    // ~3 degrees
+                const float s = 1.03f;
+                truth.m[0] =  s * std::cos(a);
+                truth.m[1] = -s * std::sin(a);
+                truth.m[3] =  s * std::sin(a);
+                truth.m[4] =  s * std::cos(a);
+                // About the centre rather than the origin, or the corners move
+                // far enough that most of the frame leaves the image.
+                ImageView v = photo.MapCpuRead();
+                const float cx = float(v.desc.width) * 0.5f;
+                const float cy = float(v.desc.height) * 0.5f;
+                truth.m[2] = cx - (truth.m[0] * cx + truth.m[1] * cy);
+                truth.m[5] = cy - (truth.m[3] * cx + truth.m[4] * cy);
+
+                for (int model = 0; model <= 2; ++model) {
+                    Affine got;
+                    int inliers = 0;
+                    std::string e;
+                    const char* names[] = {"similarity", "affine", "homography"};
+                    if (solve(truth, model, "detect_sift", &got, &inliers, &e)) {
+                        const float err = cornerError(truth, got);
+                        // The tolerance widens with the model, and that is the
+                        // behaviour rather than a concession: this warp IS a
+                        // similarity, so the affine's two extra parameters and
+                        // the homography's four have nothing real to fit and
+                        // spend themselves on noise. Measured here: 0.66 px for
+                        // 4 parameters, 1.24 for 6, 2.67 for 8, from the same
+                        // 37 matches. That is why `model` is a parameter -- a
+                        // homography is not a free upgrade.
+                        const float tol = (model == 0) ? 1.5f : (model == 1) ? 2.0f : 3.5f;
+                        Check(err < tol,
+                              std::string(names[model]) +
+                                  " recovers a rotation and scale (corner error " +
+                                  std::to_string(err) + " px, " +
+                                  std::to_string(inliers) + " matches)");
+                    } else {
+                        Check(false, std::string(names[model]) + " solved: " + e);
+                    }
+                }
+            }
+
+            // PERSPECTIVE. Only the homography can express this, and that is
+            // the point of having it: an affine fit leaves a systematic error
+            // that grows toward the edges -- exactly where a panorama shows it.
+            {
+                Affine truth;
+                ImageView v = photo.MapCpuRead();
+                const float w = float(v.desc.width);
+                truth.m[6] = 0.00008f;   // a gentle keystone: ~4% compression at the far edge
+                truth.m[2] = 0.0f;
+                truth.m[5] = 0.0f;
+                // Keep the centre roughly put, so the warp stays in frame.
+                const float scale = 1.0f + truth.m[6] * w * 0.5f;
+                truth.m[0] = scale;
+                truth.m[4] = scale;
+
+                Affine gotH, gotA;
+                int inH = 0, inA = 0;
+                std::string e1, e2;
+                const bool okH = solve(truth, 2, "detect_sift", &gotH, &inH, &e1);
+                const bool okA = solve(truth, 1, "detect_sift", &gotA, &inA, &e2);
+
+                if (okH) {
+                    const float err = cornerError(truth, gotH);
+                    Check(err < 3.0f,
+                          "homography recovers a perspective warp (corner error " +
+                              std::to_string(err) + " px)");
+                    Check(!gotH.IsAffine(),
+                          "and the result really carries perspective terms");
+                } else {
+                    Check(false, "homography solved a perspective warp: " + e1);
+                }
+
+                // The affine fit must be measurably WORSE, or the homography's
+                // two extra parameters are buying nothing and the test above
+                // proves nothing either.
+                if (okH && okA) {
+                    const float eH = cornerError(truth, gotH);
+                    const float eA = cornerError(truth, gotA);
+                    Check(eA > eH,
+                          "and beats the affine fit on it (" +
+                              std::to_string(eA) + " vs " + std::to_string(eH) + " px)");
+                }
+            }
+
+            // Aligning without matches is an error rather than a silent no-op:
+            // a script missing its matcher otherwise looks like frames that
+            // happen to need no alignment.
+            {
+                ImageSet plain;
+                for (int f = 0; f < 2; ++f) {
+                    Image im;
+                    im.Alloc({32, 32, Format::RGBA8});
+                    plain.images.push_back(std::move(im));
+                }
+                plain.shape = Shape{{{"frame", 2}}};
+                std::vector<Data> s;
+                s.push_back(Data{std::move(plain)});
+
+                Pipeline p;
+                p.AddStage(Registry::Get().Create("align_features"), "align_features",
+                           {{-1, 0}}, 1, 1);
+                std::string e;
+                const bool ran = p.Execute(&s, nullptr, &e);
+                Check(!ran && e.find("no matches") != std::string::npos,
+                      "aligning without matches is an error: \"" + e + "\"");
+            }
+        }
+    }
+
     // draw_matches turns the sidecar into something visible, and says so when
     // there is nothing to draw.
     {

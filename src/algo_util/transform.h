@@ -56,47 +56,109 @@ inline constexpr const char* kTransformSidecar = "transform";
 // Identity means "no transform", so an image with one attached but unsolved
 // behaves exactly like one with none.
 struct Affine {
-    float m[6] = {1.0f, 0.0f, 0.0f,
-                  0.0f, 1.0f, 0.0f};
+    // Eight parameters, not six. The first six are the affine matrix exactly as
+    // before; m[6] and m[7] are the perspective row, zero for an affine warp.
+    //
+    // WHY THIS GREW, and why it is one type rather than two:
+    //
+    // The pixel aligner is 6 DOF for a stated reason -- on frames differing by
+    // about a pixel, the perspective terms are not constrained by the data and
+    // the solver would fit noise with them. Feature alignment changes that:
+    // matches spread across the frame DO constrain perspective, and a camera
+    // that rotated about its own centre (a pan, the panorama case) is related
+    // to the next frame by a homography and by nothing simpler.
+    //
+    // Splitting into Affine and Homography types would mean two samplers, two
+    // sidecars, and every merge choosing between them -- for a difference of
+    // two numbers that are usually zero. One type, and an affine warp is the
+    // special case where the perspective row is zero, which costs two multiplies
+    // and a divide-by-one per pixel.
+    float m[8] = {1.0f, 0.0f, 0.0f,
+                  0.0f, 1.0f, 0.0f,
+                  0.0f, 0.0f};
 
     void MapPoint(float x, float y, float* ox, float* oy) const {
-        *ox = m[0] * x + m[1] * y + m[2];
-        *oy = m[3] * x + m[4] * y + m[5];
+        const float w = m[6] * x + m[7] * y + 1.0f;
+        // Guarded: a point on the horizon line of a strong homography maps to
+        // infinity, and letting that through produces coordinates the sampler
+        // clamps to a corner -- a plausible-looking smear rather than an error.
+        const float iw = (std::abs(w) > 1e-9f) ? 1.0f / w : 0.0f;
+        *ox = (m[0] * x + m[1] * y + m[2]) * iw;
+        *oy = (m[3] * x + m[4] * y + m[5]) * iw;
     }
+
+    bool IsAffine() const { return m[6] == 0.0f && m[7] == 0.0f; }
 
     bool IsIdentity() const {
         return m[0] == 1.0f && m[1] == 0.0f && m[2] == 0.0f &&
-               m[3] == 0.0f && m[4] == 1.0f && m[5] == 0.0f;
+               m[3] == 0.0f && m[4] == 1.0f && m[5] == 0.0f &&
+               m[6] == 0.0f && m[7] == 0.0f;
+    }
+
+    // The full 3x3, with the bottom-right fixed at 1. Written out because the
+    // composition and inverse below are ordinary matrix algebra once the
+    // storage is unpacked, and doing it in terms of m[] indices is how a
+    // transcription error hides.
+    void To3x3(float h[9]) const {
+        h[0] = m[0]; h[1] = m[1]; h[2] = m[2];
+        h[3] = m[3]; h[4] = m[4]; h[5] = m[5];
+        h[6] = m[6]; h[7] = m[7]; h[8] = 1.0f;
+    }
+
+    // Back from a 3x3, normalised so h[8] is 1.
+    //
+    // A homography is defined only up to scale, so two matrices differing by a
+    // constant factor are the SAME transform -- normalising is what lets the
+    // eight stored numbers mean one thing.
+    static Affine From3x3(const float h[9]) {
+        Affine o;
+        const float s = (std::abs(h[8]) > 1e-12f) ? 1.0f / h[8] : 1.0f;
+        o.m[0] = h[0] * s; o.m[1] = h[1] * s; o.m[2] = h[2] * s;
+        o.m[3] = h[3] * s; o.m[4] = h[4] * s; o.m[5] = h[5] * s;
+        o.m[6] = h[6] * s; o.m[7] = h[7] * s;
+        return o;
     }
 
     // Composition: apply `inner` then `this`.
     Affine Then(const Affine& inner) const {
-        Affine o;
-        o.m[0] = m[0] * inner.m[0] + m[1] * inner.m[3];
-        o.m[1] = m[0] * inner.m[1] + m[1] * inner.m[4];
-        o.m[2] = m[0] * inner.m[2] + m[1] * inner.m[5] + m[2];
-        o.m[3] = m[3] * inner.m[0] + m[4] * inner.m[3];
-        o.m[4] = m[3] * inner.m[1] + m[4] * inner.m[4];
-        o.m[5] = m[3] * inner.m[2] + m[4] * inner.m[5] + m[5];
-        return o;
+        float a[9], b[9], c[9] = {};
+        To3x3(a);
+        inner.To3x3(b);
+        for (int r = 0; r < 3; ++r)
+            for (int k = 0; k < 3; ++k)
+                for (int col = 0; col < 3; ++col)
+                    c[r * 3 + col] += a[r * 3 + k] * b[k * 3 + col];
+        return From3x3(c);
     }
 
     // The inverse warp. Returns identity when the matrix is singular, which is
     // the safe answer: an un-warped frame merges slightly misaligned, where a
     // garbage warp merges as noise.
     Affine Inverse(bool* ok = nullptr) const {
-        const float det = m[0] * m[4] - m[1] * m[3];
+        float h[9];
+        To3x3(h);
+
+        // Cofactor inverse of the full 3x3. The affine case falls out of this
+        // with the same answer the 2x2 formula gave, so there is one path
+        // rather than a branch that could disagree with itself.
+        float c[9];
+        c[0] = h[4] * h[8] - h[5] * h[7];
+        c[1] = h[2] * h[7] - h[1] * h[8];
+        c[2] = h[1] * h[5] - h[2] * h[4];
+        c[3] = h[5] * h[6] - h[3] * h[8];
+        c[4] = h[0] * h[8] - h[2] * h[6];
+        c[5] = h[2] * h[3] - h[0] * h[5];
+        c[6] = h[3] * h[7] - h[4] * h[6];
+        c[7] = h[1] * h[6] - h[0] * h[7];
+        c[8] = h[0] * h[4] - h[1] * h[3];
+
+        const float det = h[0] * c[0] + h[1] * c[3] + h[2] * c[6];
         if (std::abs(det) < 1e-12f) { if (ok) *ok = false; return Affine{}; }
         if (ok) *ok = true;
+
         const float inv = 1.0f / det;
-        Affine o;
-        o.m[0] =  m[4] * inv;
-        o.m[1] = -m[1] * inv;
-        o.m[3] = -m[3] * inv;
-        o.m[4] =  m[0] * inv;
-        o.m[2] = -(o.m[0] * m[2] + o.m[1] * m[5]);
-        o.m[5] = -(o.m[3] * m[2] + o.m[4] * m[5]);
-        return o;
+        for (int i = 0; i < 9; ++i) c[i] *= inv;
+        return From3x3(c);
     }
 
     // Translation only, which is what a report wants to show.

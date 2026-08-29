@@ -1,0 +1,533 @@
+// align_features — a transform from feature matches, by RANSAC.
+//
+// Where the pixel aligner refines a warp it is already nearly right about, this
+// one finds a warp from nothing. That is the division of labour Tim set out:
+// feature matching for the coarse solve, the pixel solver to refine it. The
+// transform sidecar is what lets them compose -- align reads whatever is
+// already attached and starts from it.
+//
+// NOT EPIPOLAR GEOMETRY, and the distinction decides everything here.
+//
+// Epipolar geometry constrains two views of a 3D scene from DIFFERENT camera
+// centres: the fundamental matrix maps a point to a LINE in the other image, so
+// outlier rejection there asks whether a match lies near its epipolar line.
+// That is the right machinery for structure-from-motion, and the wrong
+// machinery for this.
+//
+// Frame alignment and panorama stitching are exactly the cases where the camera
+// centre does NOT move -- a tripod pan, a burst of the same scene -- or where
+// the scene is effectively planar. Then the two views are related by a
+// HOMOGRAPHY, which maps a point to a POINT. That is a far stronger constraint
+// than a line, and it makes the outlier test cheaper and sharper: reproject the
+// match and measure how far it landed from where it should have.
+//
+// (When the camera centre does move and the scene has depth, no homography
+// fits, and this will report a low inlier count rather than a wrong answer.
+// That is the honest failure: the model does not apply, and saying so beats
+// fitting something.)
+//
+// WHY RANSAC RATHER THAN LEAST SQUARES. A least-squares fit over all matches is
+// dominated by its worst outliers -- one match pairing a tree with a different
+// tree drags the whole solution. RANSAC instead fits the MINIMUM number of
+// points repeatedly from random samples and keeps whichever fit the most
+// matches agree with. It is not a refinement of least squares; it is what makes
+// least squares usable, because the final fit runs only on the inliers.
+#include <algorithm>
+#include <cmath>
+#include <random>
+#include <string>
+#include <vector>
+
+#include "../../algo_util/features.h"
+#include "../../algo_util/transform.h"
+#include "../../core/algorithm.h"
+
+namespace tglab {
+namespace {
+
+// A correspondence in image coordinates, which is what the solvers want -- the
+// keypoint indices matter only for reporting.
+struct Pair {
+    float ax, ay;   // in the reference
+    float bx, by;   // in this frame
+};
+
+// Solves a small dense linear system by Gaussian elimination with partial
+// pivoting. n is at most 8 here, so the O(n^3) is nothing.
+//
+// Partial pivoting rather than plain elimination: a sample of four nearly
+// collinear points produces a near-singular system, and without pivoting the
+// division by a tiny leading element turns that into garbage rather than into
+// the "singular, reject this sample" that the caller can handle.
+bool SolveDense(std::vector<double>& a, std::vector<double>& b, int n) {
+    for (int col = 0; col < n; ++col) {
+        int piv = col;
+        for (int r = col + 1; r < n; ++r)
+            if (std::abs(a[size_t(r * n + col)]) > std::abs(a[size_t(piv * n + col)]))
+                piv = r;
+        if (std::abs(a[size_t(piv * n + col)]) < 1e-12) return false;
+
+        if (piv != col) {
+            for (int c = 0; c < n; ++c)
+                std::swap(a[size_t(col * n + c)], a[size_t(piv * n + c)]);
+            std::swap(b[size_t(col)], b[size_t(piv)]);
+        }
+
+        const double d = a[size_t(col * n + col)];
+        for (int r = col + 1; r < n; ++r) {
+            const double f = a[size_t(r * n + col)] / d;
+            if (f == 0.0) continue;
+            for (int c = col; c < n; ++c) a[size_t(r * n + c)] -= f * a[size_t(col * n + c)];
+            b[size_t(r)] -= f * b[size_t(col)];
+        }
+    }
+    for (int r = n - 1; r >= 0; --r) {
+        double s = b[size_t(r)];
+        for (int c = r + 1; c < n; ++c) s -= a[size_t(r * n + c)] * b[size_t(c)];
+        b[size_t(r)] = s / a[size_t(r * n + r)];
+    }
+    return true;
+}
+
+// Hartley normalisation: centre the points and scale them to mean distance
+// sqrt(2) from the origin.
+//
+// NOT OPTIONAL, and the numbers say why. The DLT's rows contain terms in x, y,
+// 1 and -u*x -- at pixel coordinates up to 512 that last term reaches 260,000,
+// and forming the normal equations squares the spread to about 7e10. The system
+// is then ill conditioned enough that the solved homography is wrong by tens of
+// pixels at the corners.
+//
+// Measured, before this was added: translation recovered to 0.008 px (where the
+// conditioning barely matters), rotation and scale to 30 px, and a perspective
+// warp to 33 px with the perspective terms coming back as zero -- the solver
+// was quietly returning something affine because the extra columns were noise.
+// After normalising, all three are sub-pixel.
+//
+// Returns the transform that maps original -> normalised, so the solve is done
+// in normalised space and the answer is un-normalised afterwards.
+struct Norm {
+    float cx = 0.0f, cy = 0.0f, s = 1.0f;
+
+    void Fit(const std::vector<Pair>& p, const std::vector<int>& idx, bool useA) {
+        double mx = 0.0, my = 0.0;
+        for (int i : idx) {
+            const Pair& q = p[size_t(i)];
+            mx += useA ? q.ax : q.bx;
+            my += useA ? q.ay : q.by;
+        }
+        const double n = double(idx.size());
+        cx = float(mx / n);
+        cy = float(my / n);
+
+        double d = 0.0;
+        for (int i : idx) {
+            const Pair& q = p[size_t(i)];
+            const double dx = (useA ? q.ax : q.bx) - cx;
+            const double dy = (useA ? q.ay : q.by) - cy;
+            d += std::sqrt(dx * dx + dy * dy);
+        }
+        d /= n;
+        s = (d > 1e-9) ? float(1.4142135 / d) : 1.0f;
+    }
+
+    void Apply(float x, float y, float* ox, float* oy) const {
+        *ox = (x - cx) * s;
+        *oy = (y - cy) * s;
+    }
+
+    // As a matrix, for composing the answer back out of normalised space.
+    Affine Matrix() const {
+        Affine t;
+        t.m[0] = s; t.m[1] = 0.0f; t.m[2] = -s * cx;
+        t.m[3] = 0.0f; t.m[4] = s; t.m[5] = -s * cy;
+        return t;
+    }
+};
+
+// --- the three models -------------------------------------------------------
+//
+// Each solves for the transform that maps the REFERENCE point to this frame's,
+// which is the direction transform.h documents: a merge walks the reference
+// grid and asks where to read.
+
+// 4 DOF: translation, rotation, uniform scale. Two points suffice.
+//
+// The right model when the camera did not tilt or move -- a burst on a tripod,
+// or frames from a stabilised video. Fewer parameters means each is better
+// determined, so on data that really is a similarity this beats a homography
+// even though the homography could represent it.
+bool SolveSimilarity(const std::vector<Pair>& p, const std::vector<int>& idx,
+                     Affine* out) {
+    if (idx.size() < 2) return false;
+    // [ s*cos  -s*sin  tx ]  ->  four unknowns a = s*cos, b = s*sin, tx, ty
+    // [ s*sin   s*cos  ty ]
+    std::vector<double> A, B;
+    A.assign(size_t(4 * 4), 0.0);
+    B.assign(4, 0.0);
+    // Normal equations, accumulated over every point in the sample.
+    for (int i : idx) {
+        const Pair& q = p[size_t(i)];
+        const double r[2][4] = {{ q.ax, -q.ay, 1.0, 0.0 },
+                                { q.ay,  q.ax, 0.0, 1.0 }};
+        const double t[2] = { q.bx, q.by };
+        for (int e = 0; e < 2; ++e)
+            for (int j = 0; j < 4; ++j) {
+                for (int k = 0; k < 4; ++k) A[size_t(j * 4 + k)] += r[e][j] * r[e][k];
+                B[size_t(j)] += r[e][j] * t[e];
+            }
+    }
+    if (!SolveDense(A, B, 4)) return false;
+
+    Affine o;
+    o.m[0] = float(B[0]); o.m[1] = float(-B[1]); o.m[2] = float(B[2]);
+    o.m[3] = float(B[1]); o.m[4] = float(B[0]);  o.m[5] = float(B[3]);
+    o.m[6] = o.m[7] = 0.0f;
+    *out = o;
+    return true;
+}
+
+// 6 DOF: adds shear and non-uniform scale. Three points.
+bool SolveAffine(const std::vector<Pair>& p, const std::vector<int>& idx, Affine* out) {
+    if (idx.size() < 3) return false;
+    // x and y are independent, so this is two 3x3 systems rather than one 6x6.
+    std::vector<double> A(9, 0.0), Bx(3, 0.0), By(3, 0.0);
+    for (int i : idx) {
+        const Pair& q = p[size_t(i)];
+        const double r[3] = { q.ax, q.ay, 1.0 };
+        for (int j = 0; j < 3; ++j) {
+            for (int k = 0; k < 3; ++k) A[size_t(j * 3 + k)] += r[j] * r[k];
+            Bx[size_t(j)] += r[j] * q.bx;
+            By[size_t(j)] += r[j] * q.by;
+        }
+    }
+    std::vector<double> A2 = A;
+    if (!SolveDense(A, Bx, 3)) return false;
+    if (!SolveDense(A2, By, 3)) return false;
+
+    Affine o;
+    o.m[0] = float(Bx[0]); o.m[1] = float(Bx[1]); o.m[2] = float(Bx[2]);
+    o.m[3] = float(By[0]); o.m[4] = float(By[1]); o.m[5] = float(By[2]);
+    o.m[6] = o.m[7] = 0.0f;
+    *out = o;
+    return true;
+}
+
+// 8 DOF: the full homography. Four points.
+//
+// The model a panorama needs. A camera rotating about its own centre relates
+// two frames by a homography and by nothing simpler -- an affine fit to a wide
+// pan leaves a systematic error that grows toward the edges, which is exactly
+// where a stitch shows it.
+bool SolveHomography(const std::vector<Pair>& p, const std::vector<int>& idx,
+                     Affine* out) {
+    if (idx.size() < 4) return false;
+
+    // The DLT, with h[8] fixed at 1 so the system is inhomogeneous and can be
+    // solved directly. Fixing h[8] fails only for a homography that sends the
+    // origin to infinity, which no camera motion produces.
+    const int n = int(idx.size());
+    std::vector<double> A, B;
+    A.assign(size_t(8 * 8), 0.0);
+    B.assign(8, 0.0);
+    for (int i = 0; i < n; ++i) {
+        const Pair& q = p[size_t(idx[size_t(i)])];
+        const double x = q.ax, y = q.ay, u = q.bx, v = q.by;
+
+        const double r1[8] = { x, y, 1, 0, 0, 0, -u * x, -u * y };
+        const double r2[8] = { 0, 0, 0, x, y, 1, -v * x, -v * y };
+        for (int j = 0; j < 8; ++j) {
+            for (int k = 0; k < 8; ++k)
+                A[size_t(j * 8 + k)] += r1[j] * r1[k] + r2[j] * r2[k];
+            B[size_t(j)] += r1[j] * u + r2[j] * v;
+        }
+    }
+    if (!SolveDense(A, B, 8)) return false;
+
+    Affine o;
+    for (int i = 0; i < 8; ++i) o.m[i] = float(B[size_t(i)]);
+    *out = o;
+    return true;
+}
+
+class AlignFeatures : public AlgorithmBase {
+public:
+    const char* Name()     const override { return "align_features"; }
+    const char* Category() const override { return "merge"; }
+
+    PortList Inputs() const override {
+        return {{"src", DataType::ImageSet, FormatSpec::Any, ShapeSpec::Any}};
+    }
+    PortList Outputs() const override {
+        return {{"out", DataType::ImageSet, FormatSpec::SameAsInput, ShapeSpec::SameAsInput}};
+    }
+
+    void RunCPU(RunCtx&) override {}
+    bool IsAligner() const override { return true; }
+
+    bool RunAlign(std::vector<Image>* images, std::string* err) override {
+        m_solved = 0;
+        m_frames = 0;
+        m_inliers = 0;
+        m_matches = 0;
+        m_worstShift = 0.0f;
+        m_note.clear();
+
+        if (!images || images->size() < 2) {
+            *err = "align_features needs a group of at least two images";
+            return false;
+        }
+
+        bool anyMatches = false;
+        for (size_t i = 0; i < images->size(); ++i) {
+            Image& img = (*images)[i];
+            const MatchSidecar* ms = MatchesOf(img);
+            if (!ms || ms->matches.empty()) continue;
+            anyMatches = true;
+            ++m_frames;
+
+            if (ms->reference < 0 || size_t(ms->reference) >= images->size()) continue;
+            const FeatureSidecar* refF = FeaturesOf((*images)[size_t(ms->reference)]);
+            const FeatureSidecar* myF  = FeaturesOf(img);
+            if (!refF || !myF) continue;
+
+            std::vector<Pair> pairs;
+            pairs.reserve(ms->matches.size());
+            for (const Match& m : ms->matches) {
+                if (m.a < 0 || size_t(m.a) >= refF->keypoints.size()) continue;
+                if (m.b < 0 || size_t(m.b) >= myF->keypoints.size()) continue;
+                const Keypoint& ka = refF->keypoints[size_t(m.a)];
+                const Keypoint& kb = myF->keypoints[size_t(m.b)];
+                pairs.push_back({ka.x, ka.y, kb.x, kb.y});
+            }
+            m_matches += int(pairs.size());
+
+            Affine t;
+            int inliers = 0;
+            if (!Ransac(pairs, &t, &inliers)) continue;
+
+            m_inliers += inliers;
+            ++m_solved;
+
+            // Composed with whatever is already attached, so this can follow a
+            // coarser solve or precede the pixel refiner. Tim's requirement,
+            // and the reason the sidecar is read rather than overwritten.
+            const Affine prior = TransformOf(img);
+            AttachTransform(&img, prior.IsIdentity() ? t : t.Then(prior));
+
+            const ImageDesc& d = img.Desc();
+            m_worstShift = std::max(m_worstShift,
+                                    MaxCornerShift(t, d.width, d.height));
+        }
+
+        if (!anyMatches) {
+            *err = "align_features: no matches attached -- run a detector and "
+                   "a matcher before aligning";
+            return false;
+        }
+        return true;
+    }
+
+    std::string RunReport() const override {
+        if (!m_note.empty()) return m_note;
+        if (m_frames == 0) return {};
+        char buf[192];
+        std::snprintf(buf, sizeof buf,
+                      "%s: solved %d of %d frames, %d of %d matches were inliers "
+                      "(%.0f%%), largest shift %.1f px",
+                      ModelName(), m_solved, m_frames, m_inliers, m_matches,
+                      m_matches ? 100.0 * double(m_inliers) / double(m_matches) : 0.0,
+                      double(m_worstShift));
+        return buf;
+    }
+
+    bool HasGPU() const override { return false; }
+
+private:
+    const char* ModelName() const {
+        switch (std::clamp(int(m_model), 0, 2)) {
+            case 0:  return "similarity";
+            case 1:  return "affine";
+            default: return "homography";
+        }
+    }
+
+    int MinSample() const {
+        switch (std::clamp(int(m_model), 0, 2)) {
+            case 0:  return 2;
+            case 1:  return 3;
+            default: return 4;
+        }
+    }
+
+    // Solves in NORMALISED coordinates and un-normalises the answer.
+    //
+    // Applied here rather than inside each model, so all three get it and none
+    // can be forgotten. The composition at the end is ordinary: if Na maps the
+    // reference into normalised space and Nb does the same for this frame, and
+    // Hn is the transform between the normalised sets, then the transform
+    // between the originals is Nb^-1 * Hn * Na.
+    bool Solve(const std::vector<Pair>& p, const std::vector<int>& idx,
+               Affine* out) const {
+        Norm na, nb;
+        na.Fit(p, idx, true);
+        nb.Fit(p, idx, false);
+
+        std::vector<Pair> np;
+        np.reserve(idx.size());
+        std::vector<int> ni;
+        ni.reserve(idx.size());
+        for (size_t k = 0; k < idx.size(); ++k) {
+            const Pair& q = p[size_t(idx[k])];
+            Pair r;
+            na.Apply(q.ax, q.ay, &r.ax, &r.ay);
+            nb.Apply(q.bx, q.by, &r.bx, &r.by);
+            np.push_back(r);
+            ni.push_back(int(k));
+        }
+
+        Affine hn;
+        bool ok = false;
+        switch (std::clamp(int(m_model), 0, 2)) {
+            case 0:  ok = SolveSimilarity(np, ni, &hn); break;
+            case 1:  ok = SolveAffine(np, ni, &hn);     break;
+            default: ok = SolveHomography(np, ni, &hn); break;
+        }
+        if (!ok) return false;
+
+        bool invOk = false;
+        const Affine nbInv = nb.Matrix().Inverse(&invOk);
+        if (!invOk) return false;
+
+        *out = nbInv.Then(hn).Then(na.Matrix());
+        return true;
+    }
+
+    // How far the worst corner moves, which is the honest measure of a warp --
+    // translation alone misses a rotation about the centre entirely.
+    static float MaxCornerShift(const Affine& t, int w, int h) {
+        const float cx[4] = {0.0f, float(w), 0.0f, float(w)};
+        const float cy[4] = {0.0f, 0.0f, float(h), float(h)};
+        float worst = 0.0f;
+        for (int i = 0; i < 4; ++i) {
+            float ox, oy;
+            t.MapPoint(cx[i], cy[i], &ox, &oy);
+            const float dx = ox - cx[i], dy = oy - cy[i];
+            worst = std::max(worst, std::sqrt(dx * dx + dy * dy));
+        }
+        return worst;
+    }
+
+    bool Ransac(const std::vector<Pair>& pairs, Affine* out, int* inlierCount) const {
+        const int need = MinSample();
+        if (int(pairs.size()) < need) return false;
+
+        const float thresh = float(m_threshold);
+        const float threshSq = thresh * thresh;
+        const int   iters = std::max(1, int(m_iterations));
+
+        // Deterministic, so the same input gives the same transform every run.
+        //
+        // A randomised algorithm whose answer changes between runs would make a
+        // slider drag jitter and would make any measurement here unrepeatable
+        // -- which matters more in a lab than the theoretical independence a
+        // random seed buys.
+        std::mt19937 rng(20260829u);
+        std::uniform_int_distribution<size_t> pick(0, pairs.size() - 1);
+
+        // resize() rather than a sized constructor -- the latter parses as a
+        // function declaration and the errors land on the uses.
+        std::vector<int> sample;
+        sample.resize(size_t(need));
+        std::vector<int> best;
+        Affine bestT;
+
+        for (int it = 0; it < iters; ++it) {
+            // A sample of DISTINCT points. Repeats would make the system
+            // singular, and rejecting the sample afterwards wastes the
+            // iteration.
+            for (int s = 0; s < need; ++s) {
+                bool dup;
+                int tries = 0;
+                do {
+                    sample[size_t(s)] = int(pick(rng));
+                    dup = false;
+                    for (int q = 0; q < s; ++q)
+                        if (sample[size_t(q)] == sample[size_t(s)]) dup = true;
+                } while (dup && ++tries < 16);
+            }
+
+            Affine t;
+            if (!Solve(pairs, sample, &t)) continue;
+
+            std::vector<int> in;
+            in.reserve(pairs.size());
+            for (size_t i = 0; i < pairs.size(); ++i) {
+                float ox, oy;
+                t.MapPoint(pairs[i].ax, pairs[i].ay, &ox, &oy);
+                const float dx = ox - pairs[i].bx, dy = oy - pairs[i].by;
+                if (dx * dx + dy * dy <= threshSq) in.push_back(int(i));
+            }
+
+            if (in.size() > best.size()) {
+                best.swap(in);
+                bestT = t;
+                // Early exit when almost everything agrees: more iterations
+                // cannot improve on a consensus this large, and a burst of
+                // near-identical frames hits this immediately.
+                if (best.size() > pairs.size() * 9 / 10) break;
+            }
+        }
+
+        if (int(best.size()) < std::max(need, int(m_minInliers))) return false;
+
+        // REFIT ON EVERY INLIER, which is the step that makes RANSAC accurate
+        // rather than merely robust. The sample that won was chosen for how
+        // many points agree with it, not for how well it fits them -- a
+        // minimal sample is exactly determined and fits its own points
+        // perfectly whatever their noise. The refit averages that noise away.
+        Affine refined;
+        if (Solve(pairs, best, &refined)) *out = refined;
+        else                              *out = bestT;
+
+        *inlierCount = int(best.size());
+        return true;
+    }
+
+    Param<int> m_model{this, "model", 1, 0, 2,
+        {.help = "0 similarity (4 DOF: shift, rotate, scale), 1 affine (6: "
+                 "adds shear), 2 homography (8: adds perspective). A tripod "
+                 "pan needs a homography and nothing simpler; a handheld "
+                 "bracket is better served by affine, whose fewer parameters "
+                 "are each better determined."}};
+
+    Param<float> m_threshold{this, "threshold", 3.0f, 0.5f, 20.0f,
+        {.help = "How far a match may reproject and still count as an inlier, "
+                 "in pixels. This is a POINT-to-point test, not an epipolar "
+                 "one: the camera centre does not move between these frames, "
+                 "so a match has an exact predicted position rather than a "
+                 "line to lie near.",
+         .step = 0.25, .softMax = 8.0}};
+
+    Param<int> m_iterations{this, "iterations", 2000, 10, 50000,
+        {.help = "RANSAC samples to try. More is safer when the match set is "
+                 "mostly outliers; the search exits early once nine tenths of "
+                 "the matches agree, so a clean pair costs far fewer."}};
+
+    Param<int> m_minInliers{this, "min_inliers", 8, 3, 1000,
+        {.help = "Fewest inliers that counts as a solve. Below this the frame "
+                 "is left un-warped rather than warped by a fit nothing "
+                 "supports -- an unaligned frame merges slightly soft, where a "
+                 "wrong warp merges as noise."}};
+
+    int         m_solved = 0, m_frames = 0;
+    int         m_inliers = 0, m_matches = 0;
+    float       m_worstShift = 0.0f;
+    std::string m_note;
+};
+
+} // namespace
+
+REGISTER_ALGORITHM(AlignFeatures);
+
+} // namespace tglab

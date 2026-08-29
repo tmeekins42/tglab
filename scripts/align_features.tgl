@@ -1,0 +1,55 @@
+# Alignment from feature matches.
+#
+# Detect, match, then solve a transform from the correspondences. The result is
+# attached as a transform sidecar, which every merge already samples through --
+# so adding this line to an HDR or focus-stack script aligns it, with no merge
+# algorithm changing.
+#
+# NOT EPIPOLAR GEOMETRY, which is the usual expectation and the wrong tool here.
+#
+# Epipolar geometry constrains two views from DIFFERENT camera centres: the
+# fundamental matrix maps a point to a LINE in the other image, and outlier
+# rejection asks whether a match lies near that line. That is right for
+# structure-from-motion.
+#
+# Frame alignment and panorama stitching are the cases where the camera centre
+# does NOT move -- a tripod pan, a bracket of one scene -- or where the scene is
+# planar. Then the frames are related by a HOMOGRAPHY, which maps a point to a
+# POINT. Stronger constraint, cheaper test: reproject the match and see how far
+# it landed from where it should have.
+#
+# WHICH MODEL, and it is a real choice rather than "use the most general":
+#
+#   similarity   4 DOF -- shift, rotate, uniform scale. A tripod burst.
+#   affine       6 DOF -- adds shear and non-uniform scale. The default.
+#   homography   8 DOF -- adds perspective. What a panorama needs.
+#
+# More parameters are not free. On a fixture that IS a similarity, measured
+# corner error from the same 37 matches:
+#
+#   similarity   0.66 px
+#   affine       1.24 px
+#   homography   2.67 px
+#
+# The extra parameters have nothing real to fit and spend themselves on noise.
+# But on a fixture with actual perspective, the order reverses hard --
+# homography 2.95 px against affine's 14.48 -- because an affine fit simply
+# cannot express the warp and the error grows toward the edges, exactly where a
+# stitch shows it.
+#
+# WHICH DETECTOR matters too, and differently from what the repeatability
+# numbers suggest. AKAZE is the more repeatable detector under translation, and
+# its orientation estimate is the weaker: on a 3-degree rotation it kept 14-20%
+# of its matches as RANSAC inliers where SIFT kept 89%. Use SIFT when the camera
+# rotates.
+
+frames = image("group")
+
+det   = choose("detector", [detect_sift, detect_akaze, detect_surf])
+match = choose("matcher", [match_brute, match_ann])
+
+frames => params( det )()
+       => params( match )()
+       => params( align_features )()
+       => merge_mean()
+       => display("aligned merge")
