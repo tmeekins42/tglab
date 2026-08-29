@@ -1915,6 +1915,60 @@ int main() {
                     Check(!FilenameLess(y, x), "the ordering is antisymmetric");
     }
 
+    // --- date ordering --------------------------------------------------------
+    //
+    // Sorting a group by when the shutter fired, which disagrees with the
+    // filename sort exactly where it matters: two bodies at one event interleave
+    // in time and separate completely by name, and a card that has wrapped past
+    // 9999 sorts IMG_0001 before IMG_9999 by name and after it by time.
+    {
+        // EXIF's format is fixed width and zero padded, so comparing the
+        // strings compares the instants -- no parsing, no timezone.
+        Check(DateSortKey("2026:08:19 14:32:07", 0) <
+              DateSortKey("2026:08:19 14:32:08", 0),
+              "one second later sorts later");
+        Check(DateSortKey("2026:08:19 09:00:00", 0) <
+              DateSortKey("2026:08:19 14:00:00", 0),
+              "the zero padding is what makes 09 sort before 14");
+        Check(DateSortKey("2026:08:19 23:59:59", 0) <
+              DateSortKey("2026:08:20 00:00:00", 0),
+              "midnight rolls over correctly");
+        Check(DateSortKey("2025:12:31 23:59:59", 0) <
+              DateSortKey("2026:01:01 00:00:00", 0),
+              "and so does new year");
+
+        // A frame with no EXIF date falls back to its file time, which is a
+        // different clock. Every fallback must sort before every real date
+        // rather than interleaving on digits -- otherwise the order depends on
+        // whether an epoch count happens to start with a bigger digit than a
+        // year does.
+        const std::string noExif = DateSortKey("", 1755600000LL);
+        const std::string dated  = DateSortKey("2026:08:19 14:32:07", 0);
+        Check(noExif < dated, "a file with no EXIF date sorts before dated ones");
+
+        // Including a file time whose digits would otherwise sort AFTER a year.
+        Check(DateSortKey("", 9999999999LL) < dated,
+              "even when its epoch count starts with a larger digit");
+
+        // The unknowns still order among themselves by file time, so a folder
+        // of PNGs is not shuffled arbitrarily.
+        Check(DateSortKey("", 100) < DateSortKey("", 200),
+              "undated files keep their own chronological order");
+
+        // Across a digit-count boundary, which is what the zero padding is for:
+        // compared as raw text, "99" sorts AFTER "100". Windows file times are
+        // uniformly 18 digits so this would not bite today, which is what would
+        // have made it a nasty surprise on some other platform later.
+        Check(DateSortKey("", 99) < DateSortKey("", 100),
+              "99 sorts before 100 despite being compared as text");
+
+        // Same instant on two frames of a burst: neither is less, so
+        // stable_sort keeps the order they already had.
+        const std::string same = "2026:08:19 14:32:07";
+        Check(!(DateSortKey(same, 0) < DateSortKey(same, 0)),
+              "frames sharing a second are ties, not reordered");
+    }
+
     // --- rank-2 reduction ----------------------------------------------------
     //
     // Reducing ONE axis of a multi-axis set: [position=2, exposure=3] over

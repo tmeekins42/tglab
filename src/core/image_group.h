@@ -38,6 +38,23 @@ void SetGroupAxis(Data* d, const std::string& axis);
 // actually occurs, and nothing else.
 bool FilenameLess(const std::string& a, const std::string& b);
 
+// A sort key for "when was this taken", from an EXIF date and a file time.
+//
+// `exifDate` is EXIF's "2026:08:19 14:32:07" -- fixed width and zero padded, so
+// comparing the strings IS comparing the instants. No parsing, and no timezone
+// to get wrong.
+//
+// A frame with no EXIF date falls back to its file timestamp, which is a
+// different clock and not comparable with the first. Rather than interleave two
+// incompatible orderings, a fallback key is prefixed with a space so every one
+// of them sorts BEFORE every EXIF key: the unknowns group together and keep
+// whatever order they arrived in. Arbitrary, but predictable, which a mixed
+// ordering would not be.
+//
+// Here rather than in the UI so it can be tested: the sort itself is a
+// permutation over ImGui state, and this is the part that can be wrong.
+std::string DateSortKey(const std::string& exifDate, long long fileTime);
+
 // Back to a single image, keeping the FIRST. Deliberately keeps one rather than
 // emptying the slot: a script referring to the entry by name should still
 // resolve, and losing every dropped file to a mis-click would be worse than

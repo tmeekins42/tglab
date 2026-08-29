@@ -1,5 +1,7 @@
 #include "image_group.h"
 
+#include <cstdio>
+
 #include <cctype>
 
 namespace tglab {
@@ -72,6 +74,26 @@ void Ungroup(Data* d) {
     if (auto* s = std::get_if<ImageSet>(d); s && !s->images.empty())
         first = std::move(s->images.front());
     *d = Data{std::move(first)};
+}
+
+
+// See the header for why the fallback sorts first rather than interleaving.
+std::string DateSortKey(const std::string& exifDate, long long fileTime) {
+    if (!exifDate.empty()) return exifDate;
+
+    // Zero padded to a fixed width, because these keys are COMPARED AS STRINGS
+    // and an unpadded number is not ordered by one: "99" sorts after "100".
+    // Windows file times happen to be uniformly 18 digits, so this would not
+    // bite today -- which is exactly why it would be a nasty surprise later, on
+    // a platform whose epoch counts vary in length.
+    //
+    // 20 digits covers the full range of a signed 64-bit count. Negative times
+    // (before the epoch, which Windows does not produce but POSIX can) sort as
+    // text and would land after positives; not worth handling until something
+    // can generate one.
+    char buf[32];
+    std::snprintf(buf, sizeof buf, " %020lld", fileTime);
+    return buf;
 }
 
 } // namespace tglab

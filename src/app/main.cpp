@@ -11,6 +11,8 @@
 #include <cstdio>
 #include <chrono>
 #include <cstdlib>
+#include <filesystem>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -307,7 +309,10 @@ public:
     void RefreshMembers(PaletteEntry& e);
     std::string UniqueSlotName(const std::string& base) const;
     std::string NewGroupSlot();
+    void SortGroupBy(PaletteEntry& e,
+                     const std::function<bool(size_t, size_t)>& less);
     void SortGroupByName(PaletteEntry& e);
+    void SortGroupByDate(PaletteEntry& e);
     void MakeGroup(PaletteEntry& e);
     void Ungroup(PaletteEntry& e);
 
@@ -2187,23 +2192,22 @@ std::string App::NewGroupSlot() {
 // Natural-ish order: a plain lexicographic sort puts IMG_10 before IMG_9, which
 // is exactly wrong for a numbered burst. Comparing digit runs numerically fixes
 // the case that actually occurs without pretending to be a full natural sort.
-void App::SortGroupByName(PaletteEntry& e) {
+// Reorders a group's images and their member state together, by a comparison
+// over member indices.
+//
+// Sorting an index permutation and applying it once to each vector, rather than
+// sorting the vectors directly: the images live in core's ImageSet and the
+// thumbnails here, so a zip would be the only way to sort them as a unit and
+// this keeps them provably in step instead.
+void App::SortGroupBy(PaletteEntry& e,
+                      const std::function<bool(size_t, size_t)>& less) {
     auto* set = std::get_if<ImageSet>(&e.data);
     if (!set || set->images.size() < 2) return;
     RefreshMembers(e);
 
-    auto baseName = [](const std::string& p) {
-        const auto slash = p.find_last_of("/\\");
-        return slash == std::string::npos ? p : p.substr(slash + 1);
-    };
-
-    // Sort an index permutation, then apply it once to each vector. Sorting the
-    // vectors directly would need a zip; this keeps them provably in step.
     std::vector<size_t> order(set->images.size());
     for (size_t i = 0; i < order.size(); ++i) order[i] = i;
-    std::stable_sort(order.begin(), order.end(), [&](size_t x, size_t y) {
-        return FilenameLess(baseName(e.members[x].path), baseName(e.members[y].path));
-    });
+    std::stable_sort(order.begin(), order.end(), less);
 
     std::vector<Image>         img;
     std::vector<PaletteMember> mem;
@@ -2216,6 +2220,63 @@ void App::SortGroupByName(PaletteEntry& e) {
     set->images = std::move(img);
     e.members   = std::move(mem);
     ++e.version;
+}
+
+static std::string BaseName(const std::string& p) {
+    const auto slash = p.find_last_of("/\\");
+    return slash == std::string::npos ? p : p.substr(slash + 1);
+}
+
+void App::SortGroupByName(PaletteEntry& e) {
+    RefreshMembers(e);
+    SortGroupBy(e, [&](size_t x, size_t y) {
+        return FilenameLess(BaseName(e.members[x].path), BaseName(e.members[y].path));
+    });
+}
+
+// Sort by when the shutter fired, falling back to the file's timestamp.
+//
+// Worth having alongside the filename sort because the two disagree exactly
+// where it matters. Two bodies shooting one event produce interleaved times and
+// completely separate filename ranges; a card that has wrapped past 9999 sorts
+// IMG_0001 before IMG_9999 by name and after it by time. A bracket is consumed
+// in order by a reduction, so a wrong position is a silently wrong merge rather
+// than an error.
+//
+// EXIF dateTaken is "2026:08:19 14:32:07", fixed width with zero padding, so a
+// plain string comparison IS chronological -- no parsing, and no timezone to
+// get wrong.
+//
+// ONE-SECOND RESOLUTION, which matters more than it sounds. Measured on Tim's
+// hdrtest2: five of its eight frames report 12:32:53, because a bracket fires
+// faster than EXIF can distinguish. So this sort alone cannot order a burst,
+// and it is not trying to -- it sorts by NAME first and then stably by date,
+// so ties keep the filename order, which within one burst is the right one.
+//
+// That composition is the whole design. Date alone would shuffle a bracket
+// arbitrarily; name alone gets two bodies at one event wrong, and gets a card
+// that has wrapped past 9999 wrong. Name-then-date gets both right.
+void App::SortGroupByDate(PaletteEntry& e) {
+    RefreshMembers(e);
+
+    // Filename order first, as the tie-break for frames sharing a second.
+    SortGroupByName(e);
+
+    // File mtime for anything with no EXIF date -- a PNG, a TIFF, an export
+    // that lost its metadata. Fetched once per member rather than inside the
+    // comparator, which would stat the same file O(n log n) times.
+    std::vector<std::string> key(e.members.size());
+    for (size_t i = 0; i < e.members.size(); ++i) {
+        long long fileTime = 0;
+        if (e.members[i].exif.dateTaken.empty()) {
+            std::error_code ec;
+            const auto t = std::filesystem::last_write_time(e.members[i].path, ec);
+            if (!ec) fileTime = static_cast<long long>(t.time_since_epoch().count());
+        }
+        key[i] = DateSortKey(e.members[i].exif.dateTaken, fileTime);
+    }
+
+    SortGroupBy(e, [&](size_t x, size_t y) { return key[x] < key[y]; });
 }
 
 // Keeps a group's per-member UI state the same length as its images.
@@ -2478,6 +2539,10 @@ void App::DrawPalettePanel() {
                 // position is a silently wrong result rather than an error.
                 if (ImGui::MenuItem("Sort by filename")) {
                     SortGroupByName(e);
+                    m_dirty = true;
+                }
+                if (ImGui::MenuItem("Sort by date taken")) {
+                    SortGroupByDate(e);
                     m_dirty = true;
                 }
                 if (ImGui::MenuItem("Remove last image")) {
