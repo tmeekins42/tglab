@@ -476,6 +476,12 @@ src/
   variance and a handheld pan has real exposure and vignetting differences
   between frames. Useful for comparing runs on the same data; not an absolute
   scale.
+- **A few pixels of residual misalignment remain**, visible when zoomed in on a
+  stitched panorama. Not pursued further yet: everything measured so far comes
+  from one handheld sweep, and a residual that small could as easily be that
+  sequence's parallax — the camera centre does move a little when handheld —
+  as anything in the solver. Worth revisiting against a tripod set and a
+  second scene, where the two can be told apart.
 
 ---
 
