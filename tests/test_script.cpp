@@ -5585,25 +5585,34 @@ int main() {
                            "align_features", {{1, 0}}, 1, 3);
 
                 std::string e;
-                if (p.Execute(&s, nullptr, &e) && p.Stages().size() > 2) {
+                // A CHAINED frame that cannot be placed is a hard ERROR, not a
+                // note appended to a successful-looking report.
+                //
+                // Tim hit the out-of-order case twice. The second time the run
+                // still said "solved 6 of 7 frames, 90% inliers" with the
+                // explanation after it -- which reads as success, and was
+                // clipped off the end of the info panel entirely. A chain
+                // cannot continue past a broken link: every later frame is
+                // positioned relative to this one, so what follows is not
+                // slightly worse, it is unrelated.
+                //
+                // This fixture takes the too-few-matches path rather than the
+                // shift guard -- reaching the guard needs plenty of GOOD
+                // matches at an impossible displacement, which is a
+                // contradiction on a synthetic fixture and ordinary on real
+                // frames (65 matches at 91% inliers, 10908 px shift on 5796 px
+                // frames). Either way the run must not claim success.
+                const bool ran = p.Execute(&s, nullptr, &e);
+                if (!ran) {
+                    std::printf("        [dbg] %s\n", e.c_str());
+                    Check(e.find("out of order") != std::string::npos ||
+                          e.find("does not follow") != std::string::npos ||
+                          e.find("no matches") != std::string::npos,
+                          "an unplaceable chained frame is an error that says "
+                          "why: \"" + e + "\"");
+                } else if (p.Stages().size() > 2) {
                     const std::string rep = p.Stages()[2].algo->RunReport();
                     std::printf("        [dbg] %s\n", rep.c_str());
-                    // Either it found too few matches to solve at all, or it
-                    // solved and the shift guard rejected it. Both are correct;
-                    // what must NOT happen is a confident attach.
-                    // EITHER path is a pass, and it is worth being honest about
-                    // which one this fixture actually takes: with 6 matches it
-                    // fails the minimum-inlier gate and never reaches the shift
-                    // guard. So this asserts the OUTCOME -- nothing is attached
-                    // -- rather than the mechanism.
-                    //
-                    // Reaching the shift guard specifically needs a pair with
-                    // plenty of good matches at an impossible displacement,
-                    // which is a contradiction on a synthetic fixture and
-                    // ordinary on real frames: the case that motivated it had
-                    // 65 matches at 91% inliers and a 10908 px shift on 5796 px
-                    // frames. That is measured on Tim's panorama and not
-                    // reproduced here.
                     const bool refused =
                         rep.find("REJECTED") != std::string::npos ||
                         rep.find("solved 0 of") != std::string::npos;
@@ -5619,8 +5628,6 @@ int main() {
                     if (os && os->images.size() == 2)
                         Check(TransformOf(os->images[1]).IsIdentity(),
                               "...and no transform was attached to it");
-                } else {
-                    Check(false, "the out-of-order pipeline ran: " + e);
                 }
             }
 

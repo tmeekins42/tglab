@@ -849,7 +849,37 @@ void App::SaveViewer(const std::string& viewer) {
 
 void App::PollLoader() {
     LoadResult r;
-    while (m_loader.TryFetch(&r)) InstallLoadedImage(std::move(r));
+    bool any = false;
+    while (m_loader.TryFetch(&r)) { InstallLoadedImage(std::move(r)); any = true; }
+
+    // A GROUP THAT JUST FINISHED LOADING IS SORTED BY NAME.
+    //
+    // Dropping a folder of files hands them over in whatever order the shell
+    // and the loader threads produce, which is not shot order -- Explorer's
+    // multi-select in particular does not preserve what you clicked. That is
+    // fine for a bracket, where a reduction consumes the set without caring,
+    // and wrong for anything sequential: a chained match pairs frame i with
+    // frame i-1 BY POSITION, so a shuffled group matches views that were never
+    // adjacent.
+    //
+    // Tim hit that twice -- both times a panorama came out with frames at right
+    // angles, and both times the fix was to sort afterwards. Doing it here
+    // means the common case is simply right, and the manual sorts remain for
+    // the cases this cannot know about (a filename order that is not shot
+    // order, which is what sort-by-date is for).
+    //
+    // Only when the queue has just drained, so a batch is sorted once rather
+    // than re-sorted on every arrival -- and only when nothing is outstanding,
+    // or a slow file would land after the sort and sit at the end.
+    if (any && m_loader.Pending() == 0) {
+        for (PaletteEntry& e : m_palette) {
+            if (!e.isGroup) continue;
+            const auto* set = std::get_if<ImageSet>(&e.data);
+            if (!set || set->images.size() < 2) continue;
+            SortGroupByName(e);
+        }
+        m_dirty = true;
+    }
 }
 
 // Picks up a finished histogram. Called once per frame.

@@ -366,6 +366,37 @@ public:
                 const float limit = 1.5f * float(std::max(d.width, d.height));
                 if (shift > limit) {
                     m_rejected = int(i);
+
+                    // IN A CHAIN THIS IS FATAL, and saying so is the point.
+                    //
+                    // Tim hit the out-of-order case twice, and the second time
+                    // the run still reported "solved 6 of 7 frames, 90%
+                    // inliers" with the explanation appended after it -- which
+                    // reads as success, and was clipped off the end of the info
+                    // panel entirely. A warning nobody sees is not a warning.
+                    //
+                    // A chain has no way to continue past a rejected link:
+                    // every later frame is positioned relative to this one, so
+                    // what follows is not "slightly worse", it is unrelated.
+                    // Stopping with a message beats producing a panorama with
+                    // frames at right angles and leaving the user to work out
+                    // why.
+                    //
+                    // A fixed reference is different -- the other frames are
+                    // independent of this one -- so there it stays a note and
+                    // the run continues.
+                    if (chainLink) {
+                        char buf[288];
+                        std::snprintf(buf, sizeof buf,
+                            "align_features: frame %d does not follow frame %d "
+                            "-- it solved, but %.0f px from where it should be, "
+                            "which is more than the frame is wide. The frames "
+                            "are probably out of order: sort the group by name "
+                            "or date (right-click the group in the palette).",
+                            int(i), int(i) - 1, double(shift));
+                        *err = buf;
+                        return false;
+                    }
                     continue;
                 }
             }
