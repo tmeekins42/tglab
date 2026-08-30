@@ -101,6 +101,84 @@ why Canny's internal stages sit in `"edge stage"` rather than `"edge"` — they
 take three inputs, or require `R32F`, so selecting them from an `"edge"`
 dropdown could only ever fail.
 
+### Attaching data to an image: sidecars
+
+Some algorithms produce something that is *about* an image rather than a
+replacement for it — keypoints, matches, a transform. Those travel as
+**sidecars**: the algorithm passes the pixels through unchanged and attaches a
+named, immutable payload.
+
+```cpp
+auto sc = std::make_shared<FeatureSidecar>();
+sc->detector = "orb";
+/* ... fill in keypoints and descriptors ... */
+if (Image* im = ctx.OutImage(0)) im->Sidecars().Set(kFeatureSidecar, sc);
+```
+
+and downstream, reading something it did not ask for and may not find:
+
+```cpp
+const FeatureSidecar* fs = FeaturesOf(img);
+if (!fs) { /* no detector ran; say so or carry on */ }
+```
+
+Two rules make this safe rather than a loose bag of state:
+
+- **Name it with a constant.** `kFeatureSidecar`, `kMatchSidecar`,
+  `kTransformSidecar`. A typo in a literal means "not found", which looks like
+  a detector that found nothing rather than a bug.
+- **Say whether it derives from pixels.** `DerivedFromPixels()` returning true
+  means the framework drops the sidecar when the pixels change — an alignment
+  solved against an image is wrong the moment that image is re-developed, and
+  silently keeping it produces a subtly wrong merge rather than an error.
+
+The gain is that a merge samples through a transform it was never told about,
+and works identically when there is none.
+
+### Algorithms that see the whole group
+
+`RunCPU` is handed one image at a time, which is wrong for anything inherently
+about *pairs* or *sets* — matching, alignment, bundle adjustment. Those return
+true from `IsAligner()` and implement `RunAlign` instead:
+
+```cpp
+bool IsAligner() const override { return true; }
+bool RunAlign(std::vector<Image>* images, std::string* err) override;
+```
+
+`RunCPU` is then never called (leave it empty). A reduction — many images in,
+one out — is a different thing again: see `Reducer` in
+[src/core/reduction.h](src/core/reduction.h), which streams `Begin`/`Accept`/
+`Finish` so an accumulator never holds the whole group. `stitch_panorama` is
+the one reduction that *must* hold every frame, because its canvas size depends
+on where the last one lands.
+
+### Changing the output's size
+
+The pipeline allocates each output from input 0 before the algorithm runs,
+which is right for the overwhelming majority: a blur, a tone map and a demosaic
+all produce one output pixel per input pixel. An algorithm that changes the
+raster says so:
+
+```cpp
+ImageDesc OutputDesc(int port, const ImageDesc& in) const override {
+    ImageDesc d = in;
+    d.width  = /* ... */;
+    d.height = /* ... */;
+    return d;
+}
+```
+
+A hook rather than a port declaration, because the size is not a property of
+the algorithm the way its format is — the same crop produces a different
+descriptor for every setting of its sliders, where a format never varies with a
+parameter. Returning `in` unchanged is the default and is what every other
+algorithm wants.
+
+The bypass path checks this: an algorithm whose `OutputDesc` differs from its
+input cannot be aliased away even when `IsNoOp()` is true, because downstream
+would get a raster of the wrong dimensions.
+
 ### Shared utilities
 
 Common building blocks live in [src/algo_util/](src/algo_util/) rather than
@@ -114,6 +192,18 @@ being algorithms themselves. Currently:
   per pixel instead of O(r²). The difference between a usable and an unusable
   local thresholder at large window sizes.
 - `MinMaxFilter` — windowed min/max in two separable passes, O(2r) per pixel.
+- `features.h` — `Keypoint`, `DescriptorSet` (which carries its own *kind*, so
+  a matcher picks L2 or Hamming from the data rather than being told),
+  `FeatureSidecar`, `MatchSidecar`, and `Percentile99()`. That last one is
+  worth knowing about even outside the detectors: `ValueScale()` converts the
+  *format*, and a scene-referred raw sits in the bottom sixth of 0..1 whatever
+  its format, so any threshold expressed as "a fraction of the range" has to be
+  measured against the image's own level or it means nothing on a raw.
+- `transform.h` — `Affine` (eight parameters: a homography with its
+  bottom-right entry pinned at 1), `SampleBilinear`, and the transform sidecar.
+  Note that pinning: a stored rotation-induced homography does **not** have
+  determinant 1, because `From3x3` normalises by h22. Do not use the
+  determinant as a health check.
 - `PixelBuffer` — unpacks an image to flat floats and packs it back, so a
   spatial filter gets branch-free neighbour access and correct handling of every
   format without repeating the format switch. `AtClamped()` gives the

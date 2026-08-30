@@ -273,20 +273,25 @@ src => gaussian_blur(sigma = sigma) => display("blurred")
 ```
 
 More in [scripts/](scripts/) — `hdr.tgl`, `stack.tgl`, `tonemap_compare.tgl`
-and `pipe.tgl` are good starting points.
+and `pipe.tgl` are good starting points; `panorama.tgl`, `features.tgl`,
+`matching.tgl`, `align_features.tgl` and `crop.tgl` cover the feature pipeline.
+Each carries its reasoning in comments, including the measurements behind the
+defaults.
 
 ---
 
 ## Algorithms
 
-39 registered. `choose("x", "category")` offers every algorithm in a category,
+52 registered. `choose("x", "category")` offers every algorithm in a category,
 so these names are the ones that matter in a script.
 
 | Category | Algorithms |
 |---|---|
-| **adjust** | `basic_adjust` (exposure, contrast, highlights, shadows, whites, blacks, vibrance, saturation, white balance), `brightness` |
+| **adjust** | `basic_adjust` (exposure, contrast, highlights, shadows, whites, blacks, vibrance, saturation, white balance), `brightness`, `crop` (trim and straighten, with a preview) |
 | **tonemap** | `tonemap` (global), `tonemap_local` (illumination/detail split) |
-| **merge** | `merge_hdr`, `merge_mean`, `align`, `reshape` |
+| **features** | `detect_sift`, `detect_surf`, `detect_akaze`, `detect_orb`, `detect_brisk`, `draw_features`, `draw_matches` |
+| **match** | `match_brute` (exact), `match_ann` (k-d forest / LSH) |
+| **merge** | `merge_hdr`, `merge_mean`, `align`, `align_features`, `bundle_adjust`, `stitch_panorama`, `reshape` |
 | **demosaic** | `demosaic_ahd`, `demosaic_consistent`, `demosaic_malvar`, `demosaic_bilinear`, `demosaic_passthrough`, `hot_pixel_repair` |
 | **denoise** | `wavelet_denoise` |
 | **filter** | `gaussian_blur`, `box_blur`, `median_blur`, `bilateral`, `guided_filter`, `nonlocal_means`, `anisotropic_diffusion`, `kuwahara`, `kuwahara_generalized`, `symmetric_nearest` |
@@ -297,12 +302,96 @@ so these names are the ones that matter in a script.
 Most have a GPU kernel and fall back to the CPU if it fails — **always saying
 so** in Status rather than merely running slower.
 
+### Features, alignment and panoramas
+
+Five detectors, two matchers, and the stages that turn matches into a stitched
+panorama. They connect through **sidecars** rather than ports: a detector
+attaches keypoints to the image it was given, a matcher reads those and attaches
+match sets, and an aligner reads those. Nothing in the chain has to be told what
+came before it.
+
+```
+frames => detect_orb()
+       => match_brute(chain = 1, window = 2)
+       => align_features(model = 2)
+       => bundle_adjust()
+       => stitch_panorama(projection = 1)
+       => display("panorama")
+```
+
+**Which detector.** The scale-space three cost 8–10 s per 45 MP frame; the
+binary two cost about 3. Measured end to end on one pair of a real sweep,
+through matching and the RANSAC solve:
+
+| detector | time | matched | inliers |
+|---|---|---|---|
+| `detect_orb` | 12.7 s | 11% | 90% |
+| `detect_brisk` | 17.0 s | 36% | 91% |
+| `detect_sift` | 23.8 s | 52% | 86% |
+| `detect_surf` | 26.7 s | 57% | 85% |
+| `detect_akaze` | 28.1 s | 21% | 86% |
+
+ORB and BRISK are not merely the fast pair, they produce the *highest* inlier
+rates here. A low match count is not a problem when a homography needs four
+points and gets hundreds. Prefer ORB for speed, BRISK when frames differ in
+scale (it refines scale continuously; ORB can only name a pyramid level).
+
+SURF is **patented** (ETH Zurich) and included anyway for a research tool that
+is not being sold — check your position before shipping anything built on it.
+
+**Descriptors travel with the data.** SIFT and SURF produce floats compared by
+L2; AKAZE, ORB and BRISK produce bit strings compared by Hamming. A matcher
+given the wrong distance still returns matches and they are garbage, so the kind
+is carried on the descriptor set and the matcher reads it rather than being
+told. Nothing in a script names a descriptor type.
+
+**`chain = 1` is what a panorama needs.** Every other group script matches each
+frame against frame 0, which is right for a bracket and wrong for a sweep:
+measured on 15 frames, the fraction of candidates kept against frame 0 decayed
+45% → 32% → 17% → 5% → 2%, and the last frame failed to solve. Consecutive
+neighbours hold 40–94% inliers throughout. `window` extends that to several
+predecessors, which is what gives `bundle_adjust` constraints beyond the chain.
+
+**`model = 2` (homography) for a pan.** A rotation about the camera centre is a
+homography and nothing simpler. From the same 158 matches on one pair:
+similarity 41% inliers, affine 41%, homography 93%. On a tripod bracket the
+opposite holds — see `scripts/align_features.tgl`.
+
+**`bundle_adjust` removes what the chain accumulates.** Solving links
+independently and composing them in sequence lets each link's residual pile up;
+by mid-panorama that is tens of pixels, which reads as a doubled ridgeline when
+zoomed in. Bundle adjustment re-solves every rotation simultaneously against
+every match. Measured: reprojection RMS 28 px → 4.7 px, and the ghosting goes.
+
+Three angles per frame plus a shared focal length, so 46 unknowns for 15 frames
+— a dense 46×46 normal-equation system, which is why there is no dependency on
+a sparse solver library.
+
+**The projection is not decoration.** Chaining homographies multiplies their
+perspective terms, so a wide pan on a flat canvas diverges: along one sweep the
+width each frame mapped to ran 5796 → 7059 → 12650, and by frame 14 the canvas
+wanted 169842 megapixels. `stitch_panorama` extracts the *rotation* from each
+transform and projects onto a cylinder (0 plane, 1 cylindrical, 2 spherical).
+Same frames, same links, 11372×3912.
+
+Its report gives the focal length it estimated — from the geometry, not from
+EXIF, so it needs no sensor size — and how much the frames **disagree** where
+they overlap. That last number is the direct measure of stitch quality;
+sharpness is not, because sharpness also moves with how much the canvas was
+scaled.
+
 ### Notes on a few
 
 - **`align`** solves each frame of a group against a reference and attaches the
   transform as a sidecar; it warps nothing itself. Merges sample through it if
   present. A correction below half a pixel is skipped when there is no other
   transform to fold into, because the resample costs more than it gains.
+- **`crop`** trims and straightens in one stage, because they are one
+  operation: rotating leaves empty corner wedges that have to be cropped, and
+  cropping first puts them back. `preview` draws the crop rectangle on the full
+  frame instead of returning the cropped raster — which is what makes it usable
+  interactively, since the part being cut away is otherwise off screen the
+  moment a slider moves.
 - **`merge_hdr`** reads shutter, aperture and ISO from EXIF and divides them
   out, producing scene-linear radiance with real headroom.
 - **`tonemap` vs `tonemap_local`** — the global operator applies one curve to
@@ -362,6 +451,22 @@ src/
   a histogram pins the algorithm to the CPU.
 - **Tonal control ranges do not follow the pixel format.** `threshold`'s level
   is fixed at 0..255, so on a float image everything falls below it.
+- **A chained match is by list order.** `chain = 1` pairs frame *i* with frame
+  *i−1* as the group holds them, so frames out of order pair views that were
+  never adjacent. That fails *confidently* — a spurious pairing was measured at
+  91% inliers, indistinguishable from a real one by rate alone — so the aligner
+  rejects any solve displacing a frame more than 1.5 frame widths and says why.
+  Sort a group by name or date before stitching.
+- **`detect_akaze` matches poorly on a wide pan.** 55% inliers against ORB's
+  92% on the same frames, which is enough to leave `bundle_adjust` stuck at
+  25 px RMS where ORB reaches 4.7. The focal estimate is clamped to a sane
+  field of view to stop it running away, which treats the symptom; the match
+  quality itself is not yet diagnosed.
+- **The overlap-disagreement metric measures more than alignment.** Two frames
+  with a 3.9 px reprojection RMS still report ~10%, because it is luminance
+  variance and a handheld pan has real exposure and vignetting differences
+  between frames. Useful for comparing runs on the same data; not an absolute
+  scale.
 
 ---
 
