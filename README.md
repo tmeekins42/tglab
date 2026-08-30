@@ -336,6 +336,13 @@ rates here. A low match count is not a problem when a homography needs four
 points and gets hundreds. Prefer ORB for speed, BRISK when frames differ in
 scale (it refines scale continuously; ORB can only name a pyramid level).
 
+**All of them are accurate enough for alignment.** Through the full pipeline on
+the same 15-frame sweep, the final reprojection RMS is 1.38 px (ORB), 1.36
+(BRISK), 1.37 (AKAZE), 1.97 (SIFT), with the focal estimates agreeing within
+4%. Detector choice is a speed and match-count decision, not an accuracy one —
+so the pairwise inlier rates above are worth reading as "how much work the
+solver has to do", not "how good the answer will be".
+
 SURF is **patented** (ETH Zurich) and included anyway for a research tool that
 is not being sold — check your position before shipping anything built on it.
 
@@ -361,7 +368,14 @@ opposite holds — see `scripts/align_features.tgl`.
 independently and composing them in sequence lets each link's residual pile up;
 by mid-panorama that is tens of pixels, which reads as a doubled ridgeline when
 zoomed in. Bundle adjustment re-solves every rotation simultaneously against
-every match. Measured: reprojection RMS 28 px → 4.7 px, and the ghosting goes.
+every match. Measured: reprojection RMS 26 px → 1.4 px, and the ghosting goes.
+
+It uses only the matches RANSAC verified. That distinction is worth knowing:
+a robust loss down-weights an outlier but does not *remove* it, and cannot
+rescue a fit the outliers already moved — the weights come from residuals
+against the current estimate, so if that estimate is wrong the wrong points look
+right. Feeding it every match left one detector stalled at 25 px where filtering
+took it to 1.37.
 
 Three angles per frame plus a shared focal length, so 46 unknowns for 15 frames
 — a dense 46×46 normal-equation system, which is why there is no dependency on
@@ -457,11 +471,6 @@ src/
   91% inliers, indistinguishable from a real one by rate alone — so the aligner
   rejects any solve displacing a frame more than 1.5 frame widths and says why.
   Sort a group by name or date before stitching.
-- **`detect_akaze` matches poorly on a wide pan.** 55% inliers against ORB's
-  92% on the same frames, which is enough to leave `bundle_adjust` stuck at
-  25 px RMS where ORB reaches 4.7. The focal estimate is clamped to a sane
-  field of view to stop it running away, which treats the symptom; the match
-  quality itself is not yet diagnosed.
 - **The overlap-disagreement metric measures more than alignment.** Two frames
   with a 3.9 px reprojection RMS still report ~10%, because it is luminance
   variance and a handheld pan has real exposure and vignetting differences
