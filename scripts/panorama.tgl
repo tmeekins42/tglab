@@ -1,0 +1,128 @@
+# Panorama stitching: detect -> match(chained) -> align -> project.
+#
+# Drop a sweep of frames into the palette, in the order they were shot, and
+# this stitches them. Everything here is the ordinary feature pipeline until
+# the last stage; what makes it a panorama rather than a merge is two settings
+# and one algorithm.
+#
+# CHAIN THE MATCHER. Every other group script matches each frame against frame
+# 0, which is right for a bracket of one scene and wrong for a sweep. Measured
+# on a 15-frame handheld pan at 24mm, matching everything against frame 0:
+#
+#   frame 3:  45% of candidates kept, solves at 85% inliers
+#   frame 7:  32%, solves at 87%
+#   frame 9:  17%, and the solve claims a 35000 px shift
+#   frame 14:  2%, and the solve FAILS
+#
+# The overlap simply runs out. Consecutive frames of the same sweep hold 40-94%
+# inliers on hundreds of matches all the way to the end -- so the information
+# was always there and the pairing was wrong. `chain = 1` matches each frame to
+# the one before it, and the aligner composes the links into one coordinate
+# system.
+#
+# The absurd shifts are the useful warning, not the failure: a homography
+# fitted to matches crowded into one corner is unconstrained everywhere else,
+# and extrapolates. It reports nonsense confidently.
+#
+# USE THE HOMOGRAPHY (model = 2). A pan is a rotation about the camera centre,
+# which is a homography and nothing simpler. On one pair from this sweep, from
+# the SAME 158 matches:
+#
+#   similarity   41% inliers
+#   affine       41%
+#   homography   93%
+#
+# Those two extra parameters more than double the inliers. (On a tripod bracket
+# the opposite holds -- see align_features.tgl. More parameters is not free, it
+# is right here specifically.)
+#
+# THE PROJECTION IS NOT DECORATION. Chaining homographies COMPOSES them, and
+# composition multiplies their perspective terms. Along this sweep the width
+# each frame mapped to ran 5796, 6108, 7059, 10647, 12650 -- each frame
+# stretched more than the last, and by frame 14 the canvas wanted 169842
+# megapixels. The individual links were all fine; the plane model cannot hold a
+# wide pan, because a flat canvas goes to infinity 90 degrees from where it
+# touches the sphere.
+#
+# stitch_panorama fixes that by extracting the ROTATION from each homography
+# and projecting onto a cylinder. Same frames, same links, 11274x3997.
+#
+#   projection = 0   plane. Right for 2-3 frames; diverges past ~90 degrees.
+#   projection = 1   cylindrical. The default: a single-row pan, 360 degrees
+#                    without divergence, verticals stay vertical.
+#   projection = 2   spherical. Multi-row, and the only one that can hold a
+#                    full sphere.
+#
+# READ THE REPORT. The stitcher measures how much the frames DISAGREE where
+# they overlap, which is the direct measure of stitch quality -- sharpness is
+# not, because it also moves with how much the canvas was scaled. On this sweep
+# it runs 6-16% for a single pair and climbs with chain length (12.7% at two
+# frames, 20.6% at eight) as the links accumulate error. If it says "CHAIN
+# BROKE at frame N", the frames past N are unaligned: shoot more overlap there.
+
+# WHICH DETECTOR. A panorama does not need SIFT's descriptor quality, and the
+# detector is most of the runtime -- on a 45 MP frame the scale-space detectors
+# cost 8-10 seconds EACH. Measured on one pair from this sweep, end to end
+# through matching and the RANSAC solve:
+#
+#   detector   time    matched   inliers
+#   orb        12.7 s   11%       90%
+#   brisk      17.0 s   36%       91%
+#   sift       23.8 s   52%       86%
+#   surf       26.7 s   57%       85%
+#   akaze      28.1 s   21%       86%
+#
+# ORB and BRISK are the fast pair, and they are not merely acceptable here --
+# they produce the HIGHEST inlier rates of the five. A lower match count is not
+# a problem when a homography needs four points and gets hundreds; what matters
+# is that the ones kept are right.
+#
+# The whole 15-frame stitch: ORB 120 s, BRISK 144 s, SIFT 181 s, with
+# essentially identical results (overlap disagreement 23.8%, 23.6%, 24.1%).
+#
+# Prefer ORB for speed and BRISK when the frames differ in scale -- BRISK
+# refines scale continuously through intra-octave layers where ORB can only
+# name a pyramid level. Reach for SIFT only if a pair refuses to solve.
+
+frames = image("group")
+
+det = choose("detector", [detect_orb, detect_brisk, detect_sift,
+                          detect_surf, detect_akaze])
+
+proj = slider("projection: 0 plane, 1 cylinder, 2 sphere", 0, 2, 1)
+
+# focal 0 estimates from the solved homographies rather than from EXIF -- no
+# sensor size needed, and it cannot disagree with the geometry actually solved.
+# Set it in PIXELS if the estimate looks wrong; the report prints what it used
+# and the field of view that implies.
+focal = slider("focal (px, 0 = estimate)", 0, 20000, 0)
+
+# BUNDLE ADJUSTMENT is what removes the ghosting a long chain leaves.
+# align_features solves each link on its own and composes them in sequence, so
+# every link's small residual accumulates: by the middle of a 15-frame sweep it
+# is tens of pixels, which reads as a doubled ridgeline when you zoom in.
+#
+# bundle_adjust re-solves ALL the rotations simultaneously against ALL the
+# matches, so an error is spread across every constraint that disagrees with it
+# rather than pushed down the chain. Measured on this sweep it takes the
+# reprojection RMS from 28 px to 4.7 px, and the ghosting visibly goes.
+#
+# Read the two numbers in its report. The FIRST is how well the chain's own
+# transforms already fit -- if that is large, something upstream is wrong and no
+# amount of adjusting will save it. The SECOND is what it converged to; a few
+# pixels is healthy on 45 MP frames.
+#
+# `window` on the matcher is what gives it something to work with beyond the
+# chain: each frame matches that many predecessors, not just one. Measured here
+# it changed the result barely at all, which is worth knowing -- the chain
+# constraints were already sufficient on this data.
+
+frames => det()
+       => match_brute(chain = 1, window = 2)
+       => align_features(model = 2)
+       => bundle_adjust()
+       => stitch_panorama(projection = proj, focal = focal)
+       => display("panorama")       
+       => params( crop ) ()       
+       => params( basic_adjust , auto_exposure = 1)()       
+       => display("final")
