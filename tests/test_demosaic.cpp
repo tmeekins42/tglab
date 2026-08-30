@@ -962,6 +962,111 @@ int main() {
                     }
                 }
 
+                // crop, CPU against GPU, in BOTH modes.
+                //
+                // Both, because they are different code paths that happen to
+                // share a kernel: applied resamples through a rotation, preview
+                // draws a polygon. A wiring mistake in one would not show in
+                // the other -- and the applied path is also the only algorithm
+                // here whose OUTPUT IS A DIFFERENT SIZE than its input, so this
+                // doubles as the check that OutputDesc reaches the GPU
+                // dispatch. It does: the shader's Width/Height and the thread
+                // grid both come from outputs[0], which is already the cropped
+                // raster by the time it is bound.
+                for (int preview = 0; preview <= 1; ++preview) {
+                    auto runCrop = [&](ExecMode mode, ComputeContext* g, Image* out) {
+                        auto algo = Registry::Get().Create("crop");
+                        if (!algo) return false;
+                        auto set = [&](const char* n, double v) {
+                            if (ParamBase* pb = algo->FindParam(n)) {
+                                std::string e; pb->SetFromScript(Value(v), &e);
+                            }
+                        };
+                        set("preview", double(preview));
+                        set("left", 0.15); set("right", 0.10);
+                        set("top", 0.20);  set("bottom", 0.05);
+                        // Rotated: an unrotated crop is a pure copy and would
+                        // agree even if the sampling were wrong.
+                        set("angle", 5.0);
+
+                        // A gradient with fine checker detail, so bilinear
+                        // sampling under rotation actually has something to
+                        // disagree about. A smooth ramp would agree between
+                        // any two interpolators.
+                        constexpr int kCW = 96, kCH = 72;
+                        Image src;
+                        ImageDesc cd{kCW, kCH, Format::RGBA32F};
+                        src.Alloc(cd);
+                        {
+                            ImageView v = src.MapCpuWrite();
+                            for (int y = 0; y < kCH; ++y)
+                                for (int x = 0; x < kCW; ++x) {
+                                    float* p = v.At<float>(x, y);
+                                    const float check =
+                                        (((x / 3) + (y / 3)) & 1) ? 0.7f : 0.2f;
+                                    p[0] = float(x) / float(kCW) * check;
+                                    p[1] = float(y) / float(kCH) * check;
+                                    p[2] = check;
+                                    p[3] = 1.0f;
+                                }
+                        }
+
+                        std::vector<Data> srcs;
+                        srcs.push_back(Data{std::move(src)});
+                        Pipeline p;
+                        p.AddStage(std::move(algo), "crop", {{-1, 0}}, 1, 1);
+                        std::string e;
+                        if (!p.Execute(&srcs, nullptr, &e, g, mode)) return false;
+                        const Data* d = p.Resolve({0, 0}, &srcs);
+                        const auto* im = d ? std::get_if<Image>(d) : nullptr;
+                        if (!im) return false;
+                        *out = const_cast<Image&>(*im).Clone();
+                        return true;
+                    };
+
+                    Image cpuOut, gpuOut;
+                    const bool okCpu = runCrop(ExecMode::ForceCPU, nullptr, &cpuOut);
+                    const bool okGpu = runCrop(ExecMode::ForceGPU, &gpu, &gpuOut);
+                    const char* what = preview ? "preview" : "applied";
+
+                    if (okCpu && okGpu) {
+                        Check(cpuOut.Desc().width == gpuOut.Desc().width &&
+                              cpuOut.Desc().height == gpuOut.Desc().height,
+                              std::string("crop ") + what +
+                                  ": both paths agree on the output size (" +
+                                  std::to_string(cpuOut.Desc().width) + "x" +
+                                  std::to_string(cpuOut.Desc().height) + " vs " +
+                                  std::to_string(gpuOut.Desc().width) + "x" +
+                                  std::to_string(gpuOut.Desc().height) + ")");
+
+                        ImageView a = cpuOut.MapCpuRead();
+                        ImageView b = gpuOut.MapCpuRead();
+                        if (a.desc.width == b.desc.width &&
+                            a.desc.height == b.desc.height) {
+                            double worst = 0.0;
+                            for (int y = 0; y < a.desc.height; ++y)
+                                for (int x = 0; x < a.desc.width; ++x)
+                                    for (int c = 0; c < 3; ++c)
+                                        worst = std::max(worst,
+                                            std::abs(double(a.At<float>(x, y)[c]) -
+                                                     double(b.At<float>(x, y)[c])));
+                            // Tight: both paths do the same four loads and
+                            // three lerps, so only float rounding separates
+                            // them. The preview's line COLOUR legitimately
+                            // differs between paths on a float image -- see
+                            // GpuConstants -- but the fixture's rectangle sits
+                            // inside the frame and the line is a few pixels of
+                            // it, so it does not dominate this.
+                            Check(worst < 0.05,
+                                  std::string("crop ") + what +
+                                      " GPU matches CPU (worst " +
+                                      std::to_string(worst) + ")");
+                        }
+                    } else {
+                        Check(false, std::string("crop ") + what + " ran both ways");
+                    }
+                }
+
                 gpu.Shutdown();
             }
             dev->Release();

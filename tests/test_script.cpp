@@ -4255,7 +4255,96 @@ int main() {
         };
 
         if (haveFile) {
-            for (const char* name : {"detect_sift", "detect_surf", "detect_akaze"}) {
+            // THE CAP MUST NOT TRUNCATE SPATIALLY.
+            //
+            // Every detector here scans top-to-bottom, so a cap applied by
+            // STOPPING the scan keeps everything above some scanline and
+            // nothing below it. That is not "fewer features" -- it is a
+            // contiguous band of the frame with none at all, and if that band
+            // is where the next frame overlaps, the pair cannot be matched.
+            //
+            // Tim found it on a panorama: the right-hand end failed to align
+            // while the feature count sat pinned at max_features. Measured on
+            // the pair that failed, before and after: 2% of candidates kept and
+            // 0% inliers, against 11% and 64% -- at the SAME cap.
+            //
+            // Three of the five detectors had it. ORB was the exception, and
+            // ranking by response then capping is what it was already doing.
+            //
+            // The test: cap hard, and require features in the BOTTOM of the
+            // frame. A truncating detector puts none there at all.
+            for (const char* name : {"detect_sift", "detect_surf", "detect_akaze",
+                                     "detect_orb", "detect_brisk"}) {
+                auto algo = Registry::Get().Create(name);
+                if (!algo) continue;
+                if (ParamBase* pb = algo->FindParam("max_features")) {
+                    std::string e; pb->SetFromScript(Value(40.0), &e);
+                }
+
+                std::vector<Data> s;
+                s.push_back(Data{photo.Clone()});
+                Pipeline p;
+                p.AddStage(std::move(algo), name, {{-1, 0}}, 1, 1);
+                std::string e;
+                if (!p.Execute(&s, nullptr, &e)) { Check(false, std::string(name) + " ran"); continue; }
+                const Data* d = p.Resolve({0, 0}, &s);
+                const auto* im = d ? std::get_if<Image>(d) : nullptr;
+                const FeatureSidecar* fs = im ? FeaturesOf(*im) : nullptr;
+                if (!fs || fs->keypoints.empty()) continue;
+
+                // THE PROPERTY IS "STRONGEST KEPT", not "spread over the frame".
+                //
+                // Counting features in the lower half was the obvious test and
+                // it does NOT work: reintroducing the truncation bug leaves it
+                // passing, because assets/test.png yields fewer candidates than
+                // the cap in its upper half, so nothing is ever truncated away.
+                // A test that passes with the bug present is worse than none.
+                //
+                // What truncation actually breaks is the RANKING: a scan that
+                // stops early keeps whatever it met first, regardless of
+                // strength. So compare against the uncapped run -- every
+                // capped feature must be among the strongest the detector
+                // found, which raster-order truncation cannot satisfy unless
+                // the image happens to be sorted.
+                auto uncapped = Registry::Get().Create(name);
+                if (ParamBase* pb = uncapped->FindParam("max_features")) {
+                    std::string e2; pb->SetFromScript(Value(50000.0), &e2);
+                }
+                std::vector<Data> s2;
+                s2.push_back(Data{photo.Clone()});
+                Pipeline p2;
+                p2.AddStage(std::move(uncapped), name, {{-1, 0}}, 1, 1);
+                std::string e2;
+                if (!p2.Execute(&s2, nullptr, &e2)) continue;
+                const Data* d2 = p2.Resolve({0, 0}, &s2);
+                const auto* im2 = d2 ? std::get_if<Image>(d2) : nullptr;
+                const FeatureSidecar* all = im2 ? FeaturesOf(*im2) : nullptr;
+                if (!all || all->keypoints.size() <= fs->keypoints.size()) continue;
+
+                // The response of the 40th strongest, uncapped.
+                std::vector<float> resp;
+                resp.reserve(all->keypoints.size());
+                for (const Keypoint& k : all->keypoints)
+                    resp.push_back(std::abs(k.response));
+                const size_t nth = fs->keypoints.size() - 1;
+                std::nth_element(resp.begin(), resp.begin() + nth, resp.end(),
+                                 std::greater<float>());
+                const float cutoff = resp[nth];
+
+                int weak = 0;
+                for (const Keypoint& k : fs->keypoints)
+                    if (std::abs(k.response) < cutoff * 0.999f) ++weak;
+
+                Check(weak == 0,
+                      std::string(name) + ": a hard cap keeps the STRONGEST "
+                      "features, not the first ones scanned (" +
+                          std::to_string(weak) + " of " +
+                          std::to_string(fs->keypoints.size()) +
+                          " were weaker than the cutoff)");
+            }
+
+            for (const char* name : {"detect_sift", "detect_surf", "detect_akaze",
+                                     "detect_orb", "detect_brisk"}) {
                 Image a = photo.Clone();
                 Image b = shift(photo, 11, -6);
 
@@ -4408,10 +4497,10 @@ int main() {
             Check(ok, "detect then match_brute runs" + (ok ? "" : ": " + merr));
 
             if (ok) {
-                Check(!ms->matches.empty(),
-                      "it finds matches (" + std::to_string(ms->matches.size()) + ")");
-                Check(ms->reference == 0, "the match set names its reference");
-                Check(ms->considered >= int(ms->matches.size()),
+                Check(!ms->Matches().empty(),
+                      "it finds matches (" + std::to_string(ms->Matches().size()) + ")");
+                Check(ms->Reference() == 0, "the match set names its reference");
+                Check(ms->considered >= int(ms->Matches().size()),
                       "candidates considered is at least matches kept");
 
                 // EVERY match must be geometrically right. The two frames
@@ -4419,7 +4508,7 @@ int main() {
                 // separated by exactly that -- which makes this a test of the
                 // matches rather than of how many there are.
                 int correct = 0;
-                for (const Match& m : ms->matches) {
+                for (const Match& m : ms->Matches()) {
                     if (m.a < 0 || m.a >= int(fa->keypoints.size())) continue;
                     if (m.b < 0 || m.b >= int(fb->keypoints.size())) continue;
                     const Keypoint& ka = fa->keypoints[size_t(m.a)];
@@ -4431,14 +4520,14 @@ int main() {
                 // 90% is a high bar and the right one: with the ratio test and
                 // cross check both on, a matcher that is working should have
                 // very few wrong pairs. Measured here at 99%.
-                Check(correct * 10 >= int(ms->matches.size()) * 9,
+                Check(correct * 10 >= int(ms->Matches().size()) * 9,
                       "matches are geometrically correct (" +
                           std::to_string(correct) + " of " +
-                          std::to_string(ms->matches.size()) + ")");
+                          std::to_string(ms->Matches().size()) + ")");
 
                 // Every match's ratio must satisfy the test that produced it.
                 bool ratiosOk = true;
-                for (const Match& m : ms->matches)
+                for (const Match& m : ms->Matches())
                     if (m.ratio > 0.8f + 1e-4f) ratiosOk = false;
                 Check(ratiosOk, "every kept match passes the ratio threshold");
             }
@@ -4454,13 +4543,13 @@ int main() {
                 std::string e2;
                 if (detectAndMatch("detect_sift", "match_brute", 1.0, false,
                                    &ga, &gb, &gms, &p2, &s2, &e2) && ok) {
-                    Check(gms->matches.size() > ms->matches.size(),
+                    Check(gms->Matches().size() > ms->Matches().size(),
                           "disabling the ratio test keeps more candidates (" +
-                              std::to_string(gms->matches.size()) + " vs " +
-                              std::to_string(ms->matches.size()) + ")");
+                              std::to_string(gms->Matches().size()) + " vs " +
+                              std::to_string(ms->Matches().size()) + ")");
 
                     int wrong = 0;
-                    for (const Match& m : gms->matches) {
+                    for (const Match& m : gms->Matches()) {
                         if (m.a < 0 || m.a >= int(ga->keypoints.size())) continue;
                         if (m.b < 0 || m.b >= int(gb->keypoints.size())) continue;
                         const Keypoint& ka = ga->keypoints[size_t(m.a)];
@@ -4492,12 +4581,12 @@ int main() {
                                    &aa, &ab, &ams, &p3, &s3, &e3)) {
                     Check(aa->descriptors.kind == DescriptorKind::Binary,
                           "the AKAZE run really is binary");
-                    Check(!ams->matches.empty(),
+                    Check(!ams->Matches().empty(),
                           "binary descriptors match too (" +
-                              std::to_string(ams->matches.size()) + ")");
+                              std::to_string(ams->Matches().size()) + ")");
 
                     int correct = 0;
-                    for (const Match& m : ams->matches) {
+                    for (const Match& m : ams->Matches()) {
                         if (m.a < 0 || m.a >= int(aa->keypoints.size())) continue;
                         if (m.b < 0 || m.b >= int(ab->keypoints.size())) continue;
                         const Keypoint& ka = aa->keypoints[size_t(m.a)];
@@ -4506,10 +4595,10 @@ int main() {
                         const float ey = (kb.y - float(kDy)) - ka.y;
                         if (std::sqrt(ex * ex + ey * ey) < 3.0f) ++correct;
                     }
-                    Check(correct * 10 >= int(ams->matches.size()) * 9,
+                    Check(correct * 10 >= int(ams->Matches().size()) * 9,
                           "binary matches are geometrically correct (" +
                               std::to_string(correct) + " of " +
-                              std::to_string(ams->matches.size()) + ")");
+                              std::to_string(ams->Matches().size()) + ")");
                 }
             }
         }
@@ -4595,12 +4684,12 @@ int main() {
             // PAIRS rather than counts: two matchers can return the same number
             // of matches and disagree about every one.
             auto recall = [](const MatchSidecar& exact, const MatchSidecar& approx) {
-                if (exact.matches.empty()) return 1.0;
+                if (exact.Matches().empty()) return 1.0;
                 int found = 0;
-                for (const Match& e : exact.matches)
-                    for (const Match& a : approx.matches)
+                for (const Match& e : exact.Matches())
+                    for (const Match& a : approx.Matches())
                         if (a.a == e.a && a.b == e.b) { ++found; break; }
-                return double(found) / double(exact.matches.size());
+                return double(found) / double(exact.Matches().size());
             };
 
             // FLOAT: the k-d forest.
@@ -4631,7 +4720,7 @@ int main() {
                     // approximation costs recall, not precision, and if this
                     // failed the ratio test would be being applied wrongly.
                     int correct = 0;
-                    for (const Match& m : ams->matches) {
+                    for (const Match& m : ams->Matches()) {
                         if (m.a < 0 || m.a >= int(aa->keypoints.size())) continue;
                         if (m.b < 0 || m.b >= int(ab->keypoints.size())) continue;
                         const Keypoint& ka = aa->keypoints[size_t(m.a)];
@@ -4640,11 +4729,11 @@ int main() {
                         const float ey = (kb.y - float(kDy)) - ka.y;
                         if (std::sqrt(ex * ex + ey * ey) < 3.0f) ++correct;
                     }
-                    Check(ams->matches.empty() ||
-                          correct * 10 >= int(ams->matches.size()) * 8,
+                    Check(ams->Matches().empty() ||
+                          correct * 10 >= int(ams->Matches().size()) * 8,
                           "and they are geometrically correct (" +
                               std::to_string(correct) + " of " +
-                              std::to_string(ams->matches.size()) + ")");
+                              std::to_string(ams->Matches().size()) + ")");
                 }
 
                 // MORE CHECKS MUST FIND MORE. If recall did not climb with the
@@ -4683,12 +4772,12 @@ int main() {
                       (okA ? "" : ": " + e2));
 
                 if (okE && okA) {
-                    Check(!ams->matches.empty(),
+                    Check(!ams->Matches().empty(),
                           "LSH finds matches (" +
-                              std::to_string(ams->matches.size()) + ")");
+                              std::to_string(ams->Matches().size()) + ")");
 
                     int correct = 0;
-                    for (const Match& m : ams->matches) {
+                    for (const Match& m : ams->Matches()) {
                         if (m.a < 0 || m.a >= int(aa->keypoints.size())) continue;
                         if (m.b < 0 || m.b >= int(ab->keypoints.size())) continue;
                         const Keypoint& ka = aa->keypoints[size_t(m.a)];
@@ -4697,10 +4786,10 @@ int main() {
                         const float ey = (kb.y - float(kDy)) - ka.y;
                         if (std::sqrt(ex * ex + ey * ey) < 3.0f) ++correct;
                     }
-                    Check(correct * 10 >= int(ams->matches.size()) * 8,
+                    Check(correct * 10 >= int(ams->Matches().size()) * 8,
                           "LSH matches are geometrically correct (" +
                               std::to_string(correct) + " of " +
-                              std::to_string(ams->matches.size()) + ")");
+                              std::to_string(ams->Matches().size()) + ")");
                 }
             }
         }
@@ -4790,7 +4879,7 @@ int main() {
                 if (!os || os->images.size() != 2) return false;
                 *got = TransformOf(os->images[1]);
                 const MatchSidecar* ms = MatchesOf(os->images[1]);
-                *inliers = ms ? int(ms->matches.size()) : 0;
+                *inliers = ms ? int(ms->Matches().size()) : 0;
                 if (p.Stages().size() > 2 && p.Stages()[2].algo)
                     std::printf("        [dbg] %s\n",
                                 p.Stages()[2].algo->RunReport().c_str());
@@ -4931,6 +5020,712 @@ int main() {
                 }
             }
 
+            // CHAINED MATCHING, and the composition that has to follow it.
+            //
+            // This is the property a panorama depends on: with `chain` on, each
+            // frame matches its PREDECESSOR, and the aligner must then compose
+            // the links so every transform is relative to frame 0. Getting the
+            // composition wrong -- or omitting it -- produces transforms that
+            // are each individually correct against a neighbour, which looks
+            // like a stitch whose every seam is fine and whose whole is wrong.
+            //
+            // Three frames, each shifted a further 7 px right and 3 down. Frame
+            // 2's transform must come back as the SUM, 14 and 6, even though it
+            // was only ever matched against frame 1.
+            {
+                Affine step;
+                step.m[2] = 7.0f;
+                step.m[5] = 3.0f;
+
+                Affine twice;
+                twice.m[2] = 14.0f;
+                twice.m[5] = 6.0f;
+
+                ImageSet set;
+                set.images.push_back(photo.Clone());
+                set.images.push_back(warpBy(photo, step));
+                set.images.push_back(warpBy(photo, twice));
+                set.shape = Shape{{{"frame", 3}}};
+
+                std::vector<Data> s;
+                s.push_back(Data{std::move(set)});
+
+                Pipeline p;
+                p.AddStage(Registry::Get().Create("detect_sift"), "detect_sift",
+                           {{-1, 0}}, 1, 1);
+                auto m = Registry::Get().Create("match_brute");
+                if (ParamBase* pb = m->FindParam("chain")) {
+                    std::string e; pb->SetFromScript(Value(1.0), &e);
+                }
+                // A LOOSE ratio, for a reason specific to this fixture rather
+                // than to chaining. Every frame here is a resampled copy of one
+                // photo, so frame 2 has been through bilinear interpolation
+                // twice and its descriptors are measurably softer than frame
+                // 1's. At the stock 0.8 the 1->2 pair kept 16 of 360 candidates
+                // and the solve failed for want of points -- which the chain
+                // then correctly refused to compose past, reporting "CHAIN
+                // BROKE at frame 2".
+                //
+                // That is the fixture being harder than real frames, not the
+                // matcher being wrong: consecutive frames of an actual pan are
+                // each sampled once, from the sensor, and hold 40-94% inliers
+                // on hundreds of matches.
+                if (ParamBase* pb = m->FindParam("ratio")) {
+                    std::string e; pb->SetFromScript(Value(0.95), &e);
+                }
+                p.AddStage(std::move(m), "match_brute", {{0, 0}}, 1, 2);
+                auto a = Registry::Get().Create("align_features");
+                if (ParamBase* pb = a->FindParam("model")) {
+                    std::string e; pb->SetFromScript(Value(0.0), &e);  // similarity
+                }
+                p.AddStage(std::move(a), "align_features", {{1, 0}}, 1, 3);
+
+                std::string e;
+                const bool ran = p.Execute(&s, nullptr, &e);
+                Check(ran, "a chained detect -> match -> align runs" +
+                           std::string(ran ? "" : ": " + e));
+                if (ran) {
+                    for (size_t st = 1; st < p.Stages().size(); ++st)
+                        if (p.Stages()[st].algo)
+                            std::printf("        [dbg] %s\n",
+                                        p.Stages()[st].algo->RunReport().c_str());
+                    const Data* out = p.Resolve({2, 0}, &s);
+                    const auto* os = out ? std::get_if<ImageSet>(out) : nullptr;
+                    if (os && os->images.size() == 3) {
+                        // Frame 1 is one step; frame 2 must be TWO, which it
+                        // can only be if the links were composed.
+                        const float e1 = cornerError(TransformOf(os->images[1]), step);
+                        const float e2 = cornerError(TransformOf(os->images[2]), twice);
+                        Check(e1 < 1.0f,
+                              "chain: frame 1 matches its own step (" +
+                                  std::to_string(e1) + " px)");
+                        Check(e2 < 1.5f,
+                              "chain: frame 2 composed to twice the step (" +
+                                  std::to_string(e2) + " px)");
+
+                        // ...and the matcher really did pair 2 with 1, not with
+                        // 0. Without this the check above would also pass for a
+                        // matcher that ignored `chain` entirely, since frame 2
+                        // IS twice the step from frame 0.
+                        const MatchSidecar* ms = MatchesOf(os->images[2]);
+                        Check(ms && ms->Reference() == 1,
+                              "chain: frame 2 was matched against frame 1");
+                    } else {
+                        Check(false, "the chained group came back intact");
+                    }
+                }
+            }
+
+            // STITCHING, end to end on the same three chained frames.
+            //
+            // The properties worth asserting are geometric rather than
+            // pictorial: the canvas has to GROW to hold frames that no longer
+            // overlap, it has to stay near the source height for a horizontal
+            // pan, and the frames have to agree where they overlap. The last is
+            // the one that catches a stitcher that runs and produces nonsense.
+            {
+                // A ROTATION, not a translation, and the distinction is the
+                // whole reason the curved projections exist.
+                //
+                // The obvious fixture -- shift each frame 7 px sideways -- is
+                // the wrong question to ask them. A pure translation is not a
+                // rotation about the camera centre, so Orthonormalise
+                // correctly DISCARDS it, and all three frames land on top of
+                // each other: measured, the canvas came back 498 px from a
+                // 512 px source (smaller than one frame) with the overlap
+                // disagreeing by 9.6%, where the plane projection managed
+                // 526 px and 0.6%. That is not the curved path failing, it is
+                // the curved path declining to invent a rotation that did not
+                // happen.
+                //
+                // So the fixture pans the camera instead: H = K R K^-1 for a
+                // rotation of `deg` about the vertical axis, which is exactly
+                // what a tripod head produces and what the projections are
+                // built to undo.
+                const float kFocal = 600.0f;
+                auto panBy = [&](float deg) {
+                    ImageView v = photo.MapCpuRead();
+                    const float cx = 0.5f * float(v.desc.width);
+                    const float cy = 0.5f * float(v.desc.height);
+                    const float a  = deg * 3.14159265f / 180.0f;
+                    const float c = std::cos(a), s = std::sin(a);
+
+                    // R about the vertical axis.
+                    const float R[9] = {   c, 0.0f,    s,
+                                        0.0f, 1.0f, 0.0f,
+                                          -s, 0.0f,    c };
+
+                    // K R, then (K R) K^-1, each written out. Plainly rather
+                    // than through a general 3x3 multiply, because the point of
+                    // this fixture is that the transform really IS of the form
+                    // the stitcher assumes -- building it via a helper the
+                    // stitcher also uses would test the two against each other
+                    // rather than against the mathematics.
+                    float M[9];
+                    for (int c2 = 0; c2 < 3; ++c2) {
+                        M[0 * 3 + c2] = kFocal * R[0 * 3 + c2] + cx * R[2 * 3 + c2];
+                        M[1 * 3 + c2] = kFocal * R[1 * 3 + c2] + cy * R[2 * 3 + c2];
+                        M[2 * 3 + c2] =                               R[2 * 3 + c2];
+                    }
+                    // K^-1 = [[1/f, 0, -cx/f], [0, 1/f, -cy/f], [0, 0, 1]],
+                    // applied on the right.
+                    float N[9];
+                    for (int r = 0; r < 3; ++r) {
+                        N[r * 3 + 0] = M[r * 3 + 0] / kFocal;
+                        N[r * 3 + 1] = M[r * 3 + 1] / kFocal;
+                        N[r * 3 + 2] = M[r * 3 + 2]
+                                     - (cx / kFocal) * M[r * 3 + 0]
+                                     - (cy / kFocal) * M[r * 3 + 1];
+                    }
+                    return Affine::From3x3(N);
+                };
+
+                auto stitch = [&](int projection, int* w, int* h,
+                                  float* disagree, std::string* err) {
+                    ImageSet set;
+                    set.images.push_back(photo.Clone());
+                    set.images.push_back(warpBy(photo, panBy(4.0f)));
+                    set.images.push_back(warpBy(photo, panBy(8.0f)));
+                    set.shape = Shape{{{"frame", 3}}};
+
+                    std::vector<Data> s;
+                    s.push_back(Data{std::move(set)});
+
+                    Pipeline p;
+                    p.AddStage(Registry::Get().Create("detect_sift"), "detect_sift",
+                               {{-1, 0}}, 1, 1);
+                    auto m = Registry::Get().Create("match_brute");
+                    if (ParamBase* pb = m->FindParam("chain")) {
+                        std::string e; pb->SetFromScript(Value(1.0), &e);
+                    }
+                    if (ParamBase* pb = m->FindParam("ratio")) {
+                        std::string e; pb->SetFromScript(Value(0.95), &e);
+                    }
+                    p.AddStage(std::move(m), "match_brute", {{0, 0}}, 1, 2);
+                    auto a = Registry::Get().Create("align_features");
+                    if (ParamBase* pb = a->FindParam("model")) {
+                        std::string e; pb->SetFromScript(Value(0.0), &e);
+                    }
+                    p.AddStage(std::move(a), "align_features", {{1, 0}}, 1, 3);
+                    auto st = Registry::Get().Create("stitch_panorama");
+                    if (ParamBase* pb = st->FindParam("projection")) {
+                        std::string e;
+                        pb->SetFromScript(Value(double(projection)), &e);
+                    }
+                    // Pinned to the focal length the fixture actually used, so
+                    // this measures the PROJECTIONS rather than the estimator.
+                    // The estimator gets its own check below.
+                    if (ParamBase* pb = st->FindParam("focal")) {
+                        std::string e;
+                        pb->SetFromScript(Value(double(kFocal)), &e);
+                    }
+                    p.AddStage(std::move(st), "stitch_panorama", {{2, 0}}, 1, 0);
+
+                    if (!p.Execute(&s, nullptr, err)) return false;
+                    if (p.Stages().size() > 3 && p.Stages()[3].algo)
+                        std::printf("        [dbg] %s\n",
+                                    p.Stages()[3].algo->RunReport().c_str());
+                    const Data* out = p.Resolve({3, 0}, &s);
+                    const auto* im = out ? std::get_if<Image>(out) : nullptr;
+                    if (!im) return false;
+                    *w = im->Desc().width;
+                    *h = im->Desc().height;
+
+                    // Disagreement is read back off the report rather than
+                    // recomputed: the algorithm already measures it where the
+                    // frames overlap, and a second implementation here could
+                    // disagree with the one that matters.
+                    const std::string rep = p.Stages()[3].algo->RunReport();
+                    const size_t k = rep.find("disagreeing ");
+                    *disagree = (k == std::string::npos)
+                        ? -1.0f : float(atof(rep.c_str() + k + 12));
+                    return true;
+                };
+
+                ImageView pv = photo.MapCpuRead();
+                const int srcW = pv.desc.width, srcH = pv.desc.height;
+
+                for (int proj = 0; proj <= 2; ++proj) {
+                    const char* names[3] = {"plane", "cylindrical", "spherical"};
+                    int w = 0, h = 0;
+                    float dis = -1.0f;
+                    std::string e;
+                    const bool ok = stitch(proj, &w, &h, &dis, &e);
+                    Check(ok, std::string("stitch_panorama runs (") + names[proj] +
+                              ")" + (ok ? "" : ": " + e));
+                    if (!ok) continue;
+
+                    // Wider than one frame, because three frames 7 px apart
+                    // cover more than one frame's worth. Not much wider -- a
+                    // canvas that exploded would be the divergence this is
+                    // built to avoid.
+                    Check(w > srcW && w < srcW * 2,
+                          std::string(names[proj]) + ": the canvas grew to hold the pan (" +
+                              std::to_string(w) + " from " + std::to_string(srcW) + ")");
+
+                    // A horizontal pan must not grow the height appreciably.
+                    // This is the check that fails when a projection is wrong:
+                    // an over-bent surface pushes the corners up and down.
+                    Check(h < srcH * 3 / 2,
+                          std::string(names[proj]) + ": the height stayed near the source (" +
+                              std::to_string(h) + " from " + std::to_string(srcH) + ")");
+
+                    // And the frames agree where they overlap. Loose, because
+                    // this fixture resamples the same photo twice and the
+                    // interpolation alone costs a few percent -- what it
+                    // catches is a stitch that placed a frame in the wrong
+                    // place entirely, which runs to tens of percent.
+                    Check(dis >= 0.0f && dis < 12.0f,
+                          std::string(names[proj]) + ": the frames agree where they overlap (" +
+                              std::to_string(dis) + "%)");
+                }
+
+                // THE FOCAL ESTIMATOR, on a fixture whose focal length is
+                // known. This is the one number the stitcher infers rather than
+                // being told, and a wrong one bends every ray: too small and
+                // the seams bow outward, too large and they bow in.
+                //
+                // Checked by unpinning `focal` and reading back what the report
+                // says, rather than by exposing the estimator -- what matters
+                // is the number the algorithm actually uses.
+                {
+                    ImageSet set;
+                    set.images.push_back(photo.Clone());
+                    // WIDER rotations than the projection checks above, and
+                    // that is the point of doing this separately. h20 is
+                    // sin(a)/f: at 4 degrees it is 1.2e-4, which the DLT has
+                    // almost no leverage on -- measured, the solve
+                    // under-recovered it by 70% and the estimate came back
+                    // 1.83x high. At 12 degrees there is three times the signal
+                    // in the same term.
+                    //
+                    // Real frames are the easy case here, which is worth
+                    // recording: on the 15-frame panorama the estimate landed
+                    // at 4503 px and was optimal, with every larger value
+                    // measurably worse. This fixture is harder than the data it
+                    // stands in for.
+                    set.images.push_back(warpBy(photo, panBy(12.0f)));
+                    set.images.push_back(warpBy(photo, panBy(24.0f)));
+                    set.shape = Shape{{{"frame", 3}}};
+
+                    std::vector<Data> s;
+                    s.push_back(Data{std::move(set)});
+
+                    Pipeline p;
+                    p.AddStage(Registry::Get().Create("detect_sift"), "detect_sift",
+                               {{-1, 0}}, 1, 1);
+                    auto m = Registry::Get().Create("match_brute");
+                    if (ParamBase* pb = m->FindParam("chain")) {
+                        std::string e; pb->SetFromScript(Value(1.0), &e);
+                    }
+                    if (ParamBase* pb = m->FindParam("ratio")) {
+                        std::string e; pb->SetFromScript(Value(0.95), &e);
+                    }
+                    p.AddStage(std::move(m), "match_brute", {{0, 0}}, 1, 2);
+                    auto a = Registry::Get().Create("align_features");
+                    if (ParamBase* pb = a->FindParam("model")) {
+                        std::string e; pb->SetFromScript(Value(2.0), &e);  // homography
+                    }
+                    p.AddStage(std::move(a), "align_features", {{1, 0}}, 1, 3);
+                    // focal left at 0, so it is estimated.
+                    p.AddStage(Registry::Get().Create("stitch_panorama"),
+                               "stitch_panorama", {{2, 0}}, 1, 0);
+
+                    std::string e;
+                    if (p.Execute(&s, nullptr, &e) && p.Stages().size() > 3) {
+                        const std::string rep = p.Stages()[3].algo->RunReport();
+                        std::printf("        [dbg] %s\n", rep.c_str());
+                        const size_t k = rep.find("focal ");
+                        const float got = (k == std::string::npos)
+                            ? 0.0f : float(atof(rep.c_str() + k + 6));
+                        // Within 25%: this recovers f from two small rotations of a
+                        // resampled photo, which is the hard end of the problem.
+                        // What it has to catch is an estimate off by a FACTOR --
+                        // a transposed index or a missing principal-point shift
+                        // gives that, and it is what makes a panorama fold.
+                        Check(got > kFocal * 0.75f && got < kFocal * 1.25f,
+                              "the focal estimate recovers the fixture's (" +
+                                  std::to_string(int(got)) + " vs " +
+                                  std::to_string(int(kFocal)) + " px)");
+                    } else {
+                        Check(false, "the focal-estimate pipeline ran: " + e);
+                    }
+                }
+
+                // A LONG CHAIN MUST NOT FLIP, which is the regression this
+                // exists for and the bug Tim found in the real panorama.
+                //
+                // Composing homographies multiplies their perspective error, so
+                // the accumulated matrix drifts away from being a rotation
+                // exponentially. Measured on the 15-frame sweep, the
+                // determinant of K^-1 H K -- which must be 1 for a rotation --
+                // ran 2.4 at frame 3, 118.9 at frame 10, 26041 at frame 11, and
+                // then went NEGATIVE. A negative determinant is a reflection,
+                // and orthonormalising a reflection yields a valid rotation
+                // that is 180 degrees off: the last three frames came out
+                // upside down.
+                //
+                // The fix was to orthonormalise each LINK before composing, so
+                // the product is a product of rotations and stays one exactly.
+                // This asserts the property that fix provides: over a chain
+                // long enough for the old code to have flipped, every frame
+                // still maps its own centre to somewhere sane, and none of them
+                // is inverted.
+                {
+                    // Six degrees a step rather than three, and warped from the
+                    // ORIGINAL each time rather than incrementally.
+                    //
+                    // At three degrees this fixture dropped frame 5 for a link
+                    // that would not read as a rotation -- and that is the
+                    // fixture being harsher than reality rather than the code
+                    // being wrong. Each frame here is one resampling of the
+                    // same photo at a different angle, so two consecutive
+                    // frames differ by an interpolation difference ON TOP of
+                    // their rotation, and the smaller the rotation the more the
+                    // interpolation dominates it.
+                    //
+                    // The real 15-frame panorama drops nothing at any chain
+                    // length, which is the case that matters: its frames come
+                    // off the sensor once each.
+                    ImageSet set;
+                    set.images.push_back(photo.Clone());
+                    const int kChain = 9;
+                    for (int i = 1; i < kChain; ++i)
+                        set.images.push_back(warpBy(photo, panBy(6.0f * float(i))));
+                    set.shape = Shape{{{"frame", kChain}}};
+
+                    std::vector<Data> s;
+                    s.push_back(Data{std::move(set)});
+
+                    Pipeline p;
+                    p.AddStage(Registry::Get().Create("detect_sift"), "detect_sift",
+                               {{-1, 0}}, 1, 1);
+                    auto m = Registry::Get().Create("match_brute");
+                    if (ParamBase* pb = m->FindParam("chain")) {
+                        std::string e; pb->SetFromScript(Value(1.0), &e);
+                    }
+                    if (ParamBase* pb = m->FindParam("ratio")) {
+                        std::string e; pb->SetFromScript(Value(0.95), &e);
+                    }
+                    p.AddStage(std::move(m), "match_brute", {{0, 0}}, 1, 2);
+                    auto a = Registry::Get().Create("align_features");
+                    if (ParamBase* pb = a->FindParam("model")) {
+                        std::string e; pb->SetFromScript(Value(2.0), &e);
+                    }
+                    p.AddStage(std::move(a), "align_features", {{1, 0}}, 1, 3);
+                    auto st = Registry::Get().Create("stitch_panorama");
+                    if (ParamBase* pb = st->FindParam("focal")) {
+                        std::string e;
+                        pb->SetFromScript(Value(double(kFocal)), &e);
+                    }
+                    p.AddStage(std::move(st), "stitch_panorama", {{2, 0}}, 1, 0);
+
+                    std::string e;
+                    if (p.Execute(&s, nullptr, &e) && p.Stages().size() > 3) {
+                        const std::string rep = p.Stages()[3].algo->RunReport();
+                        std::printf("        [dbg] %s\n", rep.c_str());
+
+                        // No frame was dropped for being unreadable as a
+                        // rotation. The old code did not drop them -- it placed
+                        // them upside down -- so this also asserts the new
+                        // rejection path stays quiet on good data.
+                        Check(rep.find("not a rotation") == std::string::npos,
+                              "a 9-frame chain keeps every frame");
+
+                        // ...and the result is still one panorama rather than a
+                        // canvas stretched to hold a flipped frame. A frame
+                        // rotated 180 degrees lands on the far side of the
+                        // reference, which roughly doubles the width.
+                        const Data* out = p.Resolve({3, 0}, &s);
+                        const auto* im = out ? std::get_if<Image>(out) : nullptr;
+                        ImageView pv2 = photo.MapCpuRead();
+                        const int srcW = pv2.desc.width;
+                        Check(im && im->Desc().width < srcW * 3,
+                              "a 9-frame chain stays one panorama (" +
+                                  std::to_string(im ? im->Desc().width : 0) +
+                                  " px from " + std::to_string(srcW) + ")");
+                    } else {
+                        Check(false, "the long-chain pipeline ran: " + e);
+                    }
+                }
+
+                // THE REFLECTION ITSELF, fed in directly.
+                //
+                // The two checks above assert that a healthy chain stays
+                // healthy, and it is worth being honest that they do NOT catch
+                // the bug they were written for: reintroducing the old
+                // compose-then-orthonormalise order leaves both passing,
+                // because this fixture's links are clean enough that nine of
+                // them do not compound into a reflection. The real panorama's
+                // did -- its determinant reached 26041 before flipping -- and a
+                // 512 px synthetic photo warped nine times does not reproduce
+                // fourteen links of real solver residual.
+                //
+                // So the invariant is tested where it actually lives: a
+                // transform whose linear part is MIRRORED must not come back as
+                // a confident 180-degree rotation. That is the property whose
+                // absence put three of Tim's frames upside down, and it holds
+                // or fails independently of how the chain got there.
+                {
+                    // A frame flipped in y, which is what a reflected R
+                    // produces: determinant negative, and every other entry
+                    // perfectly reasonable.
+                    Affine mirrored;
+                    mirrored.m[4] = -1.0f;          // y -> -y
+                    mirrored.m[5] = float(photo.Desc().height);
+
+                    ImageSet set;
+                    set.images.push_back(photo.Clone());
+                    set.images.push_back(photo.Clone());
+                    set.shape = Shape{{{"frame", 2}}};
+                    AttachTransform(&set.images[1], mirrored);
+
+                    std::vector<Data> s;
+                    s.push_back(Data{std::move(set)});
+
+                    Pipeline p;
+                    auto st = Registry::Get().Create("stitch_panorama");
+                    if (ParamBase* pb = st->FindParam("focal")) {
+                        std::string e;
+                        pb->SetFromScript(Value(double(kFocal)), &e);
+                    }
+                    p.AddStage(std::move(st), "stitch_panorama", {{-1, 0}}, 1, 0);
+
+                    std::string e;
+                    if (p.Execute(&s, nullptr, &e)) {
+                        const std::string rep = p.Stages()[0].algo->RunReport();
+                        std::printf("        [dbg] %s\n", rep.c_str());
+                        Check(rep.find("not a rotation") != std::string::npos,
+                              "a mirrored transform is rejected, not silently "
+                              "turned into a 180-degree rotation");
+                    } else {
+                        Check(false, "the mirrored-frame pipeline ran: " + e);
+                    }
+                }
+            }
+
+            // FRAMES OUT OF ORDER: a solve that succeeds and is still wrong.
+            //
+            // Tim hit this dropping files on the palette -- Windows handed them
+            // over re-ordered, so the chain paired frames that were never
+            // neighbours. The link did not fail: it reported 59 of 65 matches
+            // as inliers, 91%, against the 90% a genuinely adjacent pair gives,
+            // and the run announced "solved 7 of 7 frames".
+            //
+            // The inlier RATE cannot separate those. RANSAC finds the largest
+            // consistent subset, and a few dozen mutually consistent false
+            // matches are still consistent. What separates them is the SHIFT:
+            // 1081 px for the adjacent pair, 10908 px for the spurious one.
+            //
+            // Here: two frames displaced most of a frame width apart, which no
+            // sane pairing produces.
+            {
+                // A SMALL frame, so the guard's threshold -- 1.5 frame widths --
+                // is reachable by a shift the matcher can still see.
+                //
+                // Two fixtures were tried and rejected before this. Warping the
+                // 512 px photo by 400 px leaves so little overlap that the
+                // matcher finds nothing and the pipeline errors before the
+                // guard is reached; TILING it wraps the content around, so the
+                // solver correctly recovers the 170 px period rather than the
+                // 900 px displacement asked for. Both were the fixture being
+                // wrong, not the code -- worth recording, because each looked
+                // like a guard failure at first.
+                //
+                // 64 px frames with 96 px of shift: 1.5x the width exactly, and
+                // the wrapped content still matches strongly.
+                constexpr int kSW = 64;
+                auto makeFrame = [&](int shift) {
+                    Image im;
+                    ImageDesc d{kSW, kSW, Format::RGBA32F};
+                    im.Alloc(d);
+                    ImageView v = im.MapCpuWrite();
+                    for (int y = 0; y < kSW; ++y)
+                        for (int x = 0; x < kSW; ++x) {
+                            // An aperiodic hash texture, so every neighbourhood
+                            // is distinct and the matches are unambiguous.
+                            auto noise = [](int ix, int iy) {
+                                uint32_t s = uint32_t(ix) * 374761393u +
+                                             uint32_t(iy) * 668265263u;
+                                s = (s ^ (s >> 13)) * 1274126177u;
+                                return float(s >> 8) / float(1 << 24);
+                            };
+                            const int sx = x + shift;
+                            const float gx = float(sx) / 5.0f, gy = float(y) / 5.0f;
+                            const int x0 = int(std::floor(gx)), y0 = int(std::floor(gy));
+                            const float tx = gx - float(x0), ty = gy - float(y0);
+                            const float n00 = noise(x0, y0),     n10 = noise(x0 + 1, y0);
+                            const float n01 = noise(x0, y0 + 1), n11 = noise(x0 + 1, y0 + 1);
+                            const float nx0 = n00 + (n10 - n00) * tx;
+                            const float nx1 = n01 + (n11 - n01) * tx;
+                            float* p = v.At<float>(x, y);
+                            p[0] = p[1] = p[2] = 0.2f + 0.6f * (nx0 + (nx1 - nx0) * ty);
+                            p[3] = 1.0f;
+                        }
+                    return im;
+                };
+
+                ImageSet set;
+                set.images.push_back(makeFrame(0));
+                set.images.push_back(makeFrame(96));   // 1.5x the frame width
+                set.shape = Shape{{{"frame", 2}}};
+
+                std::vector<Data> s;
+                s.push_back(Data{std::move(set)});
+
+                Pipeline p;
+                p.AddStage(Registry::Get().Create("detect_sift"), "detect_sift",
+                           {{-1, 0}}, 1, 1);
+                auto m = Registry::Get().Create("match_brute");
+                if (ParamBase* pb = m->FindParam("ratio")) {
+                    std::string e; pb->SetFromScript(Value(0.95), &e);
+                }
+                p.AddStage(std::move(m), "match_brute", {{0, 0}}, 1, 2);
+                p.AddStage(Registry::Get().Create("align_features"),
+                           "align_features", {{1, 0}}, 1, 3);
+
+                std::string e;
+                if (p.Execute(&s, nullptr, &e) && p.Stages().size() > 2) {
+                    const std::string rep = p.Stages()[2].algo->RunReport();
+                    std::printf("        [dbg] %s\n", rep.c_str());
+                    // Either it found too few matches to solve at all, or it
+                    // solved and the shift guard rejected it. Both are correct;
+                    // what must NOT happen is a confident attach.
+                    // EITHER path is a pass, and it is worth being honest about
+                    // which one this fixture actually takes: with 6 matches it
+                    // fails the minimum-inlier gate and never reaches the shift
+                    // guard. So this asserts the OUTCOME -- nothing is attached
+                    // -- rather than the mechanism.
+                    //
+                    // Reaching the shift guard specifically needs a pair with
+                    // plenty of good matches at an impossible displacement,
+                    // which is a contradiction on a synthetic fixture and
+                    // ordinary on real frames: the case that motivated it had
+                    // 65 matches at 91% inliers and a 10908 px shift on 5796 px
+                    // frames. That is measured on Tim's panorama and not
+                    // reproduced here.
+                    const bool refused =
+                        rep.find("REJECTED") != std::string::npos ||
+                        rep.find("solved 0 of") != std::string::npos;
+                    Check(refused,
+                          "a frame displaced most of a frame width is refused, "
+                          "not attached: \"" + rep + "\"");
+
+                    // ...and nothing was attached to it, so a merge downstream
+                    // treats it as unaligned rather than warping it into the
+                    // wrong place.
+                    const Data* out = p.Resolve({2, 0}, &s);
+                    const auto* os = out ? std::get_if<ImageSet>(out) : nullptr;
+                    if (os && os->images.size() == 2)
+                        Check(TransformOf(os->images[1]).IsIdentity(),
+                              "...and no transform was attached to it");
+                } else {
+                    Check(false, "the out-of-order pipeline ran: " + e);
+                }
+            }
+
+            // BUNDLE ADJUSTMENT: does it actually reduce the reprojection
+            // error, and does it leave a good solution alone?
+            //
+            // Both matter. A refiner that improves a bad fit but degrades a
+            // good one is worse than none, and the second property is the one
+            // an over-eager solver breaks.
+            {
+                auto bundled = [&](int chainLen, float* rms0, float* rms1,
+                                   std::string* err) {
+                    // A chain of translations rather than rotations. The
+                    // adjuster models rotations, so this is deliberately the
+                    // case its model does NOT match exactly -- which is the
+                    // honest test of "does it make things worse". A fixture
+                    // built from the same rotation model it solves would
+                    // flatter it.
+                    ImageSet set;
+                    set.images.push_back(photo.Clone());
+                    for (int i = 1; i < chainLen; ++i) {
+                        Affine step;
+                        step.m[2] = 9.0f * float(i);
+                        step.m[5] = -4.0f * float(i);
+                        set.images.push_back(warpBy(photo, step));
+                    }
+                    set.shape = Shape{{{"frame", chainLen}}};
+
+                    std::vector<Data> s;
+                    s.push_back(Data{std::move(set)});
+
+                    Pipeline p;
+                    p.AddStage(Registry::Get().Create("detect_sift"), "detect_sift",
+                               {{-1, 0}}, 1, 1);
+                    auto m = Registry::Get().Create("match_brute");
+                    if (ParamBase* pb = m->FindParam("chain")) {
+                        std::string e; pb->SetFromScript(Value(1.0), &e);
+                    }
+                    if (ParamBase* pb = m->FindParam("window")) {
+                        std::string e; pb->SetFromScript(Value(2.0), &e);
+                    }
+                    if (ParamBase* pb = m->FindParam("ratio")) {
+                        std::string e; pb->SetFromScript(Value(0.95), &e);
+                    }
+                    p.AddStage(std::move(m), "match_brute", {{0, 0}}, 1, 2);
+                    auto a = Registry::Get().Create("align_features");
+                    if (ParamBase* pb = a->FindParam("model")) {
+                        std::string e; pb->SetFromScript(Value(2.0), &e);
+                    }
+                    p.AddStage(std::move(a), "align_features", {{1, 0}}, 1, 3);
+                    p.AddStage(Registry::Get().Create("bundle_adjust"),
+                               "bundle_adjust", {{2, 0}}, 1, 4);
+
+                    if (!p.Execute(&s, nullptr, err)) return false;
+                    const std::string rep = p.Stages()[3].algo->RunReport();
+                    std::printf("        [dbg] %s\n", rep.c_str());
+                    // "rms A -> B px"
+                    const size_t k = rep.find("rms ");
+                    if (k == std::string::npos) return false;
+                    *rms0 = float(atof(rep.c_str() + k + 4));
+                    const size_t a2 = rep.find("-> ", k);
+                    if (a2 == std::string::npos) return false;
+                    *rms1 = float(atof(rep.c_str() + a2 + 3));
+                    return true;
+                };
+
+                // A five-frame chain: long enough for drift, short enough that
+                // the fixture's frames still overlap.
+                float r0 = 0.0f, r1 = 0.0f;
+                std::string e;
+                if (bundled(5, &r0, &r1, &e)) {
+                    Check(r1 <= r0 + 0.01f,
+                          "bundle_adjust does not make the fit worse (" +
+                              std::to_string(r0) + " -> " + std::to_string(r1) + " px)");
+                    // A few pixels is healthy; tens means it did not converge.
+                    Check(r1 < 5.0f,
+                          "bundle_adjust converges to a few pixels (" +
+                              std::to_string(r1) + " px)");
+                } else {
+                    Check(false, "the bundle pipeline ran: " + e);
+                }
+
+                // Without matches it is an error, not a silent success -- the
+                // same contract align_features has.
+                {
+                    ImageSet plain;
+                    for (int f = 0; f < 2; ++f) {
+                        Image im;
+                        im.Alloc({32, 32, Format::RGBA8});
+                        plain.images.push_back(std::move(im));
+                    }
+                    plain.shape = Shape{{{"frame", 2}}};
+                    std::vector<Data> s;
+                    s.push_back(Data{std::move(plain)});
+
+                    Pipeline p;
+                    p.AddStage(Registry::Get().Create("bundle_adjust"),
+                               "bundle_adjust", {{-1, 0}}, 1, 1);
+                    std::string e2;
+                    const bool ran = p.Execute(&s, nullptr, &e2);
+                    Check(!ran && e2.find("no matches") != std::string::npos,
+                          "bundling without matches is an error: \"" + e2 + "\"");
+                }
+            }
+
             // Aligning without matches is an error rather than a silent no-op:
             // a script missing its matcher otherwise looks like frames that
             // happen to need no alignment.
@@ -4953,6 +5748,166 @@ int main() {
                 Check(!ran && e.find("no matches") != std::string::npos,
                       "aligning without matches is an error: \"" + e + "\"");
             }
+        }
+    }
+
+    // crop: the two modes, and the property that makes the toggle trustworthy.
+    {
+        auto run = [&](bool preview, double l, double r, double t, double b,
+                       double angle, Image* out) {
+            auto algo = Registry::Get().Create("crop");
+            if (!algo) return false;
+            auto set = [&](const char* n, double v) {
+                if (ParamBase* pb = algo->FindParam(n)) {
+                    std::string e; pb->SetFromScript(Value(v), &e);
+                }
+            };
+            set("preview", preview ? 1.0 : 0.0);
+            set("left", l); set("right", r);
+            set("top", t);  set("bottom", b);
+            set("angle", angle);
+
+            // A gradient with a hard mark in a known place, so a crop can be
+            // checked by WHERE the mark ends up rather than by pixel counts.
+            Image src;
+            ImageDesc d{100, 100, Format::RGBA32F};
+            src.Alloc(d);
+            ImageView v = src.MapCpuWrite();
+            for (int y = 0; y < 100; ++y)
+                for (int x = 0; x < 100; ++x) {
+                    float* p = v.At<float>(x, y);
+                    p[0] = float(x) / 100.0f;
+                    p[1] = float(y) / 100.0f;
+                    p[2] = 0.25f;
+                    p[3] = 1.0f;
+                }
+
+            Pipeline p;
+            std::vector<Data> s;
+            s.push_back(Data{std::move(src)});
+            p.AddStage(std::move(algo), "crop", {{-1, 0}}, 1, 1);
+            std::string e;
+            if (!p.Execute(&s, nullptr, &e)) return false;
+            const Data* dd = p.Resolve({0, 0}, &s);
+            const auto* im = dd ? std::get_if<Image>(dd) : nullptr;
+            if (!im) return false;
+            *out = const_cast<Image*>(im)->Clone();
+            return true;
+        };
+
+        // APPLIED: the output really is a different raster.
+        {
+            Image got;
+            const bool ok = run(false, 0.10, 0.20, 0.25, 0.05, 0.0, &got);
+            Check(ok, "crop runs");
+            if (ok) {
+                // 100 wide, 10% off the left and 20% off the right -> 70.
+                // 100 tall, 25% off the top and 5% off the bottom -> 70.
+                Check(got.Desc().width == 70 && got.Desc().height == 70,
+                      "crop resizes its output (" +
+                          std::to_string(got.Desc().width) + "x" +
+                          std::to_string(got.Desc().height) + ", expected 70x70)");
+
+                // ...and it is the RIGHT part of the image. The red channel is
+                // x/100, so the first output column must read 0.10.
+                ImageView gv = got.MapCpuRead();
+                const float first = gv.At<float>(0, 0)[0];
+                const float last  = gv.At<float>(69, 0)[0];
+                Check(std::fabs(first - 0.10f) < 0.02f &&
+                      std::fabs(last - 0.79f) < 0.02f,
+                      "crop takes the requested rectangle (x runs " +
+                          std::to_string(first) + ".." + std::to_string(last) + ")");
+            }
+        }
+
+        // PREVIEW: same size as the input, and it draws something.
+        {
+            Image prev;
+            const bool ok = run(true, 0.10, 0.20, 0.25, 0.05, 0.0, &prev);
+            Check(ok && prev.Desc().width == 100 && prev.Desc().height == 100,
+                  "crop preview keeps the input's size (" +
+                      std::to_string(prev.Desc().width) + "x" +
+                      std::to_string(prev.Desc().height) + ")");
+
+            if (ok) {
+                // The rectangle is drawn in green, and the outside is dimmed.
+                // Both are checked, because either alone can pass while the
+                // other is broken -- and a uniformly dimmed frame with NO
+                // rectangle is exactly what a sign error in the inside test
+                // produces. That happened: the first version had the winding
+                // backwards and every pixel scored as outside.
+                ImageView pv = prev.MapCpuRead();
+
+                // Counted as "green DOMINATES", not as a fixed brightness: the
+                // line's value is scaled to the image's own range, so asserting
+                // an absolute level would be testing that scaling rather than
+                // the drawing. The fixture's own green channel is y/100 and its
+                // red is x/100, so a pixel where green greatly exceeds both
+                // others can only be a drawn line.
+                int greenPixels = 0;
+                for (int y = 0; y < 100; ++y)
+                    for (int x = 0; x < 100; ++x) {
+                        const float* p = pv.At<float>(x, y);
+                        if (p[1] > 0.4f && p[0] < p[1] * 0.2f && p[2] < p[1] * 0.2f)
+                            ++greenPixels;
+                    }
+                Check(greenPixels > 100,
+                      "crop preview draws the rectangle (" +
+                          std::to_string(greenPixels) + " green pixels)");
+
+                // A pixel well outside the rectangle is dimmed; one well inside
+                // is not. Blue is a constant 0.25 in the fixture, so it reads
+                // the dimming directly without the gradient confusing it.
+                const float outside = pv.At<float>(2, 2)[2];
+                const float inside  = pv.At<float>(50, 50)[2];
+                Check(outside < inside * 0.8f,
+                      "crop preview dims outside the rectangle (" +
+                          std::to_string(outside) + " vs " +
+                          std::to_string(inside) + ")");
+            }
+        }
+
+        // THE TWO MODES AGREE. This is the property the whole design rests on:
+        // the rectangle drawn in preview has to be the rectangle that comes out
+        // when preview is turned off, or the toggle is a lie.
+        //
+        // Checked through the ROTATED case, because that is where they could
+        // most easily disagree -- rotating about the frame centre instead of
+        // the rectangle centre would leave both modes individually plausible
+        // and showing different parts of the image.
+        {
+            Image applied;
+            if (run(false, 0.15, 0.15, 0.15, 0.15, 8.0, &applied)) {
+                ImageView av = applied.MapCpuRead();
+                const int cw = av.desc.width, chh = av.desc.height;
+                // The centre of the cropped result must be the centre of the
+                // rectangle in the source: a symmetric crop of a 100x100 frame
+                // centres at (50, 50), where the fixture reads r = g = 0.5.
+                const float* c = av.At<float>(cw / 2, chh / 2);
+                Check(std::fabs(c[0] - 0.5f) < 0.03f && std::fabs(c[1] - 0.5f) < 0.03f,
+                      "crop rotates about the rectangle's centre, so the modes "
+                      "agree (centre reads " + std::to_string(c[0]) + ", " +
+                      std::to_string(c[1]) + ")");
+            } else {
+                Check(false, "the rotated crop ran");
+            }
+        }
+
+        // A crop that trims nothing is a pass-through the pipeline can alias
+        // away -- but only with preview OFF, since a preview genuinely changes
+        // the pixels.
+        {
+            auto algo = Registry::Get().Create("crop");
+            if (ParamBase* pb = algo->FindParam("preview")) {
+                std::string e; pb->SetFromScript(Value(0.0), &e);
+            }
+            Check(algo->IsNoOp(),
+                  "an untrimmed crop reports itself as a no-op");
+            if (ParamBase* pb = algo->FindParam("preview")) {
+                std::string e; pb->SetFromScript(Value(1.0), &e);
+            }
+            Check(!algo->IsNoOp(),
+                  "...but not in preview, where it draws a rectangle");
         }
     }
 

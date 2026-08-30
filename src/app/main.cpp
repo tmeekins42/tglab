@@ -2725,6 +2725,24 @@ void App::DrawPalettePanel() {
                 ++e.version;
                 m_dirty = true;
             }
+
+            // The drop rect grows to cover the expanded members.
+            //
+            // rowMax was set above, before these rows were drawn, so an
+            // expanded group's drop target was only its HEADER -- everything
+            // below it, which is the part that looks most like the group, hit
+            // nothing and the files became new palette entries instead.
+            //
+            // Tim hit this immediately: dropping more frames "over the previous
+            // images" made new entries, and adding to the group only worked by
+            // aiming at the first row. That reads as the feature being broken
+            // rather than as a hit-testing detail, because the visually obvious
+            // target was the wrong one.
+            //
+            // Extended here rather than by moving the assignment, so the
+            // rectangle is still whatever was actually drawn -- including
+            // however many members there turned out to be.
+            e.rowMax.y = std::max(e.rowMax.y, ImGui::GetCursorScreenPos().y);
         }
 
         ImGui::PopID();

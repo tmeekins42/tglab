@@ -36,33 +36,42 @@ static double Now() {
     return duration<double>(steady_clock::now().time_since_epoch()).count();
 }
 
-// Stage to insert before the merge, from TGLAB_PRE.
-static std::string PreAlgo() {
-    char buf[64] = {};
-    GetEnvironmentVariableA("TGLAB_PRE", buf, sizeof buf);
-    return buf[0] ? std::string(buf) : std::string("align");
+// A stage name from an env var, with any parameters that followed it.
+//
+// The var holds what would be written in a script minus the image argument, so
+// TGLAB_PRE3="align_features, model = 2" becomes
+// align_features(frames, model = 2). Splitting on the first comma is enough
+// because an algorithm name cannot contain one -- and it means sweeping a
+// parameter over real raws needs no harness change per parameter swept.
+struct StageSpec {
+    std::string name;   // empty when the var is unset
+    std::string args;   // "" or ", model = 2", ready to append
+};
+
+static StageSpec SpecFrom(const char* var, const char* fallback = "") {
+    char buf[256] = {};
+    GetEnvironmentVariableA(var, buf, sizeof buf);
+    std::string v = buf[0] ? std::string(buf) : std::string(fallback);
+    const size_t c = v.find(',');
+    if (c == std::string::npos) return {v, std::string()};
+    // The trailing text keeps its comma, so it concatenates straight on.
+    return {v.substr(0, c), v.substr(c)};
 }
+
+// Stage to insert before the merge, from TGLAB_PRE.
+static StageSpec PreAlgo()  { return SpecFrom("TGLAB_PRE", "align"); }
 
 // A second group-level stage, from TGLAB_PRE2.
-static std::string Pre2Algo() {
-    char buf[64] = {};
-    GetEnvironmentVariableA("TGLAB_PRE2", buf, sizeof buf);
-    return buf;
-}
+static StageSpec Pre2Algo() { return SpecFrom("TGLAB_PRE2"); }
 
 // A third group-level stage, from TGLAB_PRE3.
-static std::string Pre3Algo() {
-    char buf[64] = {};
-    GetEnvironmentVariableA("TGLAB_PRE3", buf, sizeof buf);
-    return buf;
-}
+static StageSpec Pre3Algo() { return SpecFrom("TGLAB_PRE3"); }
+
+// A fourth group-level stage, so detect -> match -> align -> bundle runs.
+static StageSpec Pre4Algo() { return SpecFrom("TGLAB_PRE4"); }
 
 // Stage to append after the merge, from TGLAB_POST.
-static std::string PostAlgo() {
-    char buf[64] = {};
-    GetEnvironmentVariableA("TGLAB_POST", buf, sizeof buf);
-    return buf[0] ? std::string(buf) : std::string("tonemap");
-}
+static StageSpec PostAlgo() { return SpecFrom("TGLAB_POST", "tonemap"); }
 
 int main(int argc, char** argv) {
     if (argc < 2) { std::printf("usage: group_merge <raw> [raw...]\n"); return 2; }
@@ -98,31 +107,39 @@ int main(int argc, char** argv) {
                 argc - 1, Now() - t0, ShapeOf(group).ToString().c_str());
 
     // TGLAB_MERGE picks the reduction, so the same harness exercises either.
-    char algo[64] = "merge_mean";
-    GetEnvironmentVariableA("TGLAB_MERGE", algo, sizeof algo);
+    const StageSpec merge = SpecFrom("TGLAB_MERGE", "merge_mean");
     const std::string srcStr =
         std::string("frames = image(\"group\")\n") +
         // TGLAB_PRE inserts a stage BEFORE the merge -- align, in practice --
         // so a solve can be measured against the same bracket in one run.
         (GetEnvironmentVariableA("TGLAB_PRE", nullptr, 0) > 0
-             ? std::string("frames = ") + PreAlgo() + "(frames" +
+             ? std::string("frames = ") + PreAlgo().name + "(frames" +
+               PreAlgo().args +
                (GetEnvironmentVariableA("TGLAB_NORM", nullptr, 0) > 0
                     ? ", normalize = 1" : "") + ")\n"
              : std::string()) +
         // TGLAB_PRE2 chains a SECOND group-level stage, so detect-then-match
         // can be exercised on real raws in one run.
         (GetEnvironmentVariableA("TGLAB_PRE2", nullptr, 0) > 0
-             ? std::string("frames = ") + Pre2Algo() + "(frames)\n"
+             ? std::string("frames = ") + Pre2Algo().name + "(frames" +
+               Pre2Algo().args + ")\n"
              : std::string()) +
         // A third, so detect -> match -> align can run end to end.
         (GetEnvironmentVariableA("TGLAB_PRE3", nullptr, 0) > 0
-             ? std::string("frames = ") + Pre3Algo() + "(frames)\n"
+             ? std::string("frames = ") + Pre3Algo().name + "(frames" +
+               Pre3Algo().args + ")\n"
              : std::string()) +
-        "merged = " + algo + "(frames)\n" +
+        // A fourth, so detect -> match -> align -> bundle runs end to end.
+        (GetEnvironmentVariableA("TGLAB_PRE4", nullptr, 0) > 0
+             ? std::string("frames = ") + Pre4Algo().name + "(frames" +
+               Pre4Algo().args + ")\n"
+             : std::string()) +
+        "merged = " + merge.name + "(frames" + merge.args + ")\n" +
         // TGLAB_POST appends a stage after the merge, so the tone mapper can be
         // measured against the raw merge output in the same run.
         (GetEnvironmentVariableA("TGLAB_POST", nullptr, 0) > 0
-             ? std::string("merged = ") + PostAlgo() + "(merged)\n"
+             ? std::string("merged = ") + PostAlgo().name + "(merged" +
+               PostAlgo().args + ")\n"
              : std::string()) +
         "display(merged)\n";
     const char* src = srcStr.c_str();
