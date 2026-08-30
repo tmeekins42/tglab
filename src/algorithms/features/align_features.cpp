@@ -312,20 +312,28 @@ public:
             const FeatureSidecar* myF  = FeaturesOf(img);
             if (!refF || !myF) continue;
 
+            // Pairs from the FIRST set, whose indices map one-to-one onto it --
+            // `keep` records which of those indices were used, so the inlier
+            // verdict can be written back against the right matches.
             std::vector<Pair> pairs;
+            std::vector<int>  fromMatch;
             pairs.reserve(ms->Matches().size());
-            for (const Match& m : ms->Matches()) {
+            fromMatch.reserve(ms->Matches().size());
+            for (size_t mi = 0; mi < ms->Matches().size(); ++mi) {
+                const Match& m = ms->Matches()[mi];
                 if (m.a < 0 || size_t(m.a) >= refF->keypoints.size()) continue;
                 if (m.b < 0 || size_t(m.b) >= myF->keypoints.size()) continue;
                 const Keypoint& ka = refF->keypoints[size_t(m.a)];
                 const Keypoint& kb = myF->keypoints[size_t(m.b)];
                 pairs.push_back({ka.x, ka.y, kb.x, kb.y});
+                fromMatch.push_back(int(mi));
             }
             m_matches += int(pairs.size());
 
             Affine t;
             int inliers = 0;
-            if (!Ransac(pairs, &t, &inliers)) continue;
+            std::vector<int> inlierIdx;
+            if (!Ransac(pairs, &t, &inliers, &inlierIdx)) continue;
 
             // A SOLVE THAT MOVES THE FRAME FURTHER THAN THE FRAME IS WIDE is
             // rejected, however confident it looks.
@@ -365,6 +373,70 @@ public:
             m_inliers += inliers;
             ++m_solved;
             solved[i] = t;
+
+            // MARK THE INLIERS, on every set this frame carries.
+            //
+            // The first set was just verified by RANSAC, so its verdict is
+            // recorded directly. The others -- the windowed neighbours -- were
+            // never solved here, and they are exactly what bundle adjustment
+            // reads. Left unmarked, BA takes every match the matcher produced,
+            // and on a detector whose matches are 45% outliers that is half its
+            // observations pulling the wrong way.
+            //
+            // Verified against the transform the CHAIN gives, which is the only
+            // one available: frame i's position relative to frame i-w is
+            // solved[i] composed back through the intervening links. That
+            // transform is imperfect -- removing its error is what BA is FOR --
+            // so the threshold here is deliberately loose. It is separating
+            // "consistent with roughly where this frame is" from "somewhere
+            // else entirely", not doing BA's job for it.
+            {
+                auto marked = std::make_shared<MatchSidecar>(*ms);
+                const float thr = float(m_threshold);
+
+                for (size_t si = 0; si < marked->sets.size(); ++si) {
+                    MatchSet& set = marked->sets[si];
+                    set.inlier.assign(set.matches.size(), 0);
+
+                    if (si == 0) {
+                        // RANSAC's own verdict, mapped back through the index
+                        // list built alongside `pairs`.
+                        for (int pi : inlierIdx)
+                            if (pi >= 0 && size_t(pi) < fromMatch.size())
+                                set.inlier[size_t(fromMatch[size_t(pi)])] = 1;
+                        continue;
+                    }
+
+                    // A windowed set: verify it against the chain's estimate.
+                    if (set.reference < 0 || size_t(set.reference) >= images->size())
+                        continue;
+                    const FeatureSidecar* rf = FeaturesOf((*images)[size_t(set.reference)]);
+                    if (!rf) continue;
+
+                    // reference -> this frame, via frame 0. solved[] is filled
+                    // ascending, so both are known by the time this runs.
+                    bool ok = false;
+                    const Affine refInv = solved[size_t(set.reference)].Inverse(&ok);
+                    if (!ok) continue;
+                    const Affine rel = t.Then(refInv);
+
+                    // Loose: three times the RANSAC threshold, because `rel`
+                    // carries the chain error BA has not removed yet.
+                    const float loose = 3.0f * thr;
+                    for (size_t k = 0; k < set.matches.size(); ++k) {
+                        const Match& m = set.matches[k];
+                        if (m.a < 0 || size_t(m.a) >= rf->keypoints.size()) continue;
+                        if (m.b < 0 || size_t(m.b) >= myF->keypoints.size()) continue;
+                        const Keypoint& ka = rf->keypoints[size_t(m.a)];
+                        const Keypoint& kb = myF->keypoints[size_t(m.b)];
+                        float px, py;
+                        rel.MapPoint(ka.x, ka.y, &px, &py);
+                        const float dx = px - kb.x, dy = py - kb.y;
+                        if (dx * dx + dy * dy <= loose * loose) set.inlier[k] = 1;
+                    }
+                }
+                img.Sidecars().Set(kMatchSidecar, marked);
+            }
 
             // Flagged only AFTER the solve succeeded, which is the whole point
             // of it being here rather than beside the chainLink test above.
@@ -581,7 +653,12 @@ private:
         return worst;
     }
 
-    bool Ransac(const std::vector<Pair>& pairs, Affine* out, int* inlierCount) const {
+    // `inlierIdx`, when given, receives the indices into `pairs` that agreed
+    // with the winning transform -- so a caller can mark those matches and
+    // everything downstream can use the geometric verdict rather than
+    // recomputing it or ignoring it.
+    bool Ransac(const std::vector<Pair>& pairs, Affine* out, int* inlierCount,
+                std::vector<int>* inlierIdx = nullptr) const {
         const int need = MinSample();
         if (int(pairs.size()) < need) return false;
 
@@ -654,6 +731,7 @@ private:
         else                              *out = bestT;
 
         *inlierCount = int(best.size());
+        if (inlierIdx) *inlierIdx = best;
         return true;
     }
 

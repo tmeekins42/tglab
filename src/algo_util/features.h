@@ -210,6 +210,32 @@ struct MatchSet {
 
     // How many candidate pairs were considered. See `considered` below.
     int considered = 0;
+
+    // Which matches survived the geometric check, parallel to `matches`.
+    //
+    // WHY THIS TRAVELS WITH THE MATCHES. The ratio test and cross check are
+    // DESCRIPTOR tests: they ask whether two patches look alike. RANSAC asks a
+    // different question -- whether a match is consistent with the transform
+    // everything else agrees on -- and it is the only one that can catch two
+    // genuinely similar patches in genuinely different places. A repeating
+    // texture produces exactly that, and no descriptor test will ever reject
+    // it.
+    //
+    // So the verdict is worth keeping, and worth keeping HERE rather than
+    // recomputing. Bundle adjustment reads it: without it, BA takes every match
+    // the matcher produced, and on a detector whose matches are 45% outliers
+    // that is half its observations pulling the wrong way. Measured, that left
+    // it stalled at 25 px RMS where a clean detector reached 4.7 on the same
+    // frames.
+    //
+    // Empty means "not verified", not "none passed" -- a consumer must treat an
+    // empty vector as "use them all" so a matcher run without an aligner still
+    // works.
+    std::vector<uint8_t> inlier;
+
+    bool IsInlier(size_t i) const {
+        return inlier.empty() || (i < inlier.size() && inlier[i] != 0);
+    }
 };
 
 class MatchSidecar : public SidecarBase {

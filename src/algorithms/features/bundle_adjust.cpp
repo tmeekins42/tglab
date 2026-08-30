@@ -47,6 +47,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -264,7 +265,22 @@ bool BundleAdjust::RunAlign(std::vector<Image>* images, std::string* err) {
             const FeatureSidecar* fi = FeaturesOf((*images)[size_t(set.reference)]);
             if (!fi) continue;
 
-            for (const Match& m : set.matches) {
+            for (size_t k = 0; k < set.matches.size(); ++k) {
+                // GEOMETRIC INLIERS ONLY, when the aligner marked them.
+                //
+                // Huber down-weights a large residual; it does not remove one,
+                // and it cannot when the outliers are a large enough fraction
+                // to shift the fit before the weighting settles. Measured on a
+                // detector whose matches were 45% outliers, taking everything
+                // left the solve stalled at 25 px RMS with the focal length run
+                // away to 28022 px against a true ~4800 -- while a detector at
+                // 8% outliers converged to 4.7 px on the same frames.
+                //
+                // IsInlier() returns true for an unmarked set, so a script that
+                // bundles without aligning first still works. That is the right
+                // default: "not verified" is not "rejected".
+                if (!set.IsInlier(k)) continue;
+                const Match& m = set.matches[k];
                 if (m.a < 0 || size_t(m.a) >= fi->keypoints.size()) continue;
                 if (m.b < 0 || size_t(m.b) >= fj->keypoints.size()) continue;
                 Obs o;
@@ -338,27 +354,20 @@ bool BundleAdjust::RunAlign(std::vector<Image>* images, std::string* err) {
             focal = est[est.size() / 2];
         }
 
-        // CLAMPED HERE TOO, and this is where it actually mattered.
+        // NOT CLAMPED, and it was for a while, which is worth recording.
         //
-        // The estimate is a median of sqrt(-h02/h20) over the links, and h20 is
-        // sin(a)/f -- around 1e-4, small enough that a noisy solve moves it a
-        // long way. With AKAZE's 55%-inlier matches the median came back 28022
-        // px against a true ~4800, and every rotation was then read through the
-        // wrong K: the solve stalled at 25 px RMS instead of converging to 5.
-        // ORB's 90%-inlier matches on the same frames estimated correctly.
+        // h20 is sin(a)/f -- around 1e-4 -- so a noisy solve moves this
+        // estimate a long way. With AKAZE's matches unfiltered it came back
+        // 28022 px against a true ~4800, every rotation was then read through
+        // the wrong K, and the solve stalled at 25 px RMS. Clamping it to a
+        // sane field of view made that survivable.
         //
-        // The bounds are the field of view. Half a frame width is about 90
-        // degrees horizontally and TWICE it is about 28 -- and 28 degrees is
-        // already a long lens for something being stitched. The first attempt
-        // used 8x, which is 7 degrees, and did nothing at all: the bad estimate
-        // was 28022 px, a 12-degree field, comfortably INSIDE that bound.
-        // "Physically possible" was the wrong test; "possible for frames that
-        // overlap enough to stitch" is the right one.
-        //
-        // A clamp on the ITERATION alone was not enough, which is worth
-        // recording: it left this untouched, and a bad seed is a bad seed
-        // however well the steps behave afterwards.
-        focal = std::clamp(focal, 0.5 * double(d0.width), 2.0 * double(d0.width));
+        // It was treating the symptom. The cause was that bundle adjustment
+        // was fed EVERY match rather than the geometric inliers, so 45% of its
+        // observations were wrong. With that fixed the estimate lands at 4835
+        // unaided, and every detector agrees within 4%. The clamp is gone
+        // because a guard that no longer fires is a guard whose absence nobody
+        // will notice when it stops being correct.
     }
 
     for (int i = 0; i < n; ++i) {
@@ -566,25 +575,9 @@ bool BundleAdjust::RunAlign(std::vector<Image>* images, std::string* err) {
             for (int i = 1; i < n; ++i)
                 for (int k = 0; k < 3; ++k)
                     w[size_t(i) * 3 + size_t(k)] += JB[size_t((i - 1) * 3 + k)];
-            if (doFocal) {
-                // CLAMPED to a physically sensible range, which is not a
-                // cosmetic guard.
-                //
-                // The focal length is one parameter against tens of thousands
-                // of observations, so it is normally well determined -- but it
-                // trades off against the rotations, and with enough surviving
-                // outliers the solve can buy a lower cost by inflating it. On a
-                // 15-frame panorama matched with AKAZE at 55% inliers it ran to
-                // 28022 px against a true ~4800, and the RMS stalled at 25 px
-                // instead of converging to 5. ORB's 90%-inlier matches on the
-                // same frames converged fine.
-                //
-                // Same bounds as the seed clamp above -- see there for why 2x
-                // rather than 8x.
-                const double lo = 0.5 * double(d0.width);
-                const double hi = 2.0 * double(d0.width);
-                focal = std::clamp(focal + JB[size_t(nP - 1)], lo, hi);
-            }
+            // Unclamped -- see the seed above for why the clamp that was here
+            // is gone.
+            if (doFocal) focal += JB[size_t(nP - 1)];
             rebuild();
 
             const double next = totalCost();

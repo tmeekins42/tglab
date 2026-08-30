@@ -5703,6 +5703,90 @@ int main() {
                     Check(false, "the bundle pipeline ran: " + e);
                 }
 
+                // BUNDLE ADJUSTMENT MUST USE ONLY THE GEOMETRIC INLIERS.
+                //
+                // Huber down-weights a large residual; it does not remove one,
+                // and it cannot when the outliers are a large enough fraction
+                // to move the fit before the weighting settles. Measured on a
+                // real panorama: a detector whose matches were 45% outliers
+                // left the solve stalled at 25 px RMS with the focal length run
+                // away to 28022 px against a true ~4800, while a detector at 8%
+                // outliers converged to 4.7 px on the same frames. Filtering to
+                // the inliers took BOTH to 1.4 px.
+                //
+                // The test asserts the PLUMBING rather than the outcome: after
+                // align_features runs, every match set carries an inlier
+                // verdict and some matches are rejected.
+                //
+                // It does not catch BA ignoring that verdict, and it is worth
+                // being explicit rather than implying more coverage than
+                // exists: removing the filter from bundle_adjust leaves the
+                // convergence checks above passing, because this fixture's
+                // outliers are not severe enough to stall the solve. What
+                // stalled was 45% outliers on 45 MP frames, which no synthetic
+                // fixture here reproduces. The marking is testable; the
+                // consequence was measured on real data.
+                {
+                    ImageSet set;
+                    set.images.push_back(photo.Clone());
+                    for (int i = 1; i < 4; ++i) {
+                        Affine step;
+                        step.m[2] = 9.0f * float(i);
+                        step.m[5] = -4.0f * float(i);
+                        set.images.push_back(warpBy(photo, step));
+                    }
+                    set.shape = Shape{{{"frame", 4}}};
+
+                    std::vector<Data> s;
+                    s.push_back(Data{std::move(set)});
+
+                    Pipeline p;
+                    p.AddStage(Registry::Get().Create("detect_sift"), "detect_sift",
+                               {{-1, 0}}, 1, 1);
+                    auto m = Registry::Get().Create("match_brute");
+                    if (ParamBase* pb = m->FindParam("chain")) {
+                        std::string e3; pb->SetFromScript(Value(1.0), &e3);
+                    }
+                    if (ParamBase* pb = m->FindParam("window")) {
+                        std::string e3; pb->SetFromScript(Value(2.0), &e3);
+                    }
+                    // Loose, so there ARE outliers for the geometry to reject.
+                    if (ParamBase* pb = m->FindParam("ratio")) {
+                        std::string e3; pb->SetFromScript(Value(0.99), &e3);
+                    }
+                    p.AddStage(std::move(m), "match_brute", {{0, 0}}, 1, 2);
+                    p.AddStage(Registry::Get().Create("align_features"),
+                               "align_features", {{1, 0}}, 1, 3);
+
+                    std::string e3;
+                    if (p.Execute(&s, nullptr, &e3)) {
+                        const Data* out = p.Resolve({2, 0}, &s);
+                        const auto* os = out ? std::get_if<ImageSet>(out) : nullptr;
+                        int marked = 0, total = 0, kept = 0;
+                        if (os)
+                            for (const Image& im : os->images) {
+                                const MatchSidecar* ms2 = MatchesOf(im);
+                                if (!ms2) continue;
+                                for (const MatchSet& st : ms2->sets) {
+                                    total  += int(st.matches.size());
+                                    marked += int(st.inlier.size());
+                                    for (size_t k = 0; k < st.matches.size(); ++k)
+                                        if (st.IsInlier(k)) ++kept;
+                                }
+                            }
+                        Check(total > 0 && marked == total,
+                              "align_features marks every match set with an "
+                              "inlier verdict (" + std::to_string(marked) +
+                              " of " + std::to_string(total) + ")");
+                        Check(kept > 0 && kept < total,
+                              "...and it rejects some without rejecting all (" +
+                                  std::to_string(kept) + " of " +
+                                  std::to_string(total) + " kept)");
+                    } else {
+                        Check(false, "the inlier-marking pipeline ran: " + e3);
+                    }
+                }
+
                 // Without matches it is an error, not a silent success -- the
                 // same contract align_features has.
                 {
