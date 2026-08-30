@@ -162,48 +162,76 @@ public:
             return false;
         }
 
-        const int refIdx = std::clamp(int(m_reference), 0, int(images->size()) - 1);
-        const FeatureSidecar* ref = FeaturesOf((*images)[size_t(refIdx)]);
-        if (!ref) {
-            *err = "match_brute: the reference image has no features -- "
-                   "run a detector before matching";
-            return false;
+        const int fixedRef = std::clamp(int(m_reference), 0, int(images->size()) - 1);
+        const bool chain   = bool(m_chain);
+
+        if (!chain) {
+            const FeatureSidecar* ref = FeaturesOf((*images)[size_t(fixedRef)]);
+            if (!ref) {
+                *err = "match_brute: the reference image has no features -- "
+                       "run a detector before matching";
+                return false;
+            }
+            if (ref->keypoints.empty()) {
+                m_note = "the reference image has no features to match against";
+                return true;
+            }
         }
-        if (ref->keypoints.empty()) {
-            m_note = "the reference image has no features to match against";
-            return true;
-        }
+
+        // How many previous frames each one pairs with.
+        //
+        // 1 is the plain chain. More is what bundle adjustment needs: a
+        // sequential chain contains no constraint relating frame 8 to frame 5,
+        // so nothing in it can correct drift that built up between them.
+        // Matching a window supplies those constraints directly.
+        const int window = chain ? std::max(1, int(m_window)) : 1;
 
         for (size_t i = 0; i < images->size(); ++i) {
-            if (int(i) == refIdx) continue;
-
             Image& img = (*images)[i];
             const FeatureSidecar* fs = FeaturesOf(img);
             if (!fs || fs->keypoints.empty()) continue;
 
-            // A different detector on two frames of one group is a script
-            // error rather than something to paper over: the descriptors are
-            // not comparable, and matching them would return pairs that mean
-            // nothing.
-            if (fs->descriptors.kind != ref->descriptors.kind ||
-                fs->descriptors.dim  != ref->descriptors.dim) {
-                *err = "match_brute: frame " + std::to_string(i) +
-                       " has a different descriptor from the reference (" +
-                       fs->detector + " vs " + ref->detector +
-                       ") -- one detector for the whole group";
-                return false;
+            auto ms = std::make_shared<MatchSidecar>();
+            ms->matcher = "brute";
+
+            // In chain mode frame i pairs with the `window` frames before it,
+            // NEAREST FIRST -- so sets.front() is the immediate predecessor and
+            // every consumer that wants one pairing gets the strongest.
+            // Otherwise there is a single fixed reference.
+            for (int w = 1; w <= window; ++w) {
+                const int refIdx = chain ? int(i) - w : fixedRef;
+                if (refIdx < 0 || int(i) == refIdx) continue;
+
+                const FeatureSidecar* ref = FeaturesOf((*images)[size_t(refIdx)]);
+                if (!ref || ref->keypoints.empty()) continue;
+
+                // A different detector on two frames of one group is a script
+                // error rather than something to paper over: the descriptors
+                // are not comparable, and matching them would return pairs
+                // that mean nothing.
+                if (fs->descriptors.kind != ref->descriptors.kind ||
+                    fs->descriptors.dim  != ref->descriptors.dim) {
+                    *err = "match_brute: frame " + std::to_string(i) +
+                           " has a different descriptor from the reference (" +
+                           fs->detector + " vs " + ref->detector +
+                           ") -- one detector for the whole group";
+                    return false;
+                }
+
+                MatchSet set;
+                set.reference = refIdx;
+                MatchPair(*ref, *fs, &set);
+
+                m_total += set.considered;
+                m_kept  += int(set.matches.size());
+                ++m_pairs;
+                ms->considered += set.considered;
+                ms->sets.push_back(std::move(set));
+
+                if (!chain) break;   // one fixed reference, not a window
             }
 
-            auto ms = std::make_shared<MatchSidecar>();
-            ms->reference = refIdx;
-            ms->matcher   = "brute";
-            MatchPair(*ref, *fs, ms.get());
-
-            m_total += ms->considered;
-            m_kept  += int(ms->matches.size());
-            ++m_pairs;
-
-            img.Sidecars().Set(kMatchSidecar, ms);
+            if (!ms->sets.empty()) img.Sidecars().Set(kMatchSidecar, ms);
         }
         return true;
     }
@@ -226,7 +254,7 @@ private:
     // Match HIDES the struct of the same name, and `Match m;` below then reads
     // as a call. The errors point at the variable rather than the collision.
     void MatchPair(const FeatureSidecar& ref, const FeatureSidecar& other,
-                   MatchSidecar* out) const {
+                   MatchSet* out) const {
         const float maxRatio = float(m_ratio);
         const bool  cross    = bool(m_crossCheck);
         const float sep      = std::max(0.0f, float(m_minSeparation));
@@ -281,7 +309,41 @@ private:
 
     Param<int> m_reference{this, "reference", 0, 0, 64,
         {.help = "Which frame the others are matched against. Every non-"
-                 "reference frame gets a match set pairing it to this one."}};
+                 "reference frame gets a match set pairing it to this one. "
+                 "Ignored when `chain` is on."}};
+
+    // WHY A PANORAMA CANNOT USE A FIXED REFERENCE, measured on a 15-frame
+    // handheld sweep at 24mm. Matching every frame against frame 0:
+    //
+    //   frame 3:  45% of candidates kept, solves at 85% inliers
+    //   frame 7:  32%, solves at 87%
+    //   frame 9:  17%, and the solve claims a 35000 px shift
+    //   frame 11:  5%, 66% inliers
+    //   frame 14:  2%, and the solve FAILS outright
+    //
+    // The overlap simply runs out. Consecutive frames in the same sweep hold
+    // 40-94% inliers on 619-1802 matches all the way to the end, so the
+    // information is there -- it is the pairing that was wrong.
+    //
+    // The absurd shifts are the more useful warning: a homography fitted to
+    // matches crowded into one corner is unconstrained everywhere else, and
+    // extrapolates. It does not report failure, it reports nonsense
+    // confidently, which is exactly the failure a stitcher must not build on.
+    Param<int> m_window{this, "window", 1, 1, 8,
+        {.help = "In chain mode, how many previous frames each one matches "
+                 "against. 1 is a plain chain. Raise it for bundle "
+                 "adjustment: a sequential chain holds no constraint relating "
+                 "frame 8 to frame 5, so nothing in it can undo drift that "
+                 "accumulated between them. Measured on a 15-frame sweep, "
+                 "pairs three apart still yield about 400 matches at 85-91%% "
+                 "inliers -- real constraints a chain discards. Costs one "
+                 "extra match pass per frame per step."}};
+
+    Param<bool> m_chain{this, "chain", false,
+        "Match each frame to the one before it instead of to a fixed "
+        "reference. What a panorama needs: overlap between neighbours stays "
+        "high along a sweep, while overlap with the first frame runs out. The "
+        "aligner then composes the chain into a common frame."};
 
     Param<float> m_ratio{this, "ratio", 0.8f, 0.1f, 1.0f,
         {.help = "Lowe's ratio test: keep a match only when the best candidate "

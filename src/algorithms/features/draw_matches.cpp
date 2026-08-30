@@ -56,7 +56,7 @@ public:
 
         for (Image& img : *images) {
             const MatchSidecar* ms = MatchesOf(img);
-            if (!ms || ms->matches.empty()) {
+            if (!ms || ms->Matches().empty()) {
                 // Dim it anyway, so every frame in the group looks alike and
                 // the reference is not conspicuously brighter than the rest.
                 if (dim < 1.0f) Dim(img, dim);
@@ -64,8 +64,8 @@ public:
             }
             m_noMatches = false;
 
-            if (ms->reference < 0 || size_t(ms->reference) >= images->size()) continue;
-            const FeatureSidecar* refF = FeaturesOf((*images)[size_t(ms->reference)]);
+            if (ms->Reference() < 0 || size_t(ms->Reference()) >= images->size()) continue;
+            const FeatureSidecar* refF = FeaturesOf((*images)[size_t(ms->Reference())]);
             const FeatureSidecar* myF  = FeaturesOf(img);
             if (!refF || !myF) continue;
 
@@ -109,8 +109,8 @@ private:
 
         // Most confident first, so the cap keeps the matches worth seeing.
         std::vector<const Match*> order;
-        order.reserve(ms.matches.size());
-        for (const Match& m : ms.matches) order.push_back(&m);
+        order.reserve(ms.Matches().size());
+        for (const Match& m : ms.Matches()) order.push_back(&m);
         std::stable_sort(order.begin(), order.end(),
                          [](const Match* a, const Match* b) { return a->ratio < b->ratio; });
 

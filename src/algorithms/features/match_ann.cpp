@@ -394,56 +394,96 @@ public:
             return false;
         }
 
-        const int refIdx = std::clamp(int(m_reference), 0, int(images->size()) - 1);
-        const FeatureSidecar* ref = FeaturesOf((*images)[size_t(refIdx)]);
-        if (!ref) {
-            *err = "match_ann: the reference image has no features -- "
-                   "run a detector before matching";
-            return false;
-        }
-        if (ref->keypoints.empty()) {
-            m_note = "the reference image has no features to match against";
-            return true;
+        const int fixedRef = std::clamp(int(m_reference), 0, int(images->size()) - 1);
+        const bool chain   = bool(m_chain);
+
+        if (!chain) {
+            const FeatureSidecar* r0 = FeaturesOf((*images)[size_t(fixedRef)]);
+            if (!r0) {
+                *err = "match_ann: the reference image has no features -- "
+                       "run a detector before matching";
+                return false;
+            }
+            if (r0->keypoints.empty()) {
+                m_note = "the reference image has no features to match against";
+                return true;
+            }
         }
 
         // The index is built ONCE over the reference and queried by every other
         // frame. That is the whole reason an approximate matcher pays off in a
         // group: the build is amortised over N-1 searches.
+        //
+        // Chain mode gives that up, necessarily: each frame queries a different
+        // neighbour, so there are N-1 builds over N-1 searches and the
+        // amortisation is gone. The index still beats brute force on a single
+        // pair -- that is what the checks/trees parameters buy -- but the
+        // margin is much smaller here than in the fixed-reference case, and a
+        // chained group is the one place brute force may well be the better
+        // choice. Said plainly rather than hidden: `builtFor` is what makes the
+        // rebuild explicit instead of accidental.
         KdForest  forest;
         LshTables lsh;
-        const bool isFloat = ref->descriptors.kind == DescriptorKind::Float;
-        if (isFloat)
-            forest.Build(ref->descriptors, std::max(1, int(m_trees)), 8, 12345u);
-        else
-            lsh.Build(ref->descriptors, std::max(1, int(m_trees)),
-                      int(m_keyBits), 12345u);
+        bool      isFloat  = false;
+        int       builtFor = -1;
+
+        // See match_brute's `window`: a chain alone holds no constraint
+        // relating frame 8 to frame 5, so bundle adjustment has nothing to
+        // correct drift with unless each frame matches several neighbours.
+        const int window = chain ? std::max(1, int(m_window)) : 1;
 
         for (size_t i = 0; i < images->size(); ++i) {
-            if (int(i) == refIdx) continue;
-
             Image& img = (*images)[i];
             const FeatureSidecar* fs = FeaturesOf(img);
             if (!fs || fs->keypoints.empty()) continue;
 
-            if (fs->descriptors.kind != ref->descriptors.kind ||
-                fs->descriptors.dim  != ref->descriptors.dim) {
-                *err = "match_ann: frame " + std::to_string(i) +
-                       " has a different descriptor from the reference (" +
-                       fs->detector + " vs " + ref->detector +
-                       ") -- one detector for the whole group";
-                return false;
+            auto ms = std::make_shared<MatchSidecar>();
+
+            for (int w = 1; w <= window; ++w) {
+                const int refIdx = chain ? int(i) - w : fixedRef;
+                if (refIdx < 0 || int(i) == refIdx) continue;
+
+                const FeatureSidecar* ref = FeaturesOf((*images)[size_t(refIdx)]);
+                if (!ref || ref->keypoints.empty()) continue;
+
+                if (fs->descriptors.kind != ref->descriptors.kind ||
+                    fs->descriptors.dim  != ref->descriptors.dim) {
+                    *err = "match_ann: frame " + std::to_string(i) +
+                           " has a different descriptor from the reference (" +
+                           fs->detector + " vs " + ref->detector +
+                           ") -- one detector for the whole group";
+                    return false;
+                }
+
+                if (builtFor != refIdx) {
+                    forest = KdForest{};
+                    lsh    = LshTables{};
+                    isFloat = ref->descriptors.kind == DescriptorKind::Float;
+                    if (isFloat)
+                        forest.Build(ref->descriptors, std::max(1, int(m_trees)), 8, 12345u);
+                    else
+                        lsh.Build(ref->descriptors, std::max(1, int(m_trees)),
+                                  int(m_keyBits), 12345u);
+                    builtFor = refIdx;
+                }
+
+                MatchSet set;
+                set.reference = refIdx;
+                MatchPair(*ref, *fs, forest, lsh, isFloat, &set);
+
+                m_total += set.considered;
+                m_kept  += int(set.matches.size());
+                ++m_pairs;
+                ms->considered += set.considered;
+                ms->sets.push_back(std::move(set));
+
+                if (!chain) break;
             }
 
-            auto ms = std::make_shared<MatchSidecar>();
-            ms->reference = refIdx;
-            ms->matcher   = isFloat ? "ann (kd-forest)" : "ann (lsh)";
-            MatchPair(*ref, *fs, forest, lsh, isFloat, ms.get());
-
-            m_total += ms->considered;
-            m_kept  += int(ms->matches.size());
-            ++m_pairs;
-
-            img.Sidecars().Set(kMatchSidecar, ms);
+            if (!ms->sets.empty()) {
+                ms->matcher = isFloat ? "ann (kd-forest)" : "ann (lsh)";
+                img.Sidecars().Set(kMatchSidecar, ms);
+            }
         }
         return true;
     }
@@ -463,7 +503,7 @@ public:
 private:
     void MatchPair(const FeatureSidecar& ref, const FeatureSidecar& other,
                    const KdForest& forest, const LshTables& lsh, bool isFloat,
-                   MatchSidecar* out) const {
+                   MatchSet* out) const {
         const float maxRatio = float(m_ratio);
         const int   checks   = std::max(1, int(m_checks));
         const float sepSq    = float(m_minSeparation) * float(m_minSeparation);
@@ -552,7 +592,28 @@ private:
     }
 
     Param<int> m_reference{this, "reference", 0, 0, 64,
-        {.help = "Which frame the others are matched against."}};
+        {.help = "Which frame the others are matched against. Ignored when "
+                 "`chain` is on."}};
+
+    // See match_brute's `chain` for the measurement that motivates this: along
+    // a 15-frame sweep, overlap with frame 0 decays to 2% and the solve fails,
+    // while consecutive neighbours hold throughout.
+    //
+    // Note the cost asymmetry against brute force. The index build is amortised
+    // over N-1 queries with a fixed reference, and not amortised at all in a
+    // chain -- so if the group is chained, measure before assuming this matcher
+    // is the faster one.
+    Param<int> m_window{this, "window", 1, 1, 8,
+        {.help = "In chain mode, how many previous frames each one matches "
+                 "against. See match_brute's window: 1 is a plain chain, and "
+                 "more is what bundle adjustment needs to undo accumulated "
+                 "drift. Each extra step costs another index build here, "
+                 "since the reference changes every pair."}};
+
+    Param<bool> m_chain{this, "chain", false,
+        "Match each frame to the one before it instead of to a fixed "
+        "reference. What a panorama needs. Costs this matcher its main "
+        "advantage -- the index must be rebuilt for every pair."};
 
     Param<int> m_checks{this, "checks", 256, 1, 4000,
         {.help = "How many candidates to examine per query. THE speed/accuracy "

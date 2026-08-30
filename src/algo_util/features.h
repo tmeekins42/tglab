@@ -25,6 +25,7 @@
 // already prevent.
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <string>
@@ -39,6 +40,37 @@ namespace tglab {
 // use, for the same reason as kTransformSidecar: a typo would silently mean "no
 // features", which looks like a detector that found nothing.
 inline constexpr const char* kFeatureSidecar = "features";
+
+// The image's own signal level, as the 99th percentile of its samples.
+//
+// WHY A DETECTOR NEEDS THIS. Every contrast threshold in the literature --
+// Lowe's 0.02, SURF's Hessian threshold -- was calibrated on display-referred
+// images, where the median pixel sits near 0.5 and the range really is 0..1. A
+// scene-referred float raw is nominally in 0..1 too, and occupies the bottom
+// sixth of it: measured across a 15-frame panorama, median 0.058, p99 0.16.
+// The same threshold is then roughly ten times too strict, and the detector
+// reports a scene with no texture rather than an exposure it was not scaled
+// for. Dividing by this makes the published defaults mean what they say.
+//
+// The 99th percentile rather than the maximum, because a maximum is one hot
+// pixel or one specular highlight -- and normalising by an outlier would scale
+// the whole image by whatever happened to be brightest in it, which is exactly
+// the instability this is meant to remove.
+//
+// nth_element rather than a sort: linear rather than n log n, and only the one
+// order statistic is wanted. Every second pixel in each direction is sampled,
+// which on a 45 MP frame is 2.8 M values -- far more than enough for a
+// percentile, and a quarter of the work.
+inline float Percentile99(const std::vector<float>& v) {
+    if (v.empty()) return 0.0f;
+    std::vector<float> s;
+    s.reserve(v.size() / 4 + 1);
+    for (size_t i = 0; i < v.size(); i += 4) s.push_back(std::fabs(v[i]));
+    if (s.empty()) return 0.0f;
+    const size_t i = size_t(0.99 * double(s.size() - 1));
+    std::nth_element(s.begin(), s.begin() + i, s.end());
+    return s[i];
+}
 
 // One detected point.
 //
@@ -161,12 +193,48 @@ struct Match {
 // correspondences, and each belongs with the frame it describes -- the same
 // arrangement the transform sidecar uses, and for the same reason: whatever
 // consumes it is walking the frames, not the pairs.
-class MatchSidecar : public SidecarBase {
-public:
+// One frame's matches against ONE other frame.
+//
+// Split out of MatchSidecar so a frame can carry several. Bundle adjustment
+// needs that: refining a chain against only its immediate neighbours cannot
+// remove accumulated drift, because a sequential chain has no constraint saying
+// where frame 8 sits relative to frame 5. Matching a WINDOW of neighbours
+// supplies exactly those constraints, and they are measurably there --
+// on a real 15-frame sweep, pairs three apart still yield about 400 matches at
+// 85-91% inliers, all of which a chain throws away.
+struct MatchSet {
     std::vector<Match> matches;
 
     // Which image the `a` indices refer to. -1 when unset.
     int reference = -1;
+
+    // How many candidate pairs were considered. See `considered` below.
+    int considered = 0;
+};
+
+class MatchSidecar : public SidecarBase {
+public:
+    // Every set this frame matched against, nearest neighbour first.
+    //
+    // Usually one, which is why the accessors below exist: a matcher that pairs
+    // against a single reference writes one set, and every consumer written
+    // before windowed matching reads it through `matches` and `reference`
+    // without knowing there could be more.
+    std::vector<MatchSet> sets;
+
+    // The FIRST set's matches and reference, for the consumers that want one
+    // pairing -- the aligner's chain, draw_matches, the reports.
+    //
+    // References into `sets` rather than copies, so there is one storage
+    // location and no way for the two views to disagree. That was the whole
+    // reason Param<T> is shaped the way it is, and the same argument applies
+    // here: a duplicated `matches` vector would need syncing, and every bug
+    // afterwards would be a sync bug.
+    const std::vector<Match>& Matches() const {
+        static const std::vector<Match> kEmpty;
+        return sets.empty() ? kEmpty : sets.front().matches;
+    }
+    int Reference() const { return sets.empty() ? -1 : sets.front().reference; }
 
     // What produced these, for the report.
     std::string matcher;

@@ -34,6 +34,8 @@
 // least squares usable, because the final fit runs only on the inliers.
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <random>
 #include <string>
 #include <vector>
@@ -45,8 +47,6 @@
 namespace tglab {
 namespace {
 
-// A correspondence in image coordinates, which is what the solvers want -- the
-// keypoint indices matter only for reporting.
 struct Pair {
     float ax, ay;   // in the reference
     float bx, by;   // in this frame
@@ -271,6 +271,9 @@ public:
         m_inliers = 0;
         m_matches = 0;
         m_worstShift = 0.0f;
+        m_chained = 0;
+        m_broke = -1;
+        m_rejected = -1;
         m_note.clear();
 
         if (!images || images->size() < 2) {
@@ -278,22 +281,40 @@ public:
             return false;
         }
 
+        // Each frame's solved transform, indexed as the images are, for
+        // composing a chain. Identity for the reference and for anything that
+        // did not solve, which is the right neutral element: a frame whose own
+        // solve failed contributes no correction, and one that never needed a
+        // solve contributes none either.
+        std::vector<Affine> solved(images->size());
+        std::vector<bool>   isChained(images->size(), false);
+
         bool anyMatches = false;
         for (size_t i = 0; i < images->size(); ++i) {
             Image& img = (*images)[i];
             const MatchSidecar* ms = MatchesOf(img);
-            if (!ms || ms->matches.empty()) continue;
+            if (!ms || ms->Matches().empty()) continue;
             anyMatches = true;
             ++m_frames;
 
-            if (ms->reference < 0 || size_t(ms->reference) >= images->size()) continue;
-            const FeatureSidecar* refF = FeaturesOf((*images)[size_t(ms->reference)]);
+            if (ms->Reference() < 0 || size_t(ms->Reference()) >= images->size()) continue;
+
+            // A frame matched to its immediate predecessor is a CHAIN link:
+            // its transform maps into that neighbour's frame, not into frame
+            // 0. Composing them is what puts every frame in one coordinate
+            // system -- see the loop after this one.
+            //
+            // Detected from the match sidecar rather than from a parameter of
+            // this algorithm, so the aligner cannot disagree with the matcher
+            // about which mode ran. The matcher already recorded the answer.
+            const bool chainLink = (i > 0 && ms->Reference() == int(i) - 1);
+            const FeatureSidecar* refF = FeaturesOf((*images)[size_t(ms->Reference())]);
             const FeatureSidecar* myF  = FeaturesOf(img);
             if (!refF || !myF) continue;
 
             std::vector<Pair> pairs;
-            pairs.reserve(ms->matches.size());
-            for (const Match& m : ms->matches) {
+            pairs.reserve(ms->Matches().size());
+            for (const Match& m : ms->Matches()) {
                 if (m.a < 0 || size_t(m.a) >= refF->keypoints.size()) continue;
                 if (m.b < 0 || size_t(m.b) >= myF->keypoints.size()) continue;
                 const Keypoint& ka = refF->keypoints[size_t(m.a)];
@@ -306,8 +327,67 @@ public:
             int inliers = 0;
             if (!Ransac(pairs, &t, &inliers)) continue;
 
+            // A SOLVE THAT MOVES THE FRAME FURTHER THAN THE FRAME IS WIDE is
+            // rejected, however confident it looks.
+            //
+            // Tim hit this by dropping files on the palette: Windows handed
+            // them over re-ordered, so the chain paired frame 7 with frame 0 --
+            // views about 30 degrees apart with essentially no overlap. That
+            // link did not fail. It reported 59 of 65 matches as inliers, 91%,
+            // which is indistinguishable from the 90% a genuinely adjacent pair
+            // gives, and the whole run said "solved 7 of 7 frames".
+            //
+            // What separated them was never the inlier RATE. It was:
+            //
+            //   adjacent  (0 -> 1):  543 matches kept of 5000,   1081 px shift
+            //   spurious  (7 -> 0):   65 matches kept of 5000,  10908 px shift
+            //
+            // RANSAC is doing exactly its job in both cases -- it finds the
+            // largest consistent subset, and 59 mutually consistent false
+            // matches are still consistent. What it cannot know is that a
+            // transform placing this frame two frame-widths away describes two
+            // views that barely see the same scene, so whatever agreed did so
+            // by coincidence.
+            //
+            // 1.5 frame widths rather than 1: a real pan with modest overlap
+            // legitimately shifts most of a frame, and this must not reject
+            // those. It is a bound on the absurd, not a tightness control.
+            {
+                const ImageDesc& d = img.Desc();
+                const float shift = MaxCornerShift(t, d.width, d.height);
+                const float limit = 1.5f * float(std::max(d.width, d.height));
+                if (shift > limit) {
+                    m_rejected = int(i);
+                    continue;
+                }
+            }
+
             m_inliers += inliers;
             ++m_solved;
+            solved[i] = t;
+
+            // Flagged only AFTER the solve succeeded, which is the whole point
+            // of it being here rather than beside the chainLink test above.
+            //
+            // The first version set this as soon as the sidecar named the
+            // previous frame, before Ransac had run. A frame whose solve then
+            // failed -- too few matches is the ordinary reason -- kept the flag
+            // with an IDENTITY transform, and the chain loop below dutifully
+            // composed it: the failed frame inherited its predecessor's
+            // position exactly, and every frame after it was short by one link.
+            //
+            // That is the worst shape a bug can take here. It is not a crash
+            // and not a visibly broken frame; it is a panorama where one frame
+            // sits exactly on top of its neighbour and everything downstream is
+            // offset, which reads as ghosting rather than as a failure. The
+            // test that caught it asserts frame 2 lands at TWICE the step, and
+            // it landed at one.
+            isChained[i] = chainLink;
+
+            // A chained frame is not attached here: its transform is still
+            // relative to its neighbour, and only means something once the
+            // chain below has composed it.
+            if (chainLink) continue;
 
             // Composed with whatever is already attached, so this can follow a
             // coarser solve or precede the pixel refiner. Tim's requirement,
@@ -318,6 +398,76 @@ public:
             const ImageDesc& d = img.Desc();
             m_worstShift = std::max(m_worstShift,
                                     MaxCornerShift(t, d.width, d.height));
+        }
+
+        // COMPOSE THE CHAIN.
+        //
+        // A chained solve gives T[i], mapping frame i-1's coordinates into
+        // frame i. What every consumer wants is a map from ONE common frame
+        // into each image, so the links have to be accumulated:
+        //
+        //     C[0] = I,   C[i] = T[i] . C[i-1]
+        //
+        // Frame 0's coordinate system becomes the panorama's, which is a choice
+        // and not the only one -- a centre frame would halve the accumulated
+        // error at each end. It is the honest default though, because it is the
+        // one a script can reason about: the reference frame is where it says.
+        //
+        // ERROR ACCUMULATES ALONG THE CHAIN, and nothing here hides that. Each
+        // link carries its own residual and composition multiplies them, so the
+        // far end of a long sweep is the least certain part of the result. That
+        // is inherent to sequential alignment; removing it takes a global
+        // bundle adjustment over all pairs at once, which is a different and
+        // much larger algorithm. What this does instead is REPORT the chain
+        // length, so a suspicious far end has a visible cause.
+        // ASCENDING, and that order is load-bearing: composing frame i needs
+        // frame i-1 ALREADY composed, not merely solved. Running this loop
+        // backwards, or in parallel, silently produces transforms that are each
+        // relative to their neighbour rather than to frame 0 -- which looks
+        // like a stitch where every seam is individually fine and the whole is
+        // wrong.
+        // A BROKEN LINK ENDS THE CHAIN, rather than being stepped over.
+        //
+        // If frame i never solved, nothing downstream can be placed relative to
+        // frame 0: frame i+1's transform is relative to frame i, whose own
+        // position is unknown. Composing anyway would put every later frame at
+        // whatever offset the missing link happened to leave behind -- the
+        // failure mode described above, one frame stacked on its neighbour.
+        //
+        // So the chain simply stops, and the frames past the break keep no
+        // transform at all. They then merge unaligned, which is visibly wrong
+        // in the right way: a stitch that is obviously missing its tail beats
+        // one that is subtly ghosted throughout.
+
+        m_chained = 0;
+        m_broke = -1;
+        bool live = true;
+        for (size_t i = 1; i < images->size(); ++i) {
+            if (!isChained[i]) {
+                // Frame i is not a chain link. Either it solved against a fixed
+                // reference (already attached above and fine), or it did not
+                // solve at all -- and if a LINK was expected here, the chain is
+                // broken from this point on.
+                const MatchSidecar* ms = MatchesOf((*images)[i]);
+                if (live && ms && ms->Reference() == int(i) - 1) {
+                    live = false;
+                    m_broke = int(i);
+                }
+                continue;
+            }
+            if (!live) continue;
+
+            ++m_chained;
+            solved[i] = solved[i].Then(solved[i - 1]);
+
+            Image& img = (*images)[i];
+            const Affine prior = TransformOf(img);
+            AttachTransform(&img, prior.IsIdentity() ? solved[i]
+                                                     : solved[i].Then(prior));
+
+            const ImageDesc& d = img.Desc();
+            m_worstShift = std::max(m_worstShift,
+                                    MaxCornerShift(solved[i], d.width, d.height));
         }
 
         if (!anyMatches) {
@@ -331,13 +481,26 @@ public:
     std::string RunReport() const override {
         if (!m_note.empty()) return m_note;
         if (m_frames == 0) return {};
-        char buf[192];
+        char buf[256];
+        char chain[64] = "";
+        if (m_chained > 0)
+            std::snprintf(chain, sizeof chain, ", %d chained", m_chained);
+        char broke[192] = "";
+        if (m_rejected >= 0)
+            std::snprintf(broke, sizeof broke,
+                          " -- frame %d REJECTED: it solved, but to a shift larger "
+                          "than the frame. Usually the frames are out of order.",
+                          m_rejected);
+        else if (m_broke >= 0)
+            std::snprintf(broke, sizeof broke,
+                          " -- CHAIN BROKE at frame %d, later frames unaligned",
+                          m_broke);
         std::snprintf(buf, sizeof buf,
-                      "%s: solved %d of %d frames, %d of %d matches were inliers "
-                      "(%.0f%%), largest shift %.1f px",
-                      ModelName(), m_solved, m_frames, m_inliers, m_matches,
+                      "%s: solved %d of %d frames%s, %d of %d matches were inliers "
+                      "(%.0f%%), largest shift %.1f px%s",
+                      ModelName(), m_solved, m_frames, chain, m_inliers, m_matches,
                       m_matches ? 100.0 * double(m_inliers) / double(m_matches) : 0.0,
-                      double(m_worstShift));
+                      double(m_worstShift), broke);
         return buf;
     }
 
@@ -522,6 +685,15 @@ private:
 
     int         m_solved = 0, m_frames = 0;
     int         m_inliers = 0, m_matches = 0;
+    // How many frames were composed along a chain rather than solved directly
+    // against the reference. Reported because error accumulates with it.
+    int         m_chained = 0;
+    // Where a chain stopped, or -1. Reported because a panorama missing its
+    // tail should say so rather than leave the user to notice.
+    int         m_broke = -1;
+    // A frame whose solve was rejected as implausible, or -1. Reported because
+    // the usual cause is frames in the wrong ORDER, which the user can fix.
+    int         m_rejected = -1;
     float       m_worstShift = 0.0f;
     std::string m_note;
 };
