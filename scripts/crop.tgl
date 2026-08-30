@@ -1,0 +1,53 @@
+# Cropping and straightening, with a preview that shows what is being cut.
+#
+# THE PREVIEW TOGGLE IS THE WHOLE INTERACTION. A crop that only ever shows the
+# cropped result is nearly unusable while setting it: the part being cut away is
+# off screen the moment a slider moves, so there is no way to judge where the
+# edge should sit. Nothing is lost -- the input is still there -- but the viewer
+# is not showing it.
+#
+#   preview on   the FULL frame, with the crop rectangle drawn and the outside
+#                dimmed. Move the sliders and watch the rectangle.
+#   preview off  the cropped raster, at its new size.
+#
+# Same parameters either way. Set the rectangle with preview on, then turn it
+# off to apply.
+#
+# STRAIGHTENING IS PART OF THE SAME OPERATION, not a separate stage. Rotating a
+# frame leaves empty wedges in the corners that have to be cropped away, and
+# cropping first then rotating puts them back. Doing both at once means the
+# rectangle is measured in the ROTATED frame, so the preview shows exactly what
+# comes out -- corners included.
+#
+# The angle rotates about the CENTRE OF THE RECTANGLE rather than of the frame.
+# About the frame centre the rectangle would swing away as the angle changed,
+# and the two modes would show different parts of the image for the same
+# settings.
+#
+# The trims are FRACTIONS of the frame, not pixels, so the same crop means the
+# same thing on a preview-sized image and a full-sized one -- and on every frame
+# of a group whatever their sizes.
+
+src = image("test")
+
+# check() rather than slider(): this is a toggle, and a 0..1 slider is a poor
+# way to spell one. crop's own `preview` parameter is a Param<bool>, so it draws
+# as a checkbox in the inspector too -- this only controls it from the script.
+preview = check("preview the rectangle", 1)
+
+left   = slider("trim left",   0, 0.9, 0)
+right  = slider("trim right",  0, 0.9, 0)
+top    = slider("trim top",    0, 0.9, 0)
+bottom = slider("trim bottom", 0, 0.9, 0)
+
+angle  = slider("straighten (degrees)", -20, 20, 0)
+
+src => crop(preview = preview,
+            left = left, right = right, top = top, bottom = bottom,
+            angle = angle)
+    => display("crop")
+
+# A crop that trims nothing and rotates nothing is a no-op, and the pipeline
+# aliases it away entirely -- so leaving this stage permanently in a chain costs
+# nothing until it is actually used. (Only with preview OFF: a preview really
+# does change the pixels, so it always runs.)

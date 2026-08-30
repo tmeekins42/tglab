@@ -559,6 +559,12 @@ bool Pipeline::RunStageOnce(Stage& s, const std::vector<const Data*>& in,
             // to know not to gamma-decode it and not to clamp it.
             d.linear = true;
         }
+        // The algorithm's chance to change the raster -- a crop, or a resize.
+        // Applied AFTER the format is resolved, so an algorithm that changes
+        // the size sees the format it will actually be handed and can leave it
+        // alone. See AlgorithmBase::OutputDesc.
+        d = s.algo->OutputDesc(int(p), d);
+
         if (!d.Valid()) {
             *err = "line " + std::to_string(s.line) + ": '" + s.algoName +
                    "' could not determine output size";
@@ -955,7 +961,24 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
             const bool sameShape =
                 outPorts.size() == 1 && outPorts[0].shape != ShapeSpec::Reduced;
 
-            if (sameFormat && sameShape) {
+            // ...and the same SIZE. An algorithm that resizes its output (a
+            // crop, a resize) cannot be aliased to its input even when it
+            // reports itself as doing nothing, for the same reason a format
+            // change cannot: downstream would receive a raster of the wrong
+            // dimensions.
+            //
+            // A crop whose rectangle is the whole frame IS a genuine no-op and
+            // does alias, because OutputDesc then returns the input descriptor
+            // unchanged -- which is the honest test, rather than asking the
+            // algorithm to promise.
+            bool sameSize = true;
+            if (TypeOf(*in[0]) == DataType::Image) {
+                const ImageDesc& id = std::get<Image>(*in[0]).Desc();
+                const ImageDesc  od = s.algo->OutputDesc(0, id);
+                sameSize = od.width == id.width && od.height == id.height;
+            }
+
+            if (sameFormat && sameShape && sameSize) {
                 s.outputs.clear();
                 s.outputs.resize(1);          // stays empty: nothing is produced
                 s.bypassOf = s.inputs[0];

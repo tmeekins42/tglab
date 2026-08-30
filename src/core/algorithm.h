@@ -200,6 +200,29 @@ public:
     // drops the effect.
     virtual bool IsNoOp() const { return false; }
 
+    // Restates the output descriptor for port `p`, given what the pipeline
+    // would otherwise have allocated.
+    //
+    // The pipeline sizes every output from input 0 and then runs the algorithm
+    // INTO that buffer, which is right for the overwhelming majority: a blur, a
+    // tone map and a demosaic all produce one output pixel per input pixel. An
+    // algorithm that changes the raster -- a crop, and a resize when one is
+    // written -- has no way to express that, and this is it.
+    //
+    // A HOOK RATHER THAN A PORT SPEC, because the size is not a property of the
+    // algorithm the way its format is: the same crop produces a different
+    // descriptor for every setting of its sliders. FormatSpec can stay a
+    // compile-time declaration precisely because a format does not vary with a
+    // parameter; a size does.
+    //
+    // Returning `in` unchanged (the default) means "same size as the input",
+    // which is what every existing algorithm wants and gets without saying so.
+    //
+    // Whatever comes back is validated by the caller, so a crop that computes
+    // an empty rectangle produces a named error rather than a zero-sized
+    // allocation that fails somewhere later and less clearly.
+    virtual ImageDesc OutputDesc(int /*p*/, const ImageDesc& in) const { return in; }
+
     // Solves and attaches transforms across a whole group. Called only when
     // IsAligner() is true.
     virtual bool RunAlign(std::vector<Image>* /*images*/, std::string* /*err*/) { return true; }
