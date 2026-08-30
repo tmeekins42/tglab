@@ -316,10 +316,17 @@ private:
         return d;
     }
 
+    // A candidate, held until the whole scan is done. `level` is which scale
+    // space level it came from, needed to describe it afterwards.
+    struct Cand {
+        Keypoint kp;
+        int      level;
+    };
+
     void FindExtrema(const std::vector<Level>& levels, RunCtx& ctx,
                      FeatureSidecar* out) {
         const float thresh = float(m_threshold);
-        const int   maxFeat = std::max(1, int(m_maxFeatures));
+        std::vector<Cand> cands;
 
         for (size_t i = 1; i + 1 < levels.size(); ++i) {
             if (ctx.Cancelled()) return;
@@ -342,7 +349,6 @@ private:
                             }
                         }
                     if (!isMax) continue;
-                    if (int(out->keypoints.size()) >= maxFeat) return;
 
                     // Sub-pixel by a diagonal quadratic fit, as in SURF.
                     const float dxx = here.At(x + 1, y) + here.At(x - 1, y) - 2.0f * v;
@@ -363,15 +369,53 @@ private:
                     kp.scale = levels[i].sigma * st;
                     kp.response = v;
                     kp.octave = levels[i].octave;
-                    kp.angle = m_upright ? 0.0f : Orientation(levels[i].img, kp);
 
-                    out->keypoints.push_back(kp);
-
-                    std::vector<uint8_t> desc(size_t((kDescBits + 7) / 8), 0);
-                    Describe(levels[i].img, kp, desc.data());
-                    out->descriptors.b.insert(out->descriptors.b.end(),
-                                              desc.begin(), desc.end());
+                    // Collected, not described. The orientation and the
+                    // descriptor are the expensive part and most of these will
+                    // not survive the cap -- see the ranking below.
+                    cands.push_back({kp, int(i)});
                 }
+        }
+
+        // RANK, THEN CAP. Never stop the scan.
+        //
+        // This was a `return` the moment the count hit max_features, in the
+        // middle of a raster scan -- so a frame with more than 5000 extrema
+        // kept everything above some scanline and NOTHING below it. Tim found
+        // it exactly as one would: the right-hand end of a panorama failed to
+        // align, and the feature count sat pinned at the cap.
+        //
+        // The failure is worse than "fewer features", because the loss is
+        // SPATIAL. Features are found top-to-bottom, so the discarded region is
+        // a contiguous band at the bottom of the frame -- and if that band is
+        // where the next frame overlaps, the pair has nothing to match on. The
+        // measured effect on the pair that failed: 2% of candidates kept and 0%
+        // inliers at the 5000 cap, against 5% and 49% at 15000. The features
+        // existed; the scan simply never reached them.
+        //
+        // ORB already did this correctly, which is why it was the one detector
+        // that did not fail. SURF and SIFT had the same bug.
+        const int cap = std::max(1, int(m_maxFeatures));
+        if (int(cands.size()) > cap) {
+            std::nth_element(cands.begin(), cands.begin() + cap, cands.end(),
+                             [](const Cand& a, const Cand& b) {
+                                 return a.kp.response > b.kp.response;
+                             });
+            cands.resize(size_t(cap));
+        }
+
+        // Describe only the survivors.
+        out->keypoints.reserve(cands.size());
+        for (const Cand& c : cands) {
+            if (ctx.Cancelled()) return;
+            Keypoint kp = c.kp;
+            kp.angle = m_upright ? 0.0f : Orientation(levels[size_t(c.level)].img, kp);
+            out->keypoints.push_back(kp);
+
+            std::vector<uint8_t> desc(size_t((kDescBits + 7) / 8), 0);
+            Describe(levels[size_t(c.level)].img, kp, desc.data());
+            out->descriptors.b.insert(out->descriptors.b.end(),
+                                      desc.begin(), desc.end());
         }
     }
 

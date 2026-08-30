@@ -30,6 +30,7 @@
 // trace^2/det -- which needs no square roots and is the standard formulation.
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -157,6 +158,37 @@ public:
                 base.v[size_t(y) * size_t(w) + size_t(x)] = g;
             }
 
+        // ...and then normalised again, by the image's OWN level.
+        //
+        // ValueScale() handles the FORMAT -- 8-bit to 0..1 -- and that is all it
+        // can handle. A scene-referred float raw is already "in 0..1" and still
+        // occupies the bottom sixth of it: measured on a 15-frame panorama, the
+        // median pixel was 0.058 and the 99th percentile 0.16. Lowe's contrast
+        // default of 0.02 was calibrated against display-referred images whose
+        // median sits near 0.5, so against a raw it rejects nearly everything
+        // real. It is not a threshold that is slightly too high; it is a
+        // threshold measured in the wrong units.
+        //
+        // The symptom was invisible in the ordinary way. Feature counts fell
+        // along the pan -- 354, 63, 6, 2 -- which reads exactly like a scene
+        // running out of texture, and the frames that failed were the flatter
+        // ones. Dropping the threshold to 0.005 took the worst frame from 2
+        // features to 1562, which is what proved it was never the scene.
+        //
+        // AKAZE already did this right, measuring its contrast factor as a
+        // gradient percentile with the comment that a value tuned on a
+        // high-contrast image misbehaves on a low-contrast one. Same disease,
+        // and it had the cure first.
+        //
+        // The 99th percentile rather than the max, because the max is one hot
+        // pixel or one specular highlight; and the same statistic is used by
+        // SURF, so a threshold means the same thing in both detectors.
+        m_level = Percentile99(base.v);
+        if (m_level > 1e-6f) {
+            const float inv = 1.0f / m_level;
+            for (float& v : base.v) v *= inv;
+        }
+
         auto sidecar = std::make_shared<FeatureSidecar>();
         sidecar->detector = "sift";
         sidecar->descriptors.kind = DescriptorKind::Float;
@@ -171,7 +203,10 @@ public:
 
     std::string RunReport() const override {
         if (m_found <= 0) return {};
-        return std::to_string(m_found) + " SIFT features";
+        char buf[64];
+        std::snprintf(buf, sizeof buf, "%d SIFT features (level %.3f)",
+                      m_found, m_level);
+        return buf;
     }
 
     bool HasGPU() const override { return false; }
@@ -234,6 +269,52 @@ private:
             // rather than needing a fresh blur.
             octaveBase = Halve(gauss[size_t(perOct)]);
         }
+
+        // RANK, THEN CAP, across every octave.
+        //
+        // This was a `return` the moment the count hit max_features, in the
+        // middle of a raster scan -- so a frame with more extrema than the cap
+        // kept everything above some scanline and NOTHING below it. The loss is
+        // SPATIAL, not merely numerical: features are found top-to-bottom, so
+        // what is discarded is a contiguous band at the bottom of the frame,
+        // and if that band is where the next frame overlaps, the pair has
+        // nothing to match on.
+        //
+        // Tim found it on AKAZE, which had the same bug: the right-hand end of
+        // a panorama failed to align while the feature count sat pinned at the
+        // cap. Measured there, on the pair that failed: 2% of candidates kept
+        // and 0% inliers before, 11% and 64% after -- at the SAME cap. The
+        // features existed; the scan never reached them.
+        //
+        // Done here rather than inside FindExtrema because SIFT's descriptor
+        // needs that octave's Gaussian plane, which is gone by the time the
+        // next octave runs. So candidates are described as they are found and
+        // the cap sorts the finished arrays -- which costs describing some that
+        // are then dropped, and is still far cheaper than being wrong.
+        const int cap = std::max(1, int(m_maxFeatures));
+        if (int(out->keypoints.size()) > cap) {
+            std::vector<int> order;
+            order.resize(out->keypoints.size());
+            for (size_t i = 0; i < order.size(); ++i) order[i] = int(i);
+            std::nth_element(order.begin(), order.begin() + cap, order.end(),
+                             [&](int a, int b) {
+                                 return std::abs(out->keypoints[size_t(a)].response) >
+                                        std::abs(out->keypoints[size_t(b)].response);
+                             });
+            order.resize(size_t(cap));
+
+            std::vector<Keypoint> keep;
+            std::vector<float>    kd;
+            keep.reserve(order.size());
+            kd.reserve(order.size() * size_t(kDescDim));
+            for (int idx : order) {
+                keep.push_back(out->keypoints[size_t(idx)]);
+                const float* d = &out->descriptors.f[size_t(idx) * size_t(kDescDim)];
+                kd.insert(kd.end(), d, d + kDescDim);
+            }
+            out->keypoints.swap(keep);
+            out->descriptors.f.swap(kd);
+        }
     }
 
     void FindExtrema(const std::vector<Plane>& gauss, const std::vector<Plane>& dog,
@@ -241,7 +322,6 @@ private:
                      RunCtx& ctx, FeatureSidecar* out) {
         const int w = dog[0].w, h = dog[0].h;
         const float contrast = float(m_contrast);
-        const int   maxFeat  = std::max(1, int(m_maxFeatures));
 
         // The scale factor from this octave's coordinates back to the input's.
         const float octScale = float(1 << octave);
@@ -292,7 +372,6 @@ private:
                     Orientations(g, kp, &angles);
 
                     for (float ang : angles) {
-                        if (int(out->keypoints.size()) >= maxFeat) return;
                         Keypoint k2 = kp;
                         k2.angle = ang;
                         // Back to input coordinates. Everything above works in
@@ -561,11 +640,32 @@ private:
                  "chosen to leave the input's own sampling blur intact.",
          .step = 0.05}};
 
-    Param<float> m_contrast{this, "contrast", 0.02f, 0.0f, 0.2f,
-        {.help = "Minimum DoG response, as a fraction of the intensity range. "
-                 "Raise it to keep only strong features; too low and most of "
-                 "what is found is noise in flat regions.",
-         .step = 0.002, .softMax = 0.06}};
+    // 0.04 rather than Lowe's 0.02, and the difference is the normalisation
+    // above rather than a disagreement with Lowe.
+    //
+    // Once the input is divided by its own p99, this threshold finally means
+    // what it says -- and 0.02 turns out to be too permissive when it is
+    // actually enforced. MEASURED, on the synthetic fixture (translate the
+    // scene and count how many features come back):
+    //
+    //   0.02:  46 found, 22% on the blobs, 20% repeat
+    //   0.03:  11 found, 91% on the blobs, 82% repeat
+    //   0.04:  10 found, 100% on the blobs, 90% repeat
+    //
+    // The 36 extra features at 0.02 are not weaker features, they are noise:
+    // the same 9 stable ones survive at every setting. And the real data
+    // agrees, which is what settled it -- on a 45 MP panorama pair the RANSAC
+    // inlier rate rose 52% -> 64% -> 72% across 0.02 / 0.04 / 0.06, while 0.04
+    // still left 400-1300 matches, far more than a homography needs.
+    //
+    // 0.06 is better still on inlier rate alone. 0.04 is the knee: it takes
+    // nearly all of the gain while keeping the match count high enough that a
+    // low-overlap pair does not starve.
+    Param<float> m_contrast{this, "contrast", 0.04f, 0.0f, 0.2f,
+        {.help = "Minimum DoG response, relative to the image's own 99th "
+                 "percentile. Raise it to keep only strong features; too low "
+                 "and most of what is found is noise in flat regions.",
+         .step = 0.002, .softMax = 0.08}};
 
     Param<float> m_edgeRatio{this, "edge_ratio", 10.0f, 2.0f, 50.0f,
         {.help = "Largest allowed ratio between the Hessian's eigenvalues. "
@@ -577,7 +677,11 @@ private:
         {.help = "Stop after this many. A bound on time and memory rather "
                  "than a quality control -- the strongest are not found first."}};
 
-    int m_found = 0;
+    int   m_found = 0;
+    // Reported, because a detector that silently rescales its input is a
+    // detector whose threshold no longer means what the slider says. Seeing
+    // "level 0.16" next to a raw is what makes the normalisation checkable.
+    float m_level = 0.0f;
 };
 
 } // namespace

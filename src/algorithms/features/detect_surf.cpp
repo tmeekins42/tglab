@@ -28,6 +28,7 @@
 //   ordinary parameter -- see features.h for why nothing else has to.
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -129,6 +130,21 @@ public:
                     : p[0] / scale;
             }
 
+        // Normalised by the image's own level, for the reason spelled out at
+        // Percentile99 in features.h: ValueScale() converts the FORMAT, and a
+        // scene-referred raw sits in the bottom sixth of 0..1 regardless.
+        //
+        // SURF is the more sensitive of the two detectors to this, and by a
+        // predictable amount. Its response is the determinant of the Hessian --
+        // a PRODUCT of two second derivatives -- so it scales with the SQUARE
+        // of the image level where SIFT's difference-of-Gaussian scales
+        // linearly. At a p99 of 0.12 that is a factor of about 70, not 8.
+        m_level = Percentile99(grey);
+        if (m_level > 1e-6f) {
+            const float inv = 1.0f / m_level;
+            for (float& v : grey) v *= inv;
+        }
+
         Integral ii;
         ii.Build(grey, w, h);
 
@@ -145,8 +161,10 @@ public:
 
     std::string RunReport() const override {
         if (m_found <= 0) return {};
-        return std::to_string(m_found) + " SURF features (" +
-               std::to_string(bool(m_extended) ? 128 : 64) + "f)";
+        char buf[80];
+        std::snprintf(buf, sizeof buf, "%d SURF features (%df, level %.3f)",
+                      m_found, bool(m_extended) ? 128 : 64, m_level);
+        return buf;
     }
 
     bool HasGPU() const override { return false; }
@@ -187,7 +205,10 @@ private:
     void Detect(const Integral& ii, int w, int h, RunCtx& ctx, FeatureSidecar* out) {
         const int octaves = std::clamp(int(m_octaves), 1, 4);
         const int perOct  = std::clamp(int(m_scales), 1, 4);
-        const int maxFeat = std::max(1, int(m_maxFeatures));
+
+        // Every candidate, ranked after the scan rather than truncated during
+        // it. See the cap below.
+        std::vector<Keypoint> cands;
 
         // Filter sizes. SURF grows the FILTER rather than shrinking the image,
         // so an octave is a doubling of the step between sizes rather than a
@@ -255,8 +276,6 @@ private:
                     float ox = 0.0f, oy = 0.0f, os = 0.0f;
                     if (!Interpolate(below, here, above, x, y, &ox, &oy, &os)) continue;
 
-                    if (int(out->keypoints.size()) >= maxFeat) return;
-
                     Keypoint kp;
                     kp.x = (float(x) + ox) * float(here.step);
                     kp.y = (float(y) + oy) * float(here.step);
@@ -268,15 +287,37 @@ private:
                     kp.response = v;
                     kp.octave = int(std::log2(double(here.step)));
 
-                    kp.angle = m_upright ? 0.0f : Orientation(ii, kp);
-                    out->keypoints.push_back(kp);
-
-                    const int dim = bool(m_extended) ? 128 : 64;
-                    std::vector<float> desc(size_t(dim), 0.0f);
-                    Describe(ii, kp, desc.data());
-                    out->descriptors.f.insert(out->descriptors.f.end(),
-                                              desc.begin(), desc.end());
+                    // Collected undescribed: the orientation and descriptor are
+                    // the expensive part and most of these may not survive the
+                    // cap below.
+                    cands.push_back(kp);
                 }
+        }
+
+        // RANK, THEN CAP. See detect_akaze for the failure this replaces: a
+        // `return` at the cap, mid-raster-scan, discards a contiguous band at
+        // the BOTTOM of the frame -- and if that band is where the next frame
+        // overlaps, the pair has nothing to match on.
+        const int cap = std::max(1, int(m_maxFeatures));
+        if (int(cands.size()) > cap) {
+            std::nth_element(cands.begin(), cands.begin() + cap, cands.end(),
+                             [](const Keypoint& a, const Keypoint& b) {
+                                 return a.response > b.response;
+                             });
+            cands.resize(size_t(cap));
+        }
+
+        const int dim = bool(m_extended) ? 128 : 64;
+        out->keypoints.reserve(cands.size());
+        for (Keypoint& kp : cands) {
+            if (ctx.Cancelled()) return;
+            kp.angle = m_upright ? 0.0f : Orientation(ii, kp);
+            out->keypoints.push_back(kp);
+
+            std::vector<float> desc(size_t(dim), 0.0f);
+            Describe(ii, kp, desc.data());
+            out->descriptors.f.insert(out->descriptors.f.end(),
+                                      desc.begin(), desc.end());
         }
     }
 
@@ -428,10 +469,33 @@ private:
     Param<int> m_scales{this, "scales_per_octave", 2, 1, 4,
         {.help = "Filter sizes within each octave."}};
 
+    // Bay's 0.0004, KEPT -- and worth recording that it was moved and moved
+    // back, because the reasoning is the interesting part.
+    //
+    // The normalisation above changed what this number means, so it looked like
+    // it had to move with it. On a synthetic fixture it clearly did: raising it
+    // to 0.005 took repeatability from 73% to 100%. On real images the effect
+    // is the exact opposite, and consistently so:
+    //
+    //   photo, 512px 8-bit       0.0004: 64% repeat    0.005: 46% repeat
+    //   panorama pair, 45 MP     0.0004: 78% inliers   0.005: 83%, 1/2 matches
+    //
+    // Two hypotheses for the reversal, both MEASURED AND BOTH WRONG: that the
+    // threshold was removing small-scale features (the scale distribution
+    // barely moves, mean 3.4 to 3.5), and that dense features were pairing up
+    // by luck (tightening the match tolerance from 2.5 px to 0.5 px costs every
+    // threshold about the same 10 points and preserves the ordering).
+    //
+    // So the mechanism is unexplained, and the decision does not wait on it.
+    // The synthetic fixture is smooth interpolated hash with five Gaussian
+    // blobs; a photograph is not that, and where the two disagree the
+    // photograph decides. The default stays where Bay put it, and the fixture's
+    // expectation was corrected instead.
     Param<float> m_threshold{this, "threshold", 0.0004f, 0.0f, 0.02f,
-        {.help = "Minimum Hessian determinant. Raise it to keep only strong, "
-                 "round blobs; SURF finds fewer features than SIFT at "
-                 "comparable settings and they are individually more reliable.",
+        {.help = "Minimum Hessian determinant, relative to the image's own "
+                 "99th percentile. Raise it to keep only strong, round blobs; "
+                 "SURF finds fewer features than SIFT at comparable settings "
+                 "and they are individually more reliable.",
          .step = 0.0001, .softMax = 0.004}};
 
     Param<bool> m_extended{this, "extended", false,
@@ -449,7 +513,10 @@ private:
         {.help = "Stop after this many. A bound on time rather than a quality "
                  "control -- the strongest are not found first."}};
 
-    int m_found = 0;
+    int   m_found = 0;
+    // Reported for the same reason SIFT reports it: a detector that rescales
+    // its own input silently is one whose threshold no longer matches its slider.
+    float m_level = 0.0f;
 };
 
 } // namespace
