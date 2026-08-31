@@ -1,0 +1,76 @@
+# Bloom, halation, starbursts and anamorphic streaks -- one algorithm.
+#
+# The core is Tim's description and it is exactly right: threshold the
+# highlights, blur them, add them back. What makes the rest fall out of the same
+# code is that halation and diffraction spikes are the SAME three steps with a
+# different spread. Only the kernel changes.
+#
+# ONE STAGE RATHER THAN FOUR, deliberately. Every one of these thresholds the
+# same highlights and adds into the same image, so as separate stages each would
+# re-threshold and re-add -- two of them together would count the highlights
+# twice, and the second would bloom the first one's glow. Here the threshold
+# happens once and the spreads are summed before the merge.
+#
+# WHAT THE PARAMETERS MEAN, because they follow from the optics rather than from
+# a list of looks:
+#
+#   threshold   how bright a pixel must be to glow. On a scene-linear image with
+#               real headroom this usefully goes ABOVE 1 -- the Bay Bridge test
+#               shot peaks at 8.4, so a threshold of 1.0 catches only the lamps
+#               and leaves the sky alone.
+#   knee        the soft band below the threshold. A hard cutoff leaves a
+#               visible contour wherever a gradient crosses it; the knee is what
+#               makes the glow read as light rather than as a mask.
+#   spread      blur sigma, in pixels. The visible glow reaches about 2.5x this.
+#   intensity   how much is added back. 0 turns the stage off entirely and the
+#               pipeline skips it.
+#
+#   dispersion  HALATION. Not a tint -- a spread that differs per channel.
+#               Halation is light passing through the emulsion, reflecting off
+#               the backing, and re-exposing from below; red penetrates deepest,
+#               so red is what comes back. At dispersion 1 red spreads furthest
+#               and blue least, which puts a warm fringe at the EDGE of a
+#               highlight rather than colouring the whole glow.
+#
+#   streak      diffraction spikes from the aperture blades.
+#   blades      an EVEN count gives that many spikes, an ODD count gives twice
+#               as many -- an odd polygon has no parallel edges, so each
+#               diffracts into its own spike. Six blades, six spikes; five
+#               blades, ten. Set blades = 1 for the two-spike anamorphic look.
+#   streak_angle  rotates the pattern. 0 is horizontal.
+#
+# A NOTE ON ENERGY, because the two spreads deliberately differ. The round blur
+# NORMALISES: it redistributes light, so a small bright source spread over 20x
+# the area gets 20x dimmer, which is what scattering does. A diffraction spike
+# does not -- the light in the spike is the part of the wavefront the aperture
+# edge bent, arriving IN ADDITION to what went straight through. Normalising it
+# over the length of the line divided a point source by about a hundred and made
+# the spikes invisible.
+#
+# Try it on a night shot with point lights. A daylight landscape has nothing
+# bright enough to bloom without dropping the threshold so far that the whole
+# frame glows.
+
+src = image("test")
+
+threshold = slider("threshold", 0, 4, 1.0)
+spread    = slider("spread (px)", 1, 120, 20)
+intensity = slider("intensity", 0, 3, 1.0)
+
+# Halation: red spreads furthest. 0 is achromatic bloom.
+dispersion = slider("dispersion (halation)", 0, 1, 0)
+
+# Diffraction. streak 0 is none; blades 1 gives the two-spike anamorphic look.
+streak = slider("streak", 0, 2, 0)
+blades = slider("aperture blades", 1, 16, 6)
+angle  = slider("streak angle", 0, 180, 0)
+
+src => bloom(threshold = threshold,
+             spread = spread,
+             intensity = intensity,
+             dispersion = dispersion,
+             streak = streak,
+             blades = blades,
+             streak_angle = angle)
+    => tonemap()
+    => display("bloom")

@@ -5842,6 +5842,152 @@ int main() {
         }
     }
 
+    // bloom: it adds light, only where it should, and the streak geometry.
+    {
+        // A single bright point on a dim field. Everything bloom does is
+        // measurable against that: where the glow appears, whether the dark
+        // area is left alone, and what shape the spikes take.
+        auto scene = [&]() {
+            Image im;
+            ImageDesc d{129, 129, Format::RGBA32F};
+            im.Alloc(d);
+            ImageView v = im.MapCpuWrite();
+            for (int y = 0; y < 129; ++y)
+                for (int x = 0; x < 129; ++x) {
+                    float* p = v.At<float>(x, y);
+                    p[0] = p[1] = p[2] = 0.05f;
+                    p[3] = 1.0f;
+                }
+            // A DISC, not a single pixel, and the size matters.
+            //
+            // A normalised Gaussian conserves energy, so spreading one bright
+            // pixel over sigma 8 divides it by 2*pi*sigma^2 = 402 -- the glow
+            // then peaks at 0.017 and is 0.0008 at the edge, which is real but
+            // below anything a test can distinguish from rounding. That is not
+            // the algorithm being weak: a highlight in a photograph is tens or
+            // hundreds of pixels, which is why the effect is obvious on a night
+            // shot and invisible on a one-pixel fixture.
+            //
+            // Radius 9 at 8.0 is about 250 px of source, which spreads to a
+            // glow measurable against a 0.05 background.
+            for (int y = -9; y <= 9; ++y)
+                for (int x = -9; x <= 9; ++x) {
+                    if (x * x + y * y > 81) continue;
+                    float* c = v.At<float>(64 + x, 64 + y);
+                    c[0] = c[1] = c[2] = 8.0f;
+                }
+            return im;
+        };
+
+        auto run = [&](double streak, double blades, double disp, Image* out) {
+            auto algo = Registry::Get().Create("bloom");
+            if (!algo) return false;
+            auto set = [&](const char* n, double val) {
+                if (ParamBase* pb = algo->FindParam(n)) {
+                    std::string e; pb->SetFromScript(Value(val), &e);
+                }
+            };
+            set("threshold", 1.0);
+            set("spread", 8.0);
+            set("intensity", 1.0);
+            set("dispersion", disp);
+            set("streak", streak);
+            set("blades", blades);
+            set("streak_angle", 0.0);
+
+            std::vector<Data> s;
+            s.push_back(Data{scene()});
+            Pipeline p;
+            p.AddStage(std::move(algo), "bloom", {{-1, 0}}, 1, 1);
+            std::string e;
+            if (!p.Execute(&s, nullptr, &e)) return false;
+            const Data* d = p.Resolve({0, 0}, &s);
+            const auto* im = d ? std::get_if<Image>(d) : nullptr;
+            if (!im) return false;
+            *out = const_cast<Image*>(im)->Clone();
+            return true;
+        };
+
+        Image plain;
+        if (run(0.0, 6, 0.0, &plain)) {
+            ImageView v = plain.MapCpuRead();
+            // 20 px from the point: inside the glow, well outside the source.
+            const float near  = v.At<float>(84, 64)[1];
+            const float far   = v.At<float>(8, 8)[1];
+
+            Check(near > 0.05f * 1.05f,
+                  "bloom adds light around a highlight (" +
+                      std::to_string(near) + " against a 0.05 background)");
+
+            // ADDS, not blends: the far corner is untouched. A bloom
+            // implemented as a lerp would darken everything it did not
+            // brighten, which is the giveaway of compositing rather than light.
+            Check(std::fabs(far - 0.05f) < 0.005f,
+                  "...and leaves the background alone far from one (" +
+                      std::to_string(far) + ")");
+        } else {
+            Check(false, "bloom runs");
+        }
+
+        // DISPERSION IS A SPREAD, NOT A TINT. At the outer edge of the glow
+        // only the longer wavelength has reached, so red must exceed blue
+        // there -- while an achromatic bloom keeps them equal. This is what
+        // separates halation from "bloom with a warm tint".
+        {
+            Image achro, halo;
+            if (run(0.0, 6, 0.0, &achro) && run(0.0, 6, 1.0, &halo)) {
+                ImageView a = achro.MapCpuRead();
+                ImageView h = halo.MapCpuRead();
+                // Far enough out that blue's narrower kernel has died away.
+                const float ar = a.At<float>(88, 64)[0], ab = a.At<float>(88, 64)[2];
+                const float hr = h.At<float>(88, 64)[0], hb = h.At<float>(88, 64)[2];
+                Check(std::fabs(ar - ab) < 0.002f,
+                      "an achromatic bloom spreads every channel alike (" +
+                          std::to_string(ar) + " vs " + std::to_string(ab) + ")");
+                Check(hr > hb + 0.002f,
+                      "...and dispersion puts red further out than blue (" +
+                          std::to_string(hr) + " vs " + std::to_string(hb) + ")");
+            } else {
+                Check(false, "both bloom variants ran");
+            }
+        }
+
+        // THE SPIKE COUNT, which is the part that was wrong first time.
+        //
+        // Each line is drawn in BOTH directions, so iterating over `spikes`
+        // rather than `spikes / 2` drew twice as many rays at half the
+        // spacing. Six blades hid it -- 12 rays at 30 degrees still looks like
+        // a starburst -- and blades = 1 exposed it: two lines over pi is a
+        // horizontal AND a vertical, so the anamorphic streak came out a cross.
+        //
+        // So: blades = 1 must put light along the horizontal and NOT the
+        // vertical.
+        {
+            Image anam;
+            if (run(1.5, 1, 0.0, &anam)) {
+                ImageView v = anam.MapCpuRead();
+                // 40 px out along each axis, past the round glow's reach.
+                const float horiz = v.At<float>(104, 64)[1];
+                const float vert  = v.At<float>(64, 104)[1];
+                Check(horiz > vert * 2.0f,
+                      "blades = 1 streaks horizontally, not as a cross (" +
+                          std::to_string(horiz) + " across vs " +
+                          std::to_string(vert) + " down)");
+            } else {
+                Check(false, "the anamorphic variant ran");
+            }
+        }
+
+        // Intensity 0 is a genuine no-op the pipeline can alias away.
+        {
+            auto algo = Registry::Get().Create("bloom");
+            if (ParamBase* pb = algo->FindParam("intensity")) {
+                std::string e; pb->SetFromScript(Value(0.0), &e);
+            }
+            Check(algo->IsNoOp(), "bloom at intensity 0 reports itself a no-op");
+        }
+    }
+
     // crop: the two modes, and the property that makes the toggle trustworthy.
     {
         auto run = [&](bool preview, double l, double r, double t, double b,
