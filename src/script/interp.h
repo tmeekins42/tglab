@@ -149,6 +149,6 @@ InterpResult Interpret(const Program& prog,
                        const std::vector<SourceImage>& sources,
                        UiState* ui,
                        Pipeline* out,
-                       const std::string& defaultDemosaic = "demosaic_consistent");
+                       const std::string& defaultDemosaic = "demosaic_ahd");
 
 } // namespace tglab

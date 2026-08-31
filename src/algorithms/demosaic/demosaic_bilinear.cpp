@@ -19,6 +19,7 @@
 #include <cstring>
 #include <vector>
 
+#include "clip_repair.h"
 #include "../../algo_util/pixel_buffer.h"
 #include "../../core/algorithm.h"
 
@@ -78,7 +79,6 @@ public:
                 const int c = CfaColorAt(cfa, x, y);
                 float rgb[3] = {0, 0, 0};
                 rgb[c] = at(x, y);   // the one colour actually measured here
-
                 if (c == 1) {
                     // A green site. Its horizontal and vertical neighbours are
                     // the other two colours -- which one is which depends on
@@ -96,7 +96,6 @@ public:
                     rgb[2 - c] = 0.25f * (at(x - 1, y - 1) + at(x + 1, y - 1) +
                                           at(x - 1, y + 1) + at(x + 1, y + 1));
                 }
-
                 ApplyColour(src.desc, rgb);
 
                 uint16_t* p = dst.At<uint16_t>(x, y);
@@ -157,6 +156,23 @@ int CfaColor(uint cfa, int x, int y) {
     return 1;
 }
 
+// The camera matrix with the smallest desaturation that keeps the result in
+// gamut -- keep in step with CameraMatrixInGamut in clip_repair.h.
+void CameraMatrixInGamut(inout float3 rgb, float3x3 M) {
+    float lum = (rgb.r + rgb.g + rgb.b) / 3.0;
+    float3 o = mul(M, rgb);
+    if (all(o >= 0.0)) { rgb = o; return; }
+    float t = 0.0;
+    [unroll] for (int i = 0; i < 3; ++i) {
+        if (o[i] >= 0.0) continue;
+        float span = lum - o[i];
+        if (span <= 1e-9) continue;
+        t = max(t, -o[i] / span);
+    }
+    t = min(t, 1.0);
+    rgb = o + t * (lum - o);
+}
+
 [numthreads(8, 8, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
     if (tid.x >= Width || tid.y >= Height) return;
@@ -201,32 +217,25 @@ void main(uint3 tid : SV_DispatchThreadID) {
         rgb[1] = 0.25 * (S(-1, 0) + S(1, 0) + S(0, -1) + S(0, 1));
         rgb[2 - c] = 0.25 * (S(-1, -1) + S(1, -1) + S(-1, 1) + S(1, 1));
     }
-
     #undef S
 
-    // Record which channels saturated before white balance; repair after it.
-    // Matches the CPU path -- see RecoverClipped in demosaic_malvar.cpp.
-    const float kClip = 0.99;
-    bool3 clipped = bool3(rgb.r >= kClip, rgb.g >= kClip, rgb.b >= kClip);
-
-    // White balance, then camera primaries -> sRGB. Same order as the CPU
-    // path; without either the image is heavily green with wrong hues.
-    rgb *= float3(asfloat(CamMul0), asfloat(CamMul1), asfloat(CamMul2));
-
-    if (any(clipped)) {
-        float hi = max(rgb.r, max(rgb.g, rgb.b));
-        rgb = float3(clipped.x ? hi : rgb.r,
-                     clipped.y ? hi : rgb.g,
-                     clipped.z ? hi : rgb.b);
+    // White balance with the highlight clamp, then camera primaries -> sRGB.
+    // The clamp is what keeps blown highlights from developing magenta; see
+    // clip_repair.h. Keep in step with BalanceAndClamp there.
+    {
+        float3 camMul = float3(asfloat(CamMul0), asfloat(CamMul1), asfloat(CamMul2));
+        float ceiling = min(camMul.r, min(camMul.g, camMul.b));
+        rgb = min(rgb * camMul, ceiling);
     }
-    rgb = float3(
-        asfloat(M0) * rgb.r + asfloat(M1) * rgb.g + asfloat(M2) * rgb.b,
-        asfloat(M3) * rgb.r + asfloat(M4) * rgb.g + asfloat(M5) * rgb.b,
-        asfloat(M6) * rgb.r + asfloat(M7) * rgb.g + asfloat(M8) * rgb.b);
 
-    // The matrix maps a wider gamut inward and has negative coefficients, so
-    // out-of-gamut colours can go negative.
-    Dst[tid.xy] = float4(max(rgb, 0.0), 1.0);
+    CameraMatrixInGamut(rgb, float3x3(
+        asfloat(M0), asfloat(M1), asfloat(M2),
+        asfloat(M3), asfloat(M4), asfloat(M5),
+        asfloat(M6), asfloat(M7), asfloat(M8)));
+
+    // Negatives NOT clamped -- matches the CPU path, which carries out-of-gamut
+    // colour into the linear pipeline rather than destroying it here.
+    Dst[tid.xy] = float4(rgb, 1.0);
 }
 )";
     }
@@ -244,36 +253,21 @@ void main(uint3 tid : SV_DispatchThreadID) {
     }
 
 private:
-    // White balance then the colour matrix, in that order.
+    // White balance (with the highlight clamp) then the colour matrix.
     //
     // Both are properties of the capture rather than of the demosaic, but this
     // is the only place they can be applied: before it there is one channel per
     // pixel, and after it the data has already been treated as sRGB. Skipping
     // them leaves a heavily green image with wrong hues -- the sensor's green
     // photosites are about twice as sensitive as its red and blue ones.
+    //
+    // The clamp inside BalanceAndClamp is what keeps blown highlights from
+    // developing magenta; see clip_repair.h for the physics and for the
+    // mask-based machinery this replaced.
     static void ApplyColour(const ImageDesc& d, float* rgb) {
-        // Which channels saturated is decided BEFORE white balance, against the
-        // sensor's white level; the repair happens AFTER, where neutral means
-        // the channels are equal. See RecoverClipped in demosaic_malvar.cpp --
-        // the two must agree, since a script can switch between them.
-        constexpr float kClip = 0.99f;
-        const bool clipped[3] = {rgb[0] >= kClip, rgb[1] >= kClip, rgb[2] >= kClip};
+        BalanceAndClamp(d, rgb);
 
-        rgb[0] *= d.camMul[0];
-        rgb[1] *= d.camMul[1];
-        rgb[2] *= d.camMul[2];
-
-        if (clipped[0] || clipped[1] || clipped[2]) {
-            const float hi = std::max(rgb[0], std::max(rgb[1], rgb[2]));
-            if (clipped[0]) rgb[0] = hi;
-            if (clipped[1]) rgb[1] = hi;
-            if (clipped[2]) rgb[2] = hi;
-        }
-
-        const float r = rgb[0], g = rgb[1], b = rgb[2];
-        rgb[0] = d.rgbCam[0] * r + d.rgbCam[1] * g + d.rgbCam[2] * b;
-        rgb[1] = d.rgbCam[3] * r + d.rgbCam[4] * g + d.rgbCam[5] * b;
-        rgb[2] = d.rgbCam[6] * r + d.rgbCam[7] * g + d.rgbCam[8] * b;
+        CameraMatrixInGamut(d, rgb);
 
         // The matrix has negative coefficients by design (it maps a wider
         // gamut inward), so out-of-gamut colours can go negative. Clamping

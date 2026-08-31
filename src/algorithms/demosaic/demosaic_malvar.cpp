@@ -26,6 +26,7 @@
 #include <cstring>
 #include <vector>
 
+#include "clip_repair.h"
 #include "../../algo_util/pixel_buffer.h"
 #include "../../core/algorithm.h"
 
@@ -227,6 +228,15 @@ cbuffer Params : register(b0) {
     uint M0, M1, M2, M3, M4, M5, M6, M7, M8;
 };
 
+// White balance AND the clipped-channel repair -- the repair must see balanced
+// values, since that is where neutral means the channels are equal.
+// White balance with the highlight clamp -- keep in step with
+// BalanceAndClamp in clip_repair.h.
+void BalanceAndClamp(inout float3 rgb, float3 camMul) {
+    float ceiling = min(camMul.r, min(camMul.g, camMul.b));
+    rgb = min(rgb * camMul, ceiling);
+}
+
 int CfaColor(uint cfa, int x, int y) {
     int q = (y & 1) * 2 + (x & 1);
     if (cfa == 1) { int c[4] = {0, 1, 1, 2}; return c[q]; }
@@ -271,6 +281,12 @@ void main(uint3 tid : SV_DispatchThreadID) {
     float lapH = 2.0 * centre - S(-2, 0) - S(2, 0);
     float lapV = 2.0 * centre - S(0, -2) - S(0, 2);
     float lap  = lapH + lapV;
+    // The brightest RAW SAMPLE of each colour, over a window snapped to the
+    // CFA cell so every pixel in that cell gets the SAME mask. Mirroring the
+    // interpolation's own neighbours makes the clip decision alternate with
+    // CFA parity, and that checkerboard is the fringing -- see CfaPeaks in
+    // clip_repair.h.
+
     #undef S
 
     float alpha = asfloat(AlphaBits);
@@ -280,6 +296,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     int c = CfaColor(Cfa, x, y);
     float3 rgb = float3(0, 0, 0);
     rgb[c] = centre;
+
 
     if (c == 1) {
         int horizColor = CfaColor(Cfa, x - 1, y);
@@ -292,6 +309,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
                                 min(left, right), max(left, right));
         rgb[2 - horizColor] = clamp(rgb[2 - horizColor],
                                     min(up, down), max(up, down));
+
     } else {
         rgb[1]     = 0.25 * (hSum + vSum) + alpha * lap;
         rgb[2 - c] = 0.25 * xSum + beta * lap;
@@ -303,30 +321,20 @@ void main(uint3 tid : SV_DispatchThreadID) {
         float xLo = min(min(ul, ur), min(dl, dr));
         float xHi = max(max(ul, ur), max(dl, dr));
         rgb[2 - c] = clamp(rgb[2 - c], xLo, xHi);
+
     }
 
-    // Which channels saturated is decided here, against the sensor's white
-    // level, but the repair happens AFTER white balance -- see RecoverClipped
-    // in the CPU path. Equalising first and then applying the gains makes the
-    // magenta worse, not better.
-    const float kClip = 0.99;
-    bool3 clipped = bool3(rgb.r >= kClip, rgb.g >= kClip, rgb.b >= kClip);
-
-    rgb *= float3(asfloat(CamMul0), asfloat(CamMul1), asfloat(CamMul2));
-
-    if (any(clipped)) {
-        float hi = max(rgb.r, max(rgb.g, rgb.b));
-        rgb = float3(clipped.x ? hi : rgb.r,
-                     clipped.y ? hi : rgb.g,
-                     clipped.z ? hi : rgb.b);
-    }
+    // White balance with the highlight clamp -- see clip_repair.h.
+    BalanceAndClamp(rgb, float3(asfloat(CamMul0), asfloat(CamMul1), asfloat(CamMul2)));
 
     rgb = float3(
         asfloat(M0) * rgb.r + asfloat(M1) * rgb.g + asfloat(M2) * rgb.b,
         asfloat(M3) * rgb.r + asfloat(M4) * rgb.g + asfloat(M5) * rgb.b,
         asfloat(M6) * rgb.r + asfloat(M7) * rgb.g + asfloat(M8) * rgb.b);
 
-    Dst[tid.xy] = float4(max(rgb, 0.0), 1.0);
+    // Negatives NOT clamped -- matches the CPU path, which carries out-of-gamut
+    // colour into the linear pipeline rather than destroying it here.
+    Dst[tid.xy] = float4(rgb, 1.0);
 }
 )";
     }
@@ -346,60 +354,29 @@ void main(uint3 tid : SV_DispatchThreadID) {
     }
 
 private:
+    // Clip repair lives in clip_repair.h -- both the "flag from raw samples"
+    // and the "repair before white balance" rules, with the measurements that
+    // established them.
+    //
+    // NOTE: the long comment that used to sit here argued the repair had to run
+    // AFTER white balance, citing a cast that got worse (1.95/1.00/1.32 ->
+    // 2.34/1.00/1.72) when it was moved before. That experiment moved a
+    // DIFFERENT repair -- equalise-all-clipped-channels -- which does hand the
+    // gains a neutral triple to pull apart. Lifting only to the brightest
+    // UNCLIPPED channel does not, and running it before the gains is what stops
+    // a clipped channel being lifted to another channel's camMul. Measured on
+    // _L0A0738.CR2, clipping-attributable negatives fell 6741 -> 1478.
     static void ApplyColour(const ImageDesc& d, float* rgb) {
-        // Which channels saturated must be decided BEFORE white balance --
-        // that is the only place the sensor's white level means anything --
-        // but the repair must happen AFTER, in the space where "neutral"
-        // means the channels are equal. Doing both before simply hands the
-        // gains an equal triple to pull apart again, which is the bug.
-        const bool clipped[3] = {rgb[0] >= kClip, rgb[1] >= kClip, rgb[2] >= kClip};
+        // White balance and the clipped-channel repair together -- the repair
+        // must see balanced values. See clip_repair.h.
+        BalanceAndClamp(d, rgb);
 
-        rgb[0] *= d.camMul[0];
-        rgb[1] *= d.camMul[1];
-        rgb[2] *= d.camMul[2];
-
-        RecoverClipped(rgb, clipped);
-
-        const float r = rgb[0], g = rgb[1], b = rgb[2];
-        rgb[0] = d.rgbCam[0] * r + d.rgbCam[1] * g + d.rgbCam[2] * b;
-        rgb[1] = d.rgbCam[3] * r + d.rgbCam[4] * g + d.rgbCam[5] * b;
-        rgb[2] = d.rgbCam[6] * r + d.rgbCam[7] * g + d.rgbCam[8] * b;
+        CameraMatrixInGamut(d, rgb);
 
         // Negatives NOT clamped: a colour outside sRGB's gamut lands below zero
         // after the camera matrix, and clamping destroys it before the user has
         // touched anything. The pipeline is linear float, so it costs nothing to
-        // carry -- clamping belongs at display or export. See
-        // demosaic_consistent.cpp for the measurement.
-    }
-
-    // A sensel at the white level is not a measurement, it is a lower bound:
-    // the scene was at least this bright, and how much brighter is unknowable.
-    // Treating that bound as data and applying per-channel white-balance gains
-    // to it is what turns a blown highlight magenta. On Tim's ARW the gains are
-    // R 1.578, G 1.000, B 2.961, so a clipped white sensel comes out with green
-    // crushed and red and blue running away -- the pink he saw on the
-    // over-exposed lights, before any develop slider was touched.
-    //
-    // Called AFTER white balance, with a mask captured before it. In the
-    // balanced space a neutral highlight is one where the channels are equal,
-    // so lifting the clipped ones to the brightest present restores that.
-    // A pixel where all three clipped becomes neutral; one where only red
-    // clipped keeps its hue from the channels that still hold information.
-    //
-    // The first version of this ran BEFORE white balance and made the cast
-    // WORSE, measured 1.95/1.00/1.32 to 2.34/1.00/1.72: equalising and then
-    // multiplying by the gains simply hands them a neutral triple to pull
-    // apart again. The order is the whole point.
-    //
-    // It cannot invent the true brightness -- nothing can -- but
-    // neutral-and-blown is what the eye expects from a blown highlight, and
-    // magenta is simply wrong.
-    static void RecoverClipped(float* rgb, const bool (&clipped)[3]) {
-        if (!clipped[0] && !clipped[1] && !clipped[2]) return;   // the common case
-        const float hi = std::max(rgb[0], std::max(rgb[1], rgb[2]));
-        if (clipped[0]) rgb[0] = hi;
-        if (clipped[1]) rgb[1] = hi;
-        if (clipped[2]) rgb[2] = hi;
+        // carry -- clamping belongs at display or export.
     }
 
     // Normalised so 1.0 is the sensor's white level (the demosaic divides by

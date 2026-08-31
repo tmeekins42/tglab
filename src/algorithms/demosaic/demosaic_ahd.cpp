@@ -105,6 +105,7 @@
 #include <string>
 #include <vector>
 
+#include "clip_repair.h"
 #include "../../algo_util/pixel_buffer.h"
 #include "../../core/algorithm.h"
 
@@ -146,6 +147,15 @@ cbuffer Params : register(b0) {
     uint  CamMul0, CamMul1, CamMul2;
     uint  M0, M1, M2, M3, M4, M5, M6, M7, M8;
 };
+
+// White balance AND the clipped-channel repair -- the repair must see balanced
+// values, since that is where neutral means the channels are equal.
+// White balance with the highlight clamp -- keep in step with
+// BalanceAndClamp in clip_repair.h.
+void BalanceAndClamp(inout float3 rgb, float3 camMul) {
+    float ceiling = min(camMul.r, min(camMul.g, camMul.b));
+    rgb = min(rgb * camMul, ceiling);
+}
 
 int CfaColor(uint cfa, int x, int y) {
     int q = (y & 1) * 2 + (x & 1);
@@ -338,19 +348,16 @@ void main(uint3 tid : SV_DispatchThreadID) {
     if (rHi >= rLo) rgb.r = clamp(rgb.r, rLo, rHi);
     if (bHi >= bLo) rgb.b = clamp(rgb.b, bLo, bHi);
 
-    // Which channels saturated is decided BEFORE white balance, and repaired
-    // after -- see demosaic_malvar.cpp for why that order matters.
-    const float kClipV = 0.99;
-    bool3 clipped = bool3(rgb.r >= kClipV, rgb.g >= kClipV, rgb.b >= kClipV);
-
-    rgb *= float3(asfloat(CamMul0), asfloat(CamMul1), asfloat(CamMul2));
-
-    if (any(clipped)) {
-        float hi = max(rgb.r, max(rgb.g, rgb.b));
-        rgb = float3(clipped.x ? hi : rgb.r,
-                     clipped.y ? hi : rgb.g,
-                     clipped.z ? hi : rgb.b);
-    }
+    // Brightest RAW sample feeding each channel, and repair in RAW space
+    // BEFORE white balance -- see clip_repair.h for both rules. The old code
+    // flagged from the interpolated value and lifted after the gains, which
+    // drove a third channel negative through the colour matrix.
+    // The brightest RAW SAMPLE of each colour, over a window snapped to the
+    // CFA cell so every pixel in that cell gets the SAME mask. Mirroring the
+    // interpolation's own neighbours makes the clip decision alternate with
+    // CFA parity, and that checkerboard is the fringing -- see CfaPeaks in
+    // clip_repair.h.
+    BalanceAndClamp(rgb, float3(asfloat(CamMul0), asfloat(CamMul1), asfloat(CamMul2)));
 
     float3 o;
     o.r = asfloat(M0) * rgb.r + asfloat(M1) * rgb.g + asfloat(M2) * rgb.b;
@@ -783,18 +790,10 @@ private:
     // switching method must not change colour. See demosaic_malvar.cpp for why
     // the clipped-channel repair happens after the gains rather than before.
     static void ApplyColour(const ImageDesc& d, float* rgb) {
-        const bool clipped[3] = {rgb[0] >= kClip, rgb[1] >= kClip, rgb[2] >= kClip};
+        // White balance with the highlight clamp -- see clip_repair.h.
+        BalanceAndClamp(d, rgb);
 
-        rgb[0] *= d.camMul[0];
-        rgb[1] *= d.camMul[1];
-        rgb[2] *= d.camMul[2];
-
-        RecoverClipped(rgb, clipped);
-
-        const float r = rgb[0], g = rgb[1], b = rgb[2];
-        rgb[0] = d.rgbCam[0] * r + d.rgbCam[1] * g + d.rgbCam[2] * b;
-        rgb[1] = d.rgbCam[3] * r + d.rgbCam[4] * g + d.rgbCam[5] * b;
-        rgb[2] = d.rgbCam[6] * r + d.rgbCam[7] * g + d.rgbCam[8] * b;
+        CameraMatrixInGamut(d, rgb);
 
         // Negatives NOT clamped: a colour outside sRGB's gamut lands below zero
         // after the camera matrix, and clamping destroys it before the user has
@@ -803,14 +802,6 @@ private:
         // demosaic_consistent.cpp for the measurement.
     }
 
-    static void RecoverClipped(float* rgb, const bool (&clipped)[3]) {
-        if (!clipped[0] && !clipped[1] && !clipped[2]) return;
-        const float hi = std::max(rgb[0], std::max(rgb[1], rgb[2]));
-        for (int i = 0; i < 3; ++i)
-            if (clipped[i]) rgb[i] = hi;
-    }
-
-    static constexpr float kClip = 0.99f;
 
     // How far apart in green two samples may be and still be pooled by the
     // chroma median: a floor plus a fraction of the pixel's own brightness.

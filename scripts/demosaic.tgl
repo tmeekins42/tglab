@@ -44,9 +44,39 @@ display(outB, "2 method B")
 # against it. The correction is applied to luminance only, leaving the colour
 # differences alone, so it cannot introduce false colour.
 #
-# It measures better than AHD on detail (174% of bilinear against 150%) and on
-# chroma noise (72% against 74%), and reads visibly better on fine texture --
-# fur, feathers, a fluffy jacket against a background.
+# ITS DETAIL ADVANTAGE IS REAL; ITS COLOUR ADVANTAGE IS NOT. Re-measured on
+# _L0A0738.CR2 after the camera matrix stopped manufacturing negatives:
+#
+#                      false magenta   chroma SD   detail
+#   bilinear                  16876      0.4874    0.0054  (100%)
+#   malvar                     9282      0.4876    0.0067  (124%)
+#   ahd                        9790      0.4864    0.0065  (120%)
+#   consistent                17415      0.4870    0.0084  (156%)
+#
+# Detail holds up -- 156% of bilinear against AHD's 120%. But on false magenta
+# (a pixel developing magenta although its green photosites were the brightest
+# of the three) consistent is the WORST of the four, marginally behind plain
+# bilinear, while Malvar and AHD are near half that.
+#
+# Sweeping its own controls shows the correction is not merely failing to help,
+# it is actively costing:
+#
+#   strength 0,   median 0    16876   (this IS bilinear)
+#   strength 0.5, median 0    15945
+#   strength 1,   median 0    17388
+#   strength 1,   median 1    17415
+#   strength 1,   median 2    17771
+#
+# The chroma median exists to suppress false colour and makes it worse. The
+# earlier claim of "72% chroma noise against AHD's 74%" does not reproduce --
+# all four now sit within 0.2% of each other on that measure, so it was not
+# separating the methods in the first place.
+#
+# The honest reading: the correction restores luminance detail well, and its
+# apparent colour advantage was measured while a separate bug -- the camera
+# matrix driving channels negative around highlights -- dominated the numbers.
+# With that fixed, the colour claim does not survive. What it does to false
+# colour near highlights is an open problem, not a solved one.
 #
 # Its `strength` reduces it exactly to bilinear at 0, which is worth trying:
 # sweeping it from 0 to 1 shows precisely what the correction is doing.

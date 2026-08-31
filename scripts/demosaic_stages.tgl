@@ -1,0 +1,27 @@
+# Every step of the demosaic, side by side.
+#
+# The pipeline is only three things: interpolate the two missing colours at
+# each photosite, apply the camera's white balance gains, rotate through the
+# camera matrix into sRGB. Panels 2 and 4 exist to show WHY the highlight
+# clamp is in there -- compare them against 3 and 5.
+#
+# Panel 6 is the diagnostic map: what the matrix DID to each pixel.
+#   red   = hue shift (0..30 deg)
+#   green = saturation gain -- pushed away from grey (0..0.5)
+#   blue  = a channel driven negative (0..1)
+# Green is the one to watch. The matrix's own rotation is bounded and
+# hue-dependent, so red alone does not mark a fault; saturation gain is what
+# separates the halo from ordinary colour.
+#
+# Drop a raw file onto the "test" row.
+
+src = mosaic("test")
+
+interp, balanced, clamped, unclamped, out, shift = demosaic_stages(src)
+
+display(interp,    "1 interpolated (raw scale)")
+display(balanced,  "2 white balance, NO clamp")
+display(clamped,   "3 white balance WITH clamp")
+display(unclamped, "4 matrix without the clamp -- the magenta")
+display(out,       "5 final")
+display(shift,     "6 what the matrix did (G = saturation gain)")

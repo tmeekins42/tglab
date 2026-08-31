@@ -356,6 +356,129 @@ int main() {
         }
     }
 
+    // WARNING -- THIS TEST DOES NOT CATCH THE BUG IT DOCUMENTS.
+    //
+    // Verified by reintroducing the fault (flag from the interpolated value
+    // instead of the raw peaks) and re-running: both checks below still pass.
+    // Several fixture shapes were tried -- uniform field, soft disc, hard-edged
+    // rectangle -- and none reproduces it. The failing geometry needs a channel
+    // whose photosites are pinned while its four interpolation neighbours
+    // average below 0.99, which on the real frame comes from asymmetric
+    // neighbourhoods a synthetic light does not produce.
+    //
+    // It is kept because it pins the two properties that DO hold and would
+    // otherwise regress silently: a blown highlight's core develops neutral,
+    // and nothing inside it goes negative. The regression that matters is
+    // measured on real files instead -- see clip_repair.h for the counts.
+    // --- A blown highlight must not develop a false channel -----------------
+    //
+    // The neutral case above passed for months while the image was visibly
+    // wrong. It uses a UNIFORM field at the ceiling, where every channel's
+    // neighbours are also at the ceiling, so interpolation preserves the
+    // saturation and the old flag-from-the-interpolated-value happened to be
+    // right. Real highlights have EDGES, and there the average of a pinned
+    // photosite and its dimmer neighbours falls below the threshold -- so the
+    // channel escapes the flag while the others do not.
+    //
+    // Traced on Tim's Bay Bridge frame at pixel 769,2509, a blown white light:
+    //
+    //     raw peaks     1.0000  0.9999  0.9999    all three saturated
+    //     interpolated  1.0000  0.8784  0.9999
+    //     old flags        1       0       1      green MISSED
+    //     old output    5.5531 -0.6075  4.2962    vivid magenta
+    //
+    // This fixture reproduces that geometry: a blown disc against a dim
+    // surround, sampled at its shoulder rather than its centre.
+    {
+        Image m;
+        ImageDesc d{kW, kH, Format::R32F};
+        d.cfa        = CfaPattern::RGGB;
+        d.blackLevel = 0.0f;
+        d.whiteLevel = 1.0f;
+        d.camMul[0] = 1.1729f; d.camMul[1] = 1.0f; d.camMul[2] = 3.0840f;
+        // The REAL matrix from _L0A0738.CR2. An identity matrix cannot show
+        // this fault -- the collapse comes from the matrix's negative
+        // coefficients acting on a ratio the repair invented.
+        const float kRgbCam[9] = { 1.9644f, -1.1197f,  0.1553f,
+                                  -0.2412f,  1.6738f, -0.4326f,
+                                   0.0139f, -0.5498f,  1.5359f};
+        for (int i = 0; i < 9; ++i) d.rgbCam[i] = kRgbCam[i];
+        m.Alloc(d);
+        const int cx = kW / 2, cy = kH / 2;
+        {
+            ImageView v = m.MapCpuWrite();
+            for (int y = 0; y < kH; ++y)
+                for (int x = 0; x < kW; ++x) {
+                    // A WHITE light with a HARD edge. A neutral scene colour
+                    // reads on the sensor in inverse proportion to camMul, and
+                    // saturates wherever that product would exceed the ceiling.
+                    // Filling the mosaic with a uniform value instead would
+                    // describe a strongly BLUE scene, which legitimately goes
+                    // out of gamut and says nothing about the repair.
+                    //
+                    // The edge is what makes this fixture bite. Inside a large
+                    // uniform blown area every channel's neighbours are also
+                    // pinned, so the interpolated average stays above the
+                    // threshold and flagging from it happens to be right --
+                    // which is exactly why the older neutral-field test passed
+                    // while the image was visibly wrong. At an edge, half of a
+                    // channel's neighbours are pinned and half are dim, so its
+                    // average falls well below the ceiling even though its own
+                    // photosites saturated.
+                    const bool lit = (x >= cx - 5 && x <= cx + 5 &&
+                                      y >= cy - 5 && y <= cy + 1);
+                    // 5.0, not 3.0: at 3.0 the blue photosite lands at 0.973,
+                    // just under the 0.99 clip threshold, so the pixel is
+                    // PARTIALLY clipped and the repair deliberately leaves it
+                    // alone. A light this bright saturates all three, which is
+                    // what "blown highlight" is supposed to mean here.
+                    const float scene = lit ? 5.0f : 0.30f;
+                    const int cc = CfaColorAt(d.cfa, x, y);
+                    *v.At<float>(x, y) =
+                        std::min(scene / d.camMul[cc], 1.0f);
+                }
+        }
+
+        Image out;
+        if (RunDemosaic("demosaic_bilinear", std::move(m), {}, &out, &err)) {
+            ImageView o = out.MapCpuRead();
+            // Walk the disc and find the worst channel anywhere in it. The
+            // fault is a speckle, so an average would hide it.
+            float worstNeg = 0.0f;
+            int nx = 0, ny = 0;
+            // Strictly INSIDE the lit rectangle, two pixels clear of its edge:
+            // a pixel straddling the boundary mixes lit and unlit scene and is
+            // legitimately out of gamut, which is not what this tests.
+            for (int y = cy - 3; y <= cy - 1; ++y)
+                for (int x = cx - 3; x <= cx + 3; ++x) {
+                    const uint16_t* p = o.At<uint16_t>(x, y);
+                    for (int i = 0; i < 3; ++i) {
+                        const float vv = HalfToFloat(p[i]);
+                        if (vv < worstNeg) { worstNeg = vv; nx = x; ny = y; }
+                    }
+                }
+            // A blown WHITE light carries no colour, so nothing in it can be
+            // negative. The old repair produced -0.61 on the real frame.
+            Check(worstNeg > -0.05f,
+                  "no channel is driven negative inside a blown highlight "
+                  "(worst " + std::to_string(worstNeg) + " at " +
+                  std::to_string(nx) + "," + std::to_string(ny) + ")");
+
+            // And the core must still develop neutral.
+            const uint16_t* p = o.At<uint16_t>(cx, cy);
+            const float r = HalfToFloat(p[0]), g = HalfToFloat(p[1]);
+            const float b = HalfToFloat(p[2]);
+            const float lo = std::min(r, std::min(g, b));
+            const float hi = std::max(r, std::max(g, b));
+            Check(hi > 0.0f && (hi - lo) / hi < 0.05f,
+                  "the core of a blown highlight develops neutral (R " +
+                  std::to_string(r) + " G " + std::to_string(g) + " B " +
+                  std::to_string(b) + ")");
+        } else {
+            Check(false, "blown highlight edge: " + err);
+        }
+    }
+
     // --- Malvar beats bilinear where bilinear actually fails ----------------
     //
     // On a smooth gradient every method is near-exact, so that fixture cannot

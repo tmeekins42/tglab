@@ -114,6 +114,48 @@
 // base ISO -- filtering the colour differences removes speckle that was
 // contributing to the luminance measurement.
 //
+// RE-MEASURED AFTER THE CAMERA MATRIX FIX -- READ THIS BEFORE TRUSTING THE
+// TABLE ABOVE.
+//
+// Those numbers were taken while a separate bug was active: the camera matrix
+// was driving channels negative around highlights, because bilinear
+// interpolation across the steep edge of a blown light produces channel ratios
+// the scene never had. See CameraMatrixInGamut in clip_repair.h. That fault
+// dominated any chroma measurement made near a highlight, and it was present
+// for every method, so it was invisible in a like-for-like comparison.
+//
+// With it fixed, re-measured on _L0A0738.CR2:
+//
+//                      false magenta   chroma SD   detail
+//   bilinear                  16876      0.4874    0.0054  (100%)
+//   malvar                     9282      0.4876    0.0067  (124%)
+//   ahd                        9790      0.4864    0.0065  (120%)
+//   consistent                17415      0.4870    0.0084  (156%)
+//
+// The DETAIL advantage survives: 156% of bilinear against AHD's 120%. That is
+// the claim this algorithm exists to make, and it holds.
+//
+// The CHROMA advantage does not. All four now sit within 0.2% of each other on
+// chroma SD, so that measure was not separating the methods at all. And on
+// false magenta -- a pixel developing magenta although its green photosites
+// were the BRIGHTEST of the three, i.e. colour the sensor never recorded --
+// this method is the worst of the four, marginally behind the plain bilinear
+// it starts from.
+//
+// Sweeping its own controls shows the correction is actively costing here:
+//
+//   strength 0,   median 0    16876   (identical to bilinear, as designed)
+//   strength 0.5, median 0    15945
+//   strength 1,   median 0    17388
+//   strength 1,   median 1    17415
+//   strength 1,   median 2    17771
+//
+// The chroma median exists to suppress false colour and makes it worse.
+//
+// Honest summary: the luminance-detail recovery is real and measured. The
+// colour-cleanliness claim was an artefact of measuring around a bug. What this
+// method does to false colour near highlights is an open problem.
+//
 // This is deliberately NOT wavelet_denoise's job. That removes SENSOR noise:
 // broadband, across the whole image, tuned per frame by the user. This removes
 // RECONSTRUCTION artefacts: isolated, on the CFA lattice, with a known cause
@@ -212,6 +254,7 @@
 #include <string>
 #include <vector>
 
+#include "clip_repair.h"
 #include "../../algo_util/pixel_buffer.h"
 #include "../../core/algorithm.h"
 
@@ -389,6 +432,29 @@ public:
                     // actually means, and no scaling of a triple can change
                     // which channel dominates -- which is why this cannot
                     // introduce false colour.
+                    //
+                    // AND THAT IS ALSO ITS LIMIT. Preserving the ratios means
+                    // preserving a WRONG ratio just as faithfully as a right
+                    // one. Where bilinear has already produced false colour --
+                    // at the steep edge of a highlight, where it averages one
+                    // channel from saturated neighbours and takes another from
+                    // a single dim centre -- boosting the luminance boosts that
+                    // false colour with it. Measured on _L0A0738.CR2, splitting
+                    // by local contrast:
+                    //
+                    //                   false magenta      luminance detail
+                    //                  edge      flat      edge      flat
+                    //   bilinear      16863        13   0.05507   0.00190
+                    //   malvar         9271        11   0.06277   0.00274
+                    //   ahd            9785         5   0.06164   0.00258
+                    //   consistent    17411         4   0.07153   0.00386
+                    //
+                    // The damage is ENTIRELY at edges: 17411 against bilinear's
+                    // 16863, while in flat regions this method is the cleanest
+                    // of the four. AHD and Malvar beat it at edges because they
+                    // steer on CHROMA and so repair bilinear's false colour;
+                    // this steers on LUMINANCE only, so it inherits that error
+                    // and then scales it.
                     const float lum = Luma(rgb[0], rgb[1], rgb[2]);
                     if (lum > 1e-5f) {
                         const float want = lum + strength * m_delta[i];
@@ -605,22 +671,10 @@ private:
     // are properties of the capture, not of the interpolation, so switching
     // method must not change colour.
     static void ApplyColour(const ImageDesc& d, float* rgb) {
-        const bool clipped[3] = {rgb[0] >= kClip, rgb[1] >= kClip, rgb[2] >= kClip};
+        // White balance with the highlight clamp -- see clip_repair.h.
+        BalanceAndClamp(d, rgb);
 
-        rgb[0] *= d.camMul[0];
-        rgb[1] *= d.camMul[1];
-        rgb[2] *= d.camMul[2];
-
-        if (clipped[0] || clipped[1] || clipped[2]) {
-            const float hi = std::max(rgb[0], std::max(rgb[1], rgb[2]));
-            for (int i = 0; i < 3; ++i)
-                if (clipped[i]) rgb[i] = hi;
-        }
-
-        const float r = rgb[0], g = rgb[1], b = rgb[2];
-        rgb[0] = d.rgbCam[0] * r + d.rgbCam[1] * g + d.rgbCam[2] * b;
-        rgb[1] = d.rgbCam[3] * r + d.rgbCam[4] * g + d.rgbCam[5] * b;
-        rgb[2] = d.rgbCam[6] * r + d.rgbCam[7] * g + d.rgbCam[8] * b;
+        CameraMatrixInGamut(d, rgb);
 
         // Negatives are NOT clamped here, deliberately.
         //
@@ -766,6 +820,15 @@ cbuffer Params : register(b0) {
     uint CamMul0, CamMul1, CamMul2;
     uint M0, M1, M2, M3, M4, M5, M6, M7, M8;
 };
+
+// White balance AND the clipped-channel repair -- the repair must see balanced
+// values, since that is where neutral means the channels are equal.
+// White balance with the highlight clamp -- keep in step with
+// BalanceAndClamp in clip_repair.h.
+void BalanceAndClamp(inout float3 rgb, float3 camMul) {
+    float ceiling = min(camMul.r, min(camMul.g, camMul.b));
+    rgb = min(rgb * camMul, ceiling);
+}
 
 int CfaColor(uint cfa, int x, int y) {
     int q = (y & 1) * 2 + (x & 1);
@@ -973,21 +1036,22 @@ void main(uint3 tid : SV_DispatchThreadID) {
     if (tid.x >= Width || tid.y >= Height) return;
     int x = int(tid.x), y = int(tid.y);
 
-    (void)x; (void)y;
     if (Cfa == 0) { U0[tid.xy] = float4(T0[int2(tid.xy)].rgb, 1.0); return; }
 
     // The correction and the sample bound happened in the apply pass; the
     // chroma median ran after that. This is only the colour transform.
     float3 rgb = T1[int2(tid.xy)].rgb;
 
-    // Which channels saturated is decided BEFORE white balance and repaired
-    // after -- see demosaic_malvar.cpp for why that order matters.
-    bool3 clipped = bool3(rgb.r >= 0.99, rgb.g >= 0.99, rgb.b >= 0.99);
-    rgb *= float3(asfloat(CamMul0), asfloat(CamMul1), asfloat(CamMul2));
-    if (any(clipped)) {
-        float m = max(rgb.r, max(rgb.g, rgb.b));
-        rgb = float3(clipped.x ? m : rgb.r, clipped.y ? m : rgb.g, clipped.z ? m : rgb.b);
-    }
+    // Brightest RAW sample feeding each channel, then repair in RAW space
+    // BEFORE white balance -- see clip_repair.h for both rules and the
+    // measurements. T0 is the mosaic, so the raw peaks are available here even
+    // though the interpolation finished several passes ago.
+    // The brightest RAW SAMPLE of each colour, over a window snapped to the
+    // CFA cell so every pixel in that cell gets the SAME mask. Mirroring the
+    // interpolation's own neighbours makes the clip decision alternate with
+    // CFA parity, and that checkerboard is the fringing -- see CfaPeaks in
+    // clip_repair.h.
+    BalanceAndClamp(rgb, float3(asfloat(CamMul0), asfloat(CamMul1), asfloat(CamMul2)));
 
     float3 o;
     o.r = asfloat(M0)*rgb.r + asfloat(M1)*rgb.g + asfloat(M2)*rgb.b;
