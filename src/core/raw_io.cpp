@@ -296,8 +296,20 @@ bool LoadRawMosaic(const std::string& path, Image* out, std::string* err) {
             // Every fourth pixel in each direction: the spike is thousands of
             // samples, so a sixteenth of them still resolves it, and this runs
             // on every raw load.
-            for (int y = 0; y < d.height; y += 4)
-                for (int x = 0; x < d.width; x += 4) {
+            // `w` and `h`, NOT d.width and d.height.
+            //
+            // d.width/d.height are the ROTATED dimensions -- outW/outH above
+            // swap them when the EXIF orientation is a quarter turn. The raw
+            // buffer is never rotated, so indexing it with the rotated extents
+            // reads off the end of every row on a portrait frame and walks past
+            // the end of the allocation.
+            //
+            // A Canon R5 file with flip = 6 segfaulted before printing a single
+            // line, which is what made it look like a loader failure rather
+            // than an indexing one: the crash happens inside the raw load,
+            // before anything downstream has run.
+            for (int y = 0; y < h; y += 4)
+                for (int x = 0; x < w; x += 4) {
                     const int v = int(raw_image[size_t(y + s.top_margin) *
                                                 size_t(s.raw_width) +
                                                 size_t(x + s.left_margin)]);
