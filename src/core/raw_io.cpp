@@ -6,6 +6,7 @@
 #include <cstring>
 #include <ctime>
 #include <memory>
+#include <vector>
 
 #include "libraw/libraw.h"
 #include "stb_image.h"
@@ -260,6 +261,74 @@ bool LoadRawMosaic(const std::string& path, Image* out, std::string* err) {
     }
     d.whiteLevel = float(raw.imgdata.color.maximum);
     if (d.whiteLevel <= d.blackLevel) d.whiteLevel = d.blackLevel + 1.0f;
+
+    // ...and then MEASURED from the data, because color.maximum is not
+    // reliably the sensor's saturation point.
+    //
+    // THIS MATTERS FAR MORE THAN IT SOUNDS. Everything downstream that has to
+    // know "is this pixel blown" tests a normalised value against a threshold
+    // near 1.0, and normalisation divides by (whiteLevel - blackLevel). Get
+    // whiteLevel wrong and the test means the wrong thing.
+    //
+    // What that costs, measured on a night shot at 3313 K: the sensor really
+    // saturates at 15284 against a declared 15488, so a blown pixel normalises
+    // to 0.9848 and the clipped-channel repair -- which triggers at 0.99 --
+    // never fires. White balance then multiplies the channels apart (blue x3.08
+    // at that temperature), the camera matrix's negative green coefficients
+    // crush what is left, and a neutral saturated pixel develops as R 1.77,
+    // G 0.06, B 4.48. Every street light in the frame came out MAGENTA, and
+    // 66.5% of the bright pixels were affected.
+    //
+    // The value is genuinely per-file, so a constant cannot fix it: measured
+    // across three bodies, real saturation lands at 0.9848, 1.0000 and 1.0013
+    // of the declared white level -- on BOTH sides of it.
+    //
+    // A saturating sensor produces a SPIKE: everything brighter than the
+    // ceiling reads the same value, so pixels pile up there. Searching down
+    // from the top for a bin holding far more than its neighbours finds it.
+    // Restricted to the top half of the range, because a frame with nothing
+    // blown has its largest pile-up at the noise floor instead.
+    {
+        const int lo = int(d.blackLevel);
+        const int top = int(d.whiteLevel * 1.15f);   // room to find it ABOVE
+        if (top > lo + 16) {
+            std::vector<int> hist(size_t(top - lo + 1), 0);
+            // Every fourth pixel in each direction: the spike is thousands of
+            // samples, so a sixteenth of them still resolves it, and this runs
+            // on every raw load.
+            for (int y = 0; y < d.height; y += 4)
+                for (int x = 0; x < d.width; x += 4) {
+                    const int v = int(raw_image[size_t(y + s.top_margin) *
+                                                size_t(s.raw_width) +
+                                                size_t(x + s.left_margin)]);
+                    if (v >= lo && v <= top) ++hist[size_t(v - lo)];
+                }
+
+            const int floorBin = (int(d.whiteLevel) - lo) / 2;
+            for (int v = top - lo; v > floorBin; --v) {
+                const long long c = hist[size_t(v)];
+                if (c < 32) continue;
+                long long below = 0;
+                int n = 0;
+                for (int t = std::max(0, v - 200); t < v; ++t) { below += hist[size_t(t)]; ++n; }
+                const double avg = n ? double(below) / double(n) : 0.0;
+                // Five times the local average AND an absolute floor: a dark
+                // frame has neither, and a bright one has both by a wide
+                // margin.
+                if (double(c) > std::max(avg * 5.0, 32.0)) {
+                    const float found = float(v + lo);
+                    // Only ever LOWERED towards the measurement, and never by
+                    // more than a stop: a spike far below the declared white is
+                    // more likely a histogram artefact than a saturation point,
+                    // and trusting it would clip real highlights.
+                    if (found > d.blackLevel + 1.0f && found < d.whiteLevel)
+                        d.whiteLevel = std::max(found, d.blackLevel +
+                                                (d.whiteLevel - d.blackLevel) * 0.5f);
+                    break;
+                }
+            }
+        }
+    }
 
     // As-shot white balance, normalised to green.
     //

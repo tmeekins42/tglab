@@ -301,6 +301,61 @@ int main() {
         }
     }
 
+    // A NEUTRAL BLOWN HIGHLIGHT MUST DEVELOP NEUTRAL, whatever the white
+    // balance. This is the property that failed on a real night shot.
+    //
+    // When every channel saturates they clip to the SAME raw value, so the
+    // pixel carries no colour information at all -- but white balance then
+    // multiplies them apart. At 3313 K the blue gain was 3.08x the green, so a
+    // blown street lamp arrived at the camera matrix as a strong blue cast, the
+    // matrix's negative green coefficients crushed what was left, and the lamp
+    // developed as R 1.77, G 0.06, B 4.48. Vivid magenta, on 66.5% of the
+    // frame's bright pixels.
+    //
+    // The clipped-channel repair exists for exactly this and did not fire,
+    // because it tests a normalised value against 0.99 and LibRaw's declared
+    // white level was ABOVE where the sensor really saturated -- so a blown
+    // sample normalised to 0.985 and was never flagged. See raw_io.cpp, which
+    // now measures the saturation point from the data.
+    //
+    // Tested with an extreme multiplier because that is where it shows: a
+    // near-neutral white balance hides the fault entirely.
+    {
+        Image m;
+        ImageDesc d{kW, kH, Format::R32F};
+        d.cfa        = CfaPattern::RGGB;
+        d.blackLevel = 0.0f;
+        d.whiteLevel = 1.0f;
+        d.camMul[0] = 1.17f; d.camMul[1] = 1.0f; d.camMul[2] = 3.08f;
+        // Identity matrix: this is about the gains, and a real camera matrix
+        // would mix a second effect into the measurement.
+        for (int i = 0; i < 9; ++i) d.rgbCam[i] = (i % 4 == 0) ? 1.0f : 0.0f;
+        m.Alloc(d);
+        ImageView v = m.MapCpuWrite();
+        // Every photosite saturated: a blown neutral highlight.
+        for (int y = 0; y < kH; ++y)
+            for (int x = 0; x < kW; ++x) *v.At<float>(x, y) = 1.0f;
+
+        Image out;
+        if (RunDemosaic("demosaic_bilinear", std::move(m), {}, &out, &err)) {
+            ImageView o = out.MapCpuRead();
+            const uint16_t* p = o.At<uint16_t>(kW / 2, kH / 2);
+            const float r = HalfToFloat(p[0]);
+            const float g = HalfToFloat(p[1]);
+            const float b = HalfToFloat(p[2]);
+            const float lo = std::min(r, std::min(g, b));
+            const float hi = std::max(r, std::max(g, b));
+            // Within 2%: the repair lifts every clipped channel to the same
+            // value, so this should be exact but for half-float rounding.
+            Check(hi > 0.0f && (hi - lo) / hi < 0.02f,
+                  "a blown neutral highlight stays neutral through a 3x blue "
+                  "gain (R " + std::to_string(r) + " G " + std::to_string(g) +
+                  " B " + std::to_string(b) + ")");
+        } else {
+            Check(false, "blown highlight: " + err);
+        }
+    }
+
     // --- Malvar beats bilinear where bilinear actually fails ----------------
     //
     // On a smooth gradient every method is near-exact, so that fixture cannot
