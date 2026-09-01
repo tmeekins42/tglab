@@ -1,0 +1,49 @@
+# Vignette -- darken or lighten the corners.
+#
+# Lightroom's sign convention, because it is the one already in your fingers:
+# NEGATIVE amount darkens the corners, POSITIVE lightens them, 0 is off.
+#
+# The two directions are deliberately NOT the same operation with the sign
+# flipped:
+#
+#   darkening  scales the pixel, which is what a transmission loss actually is.
+#              It cannot push anything below zero, it preserves black, and it
+#              acts proportionally -- a bright corner loses more in absolute
+#              terms than an already-dim one.
+#
+#   lightening lifts the pixel toward white. Multiplying up instead would blow
+#              the corner highlights while barely moving its shadows, which
+#              reads as a lighting error rather than a vignette.
+#
+# The falloff runs on distance from the centre, normalised so 1.0 is the CORNER
+# rather than the edge -- normalising to the shorter axis would clip the long
+# edges of a 3:2 frame flat while its corners were still untouched.
+#
+# Try: drop a portrait or a landscape on the "test" row, then
+#   * amount -0.4, midpoint 0.4 for a natural lens falloff
+#   * amount -1, feather 0 for a hard spotlight edge
+#   * amount +0.5 for a white vignette that lifts a subject off a pale ground
+#   * roundness 1 on a wide frame to leave the corners lighter than the sides
+
+src = image("test")
+
+amount = slider("amount", -1, 1, -0.4,
+    "Negative darkens the corners, positive lightens them, 0 is off. Darkening scales the pixel as a real lens does; lightening lifts it toward white.")
+
+midpoint = slider("midpoint", 0, 1, 0.5,
+    "How far out the falloff begins, as a fraction of the distance from centre to corner. Lower reaches further into the frame.")
+
+feather = slider("feather", 0, 1, 0.5,
+    "Softness of the transition. 0 is a hard edge at the midpoint; 1 spreads the falloff across the whole frame.")
+
+roundness = slider("roundness", 0, 1, 0,
+    "0 follows the frame, so the darkened region is an ellipse matching its aspect. 1 is a true circle, leaving the corners of a wide frame lighter than its long edges.")
+
+out = vignette(src,
+               amount    = amount,
+               midpoint  = midpoint,
+               feather   = feather,
+               roundness = roundness)
+
+display(src, "1 original")
+display(out, "2 vignette")

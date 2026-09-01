@@ -18,7 +18,7 @@ class AlgorithmBase;
 struct UiControl;
 class Value;
 
-enum class ParamType : uint8_t { Float, Int, Bool };
+enum class ParamType : uint8_t { Float, Int, Bool, Text };
 
 // Optional tuning for a numeric parameter's widget.
 //
@@ -173,6 +173,48 @@ public:
 
 private:
     bool m_v, m_def;
+    const char* m_help = nullptr;
+};
+
+// A string parameter, for the one thing a number cannot express: a file path.
+//
+// It deliberately has NO widget -- DescribeControl returns false, so params()
+// skips it and the inspector does not draw a row. A path is not something to
+// drag, and a text field in the controls panel would be a worse way to choose a
+// file than the script line that is already there. The script sets it and that
+// is the whole interface.
+template <>
+class Param<std::string> : public ParamBase {
+public:
+    Param(AlgorithmBase* owner, const char* name, std::string def = {},
+          const char* help = nullptr)
+        : ParamBase(owner, name), m_v(std::move(def)), m_help(help) {}
+
+    const char* Help() const override { return m_help; }
+
+    const std::string& get() const { return m_v; }
+    bool set(std::string nv) {
+        if (nv == m_v) return false;
+        m_v = std::move(nv);
+        return true;
+    }
+
+    ParamType Type() const override { return ParamType::Text; }
+    bool      SetFromScript(const Value& v, std::string* err) override;
+    bool      DrawWidget() override;
+    bool      DescribeControl(UiControl*) const override { return false; }
+    uint64_t  HashValue() const override {
+        // FNV-1a over the path, so changing the file re-runs the stage.
+        uint64_t h = 1469598103934665603ull;
+        for (unsigned char c : m_v) {
+            h ^= c;
+            h *= 1099511628211ull;
+        }
+        return h;
+    }
+
+private:
+    std::string m_v;
     const char* m_help = nullptr;
 };
 

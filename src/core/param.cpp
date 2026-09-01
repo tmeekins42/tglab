@@ -15,6 +15,7 @@ const char* ParamTypeName(ParamType t) {
         case ParamType::Float: return "float";
         case ParamType::Int:   return "int";
         case ParamType::Bool:  return "bool";
+        case ParamType::Text:  return "text";
     }
     return "?";
 }
@@ -158,6 +159,29 @@ bool Param<bool>::DrawWidget() {
     const bool changed = ImGui::Checkbox(m_name, &tmp) && set(tmp);
     if (m_help && *m_help && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", m_help);
     return changed;
+}
+
+bool Param<std::string>::SetFromScript(const Value& v, std::string* err) {
+    if (!v.IsString()) {
+        if (err)
+            *err = std::string("parameter '") + m_name +
+                   "' expects a string, got " + v.TypeName();
+        return false;
+    }
+    set(v.AsString());
+    return true;
+}
+
+// Shown, not editable. A path is worth seeing in the inspector -- it is the
+// difference between "the LUT loaded" and "the LUT I meant loaded" -- but
+// typing one into a controls panel would be a worse way to pick a file than the
+// script line that already names it.
+bool Param<std::string>::DrawWidget() {
+    ImGui::TextDisabled("%s", m_name);
+    ImGui::SameLine();
+    ImGui::TextUnformatted(m_v.empty() ? "(none)" : m_v.c_str());
+    if (m_help && *m_help && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", m_help);
+    return false;
 }
 // --- control description (for the script's params() builtin) ----------------
 //

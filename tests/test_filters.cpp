@@ -12,12 +12,18 @@
 #include <cstdlib>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
 #include "../src/algo_util/pixel_buffer.h"
 #include "../src/core/algorithm.h"
 #include "../src/core/pipeline.h"
+#include "../src/gpu/compute.h"
+#include <d3d12.h>
+
+#include "../src/core/lut.h"
 #include "../src/script/value.h"
 
 using namespace tglab;
@@ -61,6 +67,38 @@ Image MakeEdgeImage(bool impulses) {
 }
 
 // Runs one registered algorithm over the fixture and returns its output.
+// As RunFilter, but the parameter values are script Values rather than plain
+// doubles -- needed for apply_lut, whose `file` is a string. Kept separate
+// rather than widening RunFilter, which every other test calls with doubles.
+bool RunFilterV(const std::string& name, Image&& input,
+                const std::vector<std::pair<std::string, Value>>& params,
+                Image* out, std::string* err) {
+    auto algo = Registry::Get().Create(name);
+    if (!algo) { *err = "no such algorithm: " + name; return false; }
+
+    for (const auto& [key, value] : params) {
+        bool found = false;
+        for (ParamBase* p : algo->Params()) {
+            if (key != p->Name()) continue;
+            found = true;
+            if (!p->SetFromScript(value, err)) return false;
+        }
+        if (!found) { *err = name + " has no parameter '" + key + "'"; return false; }
+    }
+
+    Pipeline pipe;
+    std::vector<Data> sources;
+    sources.push_back(Data{std::move(input)});
+    pipe.AddStage(std::move(algo), name, {{-1, 0}}, 1, 1);
+
+    if (!pipe.Execute(&sources, nullptr, err)) return false;
+
+    const Data* d = pipe.Resolve({0, 0}, &sources);
+    if (!d || !std::holds_alternative<Image>(*d)) { *err = "no output"; return false; }
+    *out = const_cast<Image&>(std::get<Image>(*d)).Clone();
+    return true;
+}
+
 bool RunFilter(const std::string& name, Image&& input,
                const std::vector<std::pair<std::string, double>>& params,
                Image* out, std::string* err) {
@@ -315,9 +353,588 @@ static void TestKelvinWhiteBalance() {
     }
 }
 
+// --- vignette -------------------------------------------------------------
+//
+// The four properties worth pinning, because each has a plausible wrong
+// implementation that looks fine on a casual glance:
+//
+//   * the centre is untouched, whatever the amount
+//   * the sign convention matches Lightroom -- negative darkens
+//   * the two directions are NOT the same operation mirrored: darkening
+//     scales (a transmission loss, which preserves black), lightening lerps
+//     toward white (multiplying up instead blows the corner highlights while
+//     barely moving its shadows, which reads as a lighting error)
+//   * at roundness 0 the falloff follows the frame's aspect, so on a
+//     non-square image the mid-edges darken equally. Normalising to the
+//     shorter axis -- the obvious mistake -- would clip the long edges flat
+//     while the corners were still untouched.
+static void TestVignette() {
+    const int W = 300, H = 200;    // 3:2, so aspect errors show
+    auto flat = [&] {
+        Image img;
+        img.Alloc({W, H, Format::RGBA32F});
+        ImageView v = img.MapCpuWrite();
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                float* p = v.At<float>(x, y);
+                p[0] = p[1] = p[2] = 0.5f; p[3] = 1.0f;
+            }
+        return img;
+    };
+    auto at = [](const Image& im, int x, int y) {
+        ImageView v = const_cast<Image&>(im).MapCpuRead();
+        return v.At<float>(x, y)[0];
+    };
+
+    std::string err;
+    Image dark, light, off, round0, round1;
+
+    if (RunFilter("vignette", flat(), {{"amount", -1.0}}, &dark, &err) &&
+        RunFilter("vignette", flat(), {{"amount",  1.0}}, &light, &err) &&
+        RunFilter("vignette", flat(), {{"amount",  0.0}}, &off, &err)) {
+
+        Check(std::fabs(at(dark, W / 2, H / 2) - 0.5f) < 1e-4f,
+              "vignette leaves the centre untouched (" +
+                  std::to_string(at(dark, W / 2, H / 2)) + ")");
+
+        Check(at(dark, 0, 0) < 0.05f,
+              "negative amount darkens the corners, as in Lightroom (" +
+                  std::to_string(at(dark, 0, 0)) + ")");
+
+        Check(at(light, 0, 0) > 0.95f,
+              "positive amount lightens them (" +
+                  std::to_string(at(light, 0, 0)) + ")");
+
+        // Not merely "brighter than the centre": a multiply would also be
+        // brighter. What distinguishes a lerp toward white is that it
+        // APPROACHES white and stops, rather than scaling past it.
+        Check(at(light, 0, 0) <= 1.0f + 1e-4f,
+              "...by lifting toward white rather than scaling up (" +
+                  std::to_string(at(light, 0, 0)) + ", must not exceed 1)");
+
+        Check(std::fabs(at(off, 0, 0) - 0.5f) < 1e-6f,
+              "amount 0 is exactly the identity (" +
+                  std::to_string(at(off, 0, 0)) + ")");
+    } else {
+        Check(false, "vignette runs: " + err);
+    }
+
+    // Aspect. At roundness 0 the shape follows the frame, so the middle of the
+    // long edge and the middle of the short edge sit at the same normalised
+    // distance and must darken identically. At roundness 1 the shape is a
+    // circle, so they must not.
+    if (RunFilter("vignette", flat(),
+                  {{"amount", -1.0}, {"midpoint", 0.3}, {"feather", 0.4},
+                   {"roundness", 0.0}}, &round0, &err) &&
+        RunFilter("vignette", flat(),
+                  {{"amount", -1.0}, {"midpoint", 0.3}, {"feather", 0.4},
+                   {"roundness", 1.0}}, &round1, &err)) {
+
+        // Sampled at the true edges, not a few pixels in: on a 300x200 frame
+        // "2 px from the edge" is a different fraction of each axis, which
+        // would make the two differ for a reason that is not the aspect.
+        const float l0 = at(round0, 0, H / 2), t0 = at(round0, W / 2, 0);
+        const float l1 = at(round1, 0, H / 2), t1 = at(round1, W / 2, 0);
+
+        Check(std::fabs(l0 - t0) < 1e-4f,
+              "roundness 0 follows the frame, so both mid-edges match (" +
+                  std::to_string(l0) + " vs " + std::to_string(t0) + ")");
+        Check(std::fabs(l1 - t1) > 1e-3f,
+              "...and roundness 1 is a circle, so they differ (" +
+                  std::to_string(l1) + " vs " + std::to_string(t1) + ")");
+    } else {
+        Check(false, "vignette roundness runs: " + err);
+    }
+
+    // Opposite corners must match. An off-by-one in the pixel-centre offset
+    // shows here and nowhere else.
+    Image sym;
+    if (RunFilter("vignette", flat(),
+                  {{"amount", -0.8}, {"midpoint", 0.4}}, &sym, &err)) {
+        const float tl = at(sym, 0, 0),         tr = at(sym, W - 1, 0);
+        const float bl = at(sym, 0, H - 1),     br = at(sym, W - 1, H - 1);
+        Check(std::fabs(tl - tr) < 1e-5f && std::fabs(tl - bl) < 1e-5f &&
+                  std::fabs(tl - br) < 1e-5f,
+              "the four corners are symmetric (" + std::to_string(tl) + " " +
+                  std::to_string(tr) + " " + std::to_string(bl) + " " +
+                  std::to_string(br) + ")");
+    } else {
+        Check(false, "vignette symmetry runs: " + err);
+    }
+}
+
+// --- film grain ------------------------------------------------------------
+//
+// Four properties, each of which has a plausible wrong version:
+//
+//   * STRENGTH IS INDEPENDENT OF SIZE. Interpolating a coarse lattice reduces
+//     variance, so without compensation the size slider quietly changes
+//     loudness too and the two controls fight. This is the one that was
+//     actually wrong first time: at size exactly 1 every pixel lands on a
+//     lattice point, nothing is interpolated, and applying the compensation
+//     anyway made size 1 measure 35% louder than every other size -- a visible
+//     step right where the slider starts.
+//   * The grain is MULTIPLICATIVE and midtone-weighted, so black stays black.
+//     Additive noise would lift the shadows into a grey haze, which is the
+//     digital-sensor look rather than film.
+//   * At colour 0 the three channels share one field exactly, so the grain
+//     moves along luminance and has no hue at all.
+//   * It does not shift exposure: the mean survives.
+static void TestFilmGrain() {
+    const int W = 128, H = 128;
+    auto flat = [&](float level) {
+        Image img;
+        img.Alloc({W, H, Format::RGBA32F});
+        ImageView v = img.MapCpuWrite();
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                float* p = v.At<float>(x, y);
+                p[0] = p[1] = p[2] = level; p[3] = 1.0f;
+            }
+        return img;
+    };
+    auto sigma = [](const Image& im, int c) {
+        ImageView v = const_cast<Image&>(im).MapCpuRead();
+        double s = 0, s2 = 0; long long n = 0;
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                const double p = v.At<float>(x, y)[c];
+                s += p; s2 += p * p; ++n;
+            }
+        const double m = s / double(n);
+        return std::sqrt(std::max(s2 / double(n) - m * m, 0.0));
+    };
+    auto mean = [](const Image& im) {
+        ImageView v = const_cast<Image&>(im).MapCpuRead();
+        double s = 0; long long n = 0;
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) { s += v.At<float>(x, y)[0]; ++n; }
+        return s / double(n);
+    };
+
+    std::string err;
+
+    // Strength holds across sizes, INCLUDING size 1.
+    double lo = 1e9, hi = 0.0;
+    bool ok = true;
+    for (double sz : {1.0, 2.0, 4.0, 8.0, 16.0}) {
+        Image out;
+        if (!RunFilter("film_grain", flat(0.5f),
+                       {{"strength", 0.2}, {"size", sz}}, &out, &err)) {
+            ok = false; break;
+        }
+        const double s = sigma(out, 0);
+        lo = std::min(lo, s);
+        hi = std::max(hi, s);
+    }
+    if (ok) {
+        Check(hi < lo * 1.1,
+              "grain strength is independent of size (sigma " +
+                  std::to_string(lo) + ".." + std::to_string(hi) + ")");
+    } else {
+        Check(false, "film_grain runs: " + err);
+    }
+
+    // Multiplicative: black stays black, midtones carry the texture.
+    Image dark, mid;
+    if (RunFilter("film_grain", flat(0.02f),
+                  {{"strength", 0.2}, {"size", 4.0}}, &dark, &err) &&
+        RunFilter("film_grain", flat(0.5f),
+                  {{"strength", 0.2}, {"size", 4.0}}, &mid, &err)) {
+        Check(sigma(dark, 0) < sigma(mid, 0) * 0.1,
+              "grain is multiplicative, so deep shadows stay clean (" +
+                  std::to_string(sigma(dark, 0)) + " vs " +
+                  std::to_string(sigma(mid, 0)) + " at midtone)");
+        Check(std::fabs(mean(mid) - 0.5) < 0.01,
+              "...and it does not shift exposure (mean " +
+                  std::to_string(mean(mid)) + " from 0.5)");
+    } else {
+        Check(false, "film_grain tonal test runs: " + err);
+    }
+
+    // Monochrome at colour 0, chromatic at colour 1.
+    Image mono, chroma;
+    if (RunFilter("film_grain", flat(0.5f),
+                  {{"strength", 0.2}, {"size", 4.0}, {"colour", 0.0}},
+                  &mono, &err) &&
+        RunFilter("film_grain", flat(0.5f),
+                  {{"strength", 0.2}, {"size", 4.0}, {"colour", 1.0}},
+                  &chroma, &err)) {
+        auto worstRB = [](const Image& im) {
+            ImageView v = const_cast<Image&>(im).MapCpuRead();
+            double w = 0;
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x)
+                    w = std::max(w, std::fabs(double(v.At<float>(x, y)[0]) -
+                                              double(v.At<float>(x, y)[2])));
+            return w;
+        };
+        Check(worstRB(mono) < 1e-6,
+              "colour 0 gives monochrome grain, identical in every channel (" +
+                  std::to_string(worstRB(mono)) + ")");
+        Check(worstRB(chroma) > 0.05,
+              "...and colour 1 gives an independent field per channel (" +
+                  std::to_string(worstRB(chroma)) + ")");
+    } else {
+        Check(false, "film_grain colour test runs: " + err);
+    }
+
+    // Strength 0 is exactly the identity.
+    Image off;
+    if (RunFilter("film_grain", flat(0.5f), {{"strength", 0.0}}, &off, &err)) {
+        Check(sigma(off, 0) < 1e-9,
+              "strength 0 is exactly the identity (sigma " +
+                  std::to_string(sigma(off, 0)) + ")");
+    } else {
+        Check(false, "film_grain identity runs: " + err);
+    }
+}
+
+// --- orton -----------------------------------------------------------------
+//
+// The effect is a darkroom sandwich: a sharp frame screened over a blurred,
+// brightened copy. The properties that make it that rather than a blurry
+// overlay:
+//
+//   * the glow SPILLS OUT of a bright area into the surrounding dark. If the
+//     brightening happened after the blur instead of before, the whole frame
+//     would lift uniformly and there would be no spill.
+//   * screen only ever BRIGHTENS. Averaging the layers instead -- the usual
+//     wrong implementation -- pulls highlights down to meet the shadows and
+//     gives a flat haze with no glow.
+//   * black stays black, because screen leaves 0 alone.
+//   * it saturates toward white rather than running away. This is the one that
+//     was wrong first time: compressing both operands through x/(1+x),
+//     screening, and expanding with the inverse is not a round trip, because
+//     the screen of two compressed values is not itself a compressed value.
+//     A 0.9 square came out at 2.79 and a 6.0 highlight at 51.75.
+static void TestOrton() {
+    const int N = 128;
+    auto spot = [&](float bg, float fg) {
+        Image img;
+        img.Alloc({N, N, Format::RGBA32F});
+        ImageView v = img.MapCpuWrite();
+        for (int y = 0; y < N; ++y)
+            for (int x = 0; x < N; ++x) {
+                const bool box = std::abs(x - N / 2) < N / 8 &&
+                                 std::abs(y - N / 2) < N / 8;
+                float* p = v.At<float>(x, y);
+                p[0] = p[1] = p[2] = box ? fg : bg;
+                p[3] = 1.0f;
+            }
+        return img;
+    };
+    auto at = [](const Image& im, int x, int y) {
+        ImageView v = const_cast<Image&>(im).MapCpuRead();
+        return v.At<float>(x, y)[0];
+    };
+
+    std::string err;
+    Image glow, off, hdr;
+    const std::vector<std::pair<std::string, double>> full = {
+        {"blur", 10.0}, {"strength", 1.0}, {"brightness", 1.4}, {"contrast", 0.0}};
+
+    if (RunFilter("orton", spot(0.05f, 0.9f), full, &glow, &err)) {
+        // Just outside the square: input 0.05, and the glow must lift it well
+        // clear of that. The farCorner corner should be much less affected.
+        const float nearBox = at(glow, N / 2, N / 2 + 20);
+        const float farCorner     = at(glow, 4, 4);
+        Check(nearBox > 0.2f,
+              "the glow spills out of a bright area into the dark (" +
+                  std::to_string(nearBox) + " from an input of 0.05)");
+        Check(nearBox > farCorner * 2.0f,
+              "...and falls off with distance (" + std::to_string(nearBox) +
+                  " beside the square vs " + std::to_string(farCorner) + " far off)");
+
+        // Screen saturates toward white. Before the fix this read 2.79.
+        const float centre = at(glow, N / 2, N / 2);
+        Check(centre <= 1.05f,
+              "a bright area saturates toward white rather than running away (" +
+                  std::to_string(centre) + " from an input of 0.9)");
+        Check(centre > 0.9f,
+              "...while still brightening it (" + std::to_string(centre) + ")");
+
+        // Screen can only brighten: nothing may come out below its input.
+        ImageView v = glow.MapCpuRead();
+        bool darkened = false;
+        for (int y = 0; y < N && !darkened; ++y)
+            for (int x = 0; x < N; ++x) {
+                const bool box = std::abs(x - N / 2) < N / 8 &&
+                                 std::abs(y - N / 2) < N / 8;
+                if (v.At<float>(x, y)[0] < (box ? 0.9f : 0.05f) - 1e-4f) {
+                    darkened = true;
+                    break;
+                }
+            }
+        Check(!darkened,
+              "the combine is a screen, so no pixel is darkened");
+    } else {
+        Check(false, "orton runs: " + err);
+    }
+
+    if (RunFilter("orton", spot(0.05f, 0.9f),
+                  {{"strength", 0.0}, {"blur", 10.0}}, &off, &err)) {
+        Check(std::fabs(at(off, N / 2, N / 2) - 0.9f) < 1e-4f &&
+                  std::fabs(at(off, 4, 4) - 0.05f) < 1e-4f,
+              "strength 0 is exactly the identity (" +
+                  std::to_string(at(off, N / 2, N / 2)) + ", " +
+                  std::to_string(at(off, 4, 4)) + ")");
+    } else {
+        Check(false, "orton identity runs: " + err);
+    }
+
+    // Black stays black -- screen leaves 0 alone whatever the brightness.
+    Image black;
+    if (RunFilter("orton", spot(0.0f, 0.0f),
+                  {{"blur", 10.0}, {"strength", 1.0}, {"brightness", 3.0}},
+                  &black, &err)) {
+        Check(at(black, N / 2, N / 2) < 1e-6f,
+              "black stays black (" + std::to_string(at(black, N / 2, N / 2)) + ")");
+    } else {
+        Check(false, "orton black runs: " + err);
+    }
+
+    // Scene-linear data above 1.0 must keep its headroom rather than being
+    // amplified. Before the fix a 6.0 highlight came out at 51.75.
+    if (RunFilter("orton", spot(0.05f, 6.0f), full, &hdr, &err)) {
+        const float centre = at(hdr, N / 2, N / 2);
+        Check(centre > 6.0f && centre < 8.0f,
+              "a scene-linear highlight keeps its headroom without running "
+              "away (" + std::to_string(centre) + " from an input of 6.0)");
+    } else {
+        Check(false, "orton HDR runs: " + err);
+    }
+}
+
+// --- 3D LUTs ---------------------------------------------------------------
+//
+// The table is written out and read back rather than shipped as a fixture, so
+// the parser is tested against a file it did not produce in memory.
+//
+// The properties worth pinning:
+//
+//   * an IDENTITY table is the identity. This is the one that catches an axis
+//     transposition: .cube stores blue slowest, and getting that backwards
+//     still round-trips on a symmetric table but swaps red and blue on a real
+//     one -- which looks like a plausible grade rather than a bug.
+//   * grid points reproduce their stored entries exactly.
+//   * a missing or malformed file passes the image through rather than
+//     blanking it, and says so.
+//   * strength blends, and 0 is the identity.
+static void TestLut() {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / "tglab_lut_test";
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+
+    // An identity 5^3 table, in .cube's own blue-slowest order.
+    const int N = 5;
+    const fs::path idPath = dir / "identity.cube";
+    {
+        std::ofstream f(idPath);
+        f << "# a deliberately small identity table\n";
+        f << "TITLE \"identity\"\n";
+        f << "LUT_3D_SIZE " << N << "\n\n";
+        for (int b = 0; b < N; ++b)
+            for (int g = 0; g < N; ++g)
+                for (int r = 0; r < N; ++r)
+                    f << float(r) / float(N - 1) << " "
+                      << float(g) / float(N - 1) << " "
+                      << float(b) / float(N - 1) << "\n";
+    }
+
+    // A table that ONLY swaps red and blue. On this one an axis-order mistake
+    // is unmissable, where on the identity it would be invisible.
+    const fs::path swapPath = dir / "swap.cube";
+    {
+        std::ofstream f(swapPath);
+        f << "LUT_3D_SIZE " << N << "\n";
+        for (int b = 0; b < N; ++b)
+            for (int g = 0; g < N; ++g)
+                for (int r = 0; r < N; ++r)
+                    f << float(b) / float(N - 1) << " "
+                      << float(g) / float(N - 1) << " "
+                      << float(r) / float(N - 1) << "\n";
+    }
+
+    Lut3D lut;
+    std::string err;
+
+    if (lut.Load(idPath.string(), &err)) {
+        Check(lut.Size() == N && !lut.Is1D(),
+              "a .cube header is parsed (size " + std::to_string(lut.Size()) + ")");
+        Check(lut.Title() == "identity",
+              "...including its title (\"" + lut.Title() + "\")");
+
+        double worst = 0.0;
+        for (int i = 0; i <= 20; ++i)
+            for (int j = 0; j <= 20; ++j) {
+                const float r = float(i) / 20.0f, g = float(j) / 20.0f;
+                const float b = float((i + j) % 21) / 20.0f;
+                float o[3];
+                lut.Sample(r, g, b, o);
+                worst = std::max({worst, std::fabs(double(o[0] - r)),
+                                  std::fabs(double(o[1] - g)),
+                                  std::fabs(double(o[2] - b))});
+            }
+        Check(worst < 1e-5,
+              "an identity table is the identity, so the axis order is right "
+              "(worst error " + std::to_string(worst) + ")");
+    } else {
+        Check(false, "identity LUT loads: " + err);
+    }
+
+    // The swap table proves the axis order rather than merely being consistent
+    // with it.
+    if (lut.Load(swapPath.string(), &err)) {
+        float o[3];
+        lut.Sample(1.0f, 0.0f, 0.0f, o);
+        Check(o[2] > 0.99f && o[0] < 0.01f,
+              "a red-to-blue table really does swap them, so blue is the "
+              "slowest axis as .cube specifies (" + std::to_string(o[0]) + " " +
+                  std::to_string(o[1]) + " " + std::to_string(o[2]) + ")");
+    } else {
+        Check(false, "swap LUT loads: " + err);
+    }
+
+    // A malformed file must fail with a message rather than half-loading.
+    const fs::path badPath = dir / "bad.cube";
+    {
+        std::ofstream f(badPath);
+        f << "LUT_3D_SIZE 5\n0.1 0.2 0.3\n";   // far too few entries
+    }
+    Lut3D bad;
+    std::string badErr;
+    const bool rejected = !bad.Load(badPath.string(), &badErr);
+    // Captured before the next Load overwrites it -- reporting `badErr` after
+    // reusing the variable printed an empty string and made a passing check
+    // look like a broken one.
+    Check(rejected && !badErr.empty(),
+          "a truncated table is rejected with a message (" + badErr + ")");
+
+    Lut3D absent;
+    std::string missingErr;
+    const bool refused = !absent.Load((dir / "nope.cube").string(), &missingErr);
+    Check(refused && !missingErr.empty(),
+          "a missing file is rejected rather than crashing (" + missingErr + ")");
+
+    // Through the algorithm: identity in, identity out, and strength blends.
+    auto grey = [] {
+        Image img;
+        img.Alloc({16, 16, Format::RGBA32F});
+        ImageView v = img.MapCpuWrite();
+        for (int y = 0; y < 16; ++y)
+            for (int x = 0; x < 16; ++x) {
+                float* p = v.At<float>(x, y);
+                p[0] = 0.8f; p[1] = 0.5f; p[2] = 0.2f; p[3] = 1.0f;
+            }
+        return img;
+    };
+    auto at = [](const Image& im, int c) {
+        ImageView v = const_cast<Image&>(im).MapCpuRead();
+        return v.At<float>(8, 8)[c];
+    };
+
+    Image out;
+    if (RunFilterV("apply_lut", grey(), {{"file", Value(idPath.string())}}, &out, &err)) {
+        Check(std::fabs(at(out, 0) - 0.8f) < 1e-4f &&
+                  std::fabs(at(out, 2) - 0.2f) < 1e-4f,
+              "apply_lut with an identity table changes nothing (" +
+                  std::to_string(at(out, 0)) + ", " + std::to_string(at(out, 2)) + ")");
+    } else {
+        Check(false, "apply_lut runs: " + err);
+    }
+
+    Image swapped, half;
+    if (RunFilterV("apply_lut", grey(), {{"file", Value(swapPath.string())}},
+                   &swapped, &err) &&
+        RunFilterV("apply_lut", grey(),
+                   {{"file", Value(swapPath.string())}, {"strength", Value(0.5)}},
+                   &half, &err)) {
+        Check(std::fabs(at(swapped, 0) - 0.2f) < 1e-3f,
+              "...and a real table is applied (red " +
+                  std::to_string(at(swapped, 0)) + ", was 0.8)");
+        // Half strength must land midway between the two.
+        Check(std::fabs(at(half, 0) - 0.5f) < 1e-2f,
+              "strength blends toward the original (" +
+                  std::to_string(at(half, 0)) + ", midway between 0.8 and 0.2)");
+    } else {
+        Check(false, "apply_lut swap runs: " + err);
+    }
+
+    // A missing file must pass the image through, not blank it.
+    Image missing;
+    if (RunFilterV("apply_lut", grey(),
+                   {{"file", Value((dir / "nope.cube").string())}}, &missing, &err)) {
+        Check(std::fabs(at(missing, 0) - 0.8f) < 1e-4f,
+              "a missing LUT passes the image through rather than blanking it (" +
+                  std::to_string(at(missing, 0)) + ")");
+    } else {
+        Check(false, "apply_lut missing-file runs: " + err);
+    }
+
+    // THE GPU PATH, WITH A TABLE ACTUALLY LOADED.
+    //
+    // gpu_audit covers apply_lut, but it runs every algorithm at its defaults
+    // -- and this one defaults to no LUT, where both paths simply pass through.
+    // "Clean" there says nothing about the shader. The table has to be loaded
+    // for the comparison to mean anything, which is what this does.
+    //
+    // The swap table is the right fixture again: an identity would agree even
+    // if the shader's row addressing were transposed.
+    {
+        ID3D12Device* dev = nullptr;
+        if (SUCCEEDED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0,
+                                        IID_PPV_ARGS(&dev)))) {
+            ComputeContext gpu;
+            if (gpu.Init(dev)) {
+                auto run = [&](ExecMode mode, Image* out) {
+                    auto algo = Registry::Get().Create("apply_lut");
+                    std::string e;
+                    if (ParamBase* p = algo->FindParam("file"))
+                        p->SetFromScript(Value(swapPath.string()), &e);
+                    std::vector<Data> src;
+                    src.push_back(Data{grey()});
+                    Pipeline pipe;
+                    pipe.AddStage(std::move(algo), "apply_lut", {{-1, 0}}, 1, 1);
+                    if (!pipe.Execute(&src, nullptr, &e, &gpu, mode)) return false;
+                    const Data* d = pipe.Resolve({0, 0}, &src);
+                    if (!d || !std::holds_alternative<Image>(*d)) return false;
+                    *out = const_cast<Image&>(std::get<Image>(*d)).Clone();
+                    return true;
+                };
+                Image onCpu, onGpu;
+                if (run(ExecMode::ForceCPU, &onCpu) && run(ExecMode::ForceGPU, &onGpu)) {
+                    double worst = 0.0;
+                    for (int c = 0; c < 3; ++c)
+                        worst = std::max(worst,
+                                         std::fabs(double(at(onCpu, c)) -
+                                                   double(at(onGpu, c))));
+                    Check(worst < 1e-4,
+                          "the GPU LUT matches the CPU with a table loaded, so "
+                          "the packed 2D layout and the tetrahedral shader are "
+                          "right (worst " + std::to_string(worst) + ")");
+                    Check(std::fabs(at(onGpu, 0) - 0.2f) < 1e-3f,
+                          "...and the GPU really applied it (red " +
+                              std::to_string(at(onGpu, 0)) + ", was 0.8)");
+                } else {
+                    Check(false, "apply_lut ran on both paths");
+                }
+            }
+            dev->Release();
+        }
+    }
+
+    fs::remove_all(dir, ec);
+}
+
 int main() {
     std::string err;
     TestKelvinWhiteBalance();
+    TestVignette();
+    TestFilmGrain();
+    TestOrton();
+    TestLut();
 
 
 // --- brightness handles every pixel format ---------------------------------

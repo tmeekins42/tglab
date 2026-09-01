@@ -1,0 +1,51 @@
+# Orton effect -- the darkroom sandwich.
+#
+# Michael Orton's original was two slides of the same scene taped together and
+# projected as one: a sharp exposure and a defocused one, both overexposed so
+# that stacking them came back to a normal density. The result is a glow that
+# spills out of the highlights while the edges stay readable -- soft without
+# being out of focus.
+#
+# THE COMBINE IS SCREEN, NOT AN AVERAGE, and that is the whole effect. Two
+# slides in a sandwich multiply their transmissions, which on the positive is
+# screen: 1 - (1 - a)(1 - b). Screen can only brighten, it saturates smoothly
+# toward white rather than clipping, and it leaves black alone. Averaging the
+# layers instead -- the usual wrong implementation -- brings the highlights
+# DOWN to meet the shadows and gives a flat haze with no glow at all. That is
+# the difference between an Orton and "a blurry overlay".
+#
+# WHY BRIGHTNESS COMES BEFORE THE BLUR. Orton overexposed both slides in the
+# camera, which is not the same as brightening the sandwich afterwards: the
+# blurred layer is lifted FIRST, so its highlights bleed outward into the
+# surrounding dark as they spread. Brightening after the blur lifts everything
+# uniformly and just washes the frame out.
+#
+# Try: drop a landscape or a portrait on the "test" row, then
+#   * blur 8, strength 0.4 for a gentle diffusion that keeps the detail
+#   * blur 30, strength 0.8, brightness 1.8 for the full dreamy look
+#   * contrast up if the result feels flat -- screening softens, and Orton
+#     prints are usually contrastier than the sum of their parts
+#   * strength 1, brightness 1.0 to see the sandwich with no overexposure
+
+src = image("test")
+
+blur = slider("blur (px)", 0, 64, 12,
+    "How far the soft layer spreads. The most visible control: small values give a gentle diffusion, large ones the dreamy glow the effect is known for.")
+
+strength = slider("strength", 0, 1, 0.5,
+    "How much of the sandwich shows against the original. 0 is off, 1 is the full effect.")
+
+brightness = slider("brightness", 1, 3, 1.4,
+    "How far the blurred layer is lifted BEFORE it is blurred, as Orton overexposed his slides in camera. This is what makes highlights bleed outward into the shadows rather than simply washing the frame out.")
+
+contrast = slider("contrast", 0, 1, 0.2,
+    "An S-curve on the result. Screening flattens, and Orton prints are usually contrastier than the sum of their parts, so a little of this puts the bite back.")
+
+out = orton(src,
+            blur       = blur,
+            strength   = strength,
+            brightness = brightness,
+            contrast   = contrast)
+
+display(src, "1 original")
+display(out, "2 orton")

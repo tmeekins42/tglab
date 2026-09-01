@@ -1,0 +1,58 @@
+# Film grain -- with a real grain size, not just an amount.
+#
+# WHAT GRAIN SIZE MEANS. A per-pixel random number has no size at all: it is
+# the same texture on a 4 MP crop as on a 45 MP frame, and turning it up only
+# makes it louder, never coarser. Real grain is silver crystals of a physical
+# size, so a bigger enlargement of the same negative shows BIGGER grains, not
+# more of them.
+#
+# So the noise is sampled on a lattice whose spacing is the grain size in
+# pixels and interpolated between lattice points. Size 1 is per-pixel; size 4
+# makes each grain about four pixels across.
+#
+# Strength is compensated for that, which matters more than it sounds:
+# interpolating a coarse lattice reduces the variance, so without compensation
+# dragging the size slider would quietly change the loudness too and the two
+# controls would fight. Here they are independent -- size changes the texture,
+# strength changes how much of it there is.
+#
+# GRAIN IS MULTIPLICATIVE. A developed crystal modulates how much light gets
+# through, so its effect scales with the exposure at that point: black stays
+# black, and the midtones carry the most visible texture. Adding a constant
+# amplitude instead lifts the shadows into a grey haze, which is what digital
+# sensor noise looks like and not what anyone means by film grain. The shadow
+# behaviour is the giveaway -- a film scan is comparatively clean in the deep
+# shadows, a noisy digital file is worst there.
+#
+# Try: drop any image on the "test" row, then
+#   * strength 0.05, size 2 for a fine 35mm look
+#   * strength 0.15, size 6 for a pushed high-ISO stock
+#   * colour up for the chroma-noise look of a pushed colour film
+#   * shadows up to spread grain evenly, which is the digital-sensor look
+
+src = image("test")
+
+strength = slider("strength", 0, 0.5, 0.08,
+    "How strong the grain is, as a fraction of the pixel's own value. Multiplicative, so black stays black and the midtones carry the most texture.")
+
+size = slider("grain size (px)", 1, 16, 2,
+    "How big each grain is, in pixels. 1 is per-pixel; larger clumps the grain, as a bigger enlargement of the same film would. Strength is compensated, so this changes only the texture, not the loudness.")
+
+colour = slider("colour", 0, 1, 0,
+    "0 gives monochrome grain -- one field shared by all three channels, so it moves along luminance only, as a black-and-white negative does. 1 gives an independent field per channel, the chroma-noise look of a pushed colour stock.")
+
+shadows = slider("shadows", 0, 1, 0,
+    "0 keeps grain out of the deep shadows and blown highlights, which is how film behaves. 1 spreads it evenly over the whole tonal range, which is the digital sensor look.")
+
+seed = slider("seed", 1, 999, 1,
+    "Changes the grain pattern without changing its character. Vary it between frames of a sequence so the grain does not sit still.")
+
+out = film_grain(src,
+                 strength = strength,
+                 size     = size,
+                 colour   = colour,
+                 shadows  = shadows,
+                 seed     = seed)
+
+display(src, "1 original")
+display(out, "2 grain")

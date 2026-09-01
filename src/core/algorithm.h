@@ -273,6 +273,28 @@ public:
     // the shader through GpuConstants/GpuPassConstants.
     virtual void MeasureForGpu(const std::vector<const Image*>& inputs) { (void)inputs; }
 
+    // Extra textures the ALGORITHM supplies, bound as SRVs after the port
+    // inputs. An empty vector -- the default -- costs nothing.
+    //
+    // What this is for: data too large for the constant buffer and not shaped
+    // like the image. A 33^3 colour LUT is 431 KB against the cbuffer's 64 KB
+    // limit, so it cannot be a constant; it is not an input port, because it
+    // comes from a file rather than from another stage; and it cannot be a
+    // scratch plane, because those are allocated at IMAGE size. Without a hook
+    // like this the only remaining option is to keep such an algorithm on the
+    // CPU.
+    //
+    // The images are owned by the algorithm and must outlive the dispatch --
+    // hold them as members. Returning the same images on every call is fine and
+    // expected: they are uploaded once and stay GPU-resident, so rebuilding
+    // them per run would upload per run. Rebuild only when the thing they
+    // describe actually changes.
+    //
+    // Indexing follows GpuPass::reads: with one input port the extra textures
+    // begin at -2, so a pass reading {-1, -2} gets the image and then the first
+    // extra. The single-kernel path binds them in the same order.
+    virtual std::vector<const Image*> GpuExtraInputs() const { return {}; }
+
     // Lets an algorithm set parameter DEFAULTS from the source it will run on,
     // before the script declares its controls.
     //

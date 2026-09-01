@@ -90,6 +90,20 @@ Param<int> m_window{this, "window", 15, 3, 201,
 
 Omit the argument and the parameter behaves exactly as before.
 
+**A path, not a number.** `Param<std::string>` exists for the one thing a
+numeric parameter cannot express — `apply_lut`'s `.cube` file. It deliberately
+has *no widget*: `DescribeControl()` returns false, so `params()` skips it and
+the inspector shows the value without offering to edit it. A path is not
+something to drag, and a text field in the controls panel would be a worse way
+to choose a file than the script line that already names it.
+
+```cpp
+Param<std::string> m_path{this, "file", {}, "Path to a .cube LUT."};
+```
+
+Its hash folds the string, so changing the file re-runs the stage like any
+other parameter change.
+
 Every numeric row supports **ctrl+click to type an exact value**, **left/right
 arrows to step** while the slider is focused, and **right-click to reset** to
 the declared default. None of these add chrome, so the panel stays one row per
@@ -704,6 +718,37 @@ refuses rather than silently truncating.
 
 Only single-input, single-output stages may iterate — anything else has no
 obvious pair of buffers to alternate between.
+
+**Data the algorithm supplies itself.** Constants go in the constant buffer and
+images arrive through ports, which covers almost everything. `apply_lut` is
+where both run out: a 33³ colour LUT is 431 KB against the constant buffer's
+64 KB limit, it comes from a *file* rather than from another stage, and it
+cannot be a scratch plane because those are allocated at image size.
+`GpuExtraInputs()` returns textures the algorithm owns, bound as SRVs after the
+port inputs:
+
+```cpp
+std::vector<const Image*> GpuExtraInputs() const override {
+    if (!m_table.Valid()) return {};
+    return {&m_table};
+}
+```
+
+The images must outlive the dispatch, so hold them as members. Returning the
+same ones every call is expected — they upload once and stay resident, so
+rebuilding them per run would upload per run. Rebuild only when the thing they
+describe changes.
+
+Indexing follows `GpuPass::reads`: with one input port the extras start at
+`-2`, so a pass reading `{-1, -2}` gets the image then the first extra.
+
+Worth noting what `apply_lut` does *not* do: bind the LUT as a 3D texture. That
+would bring hardware trilinear filtering for free, and free is the wrong price
+here — the CPU path is *tetrahedral*, so the two would visibly disagree on any
+LUT with a sharp transition, and the audit would rightly flag it. Packing the
+cube into a 2D texture and doing tetrahedral by hand keeps the paths
+bit-identical and matches what Resolve does, so a LUT looks the same in all
+three.
 
 A kernel that fails to compile falls back to the CPU rather than failing the
 run, with the DXC diagnostics reported — a shader you are mid-way through

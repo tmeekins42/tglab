@@ -1,0 +1,45 @@
+# Apply a 3D colour lookup table -- film emulation, creative grades.
+#
+# A .cube file is a cube of RGB triples on a regular grid: 35,937 of them at the
+# usual 33^3. Each says "input colour here comes out as THIS colour", and
+# everything between grid points is interpolated. That is the whole mechanism,
+# and it is why a LUT is how film emulations and creative grades ship -- it can
+# express any colour mapping at all, including ones no set of sliders could.
+#
+# It is also why a LUT cannot be turned back into sliders. Contrast is not a
+# number inside the file; it is a pattern spread across all 35,937 entries, as
+# are saturation, colour casts and split-toning. So this is load-and-apply:
+# stack the ordinary adjustments after it to taste.
+#
+# ORDER MATTERS, and this is the one thing to get right. A LUT is
+# DISPLAY-REFERRED: its domain is almost always 0..1, so it says nothing about a
+# scene-linear highlight sitting at 6.0. Sampling clamps rather than
+# extrapolating, so a LUT applied straight to raw data flattens every highlight.
+#
+# Tone map FIRST. The Status line reports what percentage of the frame was above
+# the table's domain, so a pipeline in the wrong order says so rather than just
+# looking wrong -- watch for it if the result seems oddly flat.
+#
+# Point `file` at any .cube you have. Plenty are downloadable free, and Resolve
+# and Lightroom both export them.
+
+src = image("test")
+
+# Scene-linear -> display range, so the LUT sees the values it expects.
+exposure = slider("exposure", -3, 3, 0,
+    "Stops of exposure before the tone map. Set this so the image looks about right BEFORE the LUT -- a LUT cannot fix an exposure, and it clamps anything above its domain.")
+
+toned = tonemap(basic_adjust(src, exposure = exposure))
+
+strength = slider("strength", 0, 1, 1,
+    "Blend between the tone-mapped original and the graded result. 1 is the LUT as authored, 0.5 half-strength, 0 off.")
+
+# Point this at any .cube you have -- plenty are downloadable free, and both
+# Resolve and Lightroom export them. Until it names a real file the stage
+# passes the image through and says so in Status rather than failing the run.
+out = apply_lut(toned,
+                file     = "my_lut.cube",
+                strength = strength)
+
+display(toned, "1 before")
+display(out,   "2 after")

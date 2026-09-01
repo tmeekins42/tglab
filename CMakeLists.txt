@@ -37,6 +37,7 @@ add_library(tglab_core STATIC
     src/core/image.cpp
     src/core/image_io.cpp
     src/core/param.cpp
+    src/core/lut.cpp
     src/core/algorithm.cpp
     src/core/pipeline.cpp
     src/core/worker.cpp

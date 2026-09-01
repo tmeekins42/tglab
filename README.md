@@ -275,7 +275,10 @@ src => gaussian_blur(sigma = sigma) => display("blurred")
 More in [scripts/](scripts/) — `hdr.tgl`, `stack.tgl`, `tonemap_compare.tgl`
 and `pipe.tgl` are good starting points; `panorama.tgl`, `features.tgl`,
 `matching.tgl`, `align_features.tgl` and `crop.tgl` cover the feature pipeline;
-`bloom.tgl` is glow and halation, and `demosaic_stages.tgl` opens up a
+`bloom.tgl` is glow and halation, `vignette.tgl` corner falloff,
+`film_grain.tgl` grain with a real grain size, `orton.tgl` the darkroom
+sandwich, `lut.tgl` film emulation through a .cube LUT, and
+`demosaic_stages.tgl` opens up a
 demosaic one step at a time.
 Each carries its reasoning in comments, including the measurements behind the
 defaults.
@@ -284,22 +287,22 @@ defaults.
 
 ## Algorithms
 
-54 registered. `choose("x", "category")` offers every algorithm in a category,
+58 registered. `choose("x", "category")` offers every algorithm in a category,
 so these names are the ones that matter in a script.
 
 | Category | Algorithms |
 |---|---|
-| **adjust** | `basic_adjust` (exposure, contrast, highlights, shadows, whites, blacks, vibrance, saturation, white balance), `brightness`, `crop` (trim and straighten, with a preview) |
+| **adjust** | `basic_adjust` (exposure, contrast, highlights, shadows, whites, blacks, vibrance, saturation, white balance), `brightness`, `crop` (trim and straighten, with a preview), `vignette`, `film_grain` |
 | **tonemap** | `tonemap` (global), `tonemap_local` (illumination/detail split) |
 | **features** | `detect_sift`, `detect_surf`, `detect_akaze`, `detect_orb`, `detect_brisk`, `draw_features`, `draw_matches` |
 | **match** | `match_brute` (exact), `match_ann` (k-d forest / LSH) |
 | **merge** | `merge_hdr`, `merge_mean`, `align`, `align_features`, `bundle_adjust`, `stitch_panorama`, `reshape` |
 | **demosaic** | `demosaic_ahd` (default), `demosaic_consistent`, `demosaic_malvar`, `demosaic_bilinear`, `demosaic_passthrough`, `demosaic_stages` (every intermediate as its own image, for debugging), `hot_pixel_repair` |
 | **denoise** | `wavelet_denoise` |
-| **filter** | `gaussian_blur`, `box_blur`, `median_blur`, `bilateral`, `guided_filter`, `nonlocal_means`, `anisotropic_diffusion`, `kuwahara`, `kuwahara_generalized`, `symmetric_nearest`, `bloom` (glow and halation) |
+| **filter** | `gaussian_blur`, `box_blur`, `median_blur`, `bilateral`, `guided_filter`, `nonlocal_means`, `anisotropic_diffusion`, `kuwahara`, `kuwahara_generalized`, `symmetric_nearest`, `bloom` (glow and halation), `orton` |
 | **edge** | `sobel`, `canny`, `non_max_suppression`, `hysteresis` |
 | **threshold** | `threshold`, `threshold_otsu`, `threshold_isodata`, `threshold_triangle`, `threshold_adaptive_mean`, `threshold_adaptive_gaussian`, `threshold_niblack`, `threshold_sauvola`, `threshold_bernsen` |
-| **color** | `grayscale` |
+| **color** | `grayscale`, `apply_lut` (3D .cube LUTs) |
 
 Most have a GPU kernel and fall back to the CPU if it fails — **always saying
 so** in Status rather than merely running slower.
@@ -429,6 +432,52 @@ scaled.
   channel rather than a red tint — real halation is light reflecting off a
   film base, and red penetrates deepest. `intensity` is compensated for spread,
   so widening the glow no longer dims it and the two controls stay independent.
+- **`vignette`** uses Lightroom's sign convention — negative darkens the
+  corners, positive lightens them. The two directions are not one operation
+  mirrored: darkening **scales** the pixel, which is what a transmission loss
+  is and which preserves black, while lightening **lerps toward white**, since
+  multiplying up would blow the corner highlights while barely moving its
+  shadows. The falloff is normalised so 1.0 is the corner rather than the edge,
+  and `roundness` blends between an ellipse following the frame and a true
+  circle.
+- **`film_grain`** has a real **grain size**, not just an amount: the noise is
+  sampled on a lattice whose spacing is the grain size in pixels, so grain
+  clumps rather than staying per-pixel — a bigger enlargement of the same
+  negative shows bigger grains, not more of them. Strength is compensated for
+  the variance interpolation removes, so size changes the texture and strength
+  changes the loudness, independently. The grain is **multiplicative**, so
+  black stays black and the midtones carry the texture; additive noise instead
+  lifts the shadows into the grey haze that reads as digital sensor noise.
+- **`orton`** is the darkroom sandwich: a sharp frame **screened** over a
+  blurred, brightened copy. Screen rather than an average is the whole effect —
+  it only brightens, saturates toward white, and leaves black alone, where
+  averaging pulls the highlights down to meet the shadows and gives a flat haze.
+  The brightening happens *before* the blur, as Orton overexposed his slides in
+  camera, so highlights bleed outward rather than the frame washing out.
+- **`apply_lut`** runs the image through a 3D `.cube` lookup table — the format
+  film emulations and creative grades ship in, and what Resolve and Lightroom
+  export. Interpolation is **tetrahedral** rather than trilinear, so a sharp
+  transition in the table stays sharp and a LUT looks the same here as where it
+  was authored.
+
+  A LUT is **display-referred**: its domain is almost always 0..1, so it says
+  nothing about a scene-linear highlight at 6.0, and sampling clamps rather than
+  extrapolating. **Tone map first.** The stage reports what fraction of the
+  frame was above the table's domain, so a pipeline in the wrong order says so
+  rather than merely looking flat.
+
+  A 33³ table is 35,937 entries and cannot be decomposed back into sliders —
+  contrast and saturation are patterns spread across all of them, not numbers
+  inside the file. So this is load-and-apply, with a `strength` blend; stack the
+  ordinary adjustments after it.
+
+  It runs on the GPU. The table is too big for a constant buffer (431 KB against
+  a 64 KB limit) so it rides in as a stage-owned texture — see
+  `AlgorithmBase::GpuExtraInputs` — packed 2D as `size` wide by `size²` tall.
+  Deliberately not a 3D texture: hardware filtering there is *trilinear*, which
+  would visibly disagree with the CPU's tetrahedral on any sharp LUT. Doing
+  tetrahedral by hand keeps the two bit-identical. The dispatch measures under a
+  millisecond at 1 MP.
 
 ---
 

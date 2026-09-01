@@ -1177,6 +1177,22 @@ bool Pipeline::RunStageGpu(Stage& s, const std::vector<const Data*>& in,
         if (!g) { *err = "could not make an input GPU-resident"; return false; }
         gin.push_back(&g->image);
     }
+
+    // Textures the algorithm supplies itself -- a colour LUT, a kernel, a
+    // profile. Bound after the port inputs, so a stage with one input port
+    // finds its first extra at index -2. See AlgorithmBase::GpuExtraInputs.
+    //
+    // AcquireGpuRead uploads once and leaves the image resident, so returning
+    // the same texture every run costs one upload rather than one per run.
+    for (const Image* extra : s.algo->GpuExtraInputs()) {
+        if (!extra || !extra->Valid()) {
+            *err = "an algorithm supplied an invalid extra GPU input";
+            return false;
+        }
+        GpuResidency* g = const_cast<Image*>(extra)->AcquireGpuRead(*gpu);
+        if (!g) { *err = "could not upload an algorithm's extra GPU input"; return false; }
+        gin.push_back(&g->image);
+    }
     if (GpuPassTiming())
         std::fprintf(stderr, "[pass] %s.<input upload> %.0f ms\n", s.algoName.c_str(),
                      std::chrono::duration<double, std::milli>(
