@@ -159,6 +159,34 @@ int main() {
             Check(ui.Controls()[0].value == 0.5, "slider default applied");
     }
 
+    // --- slider() takes an optional help string ------------------------------
+    //
+    // Without it a script's own sliders were the only controls in the panel
+    // with no explanation: params() carries an algorithm's ParamOpts::help
+    // through to the tooltip, so an algorithm parameter was documented and a
+    // hand-written slider beside it was not. A name and a range do not say
+    // what "knee" does.
+    {
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        const bool ok = RunScript(
+            "src = image(\"test\")\n"
+            "a = slider(\"amount\", 0, 1, 0.5, \"what it does\")\n"
+            "out = brightness(src, brightness = a)\n",
+            &ui, &p, &err, &src);
+        Check(ok, "slider() accepts a help string" + (ok ? "" : ": " + err));
+        if (ok && !ui.Controls().empty())
+            Check(ui.Controls()[0].help == "what it does",
+                  "...and it reaches the control as its tooltip");
+
+        // The four-argument form must keep working unchanged.
+        UiState ui2; Pipeline p2; std::string e2; std::vector<Data> s2;
+        Check(RunScript("src = image(\"test\")\n"
+                        "a = slider(\"amount\", 0, 1, 0.5)\n"
+                        "out = brightness(src, brightness = a)\n",
+                        &ui2, &p2, &e2, &s2),
+              "...and the four-argument form still works");
+    }
+
     // --- slider value persists across re-runs (hot reload keeps tuning) ------
     {
         UiState ui; std::string err; std::vector<Data> src;
@@ -5879,7 +5907,9 @@ int main() {
             return im;
         };
 
-        auto run = [&](double streak, double blades, double disp, Image* out) {
+        // The three spreads are the whole interface now: equal for an ordinary
+        // achromatic bloom, red wider for halation.
+        auto run = [&](double sr, double sg, double sb, Image* out) {
             auto algo = Registry::Get().Create("bloom");
             if (!algo) return false;
             auto set = [&](const char* n, double val) {
@@ -5888,12 +5918,10 @@ int main() {
                 }
             };
             set("threshold", 1.0);
-            set("spread", 8.0);
             set("intensity", 1.0);
-            set("dispersion", disp);
-            set("streak", streak);
-            set("blades", blades);
-            set("streak_angle", 0.0);
+            set("spread_r", sr);
+            set("spread_g", sg);
+            set("spread_b", sb);
 
             std::vector<Data> s;
             s.push_back(Data{scene()});
@@ -5909,7 +5937,7 @@ int main() {
         };
 
         Image plain;
-        if (run(0.0, 6, 0.0, &plain)) {
+        if (run(8.0, 8.0, 8.0, &plain)) {
             ImageView v = plain.MapCpuRead();
             // 20 px from the point: inside the glow, well outside the source.
             const float near  = v.At<float>(84, 64)[1];
@@ -5929,13 +5957,15 @@ int main() {
             Check(false, "bloom runs");
         }
 
-        // DISPERSION IS A SPREAD, NOT A TINT. At the outer edge of the glow
-        // only the longer wavelength has reached, so red must exceed blue
-        // there -- while an achromatic bloom keeps them equal. This is what
-        // separates halation from "bloom with a warm tint".
+        // HALATION IS A SPREAD, NOT A TINT. At the outer edge of the glow only
+        // the channel with the wider kernel has reached, so red must exceed
+        // blue there -- while an achromatic bloom keeps them equal. This is
+        // what separates halation from "bloom with a warm tint", and it is the
+        // reason the three radii are separate sliders rather than one radius
+        // and a colour.
         {
             Image achro, halo;
-            if (run(0.0, 6, 0.0, &achro) && run(0.0, 6, 1.0, &halo)) {
+            if (run(8.0, 8.0, 8.0, &achro) && run(14.0, 8.0, 5.0, &halo)) {
                 ImageView a = achro.MapCpuRead();
                 ImageView h = halo.MapCpuRead();
                 // Far enough out that blue's narrower kernel has died away.
@@ -5952,29 +5982,72 @@ int main() {
             }
         }
 
-        // THE SPIKE COUNT, which is the part that was wrong first time.
+        // THE THRESHOLD IS ON LUMINANCE, AND THE GLOW KEEPS THE SOURCE COLOUR.
         //
-        // Each line is drawn in BOTH directions, so iterating over `spikes`
-        // rather than `spikes / 2` drew twice as many rays at half the
-        // spacing. Six blades hid it -- 12 rays at 30 degrees still looks like
-        // a starburst -- and blades = 1 exposed it: two lines over pi is a
-        // horizontal AND a vertical, so the anamorphic streak came out a cross.
+        // These two are one test because they are the two halves of the same
+        // decision. Thresholding per channel instead would mean a saturated
+        // red lamp bloomed ONLY in red -- its red clears the bar, its green
+        // and blue do not -- so it could never throw a white halo, and the
+        // three spread sliders would collapse into a single effect.
         //
-        // So: blades = 1 must put light along the horizontal and NOT the
-        // vertical.
+        // So a red source must bloom (luminance decides, once, for the pixel)
+        // and its glow must still be red (the extracted highlight carries the
+        // pixel's own colour; only the REACH is per channel).
         {
-            Image anam;
-            if (run(1.5, 1, 0.0, &anam)) {
-                ImageView v = anam.MapCpuRead();
-                // 40 px out along each axis, past the round glow's reach.
-                const float horiz = v.At<float>(104, 64)[1];
-                const float vert  = v.At<float>(64, 104)[1];
-                Check(horiz > vert * 2.0f,
-                      "blades = 1 streaks horizontally, not as a cross (" +
-                          std::to_string(horiz) + " across vs " +
-                          std::to_string(vert) + " down)");
+            auto redScene = [] {
+                Image img;
+                img.Alloc({128, 128, Format::RGBA32F});
+                ImageView v = img.MapCpuWrite();
+                for (int y = 0; y < 128; ++y)
+                    for (int x = 0; x < 128; ++x) {
+                        float* p = v.At<float>(x, y);
+                        const bool lamp = (x >= 62 && x < 66 && y >= 62 && y < 66);
+                        // Bright enough that its LUMINANCE clears 1.0 even
+                        // though only red carries any signal.
+                        p[0] = lamp ? 8.0f : 0.05f;
+                        p[1] = lamp ? 0.0f : 0.05f;
+                        p[2] = lamp ? 0.0f : 0.05f;
+                        p[3] = 1.0f;
+                    }
+                return img;
+            };
+            auto algo = Registry::Get().Create("bloom");
+            auto set = [&](const char* n, double val) {
+                if (ParamBase* pb = algo->FindParam(n)) {
+                    std::string e; pb->SetFromScript(Value(val), &e);
+                }
+            };
+            set("threshold", 1.0);
+            set("intensity", 1.0);
+            set("spread_r", 8.0);
+            set("spread_g", 8.0);
+            set("spread_b", 8.0);
+
+            std::vector<Data> s;
+            s.push_back(Data{redScene()});
+            Pipeline p;
+            p.AddStage(std::move(algo), "bloom", {{-1, 0}}, 1, 1);
+            std::string e;
+            if (p.Execute(&s, nullptr, &e)) {
+                const Data* d = p.Resolve({0, 0}, &s);
+                const auto* im = d ? std::get_if<Image>(d) : nullptr;
+                if (im) {
+                    ImageView v = const_cast<Image*>(im)->MapCpuRead();
+                    const float r = v.At<float>(80, 64)[0];
+                    const float g = v.At<float>(80, 64)[1];
+                    Check(r > 0.05f * 1.05f,
+                          "a red-only lamp still blooms, so the threshold is "
+                          "on luminance rather than per channel (" +
+                              std::to_string(r) + " against a 0.05 background)");
+                    Check(r > g + 0.01f,
+                          "...and its glow stays red rather than developing "
+                          "grey (r " + std::to_string(r) + " vs g " +
+                              std::to_string(g) + ")");
+                } else {
+                    Check(false, "the red-lamp bloom produced an image");
+                }
             } else {
-                Check(false, "the anamorphic variant ran");
+                Check(false, "the red-lamp bloom ran");
             }
         }
 

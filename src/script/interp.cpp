@@ -554,9 +554,17 @@ private:
     bool CallSlider(const Expr& e, std::vector<Value>* out) {
         EvaledArgs a;
         if (!EvalArgs(e, &a)) return false;
-        if (a.pos.size() != 4 || !a.pos[0].IsString() ||
+        // A fifth argument is an optional tooltip. Without it a script's own
+        // sliders were the only controls in the panel with no explanation --
+        // params() carries an algorithm's ParamOpts::help through, so an
+        // algorithm parameter was documented and a hand-written slider beside
+        // it was not. A name and a range do not tell you what "knee" does.
+        const bool hasHelp = a.pos.size() == 5 && a.pos[4].IsString();
+        if ((a.pos.size() != 4 && !hasHelp) || !a.pos[0].IsString() ||
             !a.pos[1].IsNumber() || !a.pos[2].IsNumber() || !a.pos[3].IsNumber())
-            return Fail(e.line, "slider() takes (\"label\", min, max, default)");
+            return Fail(e.line,
+                        "slider() takes (\"label\", min, max, default) and an "
+                        "optional \"help\" string");
 
         UiControl proto;
         proto.kind  = UiControl::Kind::Slider;
@@ -565,6 +573,7 @@ private:
         proto.hi    = a.pos[2].AsNumber();
         proto.def   = a.pos[3].AsNumber();
         proto.value = proto.def;
+        if (hasHelp) proto.help = a.pos[4].AsString();
         if (proto.lo > proto.hi) return Fail(e.line, "slider() min is greater than max");
 
         UiControl& c = m_ui->FindOrAdd(proto);

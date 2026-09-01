@@ -1,47 +1,38 @@
 // bloom — threshold the highlights, spread them, add them back.
 //
-// The simple version is three steps and Tim's description of it is exactly
-// right: threshold, blur, merge. What makes this one worth writing as a single
-// algorithm is that HALATION, STARBURSTS and ANAMORPHIC STREAKS are all the
-// same three steps with a different spread. Only the kernel changes, so one
-// algorithm covers them and the effects compose instead of stacking as separate
-// stages that each re-threshold the image.
+// Three steps, and that is the whole algorithm: threshold, Gaussian blur, add.
+// The one addition is that the blur radius is SEPARATE PER CHANNEL, which is
+// what turns the same three steps into halation and dispersion without any
+// extra machinery.
 //
-// WHAT THE OPTICS ACTUALLY ARE, because the parameters follow from it and
-// "bloom with a red tint" is the wrong model for halation.
+//   spread_r == spread_g == spread_b   ordinary achromatic bloom
+//   spread_r >  the others             halation -- warm fringe at the edge
+//   all three different                dispersion, a spectral edge
 //
-//   BLOOM is scattering BEFORE the sensor -- veiling glare in the lens, dust,
-//   the coating. It is broadly achromatic and roughly Gaussian, and it spreads
-//   from bright areas in every direction.
+// WHY PER-CHANNEL RADIUS RATHER THAN A TINT. Halation happens inside film:
+// light passes through the emulsion, reflects off the base behind it, and
+// re-exposes the layers from below. Red penetrates deepest, so red is what
+// comes back. That makes halation a spread that DIFFERS PER CHANNEL, not a
+// bloom that has been coloured. The difference is visible: with a per-channel
+// spread the glow is neutral in its core, where all three channels reach, and
+// goes warm only at the edge where red alone has got to. A tint would colour
+// the whole glow uniformly and look nothing like film.
 //
-//   HALATION happens INSIDE film. Light passes through the emulsion, reflects
-//   off the base or the pressure plate behind it, and re-exposes the layers
-//   from below. Red penetrates deepest, so it is what comes back -- which is
-//   why halation is red-orange rather than white, and why it hugs the EDGES of
-//   bright areas rather than filling them: the returning light is offset by
-//   twice the base thickness.
+// THE THRESHOLD IS ON LUMINANCE, NOT PER CHANNEL, and that is deliberate.
+// Thresholding each channel separately would mean a saturated red lamp bloomed
+// only in red -- its red channel clears the bar, its green and blue do not --
+// so a red light could never throw a white halo, and the three spread sliders
+// would collapse into one effect. Deciding WHAT is bright once, on luminance,
+// and then letting the sliders control only HOW FAR each channel travels,
+// keeps the two decisions independent. The extracted highlight keeps its own
+// colour; only its reach is per channel.
 //
-//   So halation is not bloom that has been tinted. It is a spread that differs
-//   PER CHANNEL, which is why `dispersion` scales each channel's radius rather
-//   than colouring the result. At dispersion 1 the red channel spreads furthest
-//   and blue least, and the glow around a highlight goes warm at its edge
-//   because that is where only the red has reached.
-//
-//   STARBURST is diffraction at the aperture blades. An n-bladed iris produces
-//   n spikes for even n and 2n for odd -- a six-bladed iris gives six, a
-//   five-bladed one gives ten -- because an odd polygon's opposite edges are
-//   not parallel. That is why `blades` is a real parameter and not decoration.
-//
-//   ANAMORPHIC streaks are the horizontal flares from a cylindrical element,
-//   and are just the starburst with two spikes and no rotation. Same code path,
-//   `blades = 1` and `streak = 1`.
-//
-// WHY ONE ALGORITHM RATHER THAN FOUR. Every one of these thresholds the same
-// highlights and adds back into the same image. Split into separate stages,
-// each would re-threshold and re-add, so two of them together would count the
-// highlights twice and the second would bloom the first one's glow. Here the
-// threshold happens once and the spreads are summed before the merge, which is
-// both correct and cheaper.
+// AN EARLIER VERSION ALSO DID STARBURSTS AND ANAMORPHIC STREAKS. They were
+// removed: they never looked good at any setting, and they cost four of the
+// eleven parameters. Diffraction spikes are a genuinely different phenomenon
+// from scattering -- a spike ADDS light along a line rather than redistributing
+// it -- and folding them into the same threshold-and-blur made both worse. If
+// they come back it should be as their own stage.
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -54,45 +45,52 @@
 namespace tglab {
 namespace {
 
-// Shared by every pass: the constants and the soft-knee threshold.
+// Shared by every pass: the constants and the highlight extraction.
 const char* kCommon = R"(
-cbuffer Params : register(b0) {
+cbuffer Constants : register(b0) {
     uint Width;
     uint Height;
-    uint ThresholdBits;
-    uint KneeBits;
-    uint RadiusBits;      // base blur radius in pixels
-    uint DispersionBits;  // per-channel radius spread, 0 = achromatic
-    uint IntensityBits;
-    uint StreakBits;      // 0 = none, 1 = full directional
-    uint BladesBits;      // spike count driver
-    uint AngleBits;       // starburst rotation, radians
-    uint TintRBits;
-    uint TintGBits;
-    uint TintBBits;
-    uint PassDirBits;     // 0 = horizontal, 1 = vertical, else a spike index
+    uint C0; uint C1; uint C2; uint C3; uint C4; uint C5; uint C6;
 };
+float T()         { return asfloat(C0); }
+float Knee()      { return asfloat(C1); }
+float SpreadR()   { return asfloat(C2); }
+float SpreadG()   { return asfloat(C3); }
+float SpreadB()   { return asfloat(C4); }
+float Intensity() { return asfloat(C5); }
+float Dir()       { return asfloat(C6); }
 
-float T()   { return asfloat(ThresholdBits); }
-float Knee(){ return asfloat(KneeBits); }
-float Rad() { return asfloat(RadiusBits); }
-float Disp(){ return asfloat(DispersionBits); }
-
-// The SOFT KNEE, which is what stops the effect switching on at a hard edge.
+// Intensity, compensated for how much the spread dimmed the glow.
 //
-// A plain `max(v - t, 0)` makes every pixel either bloom or not, so a gradient
-// crossing the threshold gets a visible contour where the glow begins. The knee
+// The blur conserves energy, so a source spread over sigma falls as 1/sigma^2.
+// Dividing that back out means intensity 1 is roughly "the glow reads as
+// bright as the light that made it" whatever the spread, instead of meaning
+// something different at every radius. Referenced to sigma 8 so the familiar
+// mid-range settings keep about the strength they had.
+float Gain() {
+    float s = max((SpreadR() + SpreadG() + SpreadB()) / 3.0, 1.0);
+    return Intensity() * (s * s) / 64.0;
+}
+
+// How much of a pixel survives the threshold, as a fraction of itself.
+//
+// Decided on LUMINANCE so the choice of what is bright is made once, for the
+// pixel as a whole -- see the note at the top of the file. The soft knee
 // blends quadratically over a band below the threshold, so the contribution
-// grows from zero smoothly -- the standard formulation, and the reason bloom
-// on a sky looks like light rather than like a mask.
+// grows from zero smoothly rather than switching on at a hard edge, which is
+// what stops bloom on a sky looking like a mask.
+//
+// Rec.709 luma: green dominates because the eye does. A saturated blue light
+// therefore has to be far brighter than a green one before it blooms, which is
+// correct -- it IS dimmer to look at.
 float3 Highlight(float3 c) {
     float t = T();
     float k = max(Knee(), 1e-4);
-    float br = max(c.r, max(c.g, c.b));
-    float soft = clamp(br - t + k, 0.0, 2.0 * k);
+    float lum = dot(c, float3(0.2126, 0.7152, 0.0722));
+    float soft = clamp(lum - t + k, 0.0, 2.0 * k);
     soft = soft * soft / (4.0 * k);
-    float contrib = max(soft, br - t) / max(br, 1e-5);
-    return c * max(contrib, 0.0);
+    float contrib = max(max(soft, lum - t), 0.0) / max(lum, 1e-5);
+    return c * contrib;
 }
 )";
 
@@ -109,54 +107,38 @@ void main(uint3 tid : SV_DispatchThreadID) {
 }
 )";
 
-// Passes 2 and 3: a separable Gaussian with a PER-CHANNEL radius.
+// Passes 2 and 3: a separable Gaussian with a PER-CHANNEL sigma.
 //
-// The per-channel part is the whole of halation and dispersion. One kernel
-// weight per channel per tap, so the three colours spread by different amounts
-// in a single pass rather than needing three blurs.
+// One kernel weight per channel per tap, so all three colours spread by their
+// own amount in a single pass rather than needing three separate blurs. The
+// loop bound is the largest of the three radii; narrower channels contribute
+// nothing past their own, which costs a few wasted taps and saves two passes.
 //
-// The loop bound is the LARGEST of the three radii, and the narrower channels
-// simply contribute nothing past their own -- which costs a few wasted taps and
-// avoids three separate passes.
+// Each channel is normalised by ITS OWN weight sum. That is what makes this
+// redistribute light rather than add or lose it: a channel cut off by the loop
+// bound still integrates to 1.
 const char* kBlurHlsl = R"(
 Texture2D<float4>   Src : register(t0);
 RWTexture2D<float4> Dst : register(u0);
 
-// 1 where |x| <= edge, 0 beyond, per channel. Written out because HLSL's
-// step() takes the edge first and reads backwards here.
-float3 Step3(float x, float3 edge) {
-    return float3(x <= edge.r ? 1.0 : 0.0,
-                  x <= edge.g ? 1.0 : 0.0,
-                  x <= edge.b ? 1.0 : 0.0);
-}
-
 [numthreads(8, 8, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
     if (tid.x >= Width || tid.y >= Height) return;
+    int2 p = int2(tid.xy);
 
-    // Red spreads furthest, blue least: light of a longer wavelength
-    // penetrates the emulsion deeper before it reflects.
-    float d = Disp();
-    float3 sigma = Rad() * float3(1.0 + 0.6 * d, 1.0, max(1.0 - 0.5 * d, 0.15));
-    int    R     = (int)ceil(max(sigma.r, max(sigma.g, sigma.b)) * 2.5);
-    R = min(R, 128);
+    float3 sig = max(float3(SpreadR(), SpreadG(), SpreadB()), 0.05);
+    float rmax = max(sig.r, max(sig.g, sig.b));
+    int R = min(128, int(ceil(rmax * 2.5)));
 
-    int2 step = (PassDirBits == 0) ? int2(1, 0) : int2(0, 1);
-
-    float3 sum = float3(0, 0, 0);
-    float3 wsum = float3(0, 0, 0);
+    float3 sum = 0.0, wsum = 0.0;
     for (int i = -R; i <= R; ++i) {
-        int2 p = int2(tid.xy) + step * i;
-        p = clamp(p, int2(0, 0), int2(Width - 1, Height - 1));
-        float3 c = Src[p].rgb;
-
-        float fi = (float)i;
-        float3 w = exp(-(fi * fi) / (2.0 * sigma * sigma));
-        // A channel whose sigma is tiny would otherwise pick up a long tail of
-        // near-zero weights that sum to something; zeroing past 2.5 sigma keeps
-        // each channel's support honest.
-        w *= Step3(abs(fi), sigma * 2.5);
-
+        int2 q = (Dir() < 0.5) ? int2(p.x + i, p.y) : int2(p.x, p.y + i);
+        q = clamp(q, int2(0, 0), int2(int(Width) - 1, int(Height) - 1));
+        float3 c = Src[q].rgb;
+        float fi = float(i);
+        // Per channel: contributes nothing beyond that channel's own reach.
+        float3 inside = step(abs(fi), sig * 2.5);
+        float3 w = exp(-(fi * fi) / (2.0 * sig * sig)) * inside;
         sum  += c * w;
         wsum += w;
     }
@@ -164,116 +146,29 @@ void main(uint3 tid : SV_DispatchThreadID) {
 }
 )";
 
-// Pass 4: the directional streaks, accumulated over every spike.
+// Pass 4: add the glow back.
 //
-// One pass walks all the spikes rather than one pass each: a spike is a 1D
-// blur along a direction, and the count is small enough (2 to 16) that doing
-// them in one dispatch beats sixteen dispatches with their own barriers.
-const char* kStreakHlsl = R"(
-Texture2D<float4>   Src : register(t0);   // the thresholded highlights
-RWTexture2D<float4> Dst : register(u0);
-
-[numthreads(8, 8, 1)]
-void main(uint3 tid : SV_DispatchThreadID) {
-    if (tid.x >= Width || tid.y >= Height) return;
-
-    float streak = asfloat(StreakBits);
-    if (streak <= 0.0) { Dst[tid.xy] = float4(0, 0, 0, 1); return; }
-
-    int   blades = max((int)asfloat(BladesBits), 1);
-    float angle  = asfloat(AngleBits);
-
-    // An n-bladed iris gives n spikes when n is even and 2n when it is odd,
-    // because an odd polygon has no pair of parallel edges -- each edge
-    // diffracts into its own spike instead of sharing one with its opposite.
-    int spikes = (blades % 2 == 0) ? blades : blades * 2;
-    spikes = min(spikes, 32);
-
-    // LINES, not spikes. The inner loop runs i from -N to +N, so one line
-    // already draws two opposite rays -- iterating `spikes` times over pi
-    // therefore drew twice as many rays as asked for, and put them at half the
-    // intended spacing.
-    //
-    // The six-blade case hid it: 6 lines over pi gave 12 rays at 30 degrees,
-    // which still looks like a plausible starburst. blades = 1 is what exposed
-    // it -- 2 lines over pi is a horizontal AND a vertical, so the "anamorphic"
-    // streak came out as a cross.
-    int lines = max(spikes / 2, 1);
-
-    // Long and thin: a streak reaches much further than the round glow, which
-    // is what makes it read as a diffraction spike rather than a smear.
-    float len = Rad() * 4.0;
-    int   N   = min((int)len, 192);
-
-    float d = Disp();
-    float3 chroma = float3(1.0 + 0.6 * d, 1.0, max(1.0 - 0.5 * d, 0.15));
-
-    float3 sum = float3(0, 0, 0);
-
-    for (int s = 0; s < lines; ++s) {
-        float th = angle + 3.14159265 * (float)s / (float)lines;
-        float2 dir = float2(cos(th), sin(th));
-
-        // Both directions along the axis, so a spike is a full line rather
-        // than a ray -- diffraction is symmetric about the source.
-        for (int i = -N; i <= N; ++i) {
-            if (i == 0) continue;
-            float2 p = float2(tid.xy) + dir * (float)i;
-            if (p.x < 0.0 || p.y < 0.0 || p.x >= Width || p.y >= Height) continue;
-
-            // 1/d falloff rather than Gaussian: a diffraction spike decays far
-            // more slowly than scattering, which is exactly why it reads as a
-            // line reaching across the frame instead of a blob.
-            float w = 1.0 / (1.0 + abs((float)i) * 4.0 / max(len, 1.0));
-            sum += Src[int2(p)].rgb * w * chroma;
-        }
-    }
-    // NOT DIVIDED BY THE TOTAL WEIGHT, and this is the one place where doing
-    // the physically tidy thing gives the visually wrong answer.
-    //
-    // The round blur normalises because it REDISTRIBUTES light: the same energy
-    // is spread wider, so a small bright source spreading over 20x the area
-    // gets 20x dimmer. That is correct for scattering, and it is what a
-    // Gaussian conserving energy means.
-    //
-    // A diffraction spike is not that. The light in the spike did not come out
-    // of the core -- it is the part of the wavefront the aperture edge bent,
-    // arriving in ADDITION to what went straight through. Normalising it over
-    // the length of the line divided a point source by about a hundred and made
-    // the spikes invisible while the data insisted they were there.
-    //
-    // So the falloff is applied per tap and the sum is taken as-is, scaled only
-    // by a length normaliser that keeps the brightness roughly independent of
-    // `spread` -- otherwise widening the glow would silently dim the spikes.
-    Dst[tid.xy] = float4(sum * streak / max(len * 0.25, 1.0), 1.0);
-}
-)";
-
-// Pass 5: add the glow back.
+// The glow is scaled by GAIN, which is intensity times a compensation for how
+// far the light was spread. A normalised Gaussian CONSERVES energy, so a small
+// source spread wide goes faint as 1/sigma^2 -- a 4x4 lamp at sigma 24 peaks
+// at 0.4% of itself. That is physically right and made the control unusable:
+// widening the spread dimmed the glow, so intensity had to be re-tuned every
+// time, and at wide radii the old 0..4 range could not reach a strong look at
+// all. Compensating by sigma^2 decouples the two, so intensity means "how
+// bright" and spread means "how far", independently. See kCommon's Gain().
 const char* kCombineHlsl = R"(
-Texture2D<float4>   Src    : register(t0);   // the original image
-Texture2D<float4>   Glow   : register(t1);   // blurred highlights
-Texture2D<float4>   Streak : register(t2);   // directional spikes
-RWTexture2D<float4> Dst    : register(u0);
+Texture2D<float4>   Src  : register(t0);
+Texture2D<float4>   Glow : register(t1);
+RWTexture2D<float4> Dst  : register(u0);
 
 [numthreads(8, 8, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
     if (tid.x >= Width || tid.y >= Height) return;
-
-    float4 base = Src[int2(tid.xy)];
-    float3 g    = Glow[int2(tid.xy)].rgb + Streak[int2(tid.xy)].rgb;
-
-    float3 tint = float3(asfloat(TintRBits), asfloat(TintGBits), asfloat(TintBBits));
-    g *= tint * asfloat(IntensityBits);
-
-    // ADDED, not blended. Bloom is light that arrived in addition to what was
-    // already there -- scattered from elsewhere in the frame -- so it adds
-    // energy. A lerp would darken the highlight it is supposed to be spilling
-    // from, which is the giveaway of a bloom done as a compositing operation
-    // rather than as light.
-    //
-    // Alpha carried through untouched: glow does not change transparency.
-    Dst[tid.xy] = float4(base.rgb + g, base.a);
+    float4 c = Src[int2(tid.xy)];
+    float3 g = Glow[int2(tid.xy)].rgb;
+    // ADDITIVE, not a blend. Light adds; the original is never dimmed to make
+    // room for the glow, which is what keeps a blown highlight blown.
+    Dst[tid.xy] = float4(c.rgb + g * Gain(), c.a);
 }
 )";
 
@@ -282,18 +177,24 @@ public:
     const char* Name()     const override { return "bloom"; }
     const char* Category() const override { return "filter"; }
 
-    PortList Inputs()  const override { return {{"src", DataType::Image, FormatSpec::Any}}; }
+    PortList Inputs() const override {
+        return {{"src", DataType::Image, FormatSpec::Any}};
+    }
     PortList Outputs() const override {
         return {{"out", DataType::Image, FormatSpec::SameAsInput}};
     }
 
+    // At intensity 0 nothing is added back, so the pipeline can alias this
+    // stage away rather than running four passes to produce its input.
     bool IsNoOp() const override { return float(m_intensity) <= 0.0f; }
 
     void RunCPU(RunCtx& ctx) override;
-
     bool HasGPU() const override { return true; }
 
-    int        GpuScratchCount()  const override { return 3; }
+    // Two scratch planes: one holds the thresholded highlights and takes the
+    // vertical pass, the other takes the horizontal. The starburst version
+    // needed three.
+    int        GpuScratchCount()  const override { return 2; }
     FormatSpec GpuScratchPlanes() const override { return FormatSpec::RGBA32F; }
 
     std::vector<GpuPass> GpuPasses() const override {
@@ -301,109 +202,70 @@ public:
         // strings per call would dangle them the moment the vector went away.
         static const std::string thr = std::string(kCommon) + kThresholdHlsl;
         static const std::string blr = std::string(kCommon) + kBlurHlsl;
-        static const std::string stk = std::string(kCommon) + kStreakHlsl;
         static const std::string cmb = std::string(kCommon) + kCombineHlsl;
 
         std::vector<GpuPass> p;
-        // 0 holds the highlights, 1 and 2 ping-pong the blur, 2 ends up
-        // holding the round glow and 0 is reused for the streaks -- which is
-        // safe because the streaks read the highlights and the highlights are
-        // no longer needed once the blur has consumed them... except they ARE,
-        // so the streak pass reads 0 and writes 1, and 0 survives.
-        p.push_back({thr.c_str(), "threshold", {-1},          {0}});
-        p.push_back({blr.c_str(), "blurH",     {0},           {2}});
-        p.push_back({blr.c_str(), "blurV",     {2},           {1}});
-        p.push_back({stk.c_str(), "streak",    {0},           {2}});
-        p.push_back({cmb.c_str(), "combine",   {-1, 1, 2},    {-1}});
+        // Plane 0 holds the highlights, 1 takes the horizontal pass, and 0 is
+        // reused for the vertical result -- safe because the highlights have
+        // been consumed by then.
+        p.push_back({thr.c_str(), "threshold", {-1},    {0}});
+        p.push_back({blr.c_str(), "blurH",     {0},     {1}});
+        p.push_back({blr.c_str(), "blurV",     {1},     {0}});
+        p.push_back({cmb.c_str(), "combine",   {-1, 0}, {-1}});
         return p;
     }
 
     std::vector<uint32_t> GpuPassConstants(int pass) const override {
         auto bits = [](float f) { uint32_t u; std::memcpy(&u, &f, sizeof u); return u; };
-        // Pass 1 is the horizontal blur and pass 2 the vertical; everything
-        // else ignores the direction.
+        // Pass 1 blurs horizontally and pass 2 vertically; the rest ignore it.
         const float dir = (pass == 2) ? 1.0f : 0.0f;
         return {bits(float(m_threshold)),
                 bits(std::max(0.01f, float(m_knee))),
-                bits(std::max(0.1f, float(m_radius))),
-                bits(float(m_dispersion)),
+                bits(std::max(0.05f, float(m_spreadR))),
+                bits(std::max(0.05f, float(m_spreadG))),
+                bits(std::max(0.05f, float(m_spreadB))),
                 bits(float(m_intensity)),
-                bits(float(m_streak)),
-                bits(float(m_blades)),
-                bits(float(m_angle) * 3.14159265f / 180.0f),
-                bits(float(m_tintR)),
-                bits(float(m_tintG)),
-                bits(float(m_tintB)),
                 bits(dir)};
     }
 
 private:
-    Param<float> m_threshold{this, "threshold", 0.8f, 0.0f, 4.0f,
-        {.help = "How bright a pixel must be to bloom. On a scene-linear image "
-                 "with headroom above 1.0 this can usefully go past 1 -- only "
-                 "the genuinely blown highlights then glow.",
-         .step = 0.02, .softMax = 2.0}};
+    // 0.6 rather than the 0.8 this had when it thresholded on max(r,g,b).
+    // Luminance is always the lower number for anything that is not neutral --
+    // a fully saturated red is 0.21 of its own channel value -- so keeping 0.8
+    // would have quietly stopped most coloured highlights blooming at all.
+    Param<float> m_threshold{this, "threshold", 0.6f, 0.0f, 4.0f,
+        {.help = "Luminance above which a pixel blooms. Scene-linear, so 1.0 "
+                 "is white and above it is the headroom a raw file holds."}};
 
     Param<float> m_knee{this, "knee", 0.15f, 0.01f, 1.0f,
-        {.help = "Width of the soft transition below the threshold. A hard "
-                 "cutoff puts a visible contour wherever a gradient crosses "
-                 "it; the knee is what makes the glow read as light.",
-         .step = 0.01}};
+        {.help = "Width of the soft band below the threshold. Without it the "
+                 "bloom switches on at a hard edge and reads as a mask."}};
 
-    Param<float> m_radius{this, "spread", 24.0f, 0.5f, 256.0f,
-        {.help = "How far the glow reaches, in pixels. This is the blur sigma "
-                 "-- the visible glow extends about two and a half times it.",
-         .step = 1.0, .softMax = 80.0}};
+    // The three that do the work. Equal = ordinary bloom; red largest =
+    // halation; all different = dispersion.
+    Param<float> m_spreadR{this, "spread_r", 24.0f, 0.0f, 256.0f,
+        {.help = "How far red spreads, in pixels. Raise it above the others "
+                 "for halation -- the warm fringe film gives a bright edge."}};
 
-    Param<float> m_intensity{this, "intensity", 0.35f, 0.0f, 4.0f,
-        {.help = "How much glow is added back. 0 turns the whole stage off, "
-                 "and the pipeline then skips it entirely.",
-         .step = 0.02, .softMax = 1.5}};
+    Param<float> m_spreadG{this, "spread_g", 24.0f, 0.0f, 256.0f,
+        {.help = "How far green spreads, in pixels."}};
 
-    // HALATION, expressed as a spread that differs per channel rather than as
-    // a tint. See the file header: halation is light returning through the
-    // emulsion from the backing, and red gets deepest, so what makes it look
-    // right is red reaching further -- not the whole glow being coloured.
-    Param<float> m_dispersion{this, "dispersion", 0.0f, 0.0f, 1.0f,
-        {.help = "Spread the channels by different amounts -- red furthest, "
-                 "blue least. This is halation: the warm fringe appears where "
-                 "only the longer wavelengths have reached, so it hugs the "
-                 "edge of a highlight rather than filling it. 0 is achromatic "
-                 "bloom.",
-         .step = 0.05}};
+    Param<float> m_spreadB{this, "spread_b", 24.0f, 0.0f, 256.0f,
+        {.help = "How far blue spreads, in pixels. All three equal gives an "
+                 "ordinary achromatic bloom; vary them for a spectral edge."}};
 
-    Param<float> m_streak{this, "streak", 0.0f, 0.0f, 2.0f,
-        {.help = "Diffraction spikes from the aperture blades. 0 is none; "
-                 "raise it for a starburst on point highlights.",
-         .step = 0.05, .softMax = 1.0}};
-
-    Param<float> m_blades{this, "blades", 6.0f, 1.0f, 16.0f,
-        {.help = "Aperture blades. An EVEN count gives that many spikes, an "
-                 "ODD count gives twice as many -- an odd polygon has no "
-                 "parallel edges, so each diffracts into its own spike. Set 1 "
-                 "for a two-spike anamorphic streak.",
-         .step = 1.0}};
-
-    Param<float> m_angle{this, "streak_angle", 0.0f, 0.0f, 180.0f,
-        {.help = "Rotation of the spike pattern, in degrees. 0 puts the first "
-                 "spike horizontal, which with blades = 1 is the anamorphic "
-                 "look.",
-         .step = 5.0}};
-
-    Param<float> m_tintR{this, "tint_r", 1.0f, 0.0f, 2.0f,
-        {.help = "Colour of the glow, multiplied in after the spread. Leave at "
-                 "1,1,1 for neutral; warm it for a filmic halation on top of "
-                 "the per-channel spread.",
-         .step = 0.05}};
-    Param<float> m_tintG{this, "tint_g", 1.0f, 0.0f, 2.0f,
-        {.help = "Green component of the glow tint.", .step = 0.05}};
-    Param<float> m_tintB{this, "tint_b", 1.0f, 0.0f, 2.0f,
-        {.help = "Blue component of the glow tint.", .step = 0.05}};
+    // Compensated for spread (see Gain()), so this means the same thing at
+    // every radius. 1.0 is roughly "as bright as the light that made it";
+    // above that is a fog or a heavy diffusion filter.
+    Param<float> m_intensity{this, "intensity", 0.5f, 0.0f, 8.0f,
+        {.help = "How bright the glow is. Additive, so the highlight itself "
+                 "is never dimmed. Compensated for spread, so widening the "
+                 "spread no longer dims the glow. ~1 reads as strong as the "
+                 "source; 3+ is a foggy night."}};
 };
 
-// The CPU path, which exists so the algorithm works without a GPU and so the
-// two can be compared. Same arithmetic, laid out as three buffers rather than
-// five passes.
+REGISTER_ALGORITHM(Bloom);
+
 void Bloom::RunCPU(RunCtx& ctx) {
     const ImageView src = ctx.In(0);
     ImageView       dst = ctx.Out(0);
@@ -422,31 +284,36 @@ void Bloom::RunCPU(RunCtx& ctx) {
 
     const float thr  = float(m_threshold) * scale;
     const float knee = std::max(0.01f, float(m_knee)) * scale;
-    const float rad  = std::max(0.1f, float(m_radius));
-    const float disp = float(m_dispersion);
-    const float amt  = float(m_intensity);
-    const float strk = float(m_streak);
+    const float sig[3] = {std::max(0.05f, float(m_spreadR)),
+                          std::max(0.05f, float(m_spreadG)),
+                          std::max(0.05f, float(m_spreadB))};
 
-    // Highlights.
+    // Spread compensation, matching Gain() in the shader -- see the note above
+    // kCombineHlsl for why the raw intensity is not used directly.
+    const float sAvg = std::max(1.0f, (sig[0] + sig[1] + sig[2]) / 3.0f);
+    const float amt  = float(m_intensity) * (sAvg * sAvg) / 64.0f;
+
+    // Highlights, thresholded on luminance -- see the note at the top.
     std::vector<float> hi(size_t(w) * size_t(h) * 3, 0.0f);
     for (int y = 0; y < h; ++y)
         for (int x = 0; x < w; ++x) {
             const float* p = in.At(x, y);
-            const float r = p[0], g = (ch >= 3) ? p[1] : p[0], b = (ch >= 3) ? p[2] : p[0];
-            const float br = std::max(r, std::max(g, b));
-            float soft = std::clamp(br - thr + knee, 0.0f, 2.0f * knee);
+            const float r = p[0];
+            const float g = (ch >= 3) ? p[1] : p[0];
+            const float b = (ch >= 3) ? p[2] : p[0];
+            const float lum = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+            float soft = std::clamp(lum - thr + knee, 0.0f, 2.0f * knee);
             soft = soft * soft / (4.0f * knee);
-            const float c = std::max(std::max(soft, br - thr), 0.0f) / std::max(br, 1e-5f);
+            const float c = std::max(std::max(soft, lum - thr), 0.0f) /
+                            std::max(lum, 1e-5f);
             const size_t i = (size_t(y) * size_t(w) + size_t(x)) * 3;
             hi[i + 0] = r * c;
             hi[i + 1] = g * c;
             hi[i + 2] = b * c;
         }
 
-    // Per-channel sigma, matching the shader.
-    const float sig[3] = {rad * (1.0f + 0.6f * disp), rad,
-                          std::max(rad * (1.0f - 0.5f * disp), rad * 0.15f)};
-    const int R = std::min(128, int(std::ceil(std::max(sig[0], std::max(sig[1], sig[2])) * 2.5f)));
+    const int R = std::min(128, int(std::ceil(
+        std::max(sig[0], std::max(sig[1], sig[2])) * 2.5f)));
 
     std::vector<float> tmp(hi.size(), 0.0f), glow(hi.size(), 0.0f);
     for (int axis = 0; axis < 2; ++axis) {
@@ -461,8 +328,9 @@ void Bloom::RunCPU(RunCtx& ctx) {
                     const int sy = std::clamp(axis == 0 ? y : y + i, 0, h - 1);
                     const size_t si = (size_t(sy) * size_t(w) + size_t(sx)) * 3;
                     for (int c = 0; c < 3; ++c) {
-                        if (std::abs(float(i)) > sig[c] * 2.5f) continue;
-                        const float wgt = std::exp(-float(i * i) / (2.0f * sig[c] * sig[c]));
+                        if (std::fabs(float(i)) > sig[c] * 2.5f) continue;
+                        const float wgt =
+                            std::exp(-float(i * i) / (2.0f * sig[c] * sig[c]));
                         sum[c]  += s[si + size_t(c)] * wgt;
                         wsum[c] += wgt;
                     }
@@ -474,67 +342,24 @@ void Bloom::RunCPU(RunCtx& ctx) {
         }
     }
 
-    // Streaks, when asked for.
-    std::vector<float> streak;
-    if (strk > 0.0f) {
-        streak.assign(hi.size(), 0.0f);
-        const int blades = std::max(1, int(float(m_blades)));
-        int spikes = (blades % 2 == 0) ? blades : blades * 2;
-        spikes = std::min(spikes, 32);
-        // Lines, not spikes -- see the shader: one line draws two rays.
-        const int lines = std::max(spikes / 2, 1);
-        const float ang = float(m_angle) * 3.14159265f / 180.0f;
-        const float len = rad * 4.0f;
-        const int   N   = std::min(192, int(len));
-        const float chroma[3] = {1.0f + 0.6f * disp, 1.0f,
-                                 std::max(1.0f - 0.5f * disp, 0.15f)};
-
-        for (int y = 0; y < h; ++y) {
-            if (ctx.Cancelled()) return;
-            for (int x = 0; x < w; ++x) {
-                float sum[3] = {0, 0, 0};
-                for (int s = 0; s < lines; ++s) {
-                    const float th = ang + 3.14159265f * float(s) / float(lines);
-                    const float dx = std::cos(th), dy = std::sin(th);
-                    for (int i = -N; i <= N; ++i) {
-                        if (i == 0) continue;
-                        const int sx = int(std::lround(float(x) + dx * float(i)));
-                        const int sy = int(std::lround(float(y) + dy * float(i)));
-                        if (sx < 0 || sy < 0 || sx >= w || sy >= h) continue;
-                        const float wgt = 1.0f / (1.0f + std::abs(float(i)) * 4.0f /
-                                                        std::max(len, 1.0f));
-                        const size_t si = (size_t(sy) * size_t(w) + size_t(sx)) * 3;
-                        for (int c = 0; c < 3; ++c)
-                            sum[c] += hi[si + size_t(c)] * wgt * chroma[c];
-                    }
-                }
-                const size_t di = (size_t(y) * size_t(w) + size_t(x)) * 3;
-                // Not divided by wsum -- see the shader for why a spike adds
-                // light rather than redistributing it.
-                for (int c = 0; c < 3; ++c)
-                    streak[di + size_t(c)] =
-                        sum[c] * strk / std::max(len * 0.25f, 1.0f);
-            }
-        }
-    }
-
-    const float tint[3] = {float(m_tintR), float(m_tintG), float(m_tintB)};
+    // Add back. Additive, so a blown highlight stays blown.
     for (int y = 0; y < h; ++y)
         for (int x = 0; x < w; ++x) {
             const float* p = in.At(x, y);
-            float*       q = out.At(x, y);
+            float* o = out.At(x, y);
             const size_t i = (size_t(y) * size_t(w) + size_t(x)) * 3;
             for (int c = 0; c < ch; ++c) {
-                if (c >= 3) { q[c] = p[c]; continue; }   // alpha untouched
-                float g = glow[i + size_t(c)];
-                if (!streak.empty()) g += streak[i + size_t(c)];
-                q[c] = p[c] + g * tint[c] * amt;
+                if (c < 3) o[c] = p[c] + glow[i + size_t(c)] * amt;
+                else       o[c] = p[c];
             }
         }
+
+    // Unpack gave a working COPY, not a live view of the destination -- the
+    // writes above go nowhere without this. Omitting it produces an entirely
+    // black output with no error, which is exactly what test_filters' "no
+    // algorithm leaves its output untouched" guard exists to catch.
     out.PackInto(dst);
 }
 
-REGISTER_ALGORITHM(Bloom);
-
-} // namespace
-} // namespace tglab
+}  // namespace
+}  // namespace tglab

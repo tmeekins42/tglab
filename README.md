@@ -170,7 +170,7 @@ gx, gy, mag = sobel(src => gaussian_blur(sigma = 2))
 |---|---|
 | `image("name")` | An image from the palette. A raw file is demosaiced automatically. |
 | `mosaic("name")` | The undemosaiced sensor mosaic. Errors on a non-raw image. |
-| `slider("label", min, max, default)` | Declares a slider; returns its current value. |
+| `slider("label", min, max, default[, "help"])` | Declares a slider; returns its current value. The optional help string becomes its tooltip. |
 | `check("label", default)` | Declares a checkbox; returns 0 or 1. |
 | `choose("label", [a, b, c])` | Dropdown of algorithms; returns the selected one. |
 | `choose("label", "category")` | Same, but offers every algorithm in a category. |
@@ -274,7 +274,9 @@ src => gaussian_blur(sigma = sigma) => display("blurred")
 
 More in [scripts/](scripts/) — `hdr.tgl`, `stack.tgl`, `tonemap_compare.tgl`
 and `pipe.tgl` are good starting points; `panorama.tgl`, `features.tgl`,
-`matching.tgl`, `align_features.tgl` and `crop.tgl` cover the feature pipeline.
+`matching.tgl`, `align_features.tgl` and `crop.tgl` cover the feature pipeline;
+`bloom.tgl` is glow and halation, and `demosaic_stages.tgl` opens up a
+demosaic one step at a time.
 Each carries its reasoning in comments, including the measurements behind the
 defaults.
 
@@ -282,7 +284,7 @@ defaults.
 
 ## Algorithms
 
-52 registered. `choose("x", "category")` offers every algorithm in a category,
+54 registered. `choose("x", "category")` offers every algorithm in a category,
 so these names are the ones that matter in a script.
 
 | Category | Algorithms |
@@ -292,9 +294,9 @@ so these names are the ones that matter in a script.
 | **features** | `detect_sift`, `detect_surf`, `detect_akaze`, `detect_orb`, `detect_brisk`, `draw_features`, `draw_matches` |
 | **match** | `match_brute` (exact), `match_ann` (k-d forest / LSH) |
 | **merge** | `merge_hdr`, `merge_mean`, `align`, `align_features`, `bundle_adjust`, `stitch_panorama`, `reshape` |
-| **demosaic** | `demosaic_ahd`, `demosaic_consistent`, `demosaic_malvar`, `demosaic_bilinear`, `demosaic_passthrough`, `hot_pixel_repair` |
+| **demosaic** | `demosaic_ahd` (default), `demosaic_consistent`, `demosaic_malvar`, `demosaic_bilinear`, `demosaic_passthrough`, `demosaic_stages` (every intermediate as its own image, for debugging), `hot_pixel_repair` |
 | **denoise** | `wavelet_denoise` |
-| **filter** | `gaussian_blur`, `box_blur`, `median_blur`, `bilateral`, `guided_filter`, `nonlocal_means`, `anisotropic_diffusion`, `kuwahara`, `kuwahara_generalized`, `symmetric_nearest` |
+| **filter** | `gaussian_blur`, `box_blur`, `median_blur`, `bilateral`, `guided_filter`, `nonlocal_means`, `anisotropic_diffusion`, `kuwahara`, `kuwahara_generalized`, `symmetric_nearest`, `bloom` (glow and halation) |
 | **edge** | `sobel`, `canny`, `non_max_suppression`, `hysteresis` |
 | **threshold** | `threshold`, `threshold_otsu`, `threshold_isodata`, `threshold_triangle`, `threshold_adaptive_mean`, `threshold_adaptive_gaussian`, `threshold_niblack`, `threshold_sauvola`, `threshold_bernsen` |
 | **color** | `grayscale` |
@@ -412,8 +414,21 @@ scaled.
   every pixel: no halos, but it cannot give the sky more of the display without
   taking the same from the land. The local one splits illumination from detail
   and compresses only the illumination. Watch strong edges for halos.
+- **`demosaic_ahd`** is the default. It interpolates green *along* edges rather
+  than across them, so thin high-contrast detail keeps its colour instead of
+  breaking into speckles.
 - **`demosaic_consistent`** recovers detail by checking the reconstruction
-  against the samples the sensor actually took, rather than sharpening.
+  against the samples the sensor actually took, rather than sharpening. It
+  still measures the best of the four on detail, but it steers on luminance and
+  so preserves whatever colour its bilinear starting point got wrong — which at
+  the steep edge of a highlight is a lot. `demosaic_stages` shows why. It was
+  the default until that was measured.
+- **`bloom`** thresholds the highlights on **luminance**, blurs them with a
+  **separate radius per channel**, and adds the result back. Equal radii give an
+  ordinary glow; a wider red gives halation, which is a spread that differs per
+  channel rather than a red tint — real halation is light reflecting off a
+  film base, and red penetrates deepest. `intensity` is compensated for spread,
+  so widening the glow no longer dims it and the two controls stay independent.
 
 ---
 
@@ -476,6 +491,16 @@ src/
   variance and a handheld pan has real exposure and vignetting differences
   between frames. Useful for comparing runs on the same data; not an absolute
   scale.
+- **A coloured halo survives around blown highlights.** Bilinear interpolation
+  across the one-pixel brightness cliff at the edge of a blown light averages
+  one channel from saturated neighbours and takes another from a single dim
+  centre, producing a channel ratio the scene never had; the camera matrix then
+  rotates that false direction into a visible fringe. Blown highlight *cores*
+  develop neutral, and the matrix no longer drives any channel negative, but
+  the shoulder is still wrong. It needs an edge-aware initial estimate — a
+  colour-space repair cannot recover detail the interpolation discarded.
+  `scripts/demosaic_stages.tgl` shows each step; AHD and Malvar are markedly
+  better here than bilinear or `demosaic_consistent`.
 - **A few pixels of residual misalignment remain**, visible when zoomed in on a
   stitched panorama. Not pursued further yet: everything measured so far comes
   from one handheld sweep, and a residual that small could as easily be that

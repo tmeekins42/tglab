@@ -1,76 +1,80 @@
-# Bloom, halation, starbursts and anamorphic streaks -- one algorithm.
+# Bloom and halation -- threshold, blur, add back.
 #
-# The core is Tim's description and it is exactly right: threshold the
-# highlights, blur them, add them back. What makes the rest fall out of the same
-# code is that halation and diffraction spikes are the SAME three steps with a
-# different spread. Only the kernel changes.
+# Three steps, and that is genuinely all of it: take the pixels above a
+# threshold, blur them, add the blur back into the image. What makes this one
+# worth a script is that the blur radius is SEPARATE PER CHANNEL, which turns
+# the same three steps into several different effects:
 #
-# ONE STAGE RATHER THAN FOUR, deliberately. Every one of these thresholds the
-# same highlights and adds into the same image, so as separate stages each would
-# re-threshold and re-add -- two of them together would count the highlights
-# twice, and the second would bloom the first one's glow. Here the threshold
-# happens once and the spreads are summed before the merge.
+#   all three spreads equal      ordinary achromatic bloom
+#   spread_r above the others    halation -- the warm fringe film gives
+#   all three different          dispersion, a spectral edge
 #
-# WHAT THE PARAMETERS MEAN, because they follow from the optics rather than from
-# a list of looks:
+# WHY PER-CHANNEL RADIUS RATHER THAN A TINT. Halation happens inside film:
+# light passes through the emulsion, reflects off the base behind it, and
+# re-exposes the layers from below. Red penetrates deepest, so red is what
+# comes back. That makes it a spread that DIFFERS PER CHANNEL, not a bloom that
+# has been coloured -- and the difference is visible. With separate radii the
+# glow is neutral in its core, where all three channels reach, and goes warm
+# only at its edge where red alone has got to. A tint would colour the whole
+# glow uniformly and look nothing like film.
 #
-#   threshold   how bright a pixel must be to glow. On a scene-linear image with
-#               real headroom this usefully goes ABOVE 1 -- the Bay Bridge test
-#               shot peaks at 8.4, so a threshold of 1.0 catches only the lamps
-#               and leaves the sky alone.
-#   knee        the soft band below the threshold. A hard cutoff leaves a
-#               visible contour wherever a gradient crosses it; the knee is what
-#               makes the glow read as light rather than as a mask.
-#   spread      blur sigma, in pixels. The visible glow reaches about 2.5x this.
-#   intensity   how much is added back. 0 turns the stage off entirely and the
-#               pipeline skips it.
+# THE THRESHOLD IS ON LUMINANCE, not per channel. Thresholding each channel
+# separately would mean a saturated red lamp bloomed only in red, so it could
+# never throw a white halo and the three sliders would collapse into a single
+# effect. Deciding WHAT is bright once, and letting the sliders control only
+# HOW FAR each channel travels, keeps the two independent. The extracted
+# highlight keeps its own colour; only its reach is per channel.
 #
-#   dispersion  HALATION. Not a tint -- a spread that differs per channel.
-#               Halation is light passing through the emulsion, reflecting off
-#               the backing, and re-exposing from below; red penetrates deepest,
-#               so red is what comes back. At dispersion 1 red spreads furthest
-#               and blue least, which puts a warm fringe at the EDGE of a
-#               highlight rather than colouring the whole glow.
+# The parameters:
 #
-#   streak      diffraction spikes from the aperture blades.
-#   blades      an EVEN count gives that many spikes, an ODD count gives twice
-#               as many -- an odd polygon has no parallel edges, so each
-#               diffracts into its own spike. Six blades, six spikes; five
-#               blades, ten. Set blades = 1 for the two-spike anamorphic look.
-#   streak_angle  rotates the pattern. 0 is horizontal.
+#   threshold   luminance above which a pixel blooms. Scene-linear, so 1.0 is
+#               white and above it is the headroom a raw file still holds.
+#   knee        width of the soft band below the threshold. Without it the
+#               bloom switches on at a hard edge and reads as a mask.
+#   spread_r/g/b  how far each channel spreads, in pixels. The visible glow
+#               reaches about 2.5x these.
+#   intensity   how much is added back. ADDITIVE, so a blown highlight stays
+#               blown rather than being dimmed to make room for its own glow.
 #
-# A NOTE ON ENERGY, because the two spreads deliberately differ. The round blur
-# NORMALISES: it redistributes light, so a small bright source spread over 20x
-# the area gets 20x dimmer, which is what scattering does. A diffraction spike
-# does not -- the light in the spike is the part of the wavefront the aperture
-# edge bent, arriving IN ADDITION to what went straight through. Normalising it
-# over the length of the line divided a point source by about a hundred and made
-# the spikes invisible.
+# A NOTE ON ENERGY. The blur normalises per channel, so it REDISTRIBUTES light
+# rather than creating it: a small bright source spread over a wide radius goes
+# faint, which is what scattering actually does. That is why intensity exists
+# as a separate control -- the physical spread makes the glow dim, and the
+# slider is where you decide how much of it you want to see.
 #
-# Try it on a night shot with point lights. A daylight landscape has nothing
-# bright enough to bloom without dropping the threshold so far that the whole
-# frame glows.
+# Try: drop a night shot with bright lights on the "test" row, then
+#   * set all three spreads equal for a clean glow
+#   * raise spread_r to about twice the others for halation
+#   * pull spread_b down near zero for a strong warm edge
 
 src = image("test")
 
-threshold = slider("threshold", 0, 4, 1.0)
-spread    = slider("spread (px)", 1, 120, 20)
-intensity = slider("intensity", 0, 3, 1.0)
+threshold = slider("threshold", 0, 3, 0.6,
+    "Luminance a pixel must exceed before it blooms. Scene-linear: 1.0 is white, and above that is the headroom a raw file still holds. Lower it to make dimmer things glow.")
 
-# Halation: red spreads furthest. 0 is achromatic bloom.
-dispersion = slider("dispersion (halation)", 0, 1, 0)
+knee = slider("knee", 0.01, 1, 0.15,
+    "Softness of the threshold. The bloom fades in over a band this wide below the threshold instead of switching on at a hard edge. Too small and bright areas get a visible outline, as though masked; larger is gentler.")
 
-# Diffraction. streak 0 is none; blades 1 gives the two-spike anamorphic look.
-streak = slider("streak", 0, 2, 0)
-blades = slider("aperture blades", 1, 16, 6)
-angle  = slider("streak angle", 0, 180, 0)
+# Equal for ordinary bloom. Raise red above the others for halation.
+spread_r = slider("spread red (px)", 0, 120, 24,
+    "How far red spreads. Raise it above green and blue for halation -- the warm fringe film gives around a bright edge.")
 
-src => bloom(threshold = threshold,
-             spread = spread,
-             intensity = intensity,
-             dispersion = dispersion,
-             streak = streak,
-             blades = blades,
-             streak_angle = angle)
-    => tonemap()
-    => display("bloom")
+spread_g = slider("spread green (px)", 0, 120, 24,
+    "How far green spreads. All three equal gives an ordinary achromatic bloom.")
+
+spread_b = slider("spread blue (px)", 0, 120, 24,
+    "How far blue spreads. Pull it below the others, with red above them, for a strong warm halation edge.")
+
+intensity = slider("intensity", 0, 8, 0.5,
+    "How bright the glow is. Additive, so the highlight itself is never dimmed. Compensated for spread, so widening the spread no longer dims the glow. About 1 reads as strong as the source that made it; 3 and up is a foggy night.")
+
+out = bloom(src,
+            threshold = threshold,
+            knee      = knee,
+            spread_r  = spread_r,
+            spread_g  = spread_g,
+            spread_b  = spread_b,
+            intensity = intensity)
+
+display(src, "1 original")
+display(out, "2 bloom")
