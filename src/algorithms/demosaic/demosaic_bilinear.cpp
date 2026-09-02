@@ -253,31 +253,6 @@ void main(uint3 tid : SV_DispatchThreadID) {
     }
 
 private:
-    // White balance (with the highlight clamp) then the colour matrix.
-    //
-    // Both are properties of the capture rather than of the demosaic, but this
-    // is the only place they can be applied: before it there is one channel per
-    // pixel, and after it the data has already been treated as sRGB. Skipping
-    // them leaves a heavily green image with wrong hues -- the sensor's green
-    // photosites are about twice as sensitive as its red and blue ones.
-    //
-    // The clamp inside BalanceAndClamp is what keeps blown highlights from
-    // developing magenta; see clip_repair.h for the physics and for the
-    // mask-based machinery this replaced.
-    static void ApplyColour(const ImageDesc& d, float* rgb) {
-        BalanceAndClamp(d, rgb);
-
-        CameraMatrixInGamut(d, rgb);
-
-        // The matrix has negative coefficients by design (it maps a wider
-        // gamut inward), so out-of-gamut colours can go negative. Clamping
-        // here keeps later stages from having to reason about it.
-        // Negatives NOT clamped: a colour outside sRGB's gamut lands below zero
-        // after the camera matrix, and clamping destroys it before the user has
-        // touched anything. The pipeline is linear float, so it costs nothing to
-        // carry -- clamping belongs at display or export. See
-        // demosaic_consistent.cpp for the measurement.
-    }
 
     // Sensor metadata from the input descriptor, captured by PrepareGpu().
     int   m_cfa   = 0;

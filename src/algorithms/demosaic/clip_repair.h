@@ -183,11 +183,64 @@ inline void CameraMatrixInGamut(const ImageDesc& d, float* rgb) {
 }
 // The same rule in HLSL. Pasted into each demosaicer's shader source; keep it
 // in step with BalanceAndClamp above.
+// The whole colour step in HLSL: white balance with the highlight clamp, then
+// the camera matrix with the in-gamut solve. Paste this into a demosaic shader
+// and call ApplyColour, so the GPU path cannot drift from ApplyColour below.
+//
+// Written as one string rather than left to each shader because it already
+// drifted once: demosaic_consistent's kernel applied the bare matrix while its
+// CPU path used CameraMatrixInGamut, so the two disagreed on exactly the
+// out-of-gamut pixels the solve exists for. gpu_audit reported it clean --
+// its synthetic input never drives a channel negative, so the solve never
+// fires and the difference cannot show.
 inline const char* kClipRepairHlsl = R"(
 void BalanceAndClamp(inout float3 rgb, float3 camMul) {
     float ceiling = min(camMul.r, min(camMul.g, camMul.b));
     rgb = min(rgb * camMul, ceiling);
 }
+
+// Camera matrix with the smallest desaturation keeping the result in gamut --
+// keep in step with CameraMatrixInGamut in clip_repair.h.
+void CameraMatrixInGamut(inout float3 rgb, float3x3 M) {
+    float lum = (rgb.r + rgb.g + rgb.b) / 3.0;
+    float3 o = mul(M, rgb);
+    if (all(o >= 0.0)) { rgb = o; return; }
+    float t = 0.0;
+    [unroll] for (int i = 0; i < 3; ++i) {
+        if (o[i] >= 0.0) continue;
+        float span = lum - o[i];
+        if (span <= 1e-9) continue;
+        t = max(t, -o[i] / span);
+    }
+    rgb = o + min(t, 1.0) * (lum - o);
+}
+
+void ApplyColour(inout float3 rgb, float3 camMul, float3x3 M) {
+    BalanceAndClamp(rgb, camMul);
+    CameraMatrixInGamut(rgb, M);
+}
 )";
+
+// White balance and the camera matrix, in that order.
+//
+// Shared by every demosaicer ON PURPOSE. White balance and the camera matrix
+// are properties of the CAPTURE, not of the interpolation, so switching
+// demosaic method must not change colour -- if it did, a comparison between two
+// methods would be measuring the colour pipeline as much as the reconstruction.
+//
+// This lived as an identical private copy in each demosaicer. That was fine at
+// two and a liability at six: the clip-repair fix had to be applied four times,
+// and the GPU shaders drifted out of step with the CPU twice during it. One
+// definition means the next fix lands everywhere at once.
+inline void ApplyColour(const ImageDesc& d, float* rgb) {
+    BalanceAndClamp(d, rgb);
+    CameraMatrixInGamut(d, rgb);
+
+    // Negatives NOT clamped: a colour outside sRGB's gamut lands below zero
+    // after the camera matrix, and clamping destroys it before the user has
+    // touched anything. The pipeline is linear float, so it costs nothing to
+    // carry -- clamping belongs at display or export. See demosaic_consistent.cpp
+    // for the measurement.
+}
 
 }  // namespace tglab

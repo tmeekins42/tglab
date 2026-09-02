@@ -287,7 +287,7 @@ defaults.
 
 ## Algorithms
 
-58 registered. `choose("x", "category")` offers every algorithm in a category,
+60 registered. `choose("x", "category")` offers every algorithm in a category,
 so these names are the ones that matter in a script.
 
 | Category | Algorithms |
@@ -297,7 +297,7 @@ so these names are the ones that matter in a script.
 | **features** | `detect_sift`, `detect_surf`, `detect_akaze`, `detect_orb`, `detect_brisk`, `draw_features`, `draw_matches` |
 | **match** | `match_brute` (exact), `match_ann` (k-d forest / LSH) |
 | **merge** | `merge_hdr`, `merge_mean`, `align`, `align_features`, `bundle_adjust`, `stitch_panorama`, `reshape` |
-| **demosaic** | `demosaic_ahd` (default), `demosaic_consistent`, `demosaic_malvar`, `demosaic_bilinear`, `demosaic_passthrough`, `demosaic_stages` (every intermediate as its own image, for debugging), `hot_pixel_repair` |
+| **demosaic** | `demosaic_ahd` (default), `demosaic_consistent`, `demosaic_malvar`, `demosaic_ppg`, `demosaic_vng`, `demosaic_bilinear`, `demosaic_passthrough`, `demosaic_stages` (every intermediate as its own image, for debugging), `hot_pixel_repair` |
 | **denoise** | `wavelet_denoise` |
 | **filter** | `gaussian_blur`, `box_blur`, `median_blur`, `bilateral`, `guided_filter`, `nonlocal_means`, `anisotropic_diffusion`, `kuwahara`, `kuwahara_generalized`, `symmetric_nearest`, `bloom` (glow and halation), `orton` |
 | **edge** | `sobel`, `canny`, `non_max_suppression`, `hysteresis` |
@@ -305,7 +305,16 @@ so these names are the ones that matter in a script.
 | **color** | `grayscale`, `apply_lut` (3D .cube LUTs) |
 
 Most have a GPU kernel and fall back to the CPU if it fails — **always saying
-so** in Status rather than merely running slower.
+so** in Status rather than merely running slower. `demosaic_vng` is CPU-only.
+
+**Verify a kernel against a real file, not a synthetic one.** Compute → Compare
+CPU / GPU is the tool for this, and the reason it matters is that `gpu_audit`
+runs everything on a synthetic gradient: for a demosaic that exercises neither
+clipping nor out-of-gamut colour, so the highlight clamp and the in-gamut solve
+never fire. Three shipped demosaicers had shaders applying the bare camera
+matrix where their CPU paths used the in-gamut solve — a 0.85 divergence on
+exactly the pixels the solve exists for — and the audit called them clean
+throughout.
 
 ### Features, alignment and panoramas
 
@@ -426,6 +435,21 @@ scaled.
   so preserves whatever colour its bilinear starting point got wrong — which at
   the steep edge of a highlight is a lot. `demosaic_stages` shows why. It was
   the default until that was measured.
+- **`demosaic_ppg`** (Patterned Pixel Grouping) never interpolates red
+  directly. It interpolates R−G, which varies far more slowly than R does — a
+  colour difference tracks the *material* while the absolute value tracks the
+  material *and* the light on it — then adds back the green it already knows.
+  That is why it produces so little false colour for how simple it is, and it
+  runs 3.4× faster than AHD.
+- **`demosaic_vng`** (Variable Number of Gradients) measures the gradient in
+  all eight directions and averages over however many look smooth, so the
+  number varies per pixel. **Verified against LibRaw's own `vng_interpolate`**
+  — 0.26 of 255 mean difference on a real frame, with the residual traceable to
+  this pipeline's highlight handling, which dcraw has no equivalent of. It is
+  here as a conformance reference rather than a recommendation: it carries the
+  most luminance detail of the six and the most false colour, which is the
+  trade its design implies. Deciding from gradients is exactly what noise and
+  clipping corrupt.
 - **`bloom`** thresholds the highlights on **luminance**, blurs them with a
   **separate radius per channel**, and adds the result back. Equal radii give an
   ordinary glow; a wider red gives halation, which is a spread that differs per

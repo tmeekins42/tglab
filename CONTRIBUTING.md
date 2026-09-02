@@ -761,3 +761,28 @@ backend, and reports max/mean/RMSE difference, the count of pixels beyond
 tolerance, both timings, and an amplified diff image showing *where* they
 disagree. A kernel that merely looks right is not verified.
 
+**Compare on a REAL file, not a synthetic one.** `gpu_audit` runs every
+algorithm on a synthetic gradient, which is enough to catch a wholly broken
+kernel and not enough to catch a subtly wrong one. For a demosaic it exercises
+neither clipping nor out-of-gamut colour, so the highlight clamp and the
+in-gamut solve never fire — and three shipped demosaicers had shaders applying
+the bare camera matrix where their CPU paths used `CameraMatrixInGamut`, a 0.85
+divergence on precisely the pixels that solve exists for, with the audit
+reporting clean throughout. Two other things it cannot see: an algorithm with
+**no** kernel compares perfectly with itself (`demosaic_vng` reads 0.000000
+because both runs fall back to the CPU), and any code path the fixture does not
+reach is untested rather than correct.
+
+**Put shared shader code in one string.** Duplicating a helper into each kernel
+is how the above happened: four demosaicers each carried their own copy of the
+colour step, and three drifted from the CPU. `clip_repair.h` now exports
+`kClipRepairHlsl`, concatenated into every demosaic kernel, so there is one
+definition to fix.
+
+**Beware exact float comparisons in a kernel.** CPU and GPU do not order
+floating-point operations identically, so a branch on `a == b` can be taken
+differently on each. `demosaic_ppg` chose a green interpolation direction that
+way; 0.262% of sites hit the tie exactly and the two paths disagreed on 0.072%
+of samples. A relative band (`1e-4 * max(a, b)`) applied identically in both
+paths brought that to 0.008%.
+

@@ -667,36 +667,6 @@ private:
             }
     }
 
-    // Identical to the other demosaicers: white balance and the camera matrix
-    // are properties of the capture, not of the interpolation, so switching
-    // method must not change colour.
-    static void ApplyColour(const ImageDesc& d, float* rgb) {
-        // White balance with the highlight clamp -- see clip_repair.h.
-        BalanceAndClamp(d, rgb);
-
-        CameraMatrixInGamut(d, rgb);
-
-        // Negatives are NOT clamped here, deliberately.
-        //
-        // The camera matrix maps the sensor's response into sRGB primaries, and
-        // a color the sensor recorded that sRGB cannot represent lands outside
-        // the triangle -- which in linear sRGB coordinates means a channel below
-        // zero. Clamping destroys it at demosaic, before the user has touched a
-        // slider, and no later operation can bring it back.
-        //
-        // Measured across ten frames, between 0.01% and 1.2% of pixels have a
-        // channel clamped this way, worst on saturated foliage and skin at high
-        // ISO. That is not a large fraction, but it is exactly the saturated
-        // color a user is most likely to reach for a saturation slider over --
-        // and a value that is merely negative can come BACK into gamut after a
-        // desaturation or a white-balance change.
-        //
-        // The pipeline is linear float end to end, so a negative is
-        // representable and costs nothing to carry. Clamping belongs at the
-        // point of display or export, where the output really is bounded --
-        // ToneCurve() maps anything at or below zero to black, which is the
-        // correct behavior there and the wrong behavior here.
-    }
 
     static constexpr float kClip = 0.99f;
 
@@ -821,14 +791,6 @@ cbuffer Params : register(b0) {
     uint M0, M1, M2, M3, M4, M5, M6, M7, M8;
 };
 
-// White balance AND the clipped-channel repair -- the repair must see balanced
-// values, since that is where neutral means the channels are equal.
-// White balance with the highlight clamp -- keep in step with
-// BalanceAndClamp in clip_repair.h.
-void BalanceAndClamp(inout float3 rgb, float3 camMul) {
-    float ceiling = min(camMul.r, min(camMul.g, camMul.b));
-    rgb = min(rgb * camMul, ceiling);
-}
 
 int CfaColor(uint cfa, int x, int y) {
     int q = (y & 1) * 2 + (x & 1);
@@ -1053,24 +1015,26 @@ void main(uint3 tid : SV_DispatchThreadID) {
     // clip_repair.h.
     BalanceAndClamp(rgb, float3(asfloat(CamMul0), asfloat(CamMul1), asfloat(CamMul2)));
 
-    float3 o;
-    o.r = asfloat(M0)*rgb.r + asfloat(M1)*rgb.g + asfloat(M2)*rgb.b;
-    o.g = asfloat(M3)*rgb.r + asfloat(M4)*rgb.g + asfloat(M5)*rgb.b;
-    o.b = asfloat(M6)*rgb.r + asfloat(M7)*rgb.g + asfloat(M8)*rgb.b;
+    // The in-gamut solve, not the bare matrix -- see the note in
+    // demosaic_malvar.cpp's kernel for what applying the matrix directly cost.
+    CameraMatrixInGamut(rgb, float3x3(
+        asfloat(M0), asfloat(M1), asfloat(M2),
+        asfloat(M3), asfloat(M4), asfloat(M5),
+        asfloat(M6), asfloat(M7), asfloat(M8)));
     // Negatives deliberately NOT clamped -- see ApplyColour in the CPU path.
-    U0[tid.xy] = float4(o, 1.0);
+    U0[tid.xy] = float4(rgb, 1.0);
 }
 )";
 
 std::vector<AlgorithmBase::GpuPass> DemosaicConsistent::GpuPasses() const {
     // Assembled once: GpuPasses() returns raw pointers and is called per run,
     // so building the strings each time would dangle them.
-    static const std::string bil  = std::string(kCommon) + kBilinearHlsl;
-    static const std::string res  = std::string(kCommon) + kResidualHlsl;
-    static const std::string spr  = std::string(kCommon) + kSpreadHlsl;
-    static const std::string app  = std::string(kCommon) + kApplyHlsl;
-    static const std::string chr  = std::string(kCommon) + kChromaHlsl;
-    static const std::string comb = std::string(kCommon) + kCombineHlsl;
+    static const std::string bil  = std::string(kCommon) + kClipRepairHlsl + kBilinearHlsl;
+    static const std::string res  = std::string(kCommon) + kClipRepairHlsl + kResidualHlsl;
+    static const std::string spr  = std::string(kCommon) + kClipRepairHlsl + kSpreadHlsl;
+    static const std::string app  = std::string(kCommon) + kClipRepairHlsl + kApplyHlsl;
+    static const std::string chr  = std::string(kCommon) + kClipRepairHlsl + kChromaHlsl;
+    static const std::string comb = std::string(kCommon) + kClipRepairHlsl + kCombineHlsl;
 
     std::vector<GpuPass> p;
     // t0 is always the mosaic, because kCommon's Sample() reads it.

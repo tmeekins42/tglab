@@ -24,6 +24,7 @@
 // can be poked at rather than taken on trust.
 #include <algorithm>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include "clip_repair.h"
@@ -213,7 +214,14 @@ public:
     }
 
     const char* GpuSource() const override {
-        return R"(
+        // Assembled once with the shared colour step, so the kernel cannot
+        // drift from ApplyColour in clip_repair.h -- which it had, applying the
+        // bare matrix where the CPU used the in-gamut solve.
+        static const std::string src = std::string(kClipRepairHlsl) + kBody;
+        return src.c_str();
+    }
+
+    static constexpr const char* kBody = R"(
 Texture2D<float4>   Src : register(t0);   // R32F mosaic: only .x is a sample
 RWTexture2D<float4> Dst : register(u0);
 
@@ -228,14 +236,6 @@ cbuffer Params : register(b0) {
     uint M0, M1, M2, M3, M4, M5, M6, M7, M8;
 };
 
-// White balance AND the clipped-channel repair -- the repair must see balanced
-// values, since that is where neutral means the channels are equal.
-// White balance with the highlight clamp -- keep in step with
-// BalanceAndClamp in clip_repair.h.
-void BalanceAndClamp(inout float3 rgb, float3 camMul) {
-    float ceiling = min(camMul.r, min(camMul.g, camMul.b));
-    rgb = min(rgb * camMul, ceiling);
-}
 
 int CfaColor(uint cfa, int x, int y) {
     int q = (y & 1) * 2 + (x & 1);
@@ -327,17 +327,22 @@ void main(uint3 tid : SV_DispatchThreadID) {
     // White balance with the highlight clamp -- see clip_repair.h.
     BalanceAndClamp(rgb, float3(asfloat(CamMul0), asfloat(CamMul1), asfloat(CamMul2)));
 
-    rgb = float3(
-        asfloat(M0) * rgb.r + asfloat(M1) * rgb.g + asfloat(M2) * rgb.b,
-        asfloat(M3) * rgb.r + asfloat(M4) * rgb.g + asfloat(M5) * rgb.b,
-        asfloat(M6) * rgb.r + asfloat(M7) * rgb.g + asfloat(M8) * rgb.b);
+    // The in-gamut solve, not the bare matrix. The CPU path has always used
+    // CameraMatrixInGamut; this shader applied the matrix directly, so the two
+    // disagreed by up to 0.85 on out-of-gamut pixels -- exactly the ones the
+    // solve exists for. gpu_audit reported it clean throughout, because its
+    // synthetic gradient never drives a channel negative and the solve never
+    // fires.
+    CameraMatrixInGamut(rgb, float3x3(
+        asfloat(M0), asfloat(M1), asfloat(M2),
+        asfloat(M3), asfloat(M4), asfloat(M5),
+        asfloat(M6), asfloat(M7), asfloat(M8)));
 
     // Negatives NOT clamped -- matches the CPU path, which carries out-of-gamut
     // colour into the linear pipeline rather than destroying it here.
     Dst[tid.xy] = float4(rgb, 1.0);
 }
 )";
-    }
 
     std::vector<uint32_t> GpuConstants(int) const override {
         auto bits = [](float f) {
@@ -354,30 +359,6 @@ void main(uint3 tid : SV_DispatchThreadID) {
     }
 
 private:
-    // Clip repair lives in clip_repair.h -- both the "flag from raw samples"
-    // and the "repair before white balance" rules, with the measurements that
-    // established them.
-    //
-    // NOTE: the long comment that used to sit here argued the repair had to run
-    // AFTER white balance, citing a cast that got worse (1.95/1.00/1.32 ->
-    // 2.34/1.00/1.72) when it was moved before. That experiment moved a
-    // DIFFERENT repair -- equalise-all-clipped-channels -- which does hand the
-    // gains a neutral triple to pull apart. Lifting only to the brightest
-    // UNCLIPPED channel does not, and running it before the gains is what stops
-    // a clipped channel being lifted to another channel's camMul. Measured on
-    // _L0A0738.CR2, clipping-attributable negatives fell 6741 -> 1478.
-    static void ApplyColour(const ImageDesc& d, float* rgb) {
-        // White balance and the clipped-channel repair together -- the repair
-        // must see balanced values. See clip_repair.h.
-        BalanceAndClamp(d, rgb);
-
-        CameraMatrixInGamut(d, rgb);
-
-        // Negatives NOT clamped: a colour outside sRGB's gamut lands below zero
-        // after the camera matrix, and clamping destroys it before the user has
-        // touched anything. The pipeline is linear float, so it costs nothing to
-        // carry -- clamping belongs at display or export.
-    }
 
     // Normalised so 1.0 is the sensor's white level (the demosaic divides by
     // the black-to-white range first). A little under 1 to catch sensels that

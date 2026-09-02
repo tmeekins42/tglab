@@ -148,14 +148,6 @@ cbuffer Params : register(b0) {
     uint  M0, M1, M2, M3, M4, M5, M6, M7, M8;
 };
 
-// White balance AND the clipped-channel repair -- the repair must see balanced
-// values, since that is where neutral means the channels are equal.
-// White balance with the highlight clamp -- keep in step with
-// BalanceAndClamp in clip_repair.h.
-void BalanceAndClamp(inout float3 rgb, float3 camMul) {
-    float ceiling = min(camMul.r, min(camMul.g, camMul.b));
-    rgb = min(rgb * camMul, ceiling);
-}
 
 int CfaColor(uint cfa, int x, int y) {
     int q = (y & 1) * 2 + (x & 1);
@@ -359,13 +351,15 @@ void main(uint3 tid : SV_DispatchThreadID) {
     // clip_repair.h.
     BalanceAndClamp(rgb, float3(asfloat(CamMul0), asfloat(CamMul1), asfloat(CamMul2)));
 
-    float3 o;
-    o.r = asfloat(M0) * rgb.r + asfloat(M1) * rgb.g + asfloat(M2) * rgb.b;
-    o.g = asfloat(M3) * rgb.r + asfloat(M4) * rgb.g + asfloat(M5) * rgb.b;
-    o.b = asfloat(M6) * rgb.r + asfloat(M7) * rgb.g + asfloat(M8) * rgb.b;
+    // The in-gamut solve, not the bare matrix -- see the note in
+    // demosaic_malvar.cpp's kernel for what applying the matrix directly cost.
+    CameraMatrixInGamut(rgb, float3x3(
+        asfloat(M0), asfloat(M1), asfloat(M2),
+        asfloat(M3), asfloat(M4), asfloat(M5),
+        asfloat(M6), asfloat(M7), asfloat(M8)));
 
     // Negatives deliberately NOT clamped -- see the CPU path.
-    U0[tid.xy] = float4(o, 1.0);
+    U0[tid.xy] = float4(rgb, 1.0);
 }
 )";
 
@@ -785,22 +779,6 @@ private:
             }
     }
 
-    // Identical to the other demosaicers, deliberately: white balance and the
-    // camera matrix are properties of the capture, not of the interpolation, so
-    // switching method must not change colour. See demosaic_malvar.cpp for why
-    // the clipped-channel repair happens after the gains rather than before.
-    static void ApplyColour(const ImageDesc& d, float* rgb) {
-        // White balance with the highlight clamp -- see clip_repair.h.
-        BalanceAndClamp(d, rgb);
-
-        CameraMatrixInGamut(d, rgb);
-
-        // Negatives NOT clamped: a colour outside sRGB's gamut lands below zero
-        // after the camera matrix, and clamping destroys it before the user has
-        // touched anything. The pipeline is linear float, so it costs nothing to
-        // carry -- clamping belongs at display or export. See
-        // demosaic_consistent.cpp for the measurement.
-    }
 
 
     // How far apart in green two samples may be and still be pooled by the
@@ -867,10 +845,10 @@ private:
         // The sources are assembled once, on first use, because GpuPasses()
         // returns raw pointers and is called per run -- building the strings
         // each time would dangle them the moment the vector went out of scope.
-        static const std::string green   = std::string(kAhdCommon) + kGreenHlsl;
-        static const std::string diff    = std::string(kAhdCommon) + kDiffHlsl;
-        static const std::string median  = std::string(kAhdCommon) + kMedianHlsl;
-        static const std::string combine = std::string(kAhdCommon) + kCombineHlsl;
+        static const std::string green   = std::string(kAhdCommon) + kClipRepairHlsl + kGreenHlsl;
+        static const std::string diff    = std::string(kAhdCommon) + kClipRepairHlsl + kDiffHlsl;
+        static const std::string median  = std::string(kAhdCommon) + kClipRepairHlsl + kMedianHlsl;
+        static const std::string combine = std::string(kAhdCommon) + kClipRepairHlsl + kCombineHlsl;
 
         std::vector<GpuPass> p;
         // t0 is always the mosaic, because kAhdCommon's Sample() reads it.
