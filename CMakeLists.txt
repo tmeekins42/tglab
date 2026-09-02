@@ -196,12 +196,28 @@ if(MSVC)
 endif()
 tglab_copy_dxc(tglab_demosaic_tests)
 
+# GPU/CPU conformance for the feature-detector scale-space pyramid.
+#
+# Needs a real device, so unlike the others it is not purely CPU -- but it
+# SKIPS rather than fails when there is none, so it stays in the gating suite
+# on a machine without a GPU.
+add_executable(tglab_pyramid_tests
+    tests/test_pyramid.cpp
+    $<TARGET_OBJECTS:tglab_algorithms>
+)
+target_link_libraries(tglab_pyramid_tests PRIVATE tglab_core imgui d3d12 dxgi)
+if(MSVC)
+    target_compile_definitions(tglab_pyramid_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+tglab_copy_dxc(tglab_pyramid_tests)
+
 enable_testing()
 add_test(NAME script_spine COMMAND tglab_tests)
 add_test(NAME filters      COMMAND tglab_filter_tests)
 add_test(NAME demosaic     COMMAND tglab_demosaic_tests)
 add_test(NAME runtime      COMMAND tglab_runtime_tests)
 add_test(NAME denoise      COMMAND tglab_denoise_tests)
+add_test(NAME pyramid      COMMAND tglab_pyramid_tests)
 
 # Manual reproduction harness, not an add_test().
 #
@@ -356,6 +372,23 @@ target_link_libraries(overview PRIVATE tglab_core)
 if(MSVC)
     target_compile_definitions(overview PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
+
+# CPU-vs-GPU timing for the SIFT scale-space pyramid. A measurement tool, not a
+# test: it reports a number rather than passing or failing.
+# Per-detector CPU/GPU timing, for deciding what is worth offloading.
+add_executable(bench_detect tools/bench_detect.cpp $<TARGET_OBJECTS:tglab_algorithms>)
+target_link_libraries(bench_detect PRIVATE tglab_core d3d12 dxgi)
+if(MSVC)
+    target_compile_definitions(bench_detect PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+tglab_copy_dxc(bench_detect)
+
+add_executable(bench_pyramid tools/bench_pyramid.cpp $<TARGET_OBJECTS:tglab_algorithms>)
+target_link_libraries(bench_pyramid PRIVATE tglab_core d3d12 dxgi)
+if(MSVC)
+    target_compile_definitions(bench_pyramid PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+tglab_copy_dxc(bench_pyramid)
 
 # VRAM growth when SWITCHING scripts, which gpu_leak does not cover -- that
 # re-runs one pipeline and measures steady state. Each script builds a new

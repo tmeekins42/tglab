@@ -37,6 +37,7 @@
 #include "../../algo_util/features.h"
 #include "../../algo_util/pixel_buffer.h"
 #include "../../core/algorithm.h"
+#include "gpu_pyramid.h"
 
 namespace tglab {
 namespace {
@@ -234,20 +235,58 @@ private:
             if (ctx.Cancelled()) return;
 
             // The blur stack for this octave.
+            //
+            // Incremental: blurring an already-blurred plane by the DIFFERENCE
+            // in sigma composes to the total, and is far cheaper than
+            // re-blurring the base by a growing kernel.
+            std::vector<float> adds;
+            adds.reserve(size_t(planes - 1));
+            for (int i = 1; i < planes; ++i) {
+                const float prev = sigma0 * std::pow(k, float(i - 1));
+                const float cur  = sigma0 * std::pow(k, float(i));
+                adds.push_back(std::sqrt(std::max(cur * cur - prev * prev, 0.01f)));
+            }
+
             // resize() rather than a sized constructor: `vector<Plane> g(size_t(n))`
             // parses as a function declaration (the most vexing parse) and the
             // errors land on the USES rather than here.
             std::vector<Plane> gauss;
-            gauss.resize(size_t(planes));
-            gauss[0] = octaveBase;
-            for (int i = 1; i < planes; ++i) {
-                // Incremental: blurring an already-blurred plane by the
-                // DIFFERENCE in sigma composes to the total, and is far cheaper
-                // than re-blurring the base by a growing kernel.
-                const float prev = sigma0 * std::pow(k, float(i - 1));
-                const float cur  = sigma0 * std::pow(k, float(i));
-                const float add  = std::sqrt(std::max(cur * cur - prev * prev, 0.01f));
-                Blur(gauss[size_t(i - 1)], gauss[size_t(i)], add, tmp);
+
+            // The GPU builds the whole stack in one call, keeping the chain
+            // resident between levels; a per-level helper would read each plane
+            // back and upload it again, which at 22 MP costs more than the blur.
+            //
+            // Failure falls back rather than failing the run: a missing device
+            // or a dispatch error should make this slow, not broken. The two
+            // paths agree because gpu_pyramid reproduces Blur()'s radius rule,
+            // normalisation, addressing, and pass order -- see its header.
+            bool onGpu = false;
+            if (ComputeContext* dev = ctx.Gpu()) {
+                GpuPlane gbase;
+                gbase.v = octaveBase.v;
+                gbase.w = octaveBase.w;
+                gbase.h = octaveBase.h;
+
+                std::vector<GpuPlane> stack;
+                std::string gerr;
+                if (GpuBlurStack(dev, gbase, adds, &stack, &gerr) &&
+                    stack.size() == size_t(planes)) {
+                    gauss.resize(size_t(planes));
+                    for (int i = 0; i < planes; ++i) {
+                        gauss[size_t(i)].v = std::move(stack[size_t(i)].v);
+                        gauss[size_t(i)].w = stack[size_t(i)].w;
+                        gauss[size_t(i)].h = stack[size_t(i)].h;
+                    }
+                    onGpu = true;
+                }
+            }
+
+            if (!onGpu) {
+                gauss.resize(size_t(planes));
+                gauss[0] = octaveBase;
+                for (int i = 1; i < planes; ++i)
+                    Blur(gauss[size_t(i - 1)], gauss[size_t(i)],
+                         adds[size_t(i - 1)], tmp);
             }
 
             // Difference of Gaussian.

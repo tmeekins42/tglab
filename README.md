@@ -307,6 +307,32 @@ so these names are the ones that matter in a script.
 Most have a GPU kernel and fall back to the CPU if it fails — **always saying
 so** in Status rather than merely running slower. `demosaic_vng` is CPU-only.
 
+**Detectors are a different shape.** A detector's product is a *sidecar* — a
+list of keypoints — not an image, so the image-in/image-out GPU path cannot
+express one: there is nothing for it to write. They therefore stay CPU
+algorithms that offload only their inner loops, taking the device from
+`RunCtx::Gpu()` and reading the result back. Force CPU withholds the device, so
+the toggle still means what it says.
+
+What each one offloads differs, because their costs differ — measured with
+`bench_detect` before writing any kernel:
+
+| detector | offloaded | 22 MP CPU → GPU | |
+|---|---|---|---|
+| `detect_sift` | Gaussian pyramid (65% of runtime) | 8,937 → 2,332 ms | **3.8×** |
+| `detect_orb` | FAST + Harris response map | 5,718 → 2,114 ms | **2.7×** |
+| `detect_akaze` | nonlinear diffusion chain | 11,306 → 5,367 ms | **2.1×** |
+| `detect_brisk` | FAST + bisected score map | 5,241 → 3,721 ms | **1.4×** |
+
+BRISK gains least, and not for want of trying: roughly half its time is the
+512-bit ring descriptor, which is a per-keypoint gather rather than a per-pixel
+test and stays on the CPU. `detect_surf` is not converted — its integral image
+is a sequential prefix sum, the wrong shape for this dispatch model.
+
+The offloaded stages agree with the CPU exactly: ORB and BRISK are bit-identical,
+SIFT and AKAZE within 3.1e-05 (`tglab_pyramid_tests` checks all four, and that
+they find the same keypoints either way).
+
 **Verify a kernel against a real file, not a synthetic one.** Compute → Compare
 CPU / GPU is the tool for this, and the reason it matters is that `gpu_audit`
 runs everything on a synthetic gradient: for a demosaic that exercises neither
@@ -515,7 +541,14 @@ scaled.
 ./build/Release/tglab_tone_tests.exe     # tone curve
 ./build/Release/tglab_autodev_tests.exe  # auto-exposure measurement
 ./build/Release/tglab_runtime_tests.exe  # worker thread, shaders, GPU
+./build/Release/tglab_pyramid_tests.exe  # detector GPU paths == CPU, same keypoints
 ```
+
+`tglab_pyramid_tests` needs a device but *skips* rather than fails without one,
+so it stays in the gating suite on a machine with no GPU.
+
+`bench_detect` reports per-detector CPU/GPU timings and feature counts, and
+`bench_pyramid` isolates the SIFT blur pyramid. Both take `width height`.
 
 Or `ctest --test-dir build -C Release` for all of them. `build.ps1` configures,
 builds and tests in one step.

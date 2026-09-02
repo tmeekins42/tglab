@@ -38,12 +38,14 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <functional>
 #include <string>
 #include <vector>
 
 #include "../../algo_util/features.h"
 #include "../../algo_util/pixel_buffer.h"
 #include "../../core/algorithm.h"
+#include "gpu_pyramid.h"
 
 namespace tglab {
 namespace {
@@ -340,15 +342,58 @@ private:
         };
         std::vector<Cand> cands;
 
+        // The cross-layer score lookups stay on the CPU, though precomputing a
+        // whole-image score map per layer looks like the obvious win.
+        //
+        // It is not. IsScaleMax and RefineScale ask neighbouring layers for a
+        // score at a handful of positions each, and they run per CANDIDATE --
+        // and after suppression there are thousands of candidates against
+        // millions of pixels. Measured on 1200x800: building the maps for all
+        // seven layers cost 51 ms and computed roughly 75x more than was ever
+        // read (about 4M evaluations to serve ~53k lookups), taking BRISK from
+        // 1.0x to 0.9x. Sparse demand does not justify a dense dispatch.
+        //
+        // The per-pixel scan below is the part worth offloading, because there
+        // every pixel really is visited.
+        const std::function<float(size_t, int, int)> scoreAt =
+            [&](size_t li, int x, int y) -> float {
+                return FastScore(layers[li], x, y, 0.0f, 1.0f);
+            };
+
         for (size_t li = 0; li < layers.size(); ++li) {
             if (ctx.Cancelled()) return;
             const Layer& L = layers[li];
 
+            // FAST plus its bisected score: up to nine ring walks per pixel,
+            // which is where BRISK's time goes. Dense map, so the scan below
+            // keeps its order and the candidate list is identical either way.
+            //
+            // Only this part offloads. The scale-space suppression that follows
+            // reads NEIGHBOURING layers, so it is not a per-pixel test over one
+            // plane and stays on the CPU. See gpu_pyramid.h.
+            std::vector<float> score;
+            bool haveMap = false;
+            if (ComputeContext* dev = ctx.Gpu()) {
+                GpuPlane gsrc;
+                gsrc.v = L.v; gsrc.w = L.w; gsrc.h = L.h;
+                GpuPlane map;
+                std::string gerr;
+                if (GpuFastScore(dev, gsrc, &map, thresh, border, &gerr)) {
+                    score = std::move(map.v);
+                    haveMap = true;
+                }
+            }
+
             for (int y = border; y < L.h - border; ++y)
                 for (int x = border; x < L.w - border; ++x) {
-                    if (!FastCorner(L, x, y, thresh)) continue;
-
-                    const float s = FastScore(L, x, y, thresh, 1.0f);
+                    float s;
+                    if (haveMap) {
+                        s = score[size_t(y) * size_t(L.w) + size_t(x)];
+                        if (s <= 0.0f) continue;   // FAST rejected it
+                    } else {
+                        if (!FastCorner(L, x, y, thresh)) continue;
+                        s = FastScore(L, x, y, thresh, 1.0f);
+                    }
 
                     // Non-maximum suppression IN SCALE as well as space.
                     //
@@ -358,14 +403,14 @@ private:
                     // one position and the ratio test throws all of them away.
                     // That failure is quiet: the detector reports plenty of
                     // features and almost nothing matches.
-                    if (!IsScaleMax(layers, li, x, y, L.scale, s)) continue;
+                    if (!IsScaleMax(layers, li, x, y, L.scale, s, scoreAt)) continue;
 
                     Cand c;
                     c.lx = x;
                     c.ly = y;
                     c.x  = float(x) * L.scale;
                     c.y  = float(y) * L.scale;
-                    c.scale    = RefineScale(layers, li, x, y, L.scale, s);
+                    c.scale    = RefineScale(layers, li, x, y, L.scale, s, scoreAt);
                     c.response = s;
                     c.layer    = int(li);
                     cands.push_back(c);
@@ -416,8 +461,13 @@ private:
     // Is this the strongest response at this position across neighbouring
     // scale layers? Compared at the SAME image position, which means
     // converting coordinates between layers of different sizes.
+    // How to get a layer's FAST score at a point: from a precomputed map when
+    // there is one, or by computing it. Passed in rather than looked up so
+    // these stay static and testable.
+    using ScoreFn = const std::function<float(size_t, int, int)>&;
+
     static bool IsScaleMax(const std::vector<Layer>& layers, size_t li,
-                           int x, int y, float scale, float s) {
+                           int x, int y, float scale, float s, ScoreFn scoreAt) {
         const float ix = float(x) * scale, iy = float(y) * scale;
         for (int d = -1; d <= 1; d += 2) {
             const long long n = (long long)li + d;
@@ -441,7 +491,7 @@ private:
             for (int dy = -1; dy <= 1; ++dy)
                 for (int dx = -1; dx <= 1; ++dx) {
                     if (!FastCorner(N, nx + dx, ny + dy, s)) continue;
-                    if (FastScore(N, nx + dx, ny + dy, 0.0f, 1.0f) > s) return false;
+                    if (scoreAt(n, nx + dx, ny + dy) > s) return false;
                 }
         }
         return true;
@@ -451,16 +501,17 @@ private:
     // and its two neighbours. Falls back to the layer's own scale when there
     // are not three samples or the fit is degenerate.
     static float RefineScale(const std::vector<Layer>& layers, size_t li,
-                             int x, int y, float scale, float s) {
+                             int x, int y, float scale, float s,
+                             ScoreFn scoreAt) {
         if (li == 0 || li + 1 >= layers.size()) return scale;
 
         const float ix = float(x) * scale, iy = float(y) * scale;
-        auto scoreAt = [&](size_t n) {
+        auto at = [&](size_t n) {
             const Layer& N = layers[n];
-            return FastScore(N, int(std::lround(ix / N.scale)),
-                             int(std::lround(iy / N.scale)), 0.0f, 1.0f);
+            return scoreAt(n, int(std::lround(ix / N.scale)),
+                           int(std::lround(iy / N.scale)));
         };
-        const float sm = scoreAt(li - 1), sp = scoreAt(li + 1);
+        const float sm = at(li - 1), sp = at(li + 1);
         const float denom = sm - 2.0f * s + sp;
         if (std::abs(denom) < 1e-9f) return scale;
 

@@ -606,7 +606,12 @@ bool Pipeline::RunStageOnce(Stage& s, const std::vector<const Data*>& in,
     }
 
     if (!ranOnGpu) {
-        RunCtx ctx(in, s.outputs, cancel);
+        // The device goes in even on the CPU path, for algorithms that offload
+        // an inner loop and read the result back (a detector, whose product is
+        // a sidecar rather than an image). ForceCPU withholds it, so the mode
+        // means what it says -- otherwise "force CPU" would still dispatch.
+        RunCtx ctx(in, s.outputs, cancel,
+                   mode == ExecMode::ForceCPU ? nullptr : gpu);
         s.algo->RunCPU(ctx);
         ++m_cpuStages;
 

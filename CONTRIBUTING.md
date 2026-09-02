@@ -754,6 +754,58 @@ A kernel that fails to compile falls back to the CPU rather than failing the
 run, with the DXC diagnostics reported — a shader you are mid-way through
 writing should degrade to slow-and-correct, not to a blank viewer.
 
+### GPU work in a CPU algorithm
+
+`RunGPU` is image-in/image-out: the pipeline binds the inputs, dispatches, and
+leaves the result on the device. Some algorithms do not fit that shape at all.
+A **feature detector's product is a sidecar** — a keypoint list — and its image
+output is the input passed through untouched, so there is nothing for `RunGPU`
+to write, and the interesting work (extrema, orientation, descriptors) is
+branchy and belongs on the CPU anyway.
+
+Such an algorithm stays a CPU algorithm and reaches the device directly:
+
+```cpp
+if (ComputeContext* dev = ctx.Gpu()) {
+    // dispatch, read back, use the result
+}
+```
+
+`ctx.Gpu()` is null when there is no device, the device was lost, or the user
+picked Force CPU. **Null is ordinary, not an error** — every caller needs its
+CPU path regardless, so treat this as an optimisation that may decline. See
+[gpu_pyramid.h](src/algorithms/features/gpu_pyramid.h), which `detect_sift`
+uses for its scale space.
+
+**Measure before writing the kernel.** SIFT's pyramid was 65% of its runtime, so
+offloading it paid at 3.8×. Reasoning by analogy from that would have been wrong
+for all three of the others: ORB's pyramid is a cheap box average and its cost is
+the FAST+Harris scan; BRISK's is neither, being half descriptor; AKAZE's is the
+diffusion. `bench_detect` exists to answer this question in about a minute.
+
+The sharpest version of the trap: BRISK's `IsScaleMax` looked like the obvious
+target — up to ~160 ring walks per candidate — so a full-image score map per
+layer seemed clearly right. It made BRISK *slower* (1.0× to 0.9×), because those
+lookups run per CANDIDATE and there are thousands of those against millions of
+pixels: the map computed ~75× more than was ever read. **Dense dispatch only pays
+for dense demand.**
+
+Two things to get right, both learned the hard way here:
+
+- **Do not pass width and height in your constants.** `Dispatch` already fills
+  `b0`'s first two slots from the *output* descriptor, so passing them again
+  shifts every later field by two. The pyramid shader read the image width as
+  its blur radius and produced a plausible-looking wrong blur — no crash, no
+  validation error, just a silently different result.
+- **Keep chained work resident.** Reading each intermediate back and uploading
+  it again costs more than the compute at any real size. `GpuBlurStack` does a
+  whole octave in one call for exactly this reason.
+
+Offloading only pays if the two paths agree *exactly*. A detector that finds
+different keypoints depending on whether a device was present is worse than a
+slow one, because every comparison built on it is then meaningless — which is
+what `tglab_pyramid_tests` exists to prevent.
+
 ### Verifying a GPU kernel
 
 **Compute → Compare CPU / GPU** runs the pipeline twice, forced to each

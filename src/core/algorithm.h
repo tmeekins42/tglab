@@ -18,6 +18,14 @@
 
 namespace tglab {
 
+// Defined in gpu/compute.h. Declared here so RunCtx can hand a CPU-shaped
+// algorithm the compute device without core/ taking a dependency on gpu/.
+//
+// This exists for algorithms whose OUTPUT is not an image -- a feature
+// detector emits a sidecar -- which the image-in/image-out RunGPU path
+// cannot express. They stay CPU algorithms that offload their inner loops.
+class ComputeContext;
+
 struct Port {
     const char* name;
     DataType    type   = DataType::Image;
@@ -35,8 +43,9 @@ using PortList = std::vector<Port>;
 class RunCtx {
 public:
     RunCtx(std::span<const Data* const> in, std::span<Data> out,
-           const CancelToken* cancel = nullptr)
-        : m_in(in), m_out(out), m_cancel(cancel) {}
+           const CancelToken* cancel = nullptr,
+           ComputeContext* gpu = nullptr)
+        : m_in(in), m_out(out), m_cancel(cancel), m_gpu(gpu) {}
 
     // True when this run has been superseded and should stop.
     //
@@ -79,10 +88,22 @@ public:
     size_t NumIn()  const { return m_in.size(); }
     size_t NumOut() const { return m_out.size(); }
 
+    // The compute device, or null when there is none.
+    //
+    // For CPU algorithms that want to offload an inner loop and read the
+    // result back -- the case RunGPU cannot serve, because RunGPU is
+    // image-in/image-out and a detector's product is a sidecar.
+    //
+    // Null is ordinary, not an error: no device, a lost device, or a build
+    // with the GPU disabled. Every caller needs a CPU path anyway, so treat
+    // this as an optimisation that may decline rather than a capability.
+    ComputeContext* Gpu() const { return m_gpu; }
+
 private:
     std::span<const Data* const> m_in;
     std::span<Data>              m_out;
     const CancelToken*           m_cancel = nullptr;
+    ComputeContext*              m_gpu    = nullptr;
 };
 
 

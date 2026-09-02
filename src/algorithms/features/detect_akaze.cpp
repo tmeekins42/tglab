@@ -32,6 +32,7 @@
 #include "../../algo_util/features.h"
 #include "../../algo_util/pixel_buffer.h"
 #include "../../core/algorithm.h"
+#include "gpu_pyramid.h"
 
 namespace tglab {
 namespace {
@@ -258,7 +259,25 @@ private:
                     // -- it oscillates and diverges.
                     const int steps = std::max(1, int(std::ceil(dtTotal / 0.2f)));
                     const float dt = dtTotal / float(steps);
-                    for (int i = 0; i < steps; ++i) DiffuseStep(cur, curCond, dt, tmp);
+
+                    // The whole chain in one call when there is a device: each
+                    // step is a 5-point stencil, so it parallelises even though
+                    // the sequence does not, and keeping the intermediate
+                    // resident turns N round trips into one. See gpu_pyramid.h.
+                    bool onGpu = false;
+                    if (ComputeContext* dev = ctx.Gpu()) {
+                        GpuPlane gsrc, gcond, gout;
+                        gsrc.v  = cur.v;     gsrc.w  = cur.w;     gsrc.h  = cur.h;
+                        gcond.v = curCond.v; gcond.w = curCond.w; gcond.h = curCond.h;
+                        std::string gerr;
+                        if (GpuDiffuse(dev, gsrc, gcond, steps, dt, &gout, &gerr)) {
+                            cur.v = std::move(gout.v);
+                            onGpu = true;
+                        }
+                    }
+                    if (!onGpu)
+                        for (int i = 0; i < steps; ++i)
+                            DiffuseStep(cur, curCond, dt, tmp);
                     sigma = target;
                 }
 

@@ -50,6 +50,7 @@
 #include "../../algo_util/features.h"
 #include "../../algo_util/pixel_buffer.h"
 #include "../../core/algorithm.h"
+#include "gpu_pyramid.h"
 
 namespace tglab {
 namespace {
@@ -321,12 +322,38 @@ private:
             if (ctx.Cancelled()) return;
             const Level& L = pyramid[o];
 
+            // FAST and Harris are per-pixel tests over a small neighbourhood --
+            // the shape a dispatch is good at, and 81 taps per pixel (32 for the
+            // ring, 49 for the 7x7 response) across every level is where ORB's
+            // time goes. The map comes back DENSE: the response where FAST
+            // fired, 0 elsewhere. That keeps the scan below in its original
+            // order, so the candidate list -- and therefore the ranking -- is
+            // identical either way. See gpu_pyramid.h.
+            std::vector<float> resp;
+            bool haveMap = false;
+            if (ComputeContext* dev = ctx.Gpu()) {
+                GpuPlane src;
+                src.v = L.v; src.w = L.w; src.h = L.h;
+                GpuPlane map;
+                std::string gerr;
+                if (GpuFastHarris(dev, src, &map, thresh, kHarrisRad, border,
+                                  &gerr)) {
+                    resp = std::move(map.v);
+                    haveMap = true;
+                }
+            }
+
             for (int y = border; y < L.h - border; ++y)
                 for (int x = border; x < L.w - border; ++x) {
-                    if (!FastCorner(L, x, y, thresh)) continue;
-
-                    const float r = HarrisResponse(L, x, y, kHarrisRad);
-                    if (r <= 0.0f) continue;   // an edge, not a corner
+                    float r;
+                    if (haveMap) {
+                        r = resp[size_t(y) * size_t(L.w) + size_t(x)];
+                        if (r <= 0.0f) continue;   // not a corner, or an edge
+                    } else {
+                        if (!FastCorner(L, x, y, thresh)) continue;
+                        r = HarrisResponse(L, x, y, kHarrisRad);
+                        if (r <= 0.0f) continue;   // an edge, not a corner
+                    }
 
                     Cand c;
                     c.lx = x;
