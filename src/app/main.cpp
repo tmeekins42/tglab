@@ -1719,6 +1719,30 @@ void App::DrawControl(UiControl& c) {
                 }
                 break;
             }
+            case UiControl::Kind::Pick: {
+                if (c.options.empty()) break;
+                const int sel = std::clamp(c.selected, 0, int(c.options.size()) - 1);
+                if (ImGui::BeginCombo(widgetId.c_str(), c.options[size_t(sel)].c_str())) {
+                    for (int i = 0; i < int(c.options.size()); ++i) {
+                        const bool chosen = (i == sel);
+                        if (ImGui::Selectable(c.options[size_t(i)].c_str(), chosen)) {
+                            if (i != c.selected) {
+                                c.selected = i;
+                                // Unlike Choose, the VALUE is what reaches the
+                                // parameter -- the index is only how the widget
+                                // tracks it -- so both have to move together or
+                                // the dropdown would show one mode while the
+                                // algorithm ran another.
+                                c.value = c.lo + double(i);
+                                m_dirty = true;
+                            }
+                        }
+                        if (chosen) ImGui::SetItemDefaultFocus();
+                    }
+                    ImGui::EndCombo();
+                }
+                break;
+            }
         }
 
         // Double-click the control just drawn to restore its scripted default.
@@ -1754,8 +1778,15 @@ bool App::IsModified(const UiControl& c) {
 void App::ResetControl(UiControl& c) {
     // Back to the script-declared default, which is the first option only
     // when the script did not name one.
-    if (c.kind == UiControl::Kind::Choose) c.selected = c.defaultIndex;
-    else                                   c.value = c.def;
+    if (c.kind == UiControl::Kind::Choose) {
+        c.selected = c.defaultIndex;
+    } else if (c.kind == UiControl::Kind::Pick) {
+        // Both, for the reason in the draw case: the value is what runs.
+        c.selected = c.defaultIndex;
+        c.value    = c.def;
+    } else {
+        c.value = c.def;
+    }
 }
 
 std::string App::DefaultText(const UiControl& c) {
@@ -1764,6 +1795,7 @@ std::string App::DefaultText(const UiControl& c) {
         case UiControl::Kind::Check:
             return c.def != 0 ? "on" : "off";
         case UiControl::Kind::Choose:
+        case UiControl::Kind::Pick:
             return c.options.empty() ? std::string("-")
                                      : c.options[size_t(std::clamp(c.defaultIndex, 0,
                                            int(c.options.size()) - 1))];

@@ -47,11 +47,10 @@
 # stitch_panorama fixes that by extracting the ROTATION from each homography
 # and projecting onto a cylinder. Same frames, same links, 11274x3997.
 #
-#   projection = 0   plane. Right for 2-3 frames; diverges past ~90 degrees.
-#   projection = 1   cylindrical. The default: a single-row pan, 360 degrees
-#                    without divergence, verticals stay vertical.
-#   projection = 2   spherical. Multi-row, and the only one that can hold a
-#                    full sphere.
+#   plane         Right for 2-3 frames; diverges past ~90 degrees.
+#   cylindrical   The default: a single-row pan, 360 degrees without
+#                 divergence, verticals stay vertical.
+#   spherical     Multi-row, and the only one that can hold a full sphere.
 #
 # READ THE REPORT. The stitcher measures how much the frames DISAGREE where
 # they overlap, which is the direct measure of stitch quality -- sharpness is
@@ -89,7 +88,7 @@ frames = image("group")
 det = choose("detector", [detect_orb, detect_brisk, detect_sift,
                           detect_surf, detect_akaze])
 
-proj = slider("projection: 0 plane, 1 cylinder, 2 sphere", 0, 2, 1)
+proj = pick("projection", ["plane", "cylindrical", "spherical"], 1)
 
 # focal 0 estimates from the solved homographies rather than from EXIF -- no
 # sensor size needed, and it cannot disagree with the geometry actually solved.
@@ -117,11 +116,59 @@ focal = slider("focal (px, 0 = estimate)", 0, 20000, 0)
 # it changed the result barely at all, which is worth knowing -- the chain
 # constraints were already sufficient on this data.
 
+# WHEN GHOSTING SURVIVES THE BUNDLE, read the residual-by-band figures in
+# bundle_adjust's report before changing anything else. They split the leftover
+# error into the top, middle and bottom thirds of the frame.
+#
+#   Roughly EVEN -- the solve is imperfect. More overlap or another detector
+#   may help.
+#
+#   BOTTOM-HEAVY -- the camera translated between frames, which it does whenever
+#   a pan pivots around the photographer instead of the lens's entrance pupil.
+#   The leftover displacement is then f*T/Z: it grows as things get CLOSER, so
+#   near content misaligns while distant content is fine. No homography can fix
+#   that, and no amount of bundling will either -- one 8-parameter warp cannot
+#   give near and far content different displacements at the same time.
+#
+# For the second case, turn off the cross-fade. Feathering AVERAGES the frames
+# that overlap, and averaging two offset copies of a branch is precisely what
+# makes the doubled image; winner_takes_all picks one frame per pixel instead,
+# so there is nothing to average and nothing to ghost. The trade is that
+# exposure steps between frames stop being hidden and show as seams.
+ghostfix = check("winner takes all (parallax)", 0)
+
+# EXPOSURE SEAMS, which winner_takes_all makes visible: without a cross-fade
+# there is nothing left to hide a brightness step between frames.
+#
+# One gain per frame, solved from the overlaps. Measured on this sweep it takes
+# overlap disagreement from 29.0% to 26.1%.
+#
+# `frame_exposure` says what there is to correct, from the raws:
+#
+#   ./build/Release/frame_exposure.exe D:/lrwork/TEST/panotest1/*.CR2
+#
+# On panotest1 it reports 1/1250 f/8 ISO 100 on fourteen of fifteen frames -- a
+# total spread of 0.05 stops -- so most of the sweep needs nothing. Only
+# _L0A1220 differs (1/1000, a third of a stop), and that one this fixes exactly.
+#
+# A SPATIALLY VARYING correction was built here and removed. The same tool shows
+# the corners diverging from the centre by up to 13% with the left/right
+# asymmetry CROSSING OVER as the pan proceeds -- a scene gradient (snow to
+# water), not lens vignetting, which would be radially symmetric and darken both
+# sides equally in every frame. Fitting a per-frame ramp to that failed for a
+# structural reason: every constraint is a DIFFERENCE between two frames, so a
+# tilt applied identically to all of them is invisible to the fit and drifts
+# until it hits its limit. Measured, the ramps railed with the same sign on all
+# fifteen frames -- which tilts the whole panorama and corrects no seam, and
+# looked far worse than the seams it was meant to remove.
+gain = check("gain compensation", 0)
+
 frames => det()
-       => match_brute(chain = 1, window = 2)
+       => match_ann(chain = 1, window = 2)
        => align_features(model = 2)
+       => align()
        => bundle_adjust()
-       => stitch_panorama(projection = proj, focal = focal)
+       => stitch_panorama(projection = proj, focal = focal, winner_takes_all = ghostfix, gain_compensation = gain)
        => display("panorama")       
        => params( crop ) ()       
        => params( basic_adjust , auto_exposure = 1)()       

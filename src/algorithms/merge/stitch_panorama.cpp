@@ -273,13 +273,31 @@ public:
             std::snprintf(flip, sizeof flip,
                           " -- frame %d and later DROPPED, their link was not a rotation",
                           m_flipped);
-        char buf[320];
+        // The gain figure is worth seeing rather than hiding: a correction of
+        // more than about a third of a stop means the frames disagreed a lot,
+        // and a compensation that large is as likely to be masking a real
+        // problem upstream as fixing an exposure difference.
+        // Both the largest and the typical correction. They differ enormously
+        // on a sweep shot at locked settings -- one outlier frame needing a
+        // third of a stop against fourteen needing nothing -- and the maximum
+        // alone reads as though every frame moved.
+        // The seam gap before and after is what the correction is FOR; the size
+        // of the gains is only how it got there. Reporting the gains alone made
+        // a compensation that achieved nothing look like it was working hard.
+        char gain[160] = "";
+        if (m_gainStops > 0.0f)
+            std::snprintf(gain, sizeof gain,
+                          ", seam gap %.3f -> %.3f stops "
+                          "(gain up to %.2f, mean %.3f)",
+                          double(m_seamBefore), double(m_seamAfter),
+                          double(m_gainStops), double(m_gainMean));
+        char buf[384];
         std::snprintf(buf, sizeof buf,
                       "%s: %d frames onto %dx%d, focal %.0f px (%.0f deg fov), "
-                      "overlap %.0f%% disagreeing %.1f%%%s",
+                      "overlap %.0f%% disagreeing %.1f%%%s%s",
                       ProjName(), m_placed, m_outW, m_outH, double(m_focal),
                       double(FovDeg()), 100.0 * m_overlapPixels,
-                      100.0 * double(m_disagree), flip);
+                      100.0 * double(m_disagree), gain, flip);
         return buf;
     }
 
@@ -461,13 +479,17 @@ private:
         }
     }
 
+    static constexpr const char* kProjectionNames[] = {
+        "plane", "cylindrical", "spherical"};
+
     Param<int> m_projection{this, "projection", 1, 0, 2,
-        {.help = "0 plane, 1 cylindrical, 2 spherical. Cylindrical is the "
-                 "default because a single-row pan is the common case: it "
+        {.help = "The surface the frames are projected onto. Cylindrical is "
+                 "the default because a single-row pan is the common case: it "
                  "takes 360 degrees without diverging and keeps verticals "
                  "vertical. Plane is correct for two or three frames and "
                  "diverges past about 90 degrees. Spherical is for multi-row.",
-         .step = 1}};
+         .step = 1,
+         .choices = kProjectionNames, .choiceCount = 3}};
 
     Param<float> m_focalOverride{this, "focal", 0.0f, 0.0f, 100000.0f,
         {.help = "Focal length in PIXELS. 0 estimates it from the solved "
@@ -482,6 +504,26 @@ private:
         "cross-fade instead of showing a hard seam. Costs one extra multiply "
         "per pixel and hides the exposure differences a handheld pan always "
         "has."};
+
+    Param<bool> m_gainComp{this, "gain_compensation", false,
+        "Match brightness between frames: one gain per frame, solved from the "
+        "overlaps. Solved on a log scale so what gets averaged is a brightness "
+        "RATIO, which is what an exposure difference is. Measured on a 15-frame "
+        "sweep it took overlap disagreement from 29.0% to 26.1%. Pairs with "
+        "winner_takes_all, which removes the cross-fade that was hiding the "
+        "steps."};
+
+    Param<bool> m_winnerTakesAll{this, "winner_takes_all", false,
+        "Take each output pixel from the SINGLE best-placed frame instead of "
+        "blending the overlap. Feathering averages the frames that overlap, "
+        "which is right when they agree and is exactly what turns a "
+        "misalignment into a double image when they do not -- averaging two "
+        "offset copies of a branch IS the ghost. Choosing one frame per pixel "
+        "cannot ghost, because there is nothing to average. Use it when the "
+        "residual-by-band figures show parallax (near content misaligning "
+        "while far content is fine), which no global warp can fix. The cost "
+        "is that exposure steps between frames become visible seams, since "
+        "there is no longer a cross-fade to hide them."};
 
     Param<int> m_maxPixels{this, "max_megapixels", 400, 1, 4000,
         {.help = "Refuses to allocate a canvas larger than this. A diverging "
@@ -498,6 +540,9 @@ private:
     // canvas that covers. The direct measure of stitch quality: sharpness is
     // not, because it also moves with how much the canvas was scaled.
     float              m_disagree = 0.0f;
+    float              m_gainStops = 0.0f;   // largest gain applied, in stops
+    float              m_gainMean  = 0.0f;   // mean absolute gain, in stops
+    float              m_seamBefore = 0.0f, m_seamAfter = 0.0f;  // RMS seam gap
     // The first frame whose link could not be read as a rotation, or -1.
     int                m_flipped = -1;
     double             m_overlapPixels = 0.0;
@@ -781,8 +826,275 @@ bool StitchPanorama::Finish(Image* out, std::string* err) {
     std::vector<double> lum(size_t(m_outW) * size_t(m_outH), 0.0);
     std::vector<int>    cnt(size_t(m_outW) * size_t(m_outH), 0);
 
+    // --- gain compensation ---------------------------------------------------
+    //
+    // Solved BEFORE compositing, from what the frames report where they
+    // overlap. Two frames seeing the same scene point should read the same
+    // value; that they do not is the seam, and the ratio between them is what
+    // has to be undone.
+    //
+    // In LOG space, for two reasons. Exposure is multiplicative -- a stop is a
+    // factor, not an offset -- so averaging ratios directly would bias toward
+    // the brighter frame. And in log space the constraint "frame i over frame j
+    // equals r" becomes a LINEAR equation g_i - g_j = log r, which turns a
+    // product of unknowns into a least-squares system that solves in one pass.
+    //
+    // ONE CONSTANT PER FRAME, and deliberately not more.
+    //
+    // A per-frame linear RAMP was built here and removed, because it did not
+    // work and the reason is structural rather than a tuning problem. Every
+    // constraint is a DIFFERENCE between two frames, so any field added
+    // identically to all of them cancels out of all of them: it is a null space
+    // the objective cannot see. The constant has that freedom too, which is what
+    // the mean-removal gauge below is for -- but a ramp has three times as much
+    // of it, and gauging the ramp as well was still not enough.
+    //
+    // Measured on a real 15-frame sweep: the ramps came back RAILED at their
+    // clamp with coherent signs across the whole panorama, which tilts every
+    // frame identically and corrects no seam at all. Overlap disagreement did
+    // not improve (25.9% against level 1's 26.1%) while the visible result was
+    // much worse -- a bright wedge on every frame.
+    //
+    // Two theories were tested and both were wrong before the null space turned
+    // out to be the answer, so they are worth recording: it is NOT narrow
+    // overlap support (measured varU 0.06, varV 0.078 against 0.083 for
+    // full-frame coverage -- the fit was perfectly conditioned), and it is NOT
+    // weak damping. A model whose extra freedom is invisible to its own
+    // objective cannot be rescued by conditioning it better.
+    //
+    // If a spatially varying correction is wanted, it needs constraints a
+    // per-frame fit does not have -- a lens vignetting profile measured from a
+    // flat field, or a seam-aware blend that never asks two frames to agree
+    // across a gradient in the first place.
+    struct Gain { double k = 0.0; };
+    std::vector<Gain> gains(m_frames.size());
+
+    const bool gainOn = bool(m_gainComp);
+    if (gainOn) {
+        // Sample the canvas on a grid rather than every pixel: the gains are a
+        // handful of unknowns and do not need 42 million equations.
+        //
+        // Finer than the obvious choice, though, because only samples NEAR A
+        // SEAM are kept and a seam is a thin band. A coarse grid finds the
+        // overlap easily and the seam barely at all, which is the difference
+        // between measuring what the viewer sees and measuring the average of
+        // the whole scene.
+        const int stride = std::max(1, std::min(m_outW, m_outH) / 256);
+
+        // For each grid point, what every frame reports there -- plus its
+        // FEATHER WEIGHT, which is what decides the seam.
+        struct Hit { int frame; double lum, u, v, wgt; };
+        std::vector<Hit> hits;
+
+        // Pairwise log-ratio constraints, per frame. Solved by Gauss-Seidel
+        // below, which converges quickly because the system is diagonally
+        // dominant -- every frame is tied to its neighbours by many samples.
+        struct Link { int other; double d; };
+        std::vector<std::vector<Link>> links(m_frames.size());
+
+        for (int y = 0; y < m_outH; y += stride) {
+            const float v = minV + float(y);
+            for (int x = 0; x < m_outW; x += stride) {
+                const float u = minU + float(x);
+
+                hits.clear();
+                for (size_t fi = 0; fi < m_frames.size(); ++fi) {
+                    const Frame& f = m_frames[fi];
+                    if (!f.invertible) continue;
+
+                    float sx, sy;
+                    if (usePlane) {
+                        f.t.MapPoint(u + cx, v + cy, &sx, &sy);
+                    } else {
+                        float dx, dy, dz;
+                        CanvasToRay(u, v, &dx, &dy, &dz);
+                        if (!refRayToPixel(f, dx, dy, dz, &sx, &sy)) continue;
+                    }
+                    if (sx < 0.0f || sy < 0.0f ||
+                        sx > float(f.W() - 1) || sy > float(f.H() - 1)) continue;
+
+                    // A PATCH MEAN, not a single pixel.
+                    //
+                    // The two frames are sampled at the same CANVAS point, so
+                    // any misregistration means they are looking at different
+                    // scene points -- and in a high-contrast scene the ratio of
+                    // two different points is nothing to do with exposure.
+                    // Measured before this: the RMS seam gap came out at 0.50
+                    // stops on frames whose EXIF differed by 0.05, and it barely
+                    // responded to the gains, because most of it was parallax
+                    // and residual alignment error (bundle_adjust reports 17 px
+                    // in the middle band) rather than brightness.
+                    //
+                    // Averaging over a patch wider than that error makes the
+                    // comparison about the local average brightness, which is
+                    // what a gain can actually fix, instead of about whether the
+                    // two frames happen to be pointing at the same twig.
+                    const int kPatch = 24;   // > the ~17 px residual
+                    double acc2 = 0.0;
+                    int nacc = 0;
+                    for (int py = -kPatch; py <= kPatch; py += 8)
+                        for (int px = -kPatch; px <= kPatch; px += 8) {
+                            const float qx = sx + float(px), qy = sy + float(py);
+                            if (qx < 0.0f || qy < 0.0f ||
+                                qx > float(f.W() - 1) || qy > float(f.H() - 1))
+                                continue;
+                            float pm[4] = {0, 0, 0, 0};
+                            SampleBilinear(f.buf, qx, qy, pm);
+                            acc2 += (ch >= 3)
+                                ? 0.2126 * pm[0] + 0.7152 * pm[1] + 0.0722 * pm[2]
+                                : pm[0];
+                            ++nacc;
+                        }
+                    if (!nacc) continue;
+                    const double y0 = acc2 / double(nacc);
+                    // Near-black samples carry no reliable ratio -- the log of a
+                    // value dominated by noise is noise -- and would otherwise
+                    // pull the fit hard, because log is steep near zero.
+                    if (y0 <= 1e-4) continue;
+
+                    Hit hh;
+                    hh.frame = int(fi);
+                    hh.lum   = std::log(y0);
+                    hh.u     = double(sx) / std::max(1.0, double(f.W() - 1)) - 0.5;
+                    hh.v     = double(sy) / std::max(1.0, double(f.H() - 1)) - 0.5;
+                    // The same distance-to-edge that decides the winner below.
+                    hh.wgt   = double(std::min(std::min(sx, float(f.W() - 1) - sx),
+                                               std::min(sy, float(f.H() - 1) - sy)));
+                    hits.push_back(hh);
+                }
+                if (hits.size() < 2) continue;   // no overlap, no constraint
+
+                // CONSTRAIN THE SEAM, NOT THE WHOLE OVERLAP.
+                //
+                // The first version paired every frame with every other frame
+                // wherever they overlapped -- and on this data the overlap is
+                // 61% of a frame, so a single gain was fitted to the average
+                // disagreement across most of the picture. That average is
+                // dominated by the scene's own brightness gradient, which is
+                // real and should not be corrected, and it is measured mostly
+                // in places the viewer will never see a seam.
+                //
+                // What actually shows is the boundary: with winner_takes_all,
+                // every output pixel comes from exactly ONE frame, and a visible
+                // seam is where that choice flips. So the useful constraint is
+                // "the two frames that meet HERE should read the same HERE".
+                //
+                // The winner is the frame whose sample sits furthest from its
+                // own edge, so the seam is where the best two weights are equal.
+                // Sort by weight, take the top two, and weight the constraint by
+                // how close to that tie the sample is -- full strength at the
+                // seam, falling away from it. Samples deep inside one frame's
+                // territory, where no seam can appear, contribute nothing.
+                std::sort(hits.begin(), hits.end(),
+                          [](const Hit& a, const Hit& b) { return a.wgt > b.wgt; });
+
+                const Hit& w0 = hits[0];
+                const Hit& w1 = hits[1];
+
+                // How near the tie, as a fraction: 1 exactly at the seam, 0
+                // where the runner-up has no weight at all.
+                //
+                // The cut is tight on purpose. A loose one (sw > 0.05 admits a
+                // sample where one frame is nineteen times better placed) puts
+                // the whole overlap back in, which is the thing this exists to
+                // avoid -- measured, it left the worst seam step at 0.0335
+                // stops against 0.0341 uncorrected while inflating the gains to
+                // 0.59 stops. Requiring the two to be within about 20% of each
+                // other keeps only samples that are genuinely near a boundary.
+                const double denom = std::max(w0.wgt + w1.wgt, 1e-6);
+                const double sw = 1.0 - (w0.wgt - w1.wgt) / denom;
+                if (sw <= 0.80) continue;   // not near a seam
+
+                // Repeat the constraint in proportion to its seam weight, which
+                // is how a plain averaging solver expresses weighting.
+                const int reps = std::max(1, int(sw * 8.0 + 0.5));
+                const double d = w1.lum - w0.lum;
+                for (int r = 0; r < reps; ++r) {
+                    links[size_t(w0.frame)].push_back({w1.frame,  d});
+                    links[size_t(w1.frame)].push_back({w0.frame, -d});
+                }
+            }
+        }
+
+        // Gauss-Seidel on g_i = mean_j(g_j + d_ij).
+        //
+        // Frame 0 is NOT pinned. Pinning one frame would make every other frame
+        // move to meet it, so a single odd frame at the end of the chain would
+        // drag the whole panorama's brightness; instead the mean is removed each
+        // sweep, which fixes the same gauge freedom while keeping the overall
+        // exposure where the photographer put it.
+        for (int it = 0; it < 64; ++it) {
+            for (size_t i = 0; i < gains.size(); ++i) {
+                if (links[i].empty()) continue;
+                // The mean of what this frame's neighbours ask of it.
+                double s = 0.0;
+                for (const Link& L : links[i])
+                    s += gains[size_t(L.other)].k + L.d;
+                gains[i].k = s / double(links[i].size());
+            }
+
+            double mean = 0.0;
+            for (const Gain& G : gains) mean += G.k;
+            mean /= double(gains.size());
+            for (Gain& G : gains) G.k -= mean;
+        }
+        // How far the correction reaches, for the report. A large number is
+        // worth seeing: it means the frames disagreed a lot, and a correction
+        // that big is as likely to be hiding a real problem as fixing one.
+        double worst = 0.0;
+        for (const Gain& G : gains) worst = std::max(worst, std::fabs(G.k));
+        m_gainStops = float(worst / std::log(2.0));
+        // The SPREAD, not just the largest. On a sweep shot at locked settings
+        // most frames need nothing and one outlier needs a lot, and a single
+        // maximum makes that look like a big correction everywhere. Measured on
+        // a 15-frame sweep: fourteen frames moved 0.005-0.058 stops (invisible,
+        // and correctly so) while the one frame shot at a different shutter
+        // speed moved 0.387.
+        double sum = 0.0;
+        for (const Gain& G : gains) sum += std::fabs(G.k);
+        m_gainMean = float(sum / double(gains.size()) / std::log(2.0));
+
+        // THE SEAM RESIDUAL: how far apart the two frames still are, at the
+        // boundary, after the gains are applied.
+        //
+        // This is the number the correction is actually trying to reduce, and
+        // nothing else reports it. Overlap disagreement covers the whole overlap
+        // (mostly places no seam appears) and a column profile of the finished
+        // canvas cannot separate a seam from scene content -- measured, the
+        // largest column step sat at the same pixel and the same 0.034 stops
+        // whether the gains were off, loose or tight, because it was a treeline
+        // rather than a seam.
+        //
+        // Measured here from the same seam-weighted links the solve used, so
+        // "before" and "after" are the same quantity.
+        double before = 0.0, after = 0.0;
+        long long nl = 0;
+        for (size_t i = 0; i < links.size(); ++i)
+            for (const Link& L : links[i]) {
+                before += L.d * L.d;
+                const double r = L.d + gains[size_t(L.other)].k - gains[i].k;
+                after += r * r;
+                ++nl;
+            }
+        if (nl) {
+            m_seamBefore = float(std::sqrt(before / double(nl)) / std::log(2.0));
+            m_seamAfter  = float(std::sqrt(after  / double(nl)) / std::log(2.0));
+        }
+    }
+
+    // Winner-takes-all: the best weight seen at each pixel so far.
+    //
+    // Kept separately from wsum because the two modes mean different things by
+    // "weight" -- a running total to divide by, against a high-water mark to
+    // beat. Only allocated in the mode that uses it: this is one float per
+    // output pixel, which on a 42 MP canvas is 170 MB.
+    const bool wta = bool(m_winnerTakesAll);
+    std::vector<float> best;
+    if (wta) best.assign(size_t(m_outW) * size_t(m_outH), -1.0f);
+
     m_placed = 0;
-    for (const Frame& f : m_frames) {
+    for (size_t fi = 0; fi < m_frames.size(); ++fi) {
+        const Frame& f = m_frames[fi];
         if (!f.invertible) continue;
         ++m_placed;
 
@@ -813,14 +1125,18 @@ bool StitchPanorama::Finish(Image* out, std::string* err) {
                 if (sx < 0.0f || sy < 0.0f ||
                     sx > float(f.W() - 1) || sy > float(f.H() - 1)) continue;
 
-                // Feather weight: distance to the nearest edge of THIS frame,
-                // normalised. Zero at the border, so a frame fades out exactly
-                // where it stops having data and its neighbour takes over.
+                // Distance to the nearest edge of THIS frame. Zero at the
+                // border, so a frame fades out exactly where it stops having
+                // data and its neighbour takes over -- and, in winner-takes-all,
+                // the same measure picks the frame that sees this pixel most
+                // centrally, which is the one least likely to be distorted or
+                // vignetted here.
+                const float du = std::min(sx, float(f.W() - 1) - sx);
+                const float dv = std::min(sy, float(f.H() - 1) - sy);
+                const float dmin = std::min(du, dv);
+
                 double wgt = 1.0;
-                if (bool(m_feather)) {
-                    const float du = std::min(sx, float(f.W() - 1) - sx);
-                    const float dv = std::min(sy, float(f.H() - 1) - sy);
-                    const float dmin = std::min(du, dv);
+                if (bool(m_feather) || wta) {
                     // +1e-3 so a pixel exactly on the border still contributes
                     // something: a seam where every frame has weight zero would
                     // be a one-pixel hole.
@@ -830,10 +1146,33 @@ bool StitchPanorama::Finish(Image* out, std::string* err) {
                 float sm[4] = {0, 0, 0, 0};
                 SampleBilinear(f.buf, sx, sy, sm);
 
+                // Apply this frame's correction before it contributes.
+                //
+                // A multiply on every channel, NOT on luminance alone: scaling
+                // luminance and leaving the channels would shift the hue, and
+                // an exposure difference is a scaling of the light itself.
+                if (gainOn) {
+                    const float k = float(std::exp(gains[fi].k));
+                    for (int c = 0; c < ch; ++c) sm[c] *= k;
+                }
+
                 const size_t pi = size_t(y) * size_t(m_outW) + size_t(x);
                 const size_t bi = pi * size_t(ch);
-                for (int c = 0; c < ch; ++c) acc[bi + size_t(c)] += wgt * double(sm[c]);
-                wsum[pi] += wgt;
+                if (wta) {
+                    // REPLACE rather than accumulate. Nothing is averaged, so
+                    // nothing can ghost; the pixel is whatever the best-placed
+                    // frame saw there.
+                    if (float(wgt) > best[pi]) {
+                        best[pi] = float(wgt);
+                        for (int c = 0; c < ch; ++c)
+                            acc[bi + size_t(c)] = double(sm[c]);
+                        wsum[pi] = 1.0;
+                    }
+                } else {
+                    for (int c = 0; c < ch; ++c)
+                        acc[bi + size_t(c)] += wgt * double(sm[c]);
+                    wsum[pi] += wgt;
+                }
 
                 // Unweighted, and deliberately: the feather weight is nearly
                 // zero exactly at a seam, which is where disagreement matters

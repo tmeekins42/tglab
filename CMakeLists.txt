@@ -354,6 +354,15 @@ if(MSVC)
     target_compile_definitions(headroom PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
 
+# What differs in exposure across a sweep: EXIF settings, measured brightness,
+# and centre-vs-surround. Says whether seams want a per-frame gain or a
+# spatially varying correction.
+add_executable(frame_exposure tools/frame_exposure.cpp $<TARGET_OBJECTS:tglab_algorithms>)
+target_link_libraries(frame_exposure PRIVATE tglab_core)
+if(MSVC)
+    target_compile_definitions(frame_exposure PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
 # paper_data: regenerates the tables and figure crops under papers/, so every
 # number in the write-up has reproducible provenance.
 #   build/Release/paper_data.exe --table <raw>...
@@ -407,4 +416,30 @@ add_executable(group_merge tools/group_merge.cpp $<TARGET_OBJECTS:tglab_algorith
 target_link_libraries(group_merge PRIVATE tglab_core d3d12 dxgi)
 if(MSVC)
     target_compile_definitions(group_merge PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
+# Runs the real panorama chain on real frames, headlessly, and prints every
+# stage's report. The unit fixture is three generously overlapping frames --
+# the easy case -- and cannot show what a fourteen-frame sweep with narrow
+# overlaps does to a fit.
+add_executable(bench_stitch tools/bench_stitch.cpp $<TARGET_OBJECTS:tglab_algorithms>)
+target_link_libraries(bench_stitch PRIVATE tglab_core)
+if(MSVC)
+    target_compile_definitions(bench_stitch PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
+# Lens falloff measured from a sweep, without a flat field: average many frames
+# in SENSOR coordinates and the scene averages out while the falloff survives.
+add_executable(vignette_profile tools/vignette_profile.cpp $<TARGET_OBJECTS:tglab_algorithms>)
+target_link_libraries(vignette_profile PRIVATE tglab_core)
+if(MSVC)
+    target_compile_definitions(vignette_profile PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
+# Dehaze timing on a real image. The radius scales with the picture, so which
+# stage dominates is a question about size rather than about the code.
+add_executable(bench_dehaze tools/bench_dehaze.cpp $<TARGET_OBJECTS:tglab_algorithms>)
+target_link_libraries(bench_dehaze PRIVATE tglab_core)
+if(MSVC)
+    target_compile_definitions(bench_dehaze PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()

@@ -766,12 +766,16 @@ private:
         return true;
     }
 
+    static constexpr const char* kModelNames[] = {
+        "similarity (4 DOF)", "affine (6 DOF)", "homography (8 DOF)"};
+
     Param<int> m_model{this, "model", 1, 0, 2,
-        {.help = "0 similarity (4 DOF: shift, rotate, scale), 1 affine (6: "
-                 "adds shear), 2 homography (8: adds perspective). A tripod "
-                 "pan needs a homography and nothing simpler; a handheld "
-                 "bracket is better served by affine, whose fewer parameters "
-                 "are each better determined."}};
+        {.help = "How much freedom the fit is given. Similarity is shift, "
+                 "rotate and scale; affine adds shear; homography adds "
+                 "perspective. A tripod pan needs a homography and nothing "
+                 "simpler; a handheld bracket is better served by affine, "
+                 "whose fewer parameters are each better determined.",
+         .choices = kModelNames, .choiceCount = 3}};
 
     Param<float> m_threshold{this, "threshold", 3.0f, 0.5f, 20.0f,
         {.help = "How far a match may reproject and still count as an inlier, "

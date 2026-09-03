@@ -928,6 +928,155 @@ static void TestLut() {
     fs::remove_all(dir, ec);
 }
 
+// Dehaze, against a scene hazed by the model it inverts.
+//
+// The fixture APPLIES Koschmieder -- I = J*t + A*(1-t) -- with a known airlight
+// and a known depth ramp, so there is a real answer to compare against rather
+// than "it looks clearer". That also means the test can tell the difference
+// between removing haze and merely raising contrast, which is what a naive
+// implementation does and what a contrast metric alone would happily accept.
+static void TestDehaze() {
+    const int W = 240, H = 160;
+    const float A[3] = {0.85f, 0.88f, 0.95f};   // pale blue airlight
+
+    // The haze-free scene, built to SATISFY the dark channel prior rather than
+    // to look interesting -- the prior's assumption is that every small patch
+    // contains a near-black pixel, and a fixture that violates it is testing the
+    // prior's known failure mode instead of the implementation.
+    //
+    // A fine checker does that: whatever window the algorithm minimises over, it
+    // contains dark cells. An early version used 20 px cells against a patch
+    // radius that scaled down to 3, so the bright cells had no dark pixel within
+    // reach, the transmission came out too low there, and the near end was
+    // over-corrected by about 2x. That was the fixture breaking the prior's
+    // premise, not the code getting it wrong.
+    auto sceneAt = [&](int x, int y, float* out) {
+        const float v = ((x / 3 + y / 3) % 2 == 0) ? 0.03f : 0.55f;
+        out[0] = v;
+        out[1] = v * 0.9f;
+        out[2] = v * 0.8f;
+    };
+
+    // Transmission falls left to right: near on the left, distant on the right.
+    auto transAt = [&](int x) {
+        return 0.9f - 0.6f * (float(x) / float(W - 1));
+    };
+
+    Image hazy;
+    hazy.Alloc({W, H, Format::RGBA32F});
+    {
+        ImageView v = hazy.MapCpuWrite();
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                float j[3];
+                sceneAt(x, y, j);
+                const float t = transAt(x);
+                float* p = v.At<float>(x, y);
+                for (int c = 0; c < 3; ++c) p[c] = j[c] * t + A[c] * (1.0f - t);
+                p[3] = 1.0f;
+            }
+    }
+
+    auto at = [](const Image& im, int x, int y, int c) {
+        ImageView v = const_cast<Image&>(im).MapCpuRead();
+        return v.At<float>(x, y)[c];
+    };
+
+    std::string err;
+    Image out, off;
+
+    // sky_protect off: the fixture has no sky, and the protection would floor
+    // the transmission exactly where the test wants it measured.
+    const bool ran =
+        RunFilter("dehaze", hazy.Clone(),
+                  {{"strength", 0.95},
+                   {"sky_protect", 0.0}}, &out, &err);
+    Check(ran, "dehaze runs" + (ran ? "" : ": " + err));
+    if (!ran) return;
+
+    // Strength 0 must be a true pass-through: the control has to be able to
+    // turn the algorithm off completely.
+    if (RunFilter("dehaze", hazy.Clone(), {{"strength", 0.0}}, &off, &err)) {
+        double worst = 0.0;
+        for (int y = 0; y < H; y += 7)
+            for (int x = 0; x < W; x += 7)
+                for (int c = 0; c < 3; ++c)
+                    worst = std::max(worst,
+                        double(std::fabs(at(off, x, y, c) - at(hazy, x, y, c))));
+        Check(worst < 1e-5, "dehaze at strength 0 leaves the image alone (" +
+                                std::to_string(worst) + ")");
+    }
+
+    // THE REAL TEST: the recovered image must be closer to the true scene than
+    // the hazy one was. Measured on the HAZY HALF, where there is something to
+    // remove -- the near edge starts at t=0.9 and has almost no haze in it.
+    //
+    // Error rather than contrast, deliberately. Any contrast stretch improves a
+    // contrast score; only an actual inversion of the haze model moves the
+    // pixels toward where they belong.
+    {
+        double before = 0.0, after = 0.0;
+        int n = 0;
+        for (int y = 4; y < H - 4; y += 3)
+            for (int x = W / 2; x < W - 4; x += 3) {
+                float j[3];
+                sceneAt(x, y, j);
+                for (int c = 0; c < 3; ++c) {
+                    const double e0 = double(at(hazy, x, y, c)) - double(j[c]);
+                    const double e1 = double(at(out,  x, y, c)) - double(j[c]);
+                    before += e0 * e0;
+                    after  += e1 * e1;
+                    ++n;
+                }
+            }
+        const double rmsBefore = std::sqrt(before / double(n));
+        const double rmsAfter  = std::sqrt(after  / double(n));
+        Check(rmsAfter < rmsBefore * 0.6,
+              "dehaze recovers the scene it was hazed from (RMS " +
+                  std::to_string(rmsBefore) + " -> " + std::to_string(rmsAfter) + ")");
+    }
+
+    // The correction must GROW with distance. A uniform brightening would pass
+    // an average-error test on a ramp while being the wrong operation entirely,
+    // so compare how much each end moved.
+    {
+        auto moved = [&](int x) {
+            double s = 0.0;
+            int n = 0;
+            for (int y = 4; y < H - 4; y += 3)
+                for (int c = 0; c < 3; ++c) {
+                    s += std::fabs(double(at(out, x, y, c)) -
+                                   double(at(hazy, x, y, c)));
+                    ++n;
+                }
+            return n ? s / double(n) : 0.0;
+        };
+        const double nearEnd = moved(10);
+        const double farEnd  = moved(W - 11);
+        Check(farEnd > nearEnd * 2.0,
+              "dehaze corrects the distant end more than the near one (" +
+                  std::to_string(nearEnd) + " vs " + std::to_string(farEnd) + ")");
+    }
+
+    // Greyscale has no cross-channel minimum, so the prior cannot work and the
+    // algorithm must pass through rather than destroy the image.
+    {
+        Image grey;
+        grey.Alloc({W, H, Format::R32F});
+        {
+            ImageView v = grey.MapCpuWrite();
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) *v.At<float>(x, y) = 0.4f;
+        }
+        Image gout;
+        if (RunFilter("dehaze", grey.Clone(), {{"strength", 0.9}}, &gout, &err)) {
+            ImageView v = gout.MapCpuRead();
+            Check(std::fabs(*v.At<float>(W / 2, H / 2) - 0.4f) < 1e-5f,
+                  "dehaze passes greyscale through rather than mangling it");
+        }
+    }
+}
+
 int main() {
     std::string err;
     TestKelvinWhiteBalance();
@@ -935,6 +1084,7 @@ int main() {
     TestFilmGrain();
     TestOrton();
     TestLut();
+    TestDehaze();
 
 
 // --- brightness handles every pixel format ---------------------------------

@@ -172,6 +172,7 @@ gx, gy, mag = sobel(src => gaussian_blur(sigma = 2))
 | `mosaic("name")` | The undemosaiced sensor mosaic. Errors on a non-raw image. |
 | `slider("label", min, max, default[, "help"])` | Declares a slider; returns its current value. The optional help string becomes its tooltip. |
 | `check("label", default)` | Declares a checkbox; returns 0 or 1. |
+| `pick("label", ["a", "b"][, default])` | Dropdown of names; returns the selected **index**. For a parameter that selects a mode with an integer. |
 | `choose("label", [a, b, c])` | Dropdown of algorithms; returns the selected one. |
 | `choose("label", "category")` | Same, but offers every algorithm in a category. |
 | `choose("label", opts, default)` | A third argument names which option starts selected. |
@@ -292,7 +293,7 @@ so these names are the ones that matter in a script.
 
 | Category | Algorithms |
 |---|---|
-| **adjust** | `basic_adjust` (exposure, contrast, highlights, shadows, whites, blacks, vibrance, saturation, white balance), `brightness`, `crop` (trim and straighten, with a preview), `vignette`, `film_grain` |
+| **adjust** | `basic_adjust` (exposure, contrast, highlights, shadows, whites, blacks, vibrance, saturation, white balance), `brightness`, `crop` (trim and straighten, with a preview), `vignette`, `film_grain`, `dehaze` (dark channel prior) |
 | **tonemap** | `tonemap` (global), `tonemap_local` (illumination/detail split) |
 | **features** | `detect_sift`, `detect_surf`, `detect_akaze`, `detect_orb`, `detect_brisk`, `draw_features`, `draw_matches` |
 | **match** | `match_brute` (exact), `match_ann` (k-d forest / LSH) |
@@ -434,8 +435,62 @@ they overlap. That last number is the direct measure of stitch quality;
 sharpness is not, because sharpness also moves with how much the canvas was
 scaled.
 
+**When ghosting survives the bundle, read `bundle_adjust`'s residual-by-band
+figures before changing anything.** They split the leftover error into the top,
+middle and bottom thirds of the frame, and the two failures they distinguish
+want opposite fixes.
+
+Roughly even means the solve is imperfect — more overlap or another detector may
+help. **Bottom-heavy means the camera translated**, which it does whenever a pan
+pivots around the photographer instead of the lens's entrance pupil. The
+leftover displacement is then `f·T/Z`: it grows as things get *closer*, so near
+content misaligns while the distance is fine. **No homography can fix that** —
+one 8-parameter warp cannot give near and far content different displacements at
+once.
+
+For that case, `winner_takes_all` takes each output pixel from a single frame
+instead of blending. Feathering *averages* the overlapping frames, and averaging
+two offset copies of a branch is exactly what makes the doubled image; choosing
+one frame cannot ghost because there is nothing to average. It also avoids the
+softening that blending causes even at perfect alignment, since each frame is
+independently resampled and the average of two softened copies is softer still.
+
+The trade is that exposure steps stop being hidden. `gain_compensation` solves
+one gain per frame from the overlaps, in log space so what gets averaged is a
+brightness *ratio*. It constrains the **seam** rather than the whole overlap,
+and compares local patches rather than single pixels — two frames sampled at one
+canvas point are looking at different scene points wherever registration is
+imperfect, and in a high-contrast scene that difference is half a stop for
+reasons having nothing to do with exposure. Measured on a 15-frame sweep, the
+seam gap went 0.299 → 0.180 stops; patch comparison was worth 3× over
+single-pixel.
+
+**A per-frame gain cannot fix a difference that varies across the frame.** A
+per-frame *ramp* was built for that and removed: every constraint is a
+difference between two frames, so a tilt applied identically to all of them is
+invisible to the fit and drifts until it hits its limit. Measured, the ramps
+railed with the same sign on all fifteen frames — which tilts the whole panorama
+and corrects no seam. The remaining residual is within-frame variation (lens
+falloff plus the scene's own gradient), and fixing it needs either a measured
+flat field or a seam-aware blend, not a better global fit.
+
 ### Notes on a few
 
+- **`dehaze`** inverts the atmospheric scattering model, `I = J·t + A·(1−t)`,
+  using He's **dark channel prior**: in almost any patch of a haze-free outdoor
+  photograph some pixel is nearly black in some channel, so where that local
+  minimum is *bright*, the brightness was added by haze. Since transmission
+  falls off with distance, the map it recovers is really a rough **depth map**
+  — which is why the correction grows toward the horizon by itself.
+
+  Put it **before the tone curve**: it inverts a physical mixing of light, so it
+  needs scene-linear values. Applied to display values it lifts the shadows
+  instead and the picture washes out.
+
+  `sky_protect` covers the prior's known failure. A large bright region with no
+  dark pixel in it — sky, snow, a white wall — looks exactly like haze and comes
+  back darkened and grey. Set it to 0 to see the raw prior; over sky that is
+  usually the most visible thing the algorithm does.
 - **`align`** solves each frame of a group against a reference and attaches the
   transform as a sidecar; it warps nothing itself. Merges sample through it if
   present. A correction below half a pixel is skipped when there is no other
@@ -547,8 +602,17 @@ scaled.
 `tglab_pyramid_tests` needs a device but *skips* rather than fails without one,
 so it stays in the gating suite on a machine with no GPU.
 
-`bench_detect` reports per-detector CPU/GPU timings and feature counts, and
-`bench_pyramid` isolates the SIFT blur pyramid. Both take `width height`.
+**Measurement tools**, none of them gating tests — they report a number and
+leave the judgement to you:
+
+| Tool | Answers |
+|---|---|
+| `bench_detect <w> <h>` | Per-detector CPU/GPU timings and feature counts. |
+| `bench_pyramid <w> <h>` | The SIFT blur pyramid alone, CPU vs GPU. |
+| `bench_dehaze <image>` | Dehaze on a real image. `BENCH_ALGO=brightness` times a trivial algorithm instead, which gives the framework's own unpack/pack floor — worth knowing before optimising anything. |
+| `bench_stitch <raw>...` | The whole panorama chain headlessly, printing every stage's report. `--gain`, `--wta`. |
+| `frame_exposure <raw>...` | What actually differs across a sweep: EXIF settings, measured brightness, centre vs surround. Says whether seams want a per-frame gain or something spatial. |
+| `vignette_profile <raw>...` | Lens falloff measured by averaging frames in sensor coordinates. **Reads its own verdict**: it refuses to call a result a lens profile when the variation is not radial. |
 
 Or `ctest --test-dir build -C Release` for all of them. `build.ps1` configures,
 builds and tests in one step.

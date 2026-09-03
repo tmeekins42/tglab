@@ -124,6 +124,32 @@ template <>
 bool Param<int>::DrawWidget() {
     int tmp = m_v;
     bool changed = false;
+
+    // A named integer is a CHOICE, so draw the choice. Dragging a slider onto
+    // an exact value to select a mode is a poor way to pick one of three
+    // things, and it forces the label to spell out the mapping ("projection:
+    // 0 plane, 1 cylinder, 2 sphere") because the widget only shows a number.
+    if (m_opts.HasChoices()) {
+        const int base = m_lo;
+        const int n    = m_opts.choiceCount;
+        const int idx  = std::clamp(m_v - base, 0, n - 1);
+        if (ImGui::BeginCombo(m_name, m_opts.choices[idx])) {
+            for (int i = 0; i < n; ++i) {
+                const bool sel = (i == idx);
+                if (ImGui::Selectable(m_opts.choices[i], sel))
+                    changed |= set(base + i);
+                if (sel) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        // Help still applies, and double-click-to-reset still works, so the
+        // control behaves like every other one in the inspector.
+        bool resetC = false;
+        StepInput(&resetC, Help());
+        if (resetC) changed |= set(m_def);
+        return changed;
+    }
+
     if (ImGui::SliderInt(m_name, &tmp, SliderMin(), SliderMax(), "%d",
                          ImGuiSliderFlags_AlwaysClamp))
         changed = set(tmp);
@@ -209,6 +235,22 @@ bool Param<float>::DescribeControl(UiControl* out) const {
 
 template <>
 bool Param<int>::DescribeControl(UiControl* out) const {
+    // A named integer becomes a dropdown, so params() exposes it the same way
+    // the inspector draws it. The value stays the integer; only the widget
+    // changes.
+    if (m_opts.HasChoices()) {
+        out->kind = UiControl::Kind::Pick;
+        out->options.assign(m_opts.choices,
+                            m_opts.choices + m_opts.choiceCount);
+        out->lo  = double(m_lo);
+        out->hi  = double(m_hi);
+        out->def = double(m_def);
+        out->value = double(m_v);
+        out->selected     = std::clamp(m_v    - m_lo, 0, m_opts.choiceCount - 1);
+        out->defaultIndex = std::clamp(m_def  - m_lo, 0, m_opts.choiceCount - 1);
+        return true;
+    }
+
     // Ints ride the same slider; the value truncates at the Param boundary.
     out->kind  = UiControl::Kind::Slider;
     out->lo    = double(m_lo);

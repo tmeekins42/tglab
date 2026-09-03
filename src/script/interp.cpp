@@ -62,6 +62,11 @@ UiControl& UiState::FindOrAdd(const UiControl& proto) {
             existing->value = std::clamp(existing->value, proto.lo, proto.hi);
         if (!existing->options.empty())
             existing->selected = std::clamp(existing->selected, 0, int(existing->options.size()) - 1);
+        // A Pick carries both an index and the integer it stands for, and the
+        // integer is what runs. Re-derive it from the preserved index so the two
+        // cannot drift when a re-run changes the range.
+        if (existing->kind == UiControl::Kind::Pick)
+            existing->value = existing->lo + double(existing->selected);
         existing->seenThisRun = true;
         existing->declOrder   = m_declOrder++;
         return *existing;
@@ -367,6 +372,7 @@ private:
         if (calleeName == "shape")   return CallShape(e, out);
         if (calleeName == "slider")  return CallSlider(e, out);
         if (calleeName == "check")   return CallCheck(e, out);
+        if (calleeName == "pick")    return CallPick(e, out);
         if (calleeName == "choose")  return CallChoose(e, out);
         if (calleeName == "params")  return CallParams(e, out);
         if (calleeName == "display") return CallDisplay(e, out);
@@ -578,6 +584,65 @@ private:
 
         UiControl& c = m_ui->FindOrAdd(proto);
         out->push_back(Value(c.value));   // current value, not the default
+        return true;
+    }
+
+    // pick("label", ["a", "b", "c"], default) -> the INDEX of the chosen name.
+    //
+    // The counterpart to choose(): where that returns an algorithm, this returns
+    // a number, for the parameters that select a mode. Writing
+    //
+    //     proj = pick("projection", ["plane", "cylindrical", "spherical"], 1)
+    //
+    // gives a dropdown reading "cylindrical" instead of a slider reading 1, and
+    // the script no longer has to spell the mapping out in the label.
+    //
+    // An algorithm that declares ParamOpts::choices gets this automatically
+    // through params(), with no script change at all -- pick() is for the cases
+    // where the script owns the value rather than the algorithm.
+    bool CallPick(const Expr& e, std::vector<Value>* out) {
+        EvaledArgs a;
+        if (!EvalArgs(e, &a)) return false;
+        if (a.pos.size() < 2 || a.pos.size() > 3 || !a.pos[0].IsString() ||
+            !a.pos[1].IsList())
+            return Fail(e.line,
+                        "pick() takes (\"label\", [\"name\", ...]) with an "
+                        "optional third argument giving the default index");
+
+        UiControl proto;
+        proto.kind  = UiControl::Kind::Pick;
+        proto.label = a.pos[0].AsString();
+        for (const Value& v : a.pos[1].AsList().items) {
+            if (!v.IsString())
+                return Fail(e.line,
+                            std::string("pick() names must be strings, found ") +
+                                v.TypeName());
+            proto.options.push_back(v.AsString());
+        }
+        if (proto.options.empty())
+            return Fail(e.line, "pick() needs at least one name");
+
+        const int n = int(proto.options.size());
+        int def = 0;
+        if (a.pos.size() == 3) {
+            if (!a.pos[2].IsNumber())
+                return Fail(e.line, "pick() default must be a number");
+            def = int(a.pos[2].AsNumber());
+            if (def < 0 || def >= n)
+                return Fail(e.line, "pick() default is outside the list");
+        }
+
+        // Indices count from 0, so the value IS the index here. lo/hi are
+        // carried anyway because the panel derives the value from them.
+        proto.lo  = 0.0;
+        proto.hi  = double(n - 1);
+        proto.def = double(def);
+        proto.value        = proto.def;
+        proto.selected     = def;
+        proto.defaultIndex = def;
+
+        UiControl& c = m_ui->FindOrAdd(proto);
+        out->push_back(Value(c.value));   // current, not the default
         return true;
     }
 

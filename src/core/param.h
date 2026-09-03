@@ -10,6 +10,7 @@
 #include <cmath>
 #include <algorithm>
 #include <cstdint>
+#include <span>
 #include <string>
 
 namespace tglab {
@@ -44,8 +45,30 @@ struct ParamOpts {
     double softMin = 0.0;
     double softMax = 0.0;
 
+    // NAMES FOR AN INTEGER THAT SELECTS A MODE, rather than measures a
+    // quantity.
+    //
+    // A slider is the wrong control for a choice. "projection: 0 plane, 1
+    // cylinder, 2 sphere" has to spell the mapping out in its own label because
+    // the widget shows a number, the tooltip carries documentation that ought to
+    // be the control itself, and picking a value means dragging a slider onto an
+    // exact integer.
+    //
+    // Listing the names here fixes all three at once: the inspector draws a
+    // dropdown, the script's pick() offers the same names, and the label goes
+    // back to being a label. The VALUE is still the integer, so nothing
+    // downstream changes and an algorithm reads its parameter exactly as before.
+    //
+    // Names map to lo, lo+1, ... in order, so the range must cover them. That is
+    // deliberate rather than a general int-to-string map: modes that are not
+    // consecutive are almost always a sign the enum wants renumbering, and the
+    // simpler rule keeps the declaration a single line.
+    const char* const* choices = nullptr;
+    int choiceCount = 0;
+
     bool HasStep() const { return step > 0.0; }
     bool HasSoftRange() const { return softMin != softMax; }
+    bool HasChoices() const { return choices && choiceCount > 0; }
 };
 
 const char* ParamTypeName(ParamType t);
@@ -77,6 +100,16 @@ public:
 
     // One-line description, or nullptr. Declared through ParamOpts.
     virtual const char* Help() const { return nullptr; }
+
+    // The names for a mode-selecting integer, or empty. See ParamOpts::choices.
+    //
+    // On the base so the inspector and the script can both ask without knowing
+    // the concrete type -- the UI needs it to draw a dropdown instead of a
+    // slider, and pick() needs it to turn a name back into the integer.
+    virtual std::span<const char* const> Choices() const { return {}; }
+
+    // The lowest value the choices count up from; only meaningful with them.
+    virtual int ChoiceBase() const { return 0; }
 
 protected:
     const char* m_name;
@@ -121,6 +154,11 @@ public:
     }
     const ParamOpts& Opts() const { return m_opts; }
     const char* Help() const override { return m_opts.help; }
+
+    std::span<const char* const> Choices() const override {
+        return {m_opts.choices, size_t(m_opts.HasChoices() ? m_opts.choiceCount : 0)};
+    }
+    int ChoiceBase() const override { return int(m_lo); }
 
     // Slider extent: the soft range when one is declared, else the full range.
     T SliderMin() const { return m_opts.HasSoftRange() ? T(m_opts.softMin) : m_lo; }

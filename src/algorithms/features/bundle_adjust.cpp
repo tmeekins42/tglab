@@ -161,12 +161,18 @@ public:
     std::string RunReport() const override {
         if (!m_note.empty()) return m_note;
         if (m_frames == 0) return {};
-        char buf[224];
+        char buf[320];
+        // The band figures say WHERE the leftover error is: top/middle/bottom
+        // thirds of the frame. Even means the solve is merely imperfect;
+        // bottom-heavy means the camera translated and near content cannot
+        // follow the same warp as far content. See the note at the split.
         std::snprintf(buf, sizeof buf,
                       "bundle: %d frames, %d observations, rms %.2f -> %.2f px "
-                      "in %d iterations, focal %.0f px",
+                      "in %d iterations, focal %.0f px; residual by band "
+                      "%.1f / %.1f / %.1f px (top/mid/bottom)",
                       m_frames, m_obs, double(m_rms0), double(m_rms1),
-                      m_iters, double(m_focal));
+                      m_iters, double(m_focal),
+                      double(m_band[0]), double(m_band[1]), double(m_band[2]));
         return buf;
     }
 
@@ -231,6 +237,7 @@ private:
     int         m_obs    = 0;
     int         m_iters  = 0;
     float       m_rms0 = 0.0f, m_rms1 = 0.0f;
+    float       m_band[3] = {0.0f, 0.0f, 0.0f};   // residual by image thirds
     float       m_focal = 0.0f;
     std::string m_note;
 };
@@ -599,6 +606,40 @@ bool BundleAdjust::RunAlign(std::vector<Image>* images, std::string* err) {
 
     m_rms1 = float(std::sqrt(cost / double(obs.size())));
     m_focal = float(focal);
+
+    // --- where the leftover error IS, not just how big it is -----------------
+    //
+    // An RMS is one number and it cannot distinguish the two failures that look
+    // alike in the output. If the solve is simply imperfect, the residual is
+    // scattered evenly over the frame. If the camera TRANSLATED between shots --
+    // which it does whenever a pan pivots around the photographer rather than
+    // the lens's entrance pupil -- the leftover displacement is f*T/Z, so it
+    // grows as things get closer, and near content is not evenly distributed:
+    // in a landscape it is along the bottom.
+    //
+    // That distinction decides what to do next, and they want opposite fixes.
+    // Uniform: adjust the solver. Bottom-heavy: no homography can fix it,
+    // because one 8-parameter warp cannot give near and far content different
+    // displacements at once -- it needs deghosting or a seam that avoids the
+    // parallax, not a better global transform.
+    //
+    // Split by the y of the point in frame i, in thirds.
+    {
+        double band[3] = {0.0, 0.0, 0.0};
+        int    count[3] = {0, 0, 0};
+        const double third = 2.0 * cy / 3.0;   // cy is half the height
+        for (const Obs& o : obs) {
+            double rx = 0.0, ry = 0.0;
+            Residual(o, R, focal, cx, cy, &rx, &ry);
+            int b = int(double(o.yi) / std::max(third, 1.0));
+            b = std::clamp(b, 0, 2);
+            band[b] += rx * rx + ry * ry;
+            ++count[b];
+        }
+        for (int b = 0; b < 3; ++b)
+            m_band[b] = count[b] ? float(std::sqrt(band[b] / double(count[b])))
+                                 : 0.0f;
+    }
 
     // --- write the refined rotations back as transforms ----------------------
     for (int i = 0; i < n; ++i) {

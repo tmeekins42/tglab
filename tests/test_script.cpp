@@ -159,6 +159,84 @@ int main() {
             Check(ui.Controls()[0].value == 0.5, "slider default applied");
     }
 
+    // --- pick(): a dropdown whose value is an integer ------------------------
+    //
+    // The counterpart to choose(). Several algorithms select a mode with an
+    // integer, and a slider is the wrong control for that: it shows a number, so
+    // the label has to spell the mapping out ("projection: 0 plane, 1 cylinder,
+    // 2 sphere") and choosing means dragging onto an exact value.
+    {
+        UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+        const bool ok = RunScript(
+            "src = image(\"test\")\n"
+            "m = pick(\"mode\", [\"one\", \"two\", \"three\"], 1)\n"
+            "out = brightness(src, brightness = m)\n",
+            &ui, &p, &err, &src);
+        Check(ok, "pick() runs" + (ok ? "" : ": " + err));
+        if (ok && !ui.Controls().empty()) {
+            const UiControl& c = ui.Controls()[0];
+            Check(c.kind == UiControl::Kind::Pick, "pick() declares a Pick control");
+            Check(c.options.size() == 3, "...carrying its names");
+            // The VALUE is the integer, which is the whole point: an algorithm
+            // reads its parameter exactly as before.
+            Check(c.value == 1.0 && c.selected == 1,
+                  "...defaulting to the named index");
+        }
+
+        // Selecting a different name must move the value, not just the index --
+        // the value is what reaches the parameter, so if they drift the dropdown
+        // shows one mode while the algorithm runs another.
+        if (ok && !ui.Controls().empty()) {
+            ui.Controls()[0].selected = 2;
+            ui.Controls()[0].value    = 2.0;
+            UiState& u2 = ui;
+            Pipeline p2; std::string e2; std::vector<Data> s2;
+            const bool ok2 = RunScript(
+                "src = image(\"test\")\n"
+                "m = pick(\"mode\", [\"one\", \"two\", \"three\"], 1)\n"
+                "out = brightness(src, brightness = m)\n",
+                &u2, &p2, &e2, &s2);
+            Check(ok2 && !u2.Controls().empty() && u2.Controls()[0].value == 2.0,
+                  "pick() preserves the selection across a re-run");
+        }
+
+        // Bad input is rejected with a line number rather than silently taking
+        // option 0.
+        UiState u3; Pipeline p3; std::string e3; std::vector<Data> s3;
+        Check(!RunScript("src = image(\"test\")\n"
+                         "m = pick(\"mode\", [\"a\", \"b\"], 5)\n",
+                         &u3, &p3, &e3, &s3),
+              "pick() rejects a default outside the list");
+    }
+
+    // --- an algorithm's own named integer becomes a dropdown -----------------
+    //
+    // The point of putting the names in ParamOpts rather than in the script:
+    // params() picks them up with no script change, and the inspector draws the
+    // same control. stitch_panorama's projection is the case this was built for.
+    {
+        auto a = Registry::Get().Create("stitch_panorama");
+        Check(a != nullptr, "stitch_panorama exists");
+        if (a) {
+            ParamBase* pb = a->FindParam("projection");
+            Check(pb != nullptr, "...and has a projection parameter");
+            if (pb) {
+                Check(pb->Choices().size() == 3,
+                      "...which declares three names");
+                UiControl c;
+                Check(pb->DescribeControl(&c),
+                      "...and describes itself as a control");
+                Check(c.kind == UiControl::Kind::Pick,
+                      "...as a dropdown rather than a slider");
+                Check(c.options.size() == 3 && c.options[1] == "cylindrical",
+                      "...carrying the declared names");
+                // Range still governs: the names count up from lo.
+                Check(c.value == 1.0,
+                      "...opening on the declared default");
+            }
+        }
+    }
+
     // --- slider() takes an optional help string ------------------------------
     //
     // Without it a script's own sliders were the only controls in the panel
@@ -3229,7 +3307,7 @@ int main() {
         //
         // Only these two, and only against the stock test image: most scripts
         // want a raw file that is not in the repo.
-        for (const char* name : {"autodevelop.tgl", "denoise.tgl"}) {
+        for (const char* name : {"autodevelop.tgl", "denoise.tgl", "dehaze.tgl"}) {
             std::ifstream in(dir / name);
             std::stringstream ss;
             ss << in.rdbuf();
@@ -5306,6 +5384,123 @@ int main() {
                     Check(dis >= 0.0f && dis < 12.0f,
                           std::string(names[proj]) + ": the frames agree where they overlap (" +
                               std::to_string(dis) + "%)");
+                }
+
+                // GAIN COMPENSATION, on frames whose exposure difference is
+                // known because the fixture put it there.
+                //
+                // The middle frame is darkened by a third of a stop and the
+                // solver has to find it from the overlaps alone.
+                //
+                // Checked by DISAGREEMENT, not by the size of the correction.
+                // A magnitude check passes just as happily on a correction
+                // applied backwards -- which is exactly the bug this found: the
+                // solve stored each frame's error where it wanted the fix, so
+                // every gain came out inverted and drove the seams apart. The
+                // magnitude looked plausible throughout.
+                //
+                // So the test compensates, and requires the frames to agree
+                // BETTER than they did uncorrected. That cannot pass with the
+                // sign wrong, and it does not depend on the exact figure the
+                // fixture's overlap happens to produce.
+                {
+                    auto runGain = [&](int mode, float* disagree, float* stops,
+                                       std::string* err) {
+                        ImageSet set;
+                        set.images.push_back(photo.Clone());
+
+                        Image dim = warpBy(photo, panBy(4.0f));
+                        {
+                            // Through a PixelBuffer, NOT At<float>: the fixture
+                            // photo is 8-bit, so a raw float write would
+                            // reinterpret four pixels as one and corrupt the
+                            // frame rather than dimming it.
+                            ImageView dv = dim.MapCpuWrite();
+                            PixelBuffer db;
+                            db.Unpack(dv);
+                            const float k = std::pow(2.0f, -1.0f / 3.0f);  // -1/3 stop
+                            for (int y = 0; y < db.Height(); ++y)
+                                for (int x = 0; x < db.Width(); ++x) {
+                                    float* p = db.At(x, y);
+                                    for (int c = 0; c < std::min(3, db.Channels()); ++c)
+                                        p[c] *= k;
+                                }
+                            db.PackInto(dv);
+                        }
+                        set.images.push_back(std::move(dim));
+                        set.images.push_back(warpBy(photo, panBy(8.0f)));
+                        set.shape = Shape{{{"frame", 3}}};
+
+                        std::vector<Data> s;
+                        s.push_back(Data{std::move(set)});
+
+                        Pipeline p;
+                        p.AddStage(Registry::Get().Create("detect_sift"),
+                                   "detect_sift", {{-1, 0}}, 1, 1);
+                        auto m = Registry::Get().Create("match_brute");
+                        if (ParamBase* pb = m->FindParam("chain")) {
+                            std::string e; pb->SetFromScript(Value(1.0), &e);
+                        }
+                        if (ParamBase* pb = m->FindParam("ratio")) {
+                            std::string e; pb->SetFromScript(Value(0.95), &e);
+                        }
+                        p.AddStage(std::move(m), "match_brute", {{0, 0}}, 1, 2);
+                        auto a = Registry::Get().Create("align_features");
+                        if (ParamBase* pb = a->FindParam("model")) {
+                            std::string e; pb->SetFromScript(Value(0.0), &e);
+                        }
+                        p.AddStage(std::move(a), "align_features", {{1, 0}}, 1, 3);
+                        auto st = Registry::Get().Create("stitch_panorama");
+                        if (ParamBase* pb = st->FindParam("focal")) {
+                            std::string e;
+                            pb->SetFromScript(Value(double(kFocal)), &e);
+                        }
+                        if (ParamBase* pb = st->FindParam("gain_compensation")) {
+                            std::string e;
+                            pb->SetFromScript(Value(double(mode)), &e);
+                        }
+                        p.AddStage(std::move(st), "stitch_panorama", {{2, 0}}, 1, 0);
+
+                        if (!p.Execute(&s, nullptr, err)) return false;
+
+                        const std::string rep = p.Stages()[3].algo->RunReport();
+                        const size_t kd = rep.find("disagreeing ");
+                        *disagree = (kd == std::string::npos)
+                            ? -1.0f : float(atof(rep.c_str() + kd + 12));
+                        const size_t kg = rep.find("gain up to ");
+                        *stops = (kg == std::string::npos)
+                            ? 0.0f : float(atof(rep.c_str() + kg + 11));
+                        return true;
+                    };
+
+                    float disOff = -1.0f, disOn = -1.0f, stOff = 0.0f, stOn = 0.0f;
+                    std::string e;
+                    const bool ranOff = runGain(0, &disOff, &stOff, &e);
+                    Check(ranOff, std::string("gain compensation off runs") +
+                                      (e.empty() ? "" : ": " + e));
+                    const bool ranOn = runGain(1, &disOn, &stOn, &e);
+                    Check(ranOn, std::string("gain compensation runs") +
+                                     (e.empty() ? "" : ": " + e));
+
+                    if (ranOff && ranOn) {
+                        // The fixture plants exactly 1/3 stop, and the solver
+                        // recovers 0.231 -- so this is tight rather than loose.
+                        // The gauge removes the mean instead of pinning frame
+                        // 0, which is why the recovered figure is the full 1/3
+                        // stop on the odd frame with the other two taking half
+                        // of it in the opposite direction.
+                        Check(stOn > 0.20f && stOn < 0.27f,
+                              "gain compensation recovers the planted 1/3 stop (" +
+                                  std::to_string(stOn) + " stops)");
+
+                        // The check that has teeth: correcting must make the
+                        // frames agree BETTER. A gain applied backwards has a
+                        // perfectly reasonable magnitude and makes this worse.
+                        Check(disOn < disOff,
+                              "gain compensation reduces overlap disagreement (" +
+                                  std::to_string(disOff) + "% -> " +
+                                  std::to_string(disOn) + "%)");
+                    }
                 }
 
                 // THE FOCAL ESTIMATOR, on a fixture whose focal length is

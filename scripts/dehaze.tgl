@@ -1,0 +1,78 @@
+# Dehaze — He, Sun & Tang's dark channel prior (2009).
+#
+# WHAT IT IS DOING, because the sliders make more sense once the model does.
+#
+# A hazy pixel is a mix of the real scene and scattered light:
+#
+#     I = J * t  +  A * (1 - t)
+#
+#   I  what the camera saw
+#   J  the haze-free scene
+#   A  the AIRLIGHT -- the colour of the haze, usually a pale grey-blue
+#   t  TRANSMISSION -- how much of the scene survived, 1 clear and 0 pure haze
+#
+# t falls off with distance, so dehazing is really depth estimation: the "haze
+# map" this recovers IS a rough depth map, which is why the correction grows
+# toward the horizon on its own rather than needing a gradient painted in.
+#
+# One equation, two unknowns. The DARK CHANNEL PRIOR supplies the rest: in
+# almost any patch of a haze-free outdoor photograph, some pixel is nearly black
+# in some channel -- a shadow, dark foliage, a window. Where that local minimum
+# is NOT dark, the brightness was added by haze, and how much tells you t.
+#
+# PUT IT BEFORE THE TONE CURVE. This inverts a physical mixing of light, so it
+# belongs in scene-linear values. Applied to display values it lifts the shadows
+# instead and the picture washes out.
+
+src = image("test")
+
+# STRENGTH is how much of the estimated haze to remove.
+#
+# Not 1.0, even though the model would allow it: removing all the haze takes
+# away the aerial perspective that tells the eye something is distant, and a
+# fully dehazed landscape reads as a flat cutout. He uses 0.95 on deliberately
+# hazy scenes; 0.7-0.9 is the useful range for a photograph.
+amount = slider("dehaze", 0, 1, 0.8,
+                "How much of the estimated haze to remove. 0 is off.")
+
+# SKY PROTECT covers the prior's known failure.
+#
+# The prior assumes every patch has a dark pixel in it. A large bright region
+# with none -- open sky, snow, a white wall -- looks exactly like haze, so it
+# gets darkened and often turns grey. This floors the transmission where a pixel
+# is already close to the airlight COLOUR, which leaves a white building against
+# blue sky alone while protecting the sky itself.
+#
+# Set it to 0 to see what the raw prior does; the difference over the sky is
+# usually the most visible thing this algorithm does.
+protect = slider("sky protect", 0, 1, 0.8,
+                 "Floors the transmission where a pixel is already the airlight colour, so sky and snow are not read as haze.")
+
+hazy = src => display("original")
+
+clear = dehaze(hazy, strength = amount, sky_protect = protect)
+        => display("dehazed")
+
+# THE TWO RADII are the ones worth understanding if the result looks wrong, and
+# they fail in opposite directions. Both are stated per 1000 px and scaled to
+# the image, so a value that works here works on a 45 MP frame too.
+#
+#   patch    the window the dark channel is minimised over. Too small and the
+#            prior gets noisy, because a small patch may genuinely contain no
+#            dark pixel. Too large and thin bright things against sky -- a bare
+#            branch, a mast -- are swallowed and treated as haze.
+#
+#   refine   the guided filter that snaps the transmission map to the image's
+#            edges. Too small and the map stays blocky, which shows as halos
+#            wherever depth changes. Too large is the subtler failure: it
+#            smooths ACROSS depth, so the far distance stops being corrected
+#            more than the foreground and the whole effect flattens into a
+#            contrast boost. Measured on a synthetic depth ramp, an oversized
+#            refine radius cut the far-versus-near correction ratio from 2.7x
+#            to 1.5x.
+#
+# Uncomment to expose them:
+#
+# _ = params(dehaze)
+
+display(clear, "final")

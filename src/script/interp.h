@@ -18,7 +18,12 @@ namespace tglab {
 // A UI control declared by the script. Values persist across re-runs and hot
 // reloads (matched by label), so editing a script does not reset tuning.
 struct UiControl {
-    enum class Kind { Slider, Check, Choose };
+    // Pick is a dropdown like Choose, but its value is an INTEGER rather than
+    // an algorithm name -- the mode selector on an ordinary parameter. Kept
+    // distinct because the two mean different things downstream: Choose feeds a
+    // registry lookup, Pick feeds a Param<int>. Sharing one kind would make
+    // every consumer ask which flavour it was holding.
+    enum class Kind { Slider, Check, Choose, Pick };
 
     Kind        kind = Kind::Slider;
 

@@ -90,6 +90,43 @@ Param<int> m_window{this, "window", 15, 3, 201,
 
 Omit the argument and the parameter behaves exactly as before.
 
+**An integer that selects a MODE gets names, not a slider.** A slider shows a
+number, so the mapping ends up spelled out in the label and picking a value
+means dragging onto an exact integer:
+
+```cpp
+// Before: the label carries the documentation, the widget shows "1".
+Param<int> m_projection{this, "projection", 1, 0, 2,
+    {.help = "0 plane, 1 cylindrical, 2 spherical. ..."}};
+
+// After: a dropdown reading "cylindrical", and the label is just a label.
+static constexpr const char* kProjectionNames[] = {
+    "plane", "cylindrical", "spherical"};
+
+Param<int> m_projection{this, "projection", 1, 0, 2,
+    {.help = "The surface the frames are projected onto. ...",
+     .choices = kProjectionNames, .choiceCount = 3}};
+```
+
+Names map to `lo`, `lo+1`, … in order, so the range must cover them. The
+**value is still the integer** — the algorithm reads its parameter exactly as
+before, and nothing downstream changes. Both the inspector and `params()` pick
+this up automatically; there is no script change and no second declaration.
+
+Non-consecutive modes are not supported on purpose: they are almost always a
+sign the enum wants renumbering, and the restriction keeps the declaration one
+line.
+
+For a value the SCRIPT owns rather than an algorithm, `pick()` is the same
+control:
+
+```
+proj = pick("projection", ["plane", "cylindrical", "spherical"], 1)
+```
+
+It returns the index, so it drops straight into a parameter that expects the
+integer. And a two-state mode is a `check()`, not a two-entry `pick()`.
+
 **A path, not a number.** `Param<std::string>` exists for the one thing a
 numeric parameter cannot express — `apply_lut`'s `.cube` file. It deliberately
 has *no widget*: `DescribeControl()` returns false, so `params()` skips it and
