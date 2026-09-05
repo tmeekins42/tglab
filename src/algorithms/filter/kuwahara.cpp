@@ -48,7 +48,7 @@ public:
         if (!m_in.Valid()) return;
         m_out.AllocLike(m_in);
 
-        const int radius = std::max(1, int(m_radius));
+        const int radius = std::max(1, ctx.ScaledRadius(int(m_radius)));
         const int w = m_in.Width(), h = m_in.Height(), ch = m_in.Channels();
         const int filtered = (ch == 1) ? 1 : 3;
 
@@ -109,6 +109,9 @@ public:
     // dependency: a natural fit. Capped so a large radius cannot stall the
     // device -- four quadrants of (r+1)^2 each grows quickly.
     static constexpr int kMaxGpuRadius = 12;
+    // Reads a window of this radius, so a tile needs that much margin.
+    int ReachPixels() const override { return std::max(1, int(m_radius)); }
+
     bool HasGPU() const override { return int(m_radius) <= kMaxGpuRadius; }
 
     const char* GpuSource() const override {
@@ -177,7 +180,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     }
 
     std::vector<uint32_t> GpuConstants(int) const override {
-        return {uint32_t(std::max(1, int(m_radius)))};
+        return {uint32_t(std::max(1, GpuScaledRadius(int(m_radius))))};
     }
 
 private:

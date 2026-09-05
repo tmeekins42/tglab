@@ -6372,6 +6372,98 @@ int main() {
             }
         }
 
+        // THE GRID ROTATES WITH THE CROP, which is the only reason it is worth
+        // having: a horizon is level exactly when it lies along a grid line, and
+        // that test is meaningless if the lines keep their own angle while the
+        // rectangle turns under them.
+        //
+        // Checked by counting drawn pixels along a ROW near the rectangle's
+        // vertical centre. Unrotated, a horizontal grid line lies along that row
+        // and marks many pixels in it; rotated, the same line crosses the row in
+        // only a few places. A grid drawn in screen space would give the same
+        // count either way.
+        {
+            auto gridRun = [&](double angle, int grid, Image* out) {
+                auto algo = Registry::Get().Create("crop");
+                if (!algo) return false;
+                auto set = [&](const char* n, double v) {
+                    if (ParamBase* pb = algo->FindParam(n)) {
+                        std::string e; pb->SetFromScript(Value(v), &e);
+                    }
+                };
+                set("preview", 1.0);
+                set("left", 0.0); set("right", 0.0);
+                set("top", 0.0);  set("bottom", 0.0);
+                set("angle", angle);
+                set("preview_grid", double(grid));
+                set("preview_grid_opacity", 1.0);   // full, so the test is not
+                                                    // reading a faint blend
+
+                // Flat mid-grey: any strongly green pixel can only be drawn.
+                Image src;
+                ImageDesc d{100, 100, Format::RGBA32F};
+                src.Alloc(d);
+                {
+                    ImageView v = src.MapCpuWrite();
+                    for (int y = 0; y < 100; ++y)
+                        for (int x = 0; x < 100; ++x) {
+                            float* p = v.At<float>(x, y);
+                            p[0] = p[1] = p[2] = 0.2f; p[3] = 1.0f;
+                        }
+                }
+
+                std::vector<Data> ins;
+                ins.push_back(Data{std::move(src)});
+                std::vector<const Data*> inPtrs{&ins[0]};
+                std::vector<Data> outs(1);
+                Image o;
+                o.Alloc(d);
+                outs[0] = Data{std::move(o)};
+                RunCtx c(inPtrs, outs);
+                algo->RunCPU(c);
+                Image* got = std::get_if<Image>(&outs[0]);
+                if (!got) return false;
+                *out = got->Clone();
+                return true;
+            };
+
+            // Count drawn pixels in one row, away from the frame edge so the
+            // rectangle's own border does not enter the count.
+            auto rowMarks = [](const Image& im, int y) {
+                ImageView v = const_cast<Image&>(im).MapCpuRead();
+                int n = 0;
+                for (int x = 10; x < 90; ++x) {
+                    const float* p = v.At<float>(x, y);
+                    if (p[1] > p[0] * 1.5f && p[1] > p[2] * 1.5f) ++n;
+                }
+                return n;
+            };
+
+            Image flat, tilted, none;
+            // Thirds: horizontal lines at y = 33 and 67 of a full-frame crop.
+            if (gridRun(0.0, 2, &flat) && gridRun(20.0, 2, &tilted) &&
+                gridRun(0.0, 0, &none)) {
+
+                const int flatN   = rowMarks(flat, 33);
+                const int tiltedN = rowMarks(tilted, 33);
+                const int noneN   = rowMarks(none, 33);
+
+                Check(noneN == 0,
+                      "preview_grid = 0 draws no grid (" +
+                          std::to_string(noneN) + " marks)");
+                Check(flatN > 60,
+                      "the grid draws a horizontal line across the rectangle (" +
+                          std::to_string(flatN) + " marks)");
+                Check(tiltedN < flatN / 3,
+                      "the grid ROTATES with the crop rather than staying "
+                      "screen-aligned (" + std::to_string(tiltedN) +
+                      " marks at 20 degrees vs " + std::to_string(flatN) +
+                      " at 0)");
+            } else {
+                Check(false, "crop grid runs");
+            }
+        }
+
         // THE TWO MODES AGREE. This is the property the whole design rests on:
         // the rectangle drawn in preview has to be the rectangle that comes out
         // when preview is turned off, or the toggle is a lie.

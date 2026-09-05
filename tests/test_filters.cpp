@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -704,6 +705,55 @@ static void TestOrton() {
     } else {
         Check(false, "orton HDR runs: " + err);
     }
+
+    // THE S-CURVE MUST NOT TURN OVER ON A BLOWN HIGHLIGHT.
+    //
+    // Reported from a real landscape: overexposed cloud came out BLACK at every
+    // Orton strength. The cause was smoothstep, which is only a step on 0..1 --
+    // past 1 its cubic dives (t=1.5 gives exactly 0, t=2 gives -4, t=3 gives
+    // -27). At the default contrast of 0.2 that put anything above about 2.4x
+    // white below zero, and scene-linear highlights are routinely 4-8x.
+    //
+    // The existing HDR check above missed it entirely because it passes
+    // contrast = 0, which switches the S-curve off. Any test of an HDR path has
+    // to exercise the DEFAULT settings, not a configuration that happens to
+    // avoid the arithmetic under suspicion.
+    {
+        const std::vector<std::pair<std::string, double>> withCurve = {
+            {"blur", 10.0}, {"strength", 1.0}, {"brightness", 1.0},
+            {"contrast", 0.2}};
+
+        // Several brightnesses, because the failure was not at one value: the
+        // cubic crosses zero at t=1.5 and gets worse from there, so a single
+        // sample could sit either side of it by luck.
+        for (float fg : {1.2f, 2.0f, 4.0f, 8.0f}) {
+            Image out;
+            if (!RunFilter("orton", spot(0.05f, fg), withCurve, &out, &err)) {
+                Check(false, "orton with contrast runs: " + err);
+                continue;
+            }
+            const float centre = at(out, N / 2, N / 2);
+            Check(centre > 0.5f * fg,
+                  "a blown highlight survives the S-curve at " +
+                      std::to_string(fg) + "x white (" +
+                      std::to_string(centre) + ")");
+        }
+
+        // MONOTONIC through white: brighter in must stay brighter out. This is
+        // the property the cubic broke, and checking it directly is what makes
+        // the test about the shape of the curve rather than about one value.
+        float prev = -1e9f;
+        bool rising = true;
+        for (float fg : {0.5f, 0.9f, 1.0f, 1.1f, 1.5f, 2.0f, 3.0f, 6.0f}) {
+            Image out;
+            if (!RunFilter("orton", spot(0.05f, fg), withCurve, &out, &err))
+                continue;
+            const float centre = at(out, N / 2, N / 2);
+            if (centre <= prev) rising = false;
+            prev = centre;
+        }
+        Check(rising, "orton's S-curve stays monotonic across the white point");
+    }
 }
 
 // --- 3D LUTs ---------------------------------------------------------------
@@ -1075,6 +1125,324 @@ static void TestDehaze() {
                   "dehaze passes greyscale through rather than mangling it");
         }
     }
+
+    // AN OVER-STRONG CORRECTION MUST DARKEN, NOT CHANGE COLOUR.
+    //
+    // Where a pixel sits below the airlight, (I - A) is negative and a hard
+    // correction drives the recovery negative. Clamping each channel at zero
+    // on its own then removes the channels at different rates -- red first,
+    // blue last -- and a neutral cloud comes out PURPLE. That is much worse
+    // than the darkening it replaces, because it does not read as too much
+    // dehaze, it reads as a broken image.
+    //
+    // A scene-linear frame is what exposes it: values above 1.0 in the
+    // highlights let the airlight search land on a specular edge, after which
+    // every pixel in the sky is below the airlight.
+    {
+        Image sky;
+        sky.Alloc({W, H, Format::RGBA32F});
+        {
+            ImageView v = sky.MapCpuWrite();
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    float* p = v.At<float>(x, y);
+                    // A neutral grey cloud field, plus blown highlights well
+                    // above 1.0 for the airlight search to land on.
+                    //
+                    // The highlights are BLUE-TINTED, which is the part that
+                    // matters. A neutral airlight cannot shift a hue however
+                    // badly the clamping behaves -- all three channels recover
+                    // identically -- so a neutral fixture would pass whether
+                    // the bug were present or not. The real image's airlight
+                    // came from a sunlit cloud edge and was not neutral, and
+                    // it is the GAP between channels that decides which one
+                    // reaches the clamp first.
+                    const bool hot = (x > W - 12 && y < 12);
+                    if (hot) { p[0] = 2.4f; p[1] = 2.7f; p[2] = 3.0f; }
+                    else     { p[0] = p[1] = p[2] = 0.72f; }
+                    p[3] = 1.0f;
+                }
+        }
+
+        Image out;
+        std::string e2;
+        if (RunFilter("dehaze", sky.Clone(),
+                      {{"strength", 1.0}, {"sky_protect", 0.0}}, &out, &e2)) {
+            ImageView v = out.MapCpuRead();
+
+            // Worst hue departure over the neutral field. The input is exactly
+            // neutral, so any spread between channels is introduced by the
+            // recovery -- there is nothing else it could come from.
+            float worst = 0.0f;
+            for (int y = 20; y < H; ++y)
+                for (int x = 0; x < W - 20; ++x) {
+                    const float* p = v.At<float>(x, y);
+                    const float hi = std::max(p[0], std::max(p[1], p[2]));
+                    const float lo = std::min(p[0], std::min(p[1], p[2]));
+                    worst = std::max(worst, hi - lo);
+                }
+            Check(worst < 0.02f,
+                  "a neutral sky stays neutral however hard it is dehazed "
+                  "(worst channel spread " + std::to_string(worst) + ")");
+        } else {
+            Check(false, "dehaze runs on a scene-linear sky: " + e2);
+        }
+    }
+}
+
+// resize, and the proxy-scale bookkeeping the interactive path rests on.
+static void TestResize() {
+    const int W = 240, H = 160;
+
+    // A gradient plus fine detail. The gradient checks that resampling does not
+    // shift or bias; the fine detail is what ALIASES if a minify samples rather
+    // than averaging, which is the failure this is really guarding.
+    Image src;
+    src.Alloc({W, H, Format::RGBA32F});
+    {
+        ImageView v = src.MapCpuWrite();
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                float* p = v.At<float>(x, y);
+                p[0] = float(x) / float(W - 1);
+                p[1] = float(y) / float(H - 1);
+                p[2] = ((x + y) % 2 == 0) ? 1.0f : 0.0f;   // 1-px checker
+                p[3] = 1.0f;
+            }
+    }
+
+    auto at = [](const Image& im, int x, int y, int c) {
+        ImageView v = const_cast<Image&>(im).MapCpuRead();
+        return v.At<float>(x, y)[c];
+    };
+
+    std::string err;
+
+    // MINIFY averages rather than samples.
+    //
+    // The blue channel is a one-pixel checker, so its true local mean is 0.5
+    // everywhere. An area average returns that; point or bilinear sampling
+    // returns values near 0 or 1 depending which pixel it lands on -- and those
+    // MOVE as the scale changes, which is what makes a sampled proxy shimmer
+    // while a slider drags.
+    {
+        Image tiny;
+        if (RunFilter("resize", src.Clone(), {{"scale", 0.25}}, &tiny, &err)) {
+            Check(tiny.Desc().width == 60 && tiny.Desc().height == 40,
+                  "resize scales the raster (" +
+                      std::to_string(tiny.Desc().width) + "x" +
+                      std::to_string(tiny.Desc().height) + ")");
+
+            double worst = 0.0;
+            for (int y = 2; y < 38; ++y)
+                for (int x = 2; x < 58; ++x)
+                    worst = std::max(worst,
+                        std::fabs(double(at(tiny, x, y, 2)) - 0.5));
+            Check(worst < 0.1,
+                  "minify AREA-AVERAGES rather than sampling (checker mean "
+                  "off by at most " + std::to_string(worst) + ")");
+
+            // And the gradient survives: the first and last columns should read
+            // close to their source positions, not shifted by half a pixel.
+            Check(at(tiny, 0, 20, 0) < 0.05f && at(tiny, 59, 20, 0) > 0.95f,
+                  "minify keeps the gradient aligned (" +
+                      std::to_string(at(tiny, 0, 20, 0)) + ".." +
+                      std::to_string(at(tiny, 59, 20, 0)) + ")");
+
+            // THE SCALE FACTOR IS RECORDED. Everything downstream depends on
+            // this: an algorithm with a pixel-unit parameter reads it to know
+            // how much to shrink its radius by.
+            Check(std::fabs(tiny.Desc().proxyScale - 0.25f) < 1e-5f,
+                  "resize records proxyScale (" +
+                      std::to_string(tiny.Desc().proxyScale) + ")");
+
+            // ...and it COMPOUNDS. Half of a half is a quarter of the original,
+            // and a downstream stage needs the total rather than the last step.
+            Image tinier;
+            if (RunFilter("resize", tiny.Clone(), {{"scale", 0.5}}, &tinier, &err))
+                Check(std::fabs(tinier.Desc().proxyScale - 0.125f) < 1e-5f,
+                      "proxyScale compounds across resizes (" +
+                          std::to_string(tinier.Desc().proxyScale) + ")");
+        } else {
+            Check(false, "resize minify runs: " + err);
+        }
+    }
+
+    // MAGNIFY interpolates, and does not shift.
+    //
+    // A half-pixel offset error is invisible on a single resize and obvious on
+    // a proxy ROUND TRIP, where it shows as the preview sliding when the scale
+    // changes. Checking the gradient's endpoints catches it directly.
+    {
+        Image big;
+        if (RunFilter("resize", src.Clone(), {{"scale", 2.0}}, &big, &err)) {
+            Check(big.Desc().width == 480 && big.Desc().height == 320,
+                  "resize magnifies (" + std::to_string(big.Desc().width) + "x" +
+                      std::to_string(big.Desc().height) + ")");
+            Check(at(big, 0, 160, 0) < 0.05f && at(big, 479, 160, 0) > 0.95f,
+                  "magnify keeps the gradient aligned (" +
+                      std::to_string(at(big, 0, 160, 0)) + ".." +
+                      std::to_string(at(big, 479, 160, 0)) + ")");
+        } else {
+            Check(false, "resize magnify runs: " + err);
+        }
+    }
+
+    // THE ROUND TRIP, which is what the proxy path actually does: shrink, work,
+    // grow back. The result must land where it started -- softer, certainly,
+    // but not shifted and not differently exposed.
+    {
+        Image tiny, back;
+        if (RunFilter("resize", src.Clone(), {{"scale", 0.25}}, &tiny, &err) &&
+            RunFilter("resize", tiny.Clone(), {{"scale", 4.0}}, &back, &err)) {
+
+            Check(back.Desc().width == W && back.Desc().height == H,
+                  "the round trip returns to the original size");
+
+            // Scale back to 1.0, because a full-resolution run must not inherit
+            // a proxy's scale -- that is the cache-poisoning failure.
+            Check(std::fabs(back.Desc().proxyScale - 1.0f) < 1e-5f,
+                  "the round trip restores proxyScale to 1.0 (" +
+                      std::to_string(back.Desc().proxyScale) + ")");
+
+            // MEAN preserved: the round trip may soften but must not darken or
+            // brighten. Measured on the gradient channel, away from the border.
+            double a = 0.0, b = 0.0;
+            int n = 0;
+            for (int y = 8; y < H - 8; ++y)
+                for (int x = 8; x < W - 8; ++x) {
+                    a += double(at(src,  x, y, 0));
+                    b += double(at(back, x, y, 0));
+                    ++n;
+                }
+            const double da = a / n, db = b / n;
+            Check(std::fabs(da - db) < 0.02,
+                  "the round trip preserves the mean (" + std::to_string(da) +
+                      " -> " + std::to_string(db) + ")");
+        } else {
+            Check(false, "resize round trip runs: " + err);
+        }
+    }
+
+    // scale = 1 is a genuine pass-through, so leaving a resize in a chain costs
+    // nothing when proxying is off.
+    {
+        Image same;
+        if (RunFilter("resize", src.Clone(), {{"scale", 1.0}}, &same, &err)) {
+            double worst = 0.0;
+            for (int y = 0; y < H; y += 7)
+                for (int x = 0; x < W; x += 7)
+                    for (int c = 0; c < 3; ++c)
+                        worst = std::max(worst,
+                            std::fabs(double(at(same, x, y, c)) -
+                                      double(at(src, x, y, c))));
+            Check(worst < 1e-6, "resize at scale 1 changes nothing (" +
+                                    std::to_string(worst) + ")");
+        }
+    }
+}
+
+// Which algorithms may run on a reduced-resolution proxy.
+//
+// Checked over the WHOLE REGISTRY rather than a handful of names, because the
+// failure this guards is an algorithm added later that quietly inherits the
+// wrong default. A demosaic run on a downscaled mosaic produces mush and looks
+// like a demosaic bug; a detector run on one produces keypoints in the wrong
+// coordinate system and looks like an alignment bug. Neither points at the
+// proxy machinery that caused it.
+static void TestProxyBehaviour() {
+    using PB = AlgorithmBase::ProxyBehaviour;
+
+    // Everything that produces or consumes a SIDECAR. Listed by name rather
+    // than derived from the category, because the categories do not line up:
+    // detect_* and draw_* say "features", match_* says "match", and
+    // align_features and bundle_adjust say "merge". A category test reads
+    // correctly and silently misses two thirds of them -- which is why this
+    // list is written out, and why the test exists at all.
+    const std::set<std::string> sidecar = {
+        "detect_sift", "detect_surf", "detect_akaze", "detect_orb",
+        "detect_brisk", "match_brute", "match_ann", "align_features",
+        "bundle_adjust", "draw_features", "draw_matches",
+    };
+
+    int never = 0, other = 0;
+    for (const std::string& name : Registry::Get().Names()) {
+        auto a = Registry::Get().Create(name);
+        if (!a) continue;
+        const std::string cat = a->Category();
+        const PB pb = a->Proxy();
+
+        // A CFA mosaic cannot survive being downscaled -- the pattern IS the
+        // data. Sidecar coordinates are in image pixels and nothing rescales
+        // them.
+        if (cat == "demosaic" || sidecar.count(name)) {
+            Check(pb == PB::Never,
+                  name + " (" + cat + ") must not run on a proxy");
+            ++never;
+        } else {
+            Check(pb != PB::Never,
+                  name + " (" + cat + ") should be proxyable");
+            ++other;
+        }
+    }
+
+    Check(never > 10 && other > 20,
+          "the proxy audit covered the registry (" + std::to_string(never) +
+              " never, " + std::to_string(other) + " proxyable)");
+
+    // resize is Exact rather than Scaled: it IS the scale change, so scaling it
+    // by the current factor as well would compound it twice.
+    {
+        auto r = Registry::Get().Create("resize");
+        if (r) Check(r->Proxy() == PB::Exact, "resize is Exact, not Scaled");
+    }
+
+    // --- region declarations ------------------------------------------------
+    //
+    // An algorithm that reads neighbours must SAY how far, or a region-limited
+    // run puts a seam at every tile edge. Checked against the set that already
+    // scales a pixel-unit parameter, because the two are the same property
+    // seen from different sides: a radius worth scaling is a radius worth
+    // declaring.
+    {
+        const std::set<std::string> neighbourhood = {
+            "gaussian_blur", "box_blur", "median_blur", "bilateral",
+            "kuwahara", "kuwahara_generalized", "symmetric_nearest",
+            "nonlocal_means", "guided_filter", "bloom", "orton",
+            "threshold_niblack", "threshold_sauvola", "dehaze",
+        };
+        for (const std::string& n : neighbourhood) {
+            auto a = Registry::Get().Create(n);
+            if (!a) continue;
+            Check(a->ReachPixels() > 0,
+                  n + " declares how far it reads (" +
+                      std::to_string(a->ReachPixels()) + " px)");
+        }
+
+        // A per-pixel algorithm must declare zero, or every region would be
+        // grown for no reason.
+        for (const char* n : {"brightness", "grayscale", "apply_lut",
+                              "vignette", "basic_adjust"}) {
+            auto a = Registry::Get().Create(n);
+            if (a)
+                Check(a->ReachPixels() == 0,
+                      std::string(n) + " is per-pixel and needs no margin");
+        }
+
+        // Whole-image statistics are safe to SHRINK and unsafe to CROP -- a
+        // distinct question from ProxyBehaviour, which is why it is a separate
+        // declaration rather than a reuse of it.
+        for (const char* n : {"threshold_otsu", "tonemap", "dehaze"}) {
+            auto a = Registry::Get().Create(n);
+            if (a) {
+                Check(!a->RegionSafe(),
+                      std::string(n) + " measures the whole frame, so it "
+                      "cannot run on a region");
+                Check(a->Proxy() != PB::Never,
+                      std::string(n) + " ...but is still fine at reduced scale");
+            }
+        }
+    }
 }
 
 int main() {
@@ -1085,6 +1453,8 @@ int main() {
     TestOrton();
     TestLut();
     TestDehaze();
+    TestResize();
+    TestProxyBehaviour();
 
 
 // --- brightness handles every pixel format ---------------------------------

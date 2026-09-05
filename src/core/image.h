@@ -149,6 +149,53 @@ struct ImageDesc {
     // inference silently.
     bool linear = false;
 
+    // Pixels here per pixel of the full-resolution original. 1.0 is full
+    // resolution; 0.25 is a quarter-scale proxy.
+    //
+    // PROXY RESOLUTION: while a slider is being dragged the pipeline runs at
+    // the resolution the image is actually displayed at, and re-runs at full
+    // resolution when the drag ends. That is what makes dragging feel live --
+    // at 22 MP even `brightness`, a five-line loop, costs 0.70 s, because the
+    // unpack/pack floor is paid per pixel by every algorithm. Fewer pixels is
+    // the only lever that helps all of them at once.
+    //
+    // On the IMAGE rather than passed to the algorithm, for exactly the reason
+    // `linear` is: it has to survive a chain of stages that do not individually
+    // care about it, and threading a parameter through every one of them would
+    // be worse.
+    //
+    // An algorithm whose parameters are in PIXELS multiplies by this when it
+    // reads them -- a blur of sigma 20 must run at sigma 5 on a quarter-scale
+    // proxy to look the same. See AlgorithmBase::Proxy().
+    float proxyScale = 1.0f;
+
+    // Where this image sits in the full-resolution original, in ITS OWN pixels.
+    //
+    // Non-zero when the pipeline computed only the visible rectangle -- the
+    // other half of "compute what the viewer can see". Zoomed in, the proxy
+    // scale correctly clamps to 1.0 and saves nothing, while most of the
+    // computed pixels are off screen.
+    //
+    // ON THE IMAGE for the same reason proxyScale is: a partial result has to
+    // be self-describing. The alternative is threading the rectangle from the
+    // pipeline through the worker to the viewer, which puts the offset in one
+    // place and the pixels in another -- and anything that fails to pass it on
+    // draws the crop as though it were the whole picture.
+    int originX = 0, originY = 0;
+
+    // The extent this image is a window ONTO, in its own pixels. Zero means it
+    // is the whole thing, which is the default and the common case.
+    //
+    // Needed because origin plus extent does not recover the full size: a crop
+    // knows where it starts and how big it is, not how big the picture was.
+    // The viewer lays out against the FULL size so the image does not jump when
+    // the pipeline switches between a crop and the whole frame -- that jump is
+    // exactly the artefact the region path exists to avoid being visible.
+    int fullW = 0, fullH = 0;
+
+    int FullWidth()  const { return fullW > 0 ? fullW : width;  }
+    int FullHeight() const { return fullH > 0 ? fullH : height; }
+
     bool operator==(const ImageDesc&) const = default;
     size_t SizeInBytes() const;
     bool   Valid() const { return width > 0 && height > 0 && format != Format::Unknown; }
@@ -158,6 +205,19 @@ struct ImageDesc {
 };
 
 // Non-owning view of CPU pixels. Algorithms operate through this.
+// A rectangle of pixels, for asking that only part of an image be computed.
+//
+// Lives here rather than nested in Pipeline so the viewer can name one without
+// pulling in the pipeline header -- the view measures the rectangle and the
+// pipeline consumes it, and neither should have to know about the other.
+//
+// Empty (w or h zero) means "all of it", which is the default everywhere and
+// what a fitted view asks for.
+struct ImageRect {
+    int x = 0, y = 0, w = 0, h = 0;
+    bool Valid() const { return w > 0 && h > 0; }
+};
+
 struct ImageView {
     uint8_t*  data   = nullptr;
     ImageDesc desc{};

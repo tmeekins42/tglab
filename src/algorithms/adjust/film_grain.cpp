@@ -106,7 +106,31 @@ public:
         const float white = m_in.ValueScale();
 
         const float strength = float(m_strength);
-        const float size     = std::max(1.0f, float(m_size));
+
+        // SCALED FOR THE PROXY, but the goal here is different from a blur's
+        // and worth stating, because "scale the size" is right for an unobvious
+        // reason.
+        //
+        // A blur reproduces the full-resolution LOOK on a smaller canvas. Grain
+        // cannot: it is a random FIELD, not a function of the image, so
+        // downsampling one realisation does not approximate another. There is
+        // no per-pixel answer to converge to.
+        //
+        // What the preview owes the user is grain the same size ON SCREEN as
+        // the final image will have. A grain of S full-resolution pixels viewed
+        // at scale k occupies S*k screen pixels; a proxy is viewed 1:1, so it
+        // needs P = S*k. The same multiply, for a different reason.
+        //
+        // It DEGRADES rather than being exact, and the floor is where: below a
+        // size of 1 the lattice cannot go finer than a pixel, so a heavy zoom-
+        // out previews grain coarser than the result. That is the honest limit
+        // of the approximation, not a bug -- and it errs toward showing MORE
+        // texture than the final image, which is the safer direction for a
+        // control whose whole job is judging how much grain to add.
+        //
+        // VarianceComp below is computed from this same scaled size, so the
+        // strength compensation follows without a second adjustment.
+        const float size     = std::max(1.0f, ctx.ScaledPx(float(m_size)));
         const float colour   = float(m_colour);
         const float shadows  = float(m_shadows);
         const uint32_t seed  = uint32_t(int(m_seed));
@@ -238,7 +262,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
             std::memcpy(&u, &f, sizeof(u));
             return u;
         };
-        return {bits(float(m_strength)), bits(std::max(1.0f, float(m_size))),
+        return {bits(float(m_strength)), bits(std::max(1.0f, GpuScaledPx(float(m_size)))),
                 bits(float(m_colour)),   bits(float(m_shadows)),
                 uint32_t(int(m_seed))};
     }

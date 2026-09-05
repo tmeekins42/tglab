@@ -219,13 +219,48 @@ public:
         auto bits = [](float f) { uint32_t u; std::memcpy(&u, &f, sizeof u); return u; };
         // Pass 1 blurs horizontally and pass 2 vertically; the rest ignore it.
         const float dir = (pass == 2) ? 1.0f : 0.0f;
+        // THE SPREAD SCALES; THE GAIN MUST NOT.
+        //
+        // Gain() in the shader is Intensity * s^2 / 64, compensating for a
+        // normalised Gaussian conserving energy -- a wide spread makes a faint
+        // glow, so the compensation keeps "intensity 1" meaning one thing at
+        // every radius.
+        //
+        // But s is in PIXELS, and a proxy changes what a pixel is. Handing the
+        // shader the scaled spread made it compute the compensation for a
+        // narrower blur than the user asked for: at a third scale, spread 24
+        // becomes 8 and the gain drops by 9x. The glow vanished during a drag
+        // and reappeared at full resolution -- looking like the spread sliders
+        // did nothing until the mouse came up.
+        //
+        // The user changed nothing; only the resolution did. So the intensity
+        // is pre-multiplied by the ratio between the gain the UNSCALED spread
+        // would have produced and the one the scaled spread will, leaving the
+        // shader's arithmetic untouched.
+        const float s0 = std::max((float(m_spreadR) + float(m_spreadG) +
+                                   float(m_spreadB)) / 3.0f, 1.0f);
+        const float s1 = std::max((GpuScaledPx(float(m_spreadR)) +
+                                   GpuScaledPx(float(m_spreadG)) +
+                                   GpuScaledPx(float(m_spreadB))) / 3.0f, 1.0f);
+        const float gainFix = (s1 > 1e-6f) ? (s0 * s0) / (s1 * s1) : 1.0f;
+
         return {bits(float(m_threshold)),
                 bits(std::max(0.01f, float(m_knee))),
-                bits(std::max(0.05f, float(m_spreadR))),
-                bits(std::max(0.05f, float(m_spreadG))),
-                bits(std::max(0.05f, float(m_spreadB))),
-                bits(float(m_intensity)),
+                bits(std::max(0.05f, GpuScaledPx(float(m_spreadR)))),
+                bits(std::max(0.05f, GpuScaledPx(float(m_spreadG)))),
+                bits(std::max(0.05f, GpuScaledPx(float(m_spreadB)))),
+                bits(float(m_intensity) * gainFix),
                 bits(dir)};
+    }
+
+    // The widest channel, at the 2.5-sigma cutoff the blur pass uses. Bloom
+    // spreads FAR -- a 24 px spread reaches 60 -- so this is the stage most
+    // likely to make a region unprofitable, which is honest rather than a
+    // reason to understate it.
+    int ReachPixels() const override {
+        const float s = std::max(float(m_spreadR),
+                                 std::max(float(m_spreadG), float(m_spreadB)));
+        return std::min(128, std::max(1, int(std::ceil(s * 2.5f))));
     }
 
 private:
@@ -284,13 +319,21 @@ void Bloom::RunCPU(RunCtx& ctx) {
 
     const float thr  = float(m_threshold) * scale;
     const float knee = std::max(0.01f, float(m_knee)) * scale;
-    const float sig[3] = {std::max(0.05f, float(m_spreadR)),
-                          std::max(0.05f, float(m_spreadG)),
-                          std::max(0.05f, float(m_spreadB))};
+    const float sig[3] = {std::max(0.05f, ctx.ScaledPx(float(m_spreadR))),
+                          std::max(0.05f, ctx.ScaledPx(float(m_spreadG))),
+                          std::max(0.05f, ctx.ScaledPx(float(m_spreadB)))};
 
     // Spread compensation, matching Gain() in the shader -- see the note above
     // kCombineHlsl for why the raw intensity is not used directly.
-    const float sAvg = std::max(1.0f, (sig[0] + sig[1] + sig[2]) / 3.0f);
+    //
+    // From the UNSCALED spreads. The compensation is a statement about the
+    // user's setting, not about the raster: it exists so "intensity 1" means
+    // one thing at every radius, and s is in pixels, so computing it from the
+    // proxy-scaled values would make it mean something different at every
+    // resolution. At a third scale that cost a factor of nine and the glow
+    // disappeared for the length of a drag.
+    const float sAvg = std::max(1.0f, (float(m_spreadR) + float(m_spreadG) +
+                                       float(m_spreadB)) / 3.0f);
     const float amt  = float(m_intensity) * (sAvg * sAvg) / 64.0f;
 
     // Highlights, thresholded on luminance -- see the note at the top.

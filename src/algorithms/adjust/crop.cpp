@@ -184,6 +184,8 @@ cbuffer Params : register(b0) {
     uint DimBits;
     uint LineWBits;
     uint LineValBits;
+    uint GridBits;
+    uint GridABits;
 };
 
 // Edge-clamped bilinear, matching algo_util/transform.h's SampleBilinear --
@@ -265,12 +267,35 @@ void main(uint3 tid : SV_DispatchThreadID) {
     float lineVal = asfloat(LineValBits);
     float dim     = asfloat(DimBits);
 
-    if (inside >= -lineW * 0.5 && inside <= lineW * 0.5)
+    if (inside >= -lineW * 0.5 && inside <= lineW * 0.5) {
         Dst[tid.xy] = float4(0.0, lineVal, 0.0, s.a);
-    else if (inside > 0.0)
-        Dst[tid.xy] = s;
-    else
+    } else if (inside > 0.0) {
+        // The division grid, in the RECTANGLE'S frame so it rotates with the
+        // crop -- see the CPU path for why that is the whole point.
+        int   grid  = int(GridBits);
+        float gridA = asfloat(GridABits);
+        float gridW = max(1.0, lineW * 0.4);
+
+        float mixv = 0.0;
+        if (grid > 0) {
+            float dx = pt.x - rcx, dy = pt.y - rcy;
+            float u =  ca * dx + sa * dy;
+            float v = -sa * dx + ca * dy;
+            float fu = u / max(cw,  1.0) + 0.5;
+            float fv = v / max(chh, 1.0) + 0.5;
+
+            float best = 1e30;
+            for (int k = 1; k < grid + 1; ++k) {
+                float g = float(k) / float(grid + 1);
+                best = min(best, abs(fu - g) * cw);
+                best = min(best, abs(fv - g) * chh);
+            }
+            mixv = saturate(1.0 - (best - 0.5 * gridW)) * gridA;
+        }
+        Dst[tid.xy] = float4(lerp(s.rgb, float3(0.0, lineVal, 0.0), mixv), s.a);
+    } else {
         Dst[tid.xy] = float4(s.rgb * dim, s.a);
+    }
 }
 )";
     }
@@ -332,7 +357,11 @@ void main(uint3 tid : SV_DispatchThreadID) {
                 bits(float(m_w)),    bits(float(m_h)),
                 bits(std::clamp(float(m_dim), 0.0f, 1.0f)),
                 bits(std::max(1.0f, float(m_lineWidth))),
-                bits(m_lineVal)};
+                bits(m_lineVal),
+                // The grid count is a COUNT, not a float -- it indexes the
+                // shader's loop directly, so it must not go through bits().
+                uint32_t(std::clamp(int(m_grid), 0, 8)),
+                bits(std::clamp(float(m_gridOpacity), 0.0f, 1.0f))};
     }
 
 private:
@@ -412,6 +441,21 @@ private:
 
         const float lineVal = LineValue(in);
 
+        // NOT scaled for the proxy, deliberately -- this looks like an
+        // oversight and is not.
+        //
+        // The rectangle and grid are screen furniture, not image content. A
+        // 3-pixel line drawn on a quarter-scale proxy is displayed at 1:1 with
+        // that proxy, so it is already 3 pixels on screen; scaling it down to
+        // 0.75 would make the overlay nearly invisible during exactly the drag
+        // it exists to guide.
+        //
+        // The crop RECTANGLE itself needs no scaling either: it is in fractions
+        // of the frame, so it lands in the same place at any resolution.
+        const int   grid  = std::clamp(int(m_grid), 0, 8);
+        const float gridA = std::clamp(float(m_gridOpacity), 0.0f, 1.0f);
+        const float gridW = std::max(1.0f, float(m_lineWidth) * 0.4f);
+
         for (int y = 0; y < h; ++y)
             for (int x = 0; x < w; ++x) {
                 const float* s = in.At(x, y);
@@ -449,7 +493,50 @@ private:
                         d[c] = (c == 1 || ch < 3) ? lineVal : 0.0f;   // green
                     if (ch == 4) d[3] = s[3];
                 } else if (inside > 0.0f) {
-                    for (int c = 0; c < ch; ++c) d[c] = s[c];
+                    // Inside: the image, with the grid over it.
+                    //
+                    // The grid is drawn in the RECTANGLE'S OWN FRAME, not the
+                    // screen's, which is the entire point of having it. A
+                    // straight horizon is level when it lies along a grid line;
+                    // if the lines stayed screen-aligned they would keep their
+                    // own angle while the crop rotated under them, and matching
+                    // the two would mean nothing.
+                    //
+                    // Rotating the pixel BACK by the crop angle puts it in that
+                    // frame: the same ca/sa the corners were built from, with
+                    // the sign flipped.
+                    float mixv = 0.0f;
+                    if (grid > 0) {
+                        const float dx = float(x) - rcx, dy = float(y) - rcy;
+                        const float u =  ca * dx + sa * dy;   // along the width
+                        const float v = -sa * dx + ca * dy;   // along the height
+
+                        // Distance to the nearest division line, in pixels.
+                        // Fractional position within the rectangle, so the
+                        // spacing follows the crop rather than the frame.
+                        const float fu = u / std::max(float(cw),  1.0f) + 0.5f;
+                        const float fv = v / std::max(float(chh), 1.0f) + 0.5f;
+
+                        float best = 1e30f;
+                        for (int k = 1; k < grid + 1; ++k) {
+                            const float g = float(k) / float(grid + 1);
+                            best = std::min(best,
+                                std::fabs(fu - g) * float(cw));
+                            best = std::min(best,
+                                std::fabs(fv - g) * float(chh));
+                        }
+                        // Anti-aliased over one pixel, so a rotated line does
+                        // not stair-step -- which would be worse than no line
+                        // at all when the whole job is judging straightness.
+                        mixv = std::clamp(1.0f - (best - 0.5f * gridW),
+                                          0.0f, 1.0f) * gridA;
+                    }
+
+                    for (int c = 0; c < ch; ++c) {
+                        const float lit = (c == 1 || ch < 3) ? lineVal : 0.0f;
+                        d[c] = s[c] + (lit - s[c]) * mixv;
+                    }
+                    if (ch == 4) d[3] = s[3];
                 } else {
                     for (int c = 0; c < ch; ++c) d[c] = s[c] * dim;
                     if (ch == 4) d[3] = s[3];
@@ -498,6 +585,20 @@ private:
         {.help = "Thickness of the preview rectangle, in pixels. Wider is "
                  "easier to see on a large image shown zoomed out.",
          .step = 1.0}};
+
+    Param<int> m_grid{this, "preview_grid", 2, 0, 8,
+        {.help = "Division lines drawn inside the rectangle, for judging "
+                 "straightness against a horizon or a building edge. They "
+                 "rotate WITH the crop, so a horizon is level exactly when it "
+                 "lies along a line -- which is what makes the angle slider "
+                 "usable without guessing. 2 gives thirds; 0 turns them off.",
+         .step = 1}};
+
+    Param<float> m_gridOpacity{this, "preview_grid_opacity", 0.35f, 0.0f, 1.0f,
+        {.help = "How strongly the division lines show. Faint on purpose: they "
+                 "are a straightedge to compare against, and a bright grid "
+                 "competes with the picture you are trying to judge.",
+         .step = 0.05}};
 
     int m_w = 0, m_h = 0;
     // The input size and rectangle origin, captured in PrepareGpu: the shader

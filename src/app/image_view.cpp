@@ -5,6 +5,7 @@
 #include <cstdlib>
 
 #include "../algo_util/tone_curve.h"
+#include "visible_rect.h"
 #include "../gpu/device.h"
 #include "imgui.h"
 
@@ -73,9 +74,38 @@ void ImageViewPanel::Draw(Device& dev, Image* img) {
 
     ViewCamera& cam = m_shared ? *m_shared : m_own;
 
-    const float iw = float(m_tex.Width());
-    const float ih = float(m_tex.Height());
+    // THE SIZE THE IMAGE REPRESENTS, not the number of pixels it holds.
+    //
+    // While a slider is dragged the pipeline may hand back a reduced-resolution
+    // proxy. Laying that out by its pixel count made the picture jump: at a
+    // quarter scale it drew a quarter the size, and since the centring offset
+    // depends on the drawn size, it moved as well. Fit mode hid it -- fit
+    // recomputes the zoom from the extent every frame, so a smaller image just
+    // gets a bigger zoom -- which is why this only showed after zooming or
+    // panning.
+    //
+    // DIVIDING by proxyScale states the geometry in full-resolution pixels, so
+    // the camera means one thing whatever the pipeline is currently producing.
+    // The texture is still drawn at whatever size it is; only the mapping from
+    // image space to screen space is held steady.
+    //
+    // proxyScale is a MULTIPLIER: 0.25 on a quarter-scale proxy, so that an
+    // algorithm converts a pixel-valued parameter by multiplying (a sigma of
+    // 20 runs at 5). See ImageDesc::proxyScale and resize.cpp, which sets it.
+    // Reading it as a divisor instead inflated the layout by 1/s -- an 8191 px
+    // frame laid out as 12088 at a 68% proxy -- so the drag drew a differently
+    // scaled picture of a different part of the image.
+    //
+    // FullWidth/FullHeight for the same reason on the other axis: a
+    // region-limited run hands back a WINDOW onto the image, and laying out
+    // against the window would move the picture every time the pipeline
+    // switched between a crop and the whole frame.
+    const float pscale = std::max(img->Desc().proxyScale, 1e-6f);
+    const float iw = float(img->Desc().FullWidth())  / pscale;
+    const float ih = float(img->Desc().FullHeight()) / pscale;
 
+    // Reported at full resolution too, so the readout does not flicker between
+    // two sizes while dragging.
     ImGui::Text("%.0f x %.0f  %s", iw, ih, FormatName(img->Desc().format));
     ImGui::SameLine();
     if (ImGui::SmallButton("Fit")) cam.fit = true;
@@ -161,6 +191,10 @@ void ImageViewPanel::Draw(Device& dev, Image* img) {
         cam.panX = cam.panY = 0.0f;
     }
 
+    // Recorded after fit may have recomputed it, so it is what was actually
+    // drawn rather than what was requested.
+    m_lastZoom = cam.zoom;
+
     const ImVec2 size(iw * cam.zoom, ih * cam.zoom);
 
     // Draw through the draw list rather than ImGui::Image() so the image never
@@ -168,12 +202,47 @@ void ImageViewPanel::Draw(Device& dev, Image* img) {
     // otherwise a zoomed image spills over neighbouring panels.
     const ImVec2 offset(std::max(0.0f, (region.x - size.x) * 0.5f) + cam.panX,
                         std::max(0.0f, (region.y - size.y) * 0.5f) + cam.panY);
+
+    // p0 is where the WHOLE image's top-left would be, which is what the camera
+    // is expressed against. A partial result is then drawn at its own origin
+    // inside that -- so the layout does not move when the pipeline switches
+    // between a crop and the whole frame, which is the entire point.
     const ImVec2 p0(origin.x + offset.x, origin.y + offset.y);
     const ImVec2 p1(p0.x + size.x, p0.y + size.y);
 
+    // Where the pixels actually go. Equal to p0/p1 for a whole image, since
+    // the origin is then zero and the extent is the full one.
+    const float ox = float(img->Desc().originX) / pscale;
+    const float oy = float(img->Desc().originY) / pscale;
+    const ImVec2 q0(p0.x + ox * cam.zoom, p0.y + oy * cam.zoom);
+    const ImVec2 q1(q0.x + float(m_tex.Width())  / pscale * cam.zoom,
+                    q0.y + float(m_tex.Height()) / pscale * cam.zoom);
+
+    // WHAT THIS PANEL CAN ACTUALLY SEE, in full-resolution image pixels.
+    //
+    // The intersection of the panel with the drawn image, mapped back through
+    // the zoom. Recorded rather than acted on here: the pipeline decides
+    // whether a region is worth cropping to, and it needs the union across
+    // every visible viewer -- one panel showing the whole frame means the whole
+    // frame has to be computed however far another is zoomed in.
+    //
+    // Rounded OUTWARD. A rectangle that is half a pixel short leaves a seam at
+    // the edge of the visible area, which is the one place the user is looking.
+    // The arithmetic lives in visible_rect.h so it can be tested without a
+    // window -- see the note there on why the units are the whole difficulty.
+    {
+        VisibleRectInput vin;
+        vin.panelX = origin.x;  vin.panelY = origin.y;
+        vin.panelW = region.x;  vin.panelH = region.y;
+        vin.imageX = p0.x;      vin.imageY = p0.y;
+        vin.imageW = size.x;    vin.imageH = size.y;
+        vin.zoom = cam.zoom;
+        m_visRect = ComputeVisibleRect(vin);
+    }
+
     ImDrawList* dl = ImGui::GetWindowDrawList();
     dl->PushClipRect(origin, ImVec2(origin.x + region.x, origin.y + region.y), true);
-    dl->AddImage(ImTextureRef(static_cast<ImTextureID>(m_tex.Handle().ptr)), p0, p1);
+    dl->AddImage(ImTextureRef(static_cast<ImTextureID>(m_tex.Handle().ptr)), q0, q1);
     dl->PopClipRect();
 
     // Wheel zooms, left-drag pans — both disable fit so the user stays in control.
@@ -217,7 +286,7 @@ void ImageViewPanel::Draw(Device& dev, Image* img) {
     }
 
     if (m_loupe && ImGui::IsItemHovered())
-        DrawLoupe(dev, *img, ImGui::GetIO().MousePos, p0, cam.zoom, dl);
+        DrawLoupe(dev, *img, ImGui::GetIO().MousePos, q0, cam.zoom, dl);
 
     // Right-click to save what this panel is showing.
     //
@@ -254,8 +323,16 @@ void ImageViewPanel::DrawLoupe(Device& dev, Image& img, const ImVec2& mouse,
     if (!d.Valid()) return;
 
     // Which image pixel the cursor is over.
-    const int cx = int((mouse.x - imgOrigin.x) / zoom);
-    const int cy = int((mouse.y - imgOrigin.y) / zoom);
+    //
+    // The zoom is stated in FULL-RESOLUTION pixels (see the note where iw is
+    // computed), so converting with it alone lands in full-resolution
+    // coordinates -- which index past the end of a proxy. Scaling by proxyScale
+    // brings it back to this image's own pixels. Without it the loupe simply
+    // stopped drawing over most of the frame during a drag, because the bounds
+    // check below rejected it.
+    const float pscale = std::max(d.proxyScale, 1e-6f);
+    const int cx = int((mouse.x - imgOrigin.x) / zoom * pscale);
+    const int cy = int((mouse.y - imgOrigin.y) / zoom * pscale);
     if (cx < 0 || cy < 0 || cx >= d.width || cy >= d.height) return;
 
     // Odd, so there is a true centre pixel to put the crosshair on.

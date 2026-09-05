@@ -38,12 +38,15 @@ public:
         if (!m_in.Valid()) return;
         m_out.AllocLike(m_in);
 
-        const int radius = std::max(1, int(m_radius));
+        const int radius = std::max(1, ctx.ScaledRadius(int(m_radius)));
         if (src.desc.format == Format::RGBA8) RunHistogram(radius, ctx);
         else                                  RunSelection(radius, ctx);
 
         m_out.PackInto(dst);
     }
+
+    // Reads a window of this radius, so a tile needs that much margin.
+    int ReachPixels() const override { return std::max(1, int(m_radius)); }
 
 private:
     // Huang's sliding histogram. Values are 0..255, so 256 bins suffice and the

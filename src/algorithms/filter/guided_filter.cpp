@@ -50,7 +50,7 @@ public:
         if (!m_in.Valid()) return;
         m_out.AllocLike(m_in);
 
-        const int radius = std::max(1, int(m_radius));
+        const int radius = std::max(1, ctx.ScaledRadius(int(m_radius)));
         const float epsFrac = std::max(1e-5f, float(m_eps));
         const float scale = m_in.ValueScale();
         // eps is compared against a variance, so square the fractional value.
@@ -108,6 +108,9 @@ public:
 
         m_out.PackInto(dst);
     }
+
+    // Reads a window of this radius, so a tile needs that much margin.
+    int ReachPixels() const override { return std::max(1, int(m_radius)); }
 
 private:
     // Separable running-sum box mean: O(1) per pixel, which is the whole point.

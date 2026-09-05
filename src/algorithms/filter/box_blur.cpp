@@ -29,7 +29,7 @@ public:
         m_in.Unpack(src);
         if (!m_in.Valid()) return;
 
-        const int radius = std::max(1, int(m_radius));
+        const int radius = std::max(1, ctx.ScaledRadius(int(m_radius)));
         const int w = m_in.Width(), h = m_in.Height(), ch = m_in.Channels();
 
         m_tmp.AllocLike(m_in);
@@ -53,6 +53,9 @@ public:
     // followed from it is gone: at radius 24 one pass is 2,401 fetches per pixel
     // against 98 for two separable ones, and above the cap the stage fell back
     // to the CPU exactly where a blur costs most.
+    // Reads a window of this radius, so a tile needs that much margin.
+    int ReachPixels() const override { return std::max(1, int(m_radius)); }
+
     bool HasGPU() const override { return true; }
     int  GpuIterations() const override { return 2; }
 
@@ -89,7 +92,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     }
 
     std::vector<uint32_t> GpuConstants(int iteration) const override {
-        return {uint32_t(std::max(1, int(m_radius))), uint32_t(iteration)};
+        return {uint32_t(std::max(1, GpuScaledRadius(int(m_radius)))), uint32_t(iteration)};
     }
 
 private:

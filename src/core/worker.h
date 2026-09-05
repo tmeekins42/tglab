@@ -146,6 +146,13 @@ public:
     // work -- algorithm loops, allocation, and recording the GPU commands.
     double LastGpuMs() const { return m_lastGpuMs.load(std::memory_order_relaxed); }
 
+    // The resolution the last run actually used, as a fraction of full.
+    //
+    // Reported because "it still feels slow" is otherwise unanswerable from
+    // the outside: a proxy that silently declined to engage looks exactly like
+    // one that engaged and did not help, and the two want opposite fixes.
+    float LastScale() const { return m_lastScale.load(std::memory_order_relaxed); }
+
     // What the stages reported about the last completed run -- see
     // AlgorithmBase::RunReport. One short line each, in stage order; usually
     // empty, since most algorithms have nothing to add.
@@ -237,6 +244,7 @@ private:
     std::atomic<int>      m_lastCachedStages{0};
     std::atomic<double>   m_lastMs{0.0};
     std::atomic<double>   m_lastGpuMs{0.0};
+    std::atomic<float>    m_lastScale{1.0f};
     std::atomic<int>      m_lastBypassed{0};
     std::atomic<bool>     m_saveRequested{false};
 

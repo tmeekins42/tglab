@@ -69,6 +69,16 @@ public:
         const int w = m_in.Width(), h = m_in.Height(), ch = m_in.Channels();
         if (w <= 0 || h <= 0) return;
 
+        // WHERE THIS RASTER SITS IN THE PICTURE. Both are identities for a
+        // whole, full-resolution image -- the common case -- and both matter
+        // the moment the pipeline hands over a crop or a proxy, because the
+        // geometry below is anchored to the frame rather than to the pixels.
+        const ImageDesc& d = ctx.InDesc(0);
+        const int fullW = std::max(1, d.FullWidth());
+        const int fullH = std::max(1, d.FullHeight());
+        const int offX  = d.originX;
+        const int offY  = d.originY;
+
         // White is 255 on an RGBA8 image and 1.0 on a float one, and the
         // lightening direction lerps toward it -- so unlike a pure multiply,
         // this direction genuinely needs the image's own units.
@@ -82,8 +92,8 @@ public:
         for (int y = 0; y < h; ++y) {
             if (ctx.Cancelled()) return;
             for (int x = 0; x < w; ++x) {
-                const float d = Distance(x, y, w, h, roundness);
-                const float k = Falloff(d, midpoint, feather);
+                const float dist = Distance(x + offX, y + offY, fullW, fullH, roundness);
+                const float k = Falloff(dist, midpoint, feather);
 
                 const int colours = (ch == 4) ? 3 : ch;
                 for (int c = 0; c < colours; ++c)
@@ -120,6 +130,14 @@ cbuffer Params : register(b0) {
     uint MidpointBits;
     uint FeatherBits;
     uint RoundnessBits;
+
+    // The FULL frame and where this raster sits in it. Equal to Width/Height
+    // and 0,0 for a whole image; different when the pipeline hands over a crop
+    // of the visible area, which must not move the vignette.
+    uint FullWidth;
+    uint FullHeight;
+    uint OffsetX;
+    uint OffsetY;
 };
 
 [numthreads(8, 8, 1)]
@@ -134,12 +152,15 @@ void main(uint3 tid : SV_DispatchThreadID) {
     // Pixel centres, so the distance is symmetric about the middle: sampling
     // at the top-left corner of each texel biases everything half a pixel up
     // and left, which shows as an off-centre vignette on a small image.
-    float2 p = (float2(tid.xy) + 0.5) / float2(Width, Height) * 2.0 - 1.0;
+    // Against the FULL frame, offset by where this raster starts in it.
+    float2 fullSize = float2(max(FullWidth, 1u), max(FullHeight, 1u));
+    float2 pos      = float2(tid.xy) + float2(OffsetX, OffsetY);
+    float2 p = (pos + 0.5) / fullSize * 2.0 - 1.0;
 
     // Aspect correction, blended by roundness. At 0 the vignette is an ellipse
     // following the frame; at 1 it is a true circle, so the corners of a wide
     // frame stay lighter than its long edges.
-    float aspect = float(Width) / float(Height);
+    float aspect = fullSize.x / fullSize.y;
     float2 q = p;
     if (aspect > 1.0) q.x = p.x * lerp(1.0, aspect, roundness);
     else              q.y = p.y * lerp(1.0, 1.0 / aspect, roundness);
@@ -175,6 +196,16 @@ void main(uint3 tid : SV_DispatchThreadID) {
 )";
     }
 
+    // The frame this raster is a window onto. See Distance(): the geometry is
+    // anchored to the picture, so a crop or a proxy must not change it.
+    void PrepareGpu(const std::vector<ImageDesc>& inputs) override {
+        if (inputs.empty()) return;
+        m_fullW = std::max(1, inputs[0].FullWidth());
+        m_fullH = std::max(1, inputs[0].FullHeight());
+        m_offX  = inputs[0].originX;
+        m_offY  = inputs[0].originY;
+    }
+
     std::vector<uint32_t> GpuConstants(int) const override {
         auto bits = [](float f) {
             uint32_t u;
@@ -182,12 +213,21 @@ void main(uint3 tid : SV_DispatchThreadID) {
             return u;
         };
         return {bits(float(m_amount)), bits(float(m_midpoint)),
-                bits(float(m_feather)), bits(float(m_roundness))};
+                bits(float(m_feather)), bits(float(m_roundness)),
+                uint32_t(m_fullW), uint32_t(m_fullH),
+                uint32_t(m_offX),  uint32_t(m_offY)};
     }
 
 private:
     // Distance from the centre, 1.0 at the corner. Kept in step with the HLSL
     // above -- see the comments there for why each step is as it is.
+    //
+    // x/y are the pixel's position in the FULL FRAME and w/h the full frame's
+    // size, NOT this image's. A vignette is a property of the lens, so it is
+    // anchored to the picture rather than to whatever raster happens to be in
+    // hand. Passing the local extent instead re-centred the darkening on the
+    // visible rectangle during a zoomed-in drag -- the effect appeared to
+    // follow the viewport, which is exactly what a vignette must not do.
     static float Distance(int x, int y, int w, int h, float roundness) {
         const float px = (float(x) + 0.5f) / float(w) * 2.0f - 1.0f;
         const float py = (float(y) + 0.5f) / float(h) * 2.0f - 1.0f;
@@ -256,6 +296,10 @@ private:
          .step = 0.01}};
 
     PixelBuffer m_in, m_out;
+
+    // Set by PrepareGpu from the input descriptor; the identity for a whole
+    // full-resolution image.
+    int m_fullW = 1, m_fullH = 1, m_offX = 0, m_offY = 0;
 };
 
 REGISTER_ALGORITHM(Vignette);

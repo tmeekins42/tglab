@@ -24,6 +24,16 @@
 # and the two modes would show different parts of the image for the same
 # settings.
 #
+# THE GRID IS WHAT MAKES THE ANGLE SLIDER USABLE. `preview_grid` draws division
+# lines inside the rectangle -- 2 for thirds, 0 to turn them off -- and they
+# rotate WITH the crop. That is the whole point: a horizon is level exactly when
+# it lies along a line, so straightening becomes a comparison rather than a
+# guess. Screen-aligned lines would keep their own angle while the rectangle
+# turned under them, and matching the two would mean nothing.
+#
+# `preview_grid_opacity` keeps them faint on purpose. They are a straightedge to
+# judge against, and a bright grid competes with the picture being judged.
+#
 # The trims are FRACTIONS of the frame, not pixels, so the same crop means the
 # same thing on a preview-sized image and a full-sized one -- and on every frame
 # of a group whatever their sizes.

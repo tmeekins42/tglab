@@ -25,7 +25,7 @@ public:
         ImageView       dst = ctx.Out(0);
         if (!src.Valid() || !dst.Valid()) return;
 
-        const float sigma = std::max(0.01f, float(m_sigma));
+        const float sigma = std::max(0.01f, ctx.ScaledPx(float(m_sigma)));
         // Radius from sigma: 3 sigma captures ~99.7% of the kernel's weight.
         const int radius = std::clamp(int(std::ceil(sigma * 3.0f)), 1, 64);
 
@@ -128,6 +128,14 @@ public:
     // The minimum used to be 0.1, so there was no way to express "off" at all.
     bool IsNoOp() const override { return float(m_sigma) <= 0.0f; }
 
+    // The same 3-sigma rule the kernel uses, and the same clamp: a tile needs
+    // exactly what a pixel reads, so declaring more wastes work and declaring
+    // less puts a seam at every tile edge.
+    int ReachPixels() const override {
+        return std::clamp(int(std::ceil(std::max(0.01f, float(m_sigma)) * 3.0f)),
+                          1, 64);
+    }
+
     bool HasGPU() const override { return true; }
     int  GpuIterations() const override { return 2; }
 
@@ -171,7 +179,10 @@ void main(uint3 tid : SV_DispatchThreadID) {
     }
 
     std::vector<uint32_t> GpuConstants(int iteration) const override {
-        const float sigma = m_sigma;
+        // Scaled for the proxy, exactly as the CPU path does -- the two must
+        // blur by the same fraction of the picture or the preview and the
+        // final image disagree.
+        const float sigma = GpuScaledPx(float(m_sigma));
         uint32_t bits;
         std::memcpy(&bits, &sigma, sizeof(bits));
         return {bits, uint32_t(iteration)};

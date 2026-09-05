@@ -151,6 +151,50 @@ public:
     // user moved on" apart from a real failure worth showing.
     static constexpr const char* kCancelled = "cancelled";
 
+    // --- proxy resolution ---------------------------------------------------
+    //
+    // Run the dirty stages at a fraction of full resolution, for the duration
+    // of a slider drag. 1.0 is off.
+    //
+    // A MEMBER RATHER THAN AN EXECUTE ARGUMENT because it participates in the
+    // CACHE, not just in one run. A proxy result and a full-resolution result
+    // for identical parameters are different images, and reusing one for the
+    // other is the failure this whole mechanism has to avoid -- see
+    // SameStage, which compares it.
+    //
+    // Without that comparison a drag leaves proxy outputs in the cache, the
+    // final full-resolution run finds its early stages "unchanged" and reuses
+    // them, and the result is silently soft. Nothing reports an error; the
+    // picture is just wrong in a way that looks like a bad resample.
+    void SetProxyScale(float s) { m_proxyScale = s; }
+    float ProxyScale() const { return m_proxyScale; }
+
+    // --- region processing --------------------------------------------------
+    //
+    // The part of the FULL-RESOLUTION image the viewer can actually see. An
+    // empty rect means "all of it", which is the default and what a fitted
+    // view asks for.
+    //
+    // Complements the scale: zoomed out, the scale saves the work; zoomed in,
+    // the scale clamps to 1.0 and this does. Both are the same instruction --
+    // compute what is visible -- expressed on the two axes that matter.
+    //
+    // Stated in full-resolution pixels so the caller does not have to know
+    // whether a proxy is also in play; Execute converts.
+    using Rect = ImageRect;
+    void SetRegion(Rect r) { m_requestRegion = r; }
+
+    // What the last run actually cropped to, empty when it used the whole
+    // frame. Reported for the same reason RanAtScale is: a region that
+    // silently declined to engage looks exactly like one that engaged and did
+    // not help.
+    Rect RanOnRegion() const { return m_runRegion; }
+
+    // What the last run ACTUALLY used, which is 1.0 when a Never stage in the
+    // dirty range vetoed the request. Reported so the status line can say the
+    // preview is full quality rather than leaving the user wondering.
+    float RanAtScale() const { return m_ranAtScale; }
+
     // How the last run was split. These add up to the pipeline stage count:
     // stages skipped by the dirty-hash cache are counted separately rather
     // than vanishing, so "0 CPU, 0 GPU" never means "nothing happened".
@@ -230,6 +274,83 @@ private:
     int                     m_cachedStages = 0;
     int                     m_bypassedStages = 0;
     size_t                  m_firstDirty = 0;
+    float                   m_proxyScale = 1.0f;
+    float                   m_ranAtScale = 1.0f;
+    Rect                    m_requestRegion{};
+    Rect                    m_runRegion{};
+    int                     m_regionMargin = 0;
+
+    // How much of the crop is margin rather than requested picture, and how
+    // big the requested picture is. Full-resolution pixels; see the trim at
+    // the end of Execute().
+    int                     m_marginLeft = 0, m_marginTop = 0;
+    int                     m_visibleW = 0, m_visibleH = 0;
+
+    // Cached downsample of whatever crosses into the dirty range.
+    //
+    // THE PROXY'S OWN COST, and without this cache it dominates everything it
+    // was meant to save. Dragging a slider late in a chain leaves the upstream
+    // stages cached, so the same full-resolution image is downsampled again on
+    // every frame -- a 45 MP area-average, plus a 45 MP clone to feed it, to
+    // produce a 4 MP proxy. Measured on a CR3: the dirty stages were ~10% of
+    // the pixels and the run still took a full second, because 90% of the work
+    // was manufacturing the input.
+    //
+    // Keyed by WHICH STAGE PRODUCED THE SOURCE and the hash of everything that
+    // stage depended on -- never by the source's address.
+    //
+    // A pointer is not an identity. The first version keyed on the source's CPU
+    // pixel pointer, which is unique only while that buffer is alive: when a
+    // stage re-runs, its old output is freed and the replacement can land at
+    // the same address. The cache would then report a hit for a DIFFERENT
+    // image, and the run would silently use a proxy of the previous frame's
+    // pixels -- denoise applied to the exposure you just moved away from.
+    //
+    // It also grew without bound in exactly the case that matters. Dragging a
+    // slider EARLY in a chain makes the upstream stage re-run every frame, so
+    // every frame produced a new entry: at 40 MB per proxy of a 45 MP raw, a
+    // few seconds of dragging exhausted VRAM and the GPU path collapsed into
+    // "could not make an input GPU-resident" on every algorithm.
+    //
+    // One entry, replaced rather than appended. A drag reuses one boundary, so
+    // there is nothing a second entry would serve.
+    struct ProxyCacheEntry {
+        int      stage = -2;        // which stage produced the source
+        int      port  = 0;
+        uint64_t key   = 0;         // that stage's parameter + source hash
+        int      srcW = 0, srcH = 0;
+        float    scale = 0.0f;
+        // The pixels live in m_proxyCacheData, so a stage can be pointed at
+        // them without a copy -- see the note at the cache hit.
+        bool     valid = false;
+    };
+    ProxyCacheEntry m_proxyCache;
+    Data            m_proxyCacheData;
+
+    // A GPU measurement that depends only on its input, cached across runs.
+    //
+    // Keyed the same way the proxy cache is -- on the producing stage and that
+    // stage's hashes -- because the question is identical: is this the same
+    // image as last time? Keyed on the STAGE INDEX as well, since two dehaze
+    // stages in one script measure different inputs and must not share an
+    // entry.
+    //
+    // See AlgorithmBase::MeasurementDependsOnlyOnInput for the contract an
+    // algorithm accepts by opting in.
+    struct MeasureCacheEntry {
+        int      stage = -1;        // which stage owns this measurement
+        uint64_t key   = 0;         // identity of the input it was measured from
+        int      srcW = 0, srcH = 0;
+        std::vector<uint32_t> blob;
+        bool     valid = false;
+    };
+    std::vector<MeasureCacheEntry> m_measureCache;
+
+    // The identity of the data on `port` of stage `si`: the producing stage's
+    // parameter and source hashes, or the palette version for a source.
+    // Shared by the proxy cache and the measurement cache so the two cannot
+    // drift apart on what "the same input" means.
+    uint64_t InputIdentity(const Stage& s, size_t port) const;
 
     // When the current Execute() began, so the live tallies published to
     // Progress can report elapsed time. A member rather than a local because

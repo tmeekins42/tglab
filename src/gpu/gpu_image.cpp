@@ -1,5 +1,7 @@
 #include "gpu_image.h"
 
+#include <cstdio>
+
 namespace tglab {
 
 // Declared in core/image.cpp.
@@ -45,7 +47,11 @@ GpuResidency* Image::AcquireGpuRead(ComputeContext& ctx) {
     const bool needUpload = !HasGpu();
     if (!EnsureGpuStorage(*this, ctx)) {
         auto fresh = std::unique_ptr<GpuResidency, GpuResidencyDeleter>(new GpuResidency());
-        if (!ctx.CreateImage(m_desc, &fresh->image)) return nullptr;
+        if (!ctx.CreateImage(m_desc, &fresh->image)) {
+            // CreateImage already reported the HRESULT and the size.
+            std::fprintf(stderr, "[gpu] residency: allocation failed\n");
+            return nullptr;
+        }
         fresh->owner = &ctx;
         m_gpu = std::move(fresh);
     }
@@ -53,9 +59,27 @@ GpuResidency* Image::AcquireGpuRead(ComputeContext& ctx) {
     // Transfer only when the GPU copy is missing or stale. This is the rule
     // that keeps a chain of GPU stages free of intermediate uploads.
     if (needUpload) {
-        if (!HasCpu()) return nullptr;   // nothing anywhere to upload from
+        if (!HasCpu()) {
+            // SAYS WHICH CONDITION FIRED. "could not make an input
+            // GPU-resident" covers three unrelated failures -- allocation, an
+            // image with pixels nowhere, and a failed upload -- and they want
+            // different fixes. Reported here because the caller cannot tell
+            // them apart, and chasing the wrong one costs an afternoon.
+            std::fprintf(stderr,
+                         "[gpu] residency: %dx%d image has pixels nowhere "
+                         "(res=%d)\n",
+                         m_desc.width, m_desc.height, int(m_res));
+            return nullptr;   // nothing anywhere to upload from
+        }
         ImageView v = MapCpuRead();
-        if (!v.Valid() || !ctx.Upload(v, &m_gpu->image)) return nullptr;
+        if (!v.Valid() || !ctx.Upload(v, &m_gpu->image)) {
+            std::fprintf(stderr,
+                         "[gpu] residency: upload of a %dx%d image failed "
+                         "(view %s)\n",
+                         m_desc.width, m_desc.height,
+                         v.Valid() ? "valid" : "INVALID");
+            return nullptr;
+        }
         m_res = Residency::Both;
     }
     return m_gpu.get();

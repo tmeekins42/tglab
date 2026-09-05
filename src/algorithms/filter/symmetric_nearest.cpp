@@ -39,7 +39,7 @@ public:
         if (!m_in.Valid()) return;
         m_out.AllocLike(m_in);
 
-        const int radius = std::max(1, int(m_radius));
+        const int radius = std::max(1, ctx.ScaledRadius(int(m_radius)));
         const int w = m_in.Width(), h = m_in.Height(), ch = m_in.Channels();
         const int filtered = (ch == 1) ? 1 : 3;
 
@@ -90,6 +90,9 @@ public:
     // Each pixel walks its own window and never writes anywhere else, so this
     // ports directly.
     static constexpr int kMaxGpuRadius = 12;
+    // Reads a window of this radius, so a tile needs that much margin.
+    int ReachPixels() const override { return std::max(1, int(m_radius)); }
+
     bool HasGPU() const override { return int(m_radius) <= kMaxGpuRadius; }
 
     const char* GpuSource() const override {

@@ -53,7 +53,7 @@ public:
         if (!m_in.Valid()) return;
         m_out.AllocLike(m_in);
 
-        const int radius  = std::max(1, int(m_radius));
+        const int radius  = std::max(1, ctx.ScaledRadius(int(m_radius)));
         const int sectors = std::max(3, int(m_sectors));
         const float q     = std::max(0.1f, float(m_sharpness));
 
@@ -133,6 +133,9 @@ public:
 
         m_out.PackInto(dst);
     }
+
+    // Reads a window of this radius, so a tile needs that much margin.
+    int ReachPixels() const override { return std::max(1, int(m_radius)); }
 
 private:
     static float Luma(const float* p, int channels) {

@@ -50,7 +50,7 @@ public:
         ImageView       dst = ctx.Out(0);
         if (!src.Valid() || !dst.Valid()) return;
 
-        const int radius = RadiusFromWindow(int(m_window));
+        const int radius = ctx.ScaledRadius(RadiusFromWindow(int(m_window)));
         const int w = src.desc.width;
         const int h = src.desc.height;
         const bool invert = m_invert;
@@ -194,7 +194,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
             std::memcpy(&u, &f, sizeof(u));
             return u;
         };
-        return {uint32_t(RadiusFromWindow(int(m_window))),
+        return {uint32_t(GpuScaledRadius(RadiusFromWindow(int(m_window)))),
                 uint32_t(GpuMode()),
                 bits(GpuParamA()),
                 bits(GpuParamB()),
@@ -218,6 +218,11 @@ protected:
     Param<int>  m_window{this, "window", 15, 3, 201, {.help = "Side length of the neighbourhood each pixel's threshold is computed from, in pixels. Should be larger than the strokes you want to keep but smaller than the illumination changes you want to correct. Odd values only.", .step = 2, .softMin = 3, .softMax = 51}};
     Param<bool> m_invert{this, "invert", false,
                          "Swap foreground and background: on gives white text on black."};
+
+    // Half the window, which is what the radius already is.
+    int ReachPixels() const override {
+        return std::max(1, (std::max(3, int(m_window)) - 1) / 2);
+    }
 
 private:
     IntegralImage m_integral;

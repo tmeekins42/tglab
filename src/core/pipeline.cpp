@@ -1,10 +1,13 @@
 #include "pipeline.h"
 
+#include "../script/value.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <functional>
 #include <cassert>
+#include <deque>
 #include <map>
 #include <set>
 
@@ -195,6 +198,123 @@ const Data* Pipeline::Resolve(PortRef r, const std::vector<Data>* sources) const
     const Stage& s = m_stages[size_t(r.stage)];
     if (r.port < 0 || size_t(r.port) >= s.outputs.size()) return nullptr;
     return &s.outputs[size_t(r.port)];
+}
+
+// Shrinks an image for the proxy path, THROUGH THE REGISTERED `resize`.
+//
+// Not a private copy of the resampling. `resize` area-averages on minify --
+// which is the part that matters, because sampling instead would alias and
+// aliasing MOVES as the scale changes, so a preview would shimmer while a
+// slider drags. A second implementation here would be a second place for that
+// to be got wrong, and the wrong one would only show up as a flicker nobody
+// could attribute.
+//
+// It also sets ImageDesc::proxyScale, which is how every downstream algorithm
+// learns to shrink its pixel-unit parameters.
+// Copies a rectangle out of an image, for the region path.
+//
+// A straight memcpy per row rather than going through the `crop` algorithm.
+// crop takes FRACTIONS and carries a preview mode and a rotation; expressing an
+// exact pixel rectangle through it would mean converting to fractions and back,
+// which is a rounding error waiting to happen on the one operation that has to
+// land on exact pixel boundaries.
+//
+// The crop is a window onto the same raster, so proxyScale and every other
+// descriptor field carry over unchanged -- only the extent differs.
+static bool CropImage(const Image& src, int x, int y, int w, int h, Image* out) {
+    ImageView sv = const_cast<Image&>(src).MapCpuRead();
+    if (!sv.Valid()) return false;
+
+    const ImageDesc& sd = src.Desc();
+    if (x < 0 || y < 0 || w <= 0 || h <= 0 ||
+        x + w > sd.width || y + h > sd.height) return false;
+
+    ImageDesc d = sd;
+    d.width  = w;
+    d.height = h;
+
+    // ACCUMULATED, not assigned: cropping a crop compounds the offset, and the
+    // proxy path may already have moved the origin.
+    d.originX = sd.originX + x;
+    d.originY = sd.originY + y;
+
+    // The full extent is whatever the source was a window onto -- or the source
+    // itself, if it was the whole picture.
+    d.fullW = sd.FullWidth();
+    d.fullH = sd.FullHeight();
+
+    Image dst;
+    dst.Alloc(d);
+    ImageView dv = dst.MapCpuWrite();
+    if (!dv.Valid()) return false;
+
+    const int bpp = BytesPerPixel(sd.format);
+    for (int row = 0; row < h; ++row)
+        std::memcpy(dv.data + size_t(row) * size_t(dv.Pitch()),
+                    sv.data + size_t(y + row) * size_t(sv.Pitch()) +
+                              size_t(x) * size_t(bpp),
+                    size_t(w) * size_t(bpp));
+
+    *out = std::move(dst);
+    return true;
+}
+
+static bool DownsampleImage(const Image& src, int w, int h, Image* out) {
+    auto algo = Registry::Get().Create("resize");
+    if (!algo) return false;
+
+    const ImageDesc& sd = src.Desc();
+    if (sd.width <= 0 || sd.height <= 0) return false;
+
+    // One scale for both axes: resize takes a single factor, and the caller
+    // derives w/h from that same factor, so they agree by construction.
+    const double factor = double(w) / double(sd.width);
+    if (ParamBase* p = algo->FindParam("scale")) {
+        std::string e;
+        if (!p->SetFromScript(Value(factor), &e)) return false;
+    }
+
+    std::vector<Data> ins;
+    ins.push_back(Data{const_cast<Image&>(src).Clone()});
+    std::vector<const Data*> inPtrs{&ins[0]};
+
+    ImageDesc od = algo->OutputDesc(0, sd);
+    if (!od.Valid()) return false;
+    Image dst;
+    dst.Alloc(od);
+
+    std::vector<Data> outs(1);
+    outs[0] = Data{std::move(dst)};
+    RunCtx ctx(inPtrs, outs);
+    algo->RunCPU(ctx);
+
+    Image* got = std::get_if<Image>(&outs[0]);
+    if (!got || !got->Valid()) return false;
+    *out = std::move(*got);
+    (void)h;   // derived from the same factor; kept for the caller's clarity
+    return true;
+}
+
+// WHAT MAKES TWO RUNS' INPUTS THE SAME IMAGE.
+//
+// Never the source's ADDRESS: a freed allocation is reused, so a pointer that
+// compares equal can point at different pixels. The producing stage's own
+// hashes are the honest identity -- if its parameters and sources are
+// unchanged, it produced the same thing.
+//
+// One function rather than two copies, because the proxy cache and the
+// measurement cache are asking exactly the same question, and a divergence
+// between them would show up as one of them serving stale data.
+uint64_t Pipeline::InputIdentity(const Stage& s, size_t port) const {
+    if (port >= s.inputs.size()) return 0;
+    const PortRef& sr = s.inputs[port];
+    if (sr.stage >= 0 && size_t(sr.stage) < m_stages.size()) {
+        const Stage& ps = m_stages[size_t(sr.stage)];
+        return ps.paramHash ^ (ps.sourceHash * 1099511628211ull);
+    }
+    // A palette source: its version already distinguishes a replaced image
+    // from the same one.
+    return s.sourceHash;
 }
 
 bool Pipeline::SameStage(const Stage& a, const Stage& b) {
@@ -773,6 +893,60 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
     // before it can reuse its cached output. Comparing by hash means there is
     // no dirty flag to forget to set.
     size_t firstDirty = 0;
+
+    // A RUN AT A DIFFERENT SCALE SHARES NOTHING WITH THE PREVIOUS ONE.
+    //
+    // Every cached output is an image at the scale it was computed at, so a
+    // proxy result and a full-resolution one are different images even when
+    // every parameter matches. Reusing one for the other is the failure the
+    // whole proxy mechanism has to avoid, and it is a QUIET one: the run
+    // succeeds, nothing is reported, and the picture is merely soft in a way
+    // that looks like a bad resample rather than a cache bug.
+    //
+    // Checked once here rather than per stage because it is a property of the
+    // run, not of any stage -- and because getting it wrong for a single stage
+    // would be worse than not checking at all.
+    // A CACHED STAGE IS JUDGED BY THE SCALE OF ITS OWN OUTPUT, per stage.
+    //
+    // The first version discarded the whole previous pipeline whenever the
+    // requested scale differed, and that was wrong in both directions.
+    //
+    // It was too BLUNT: the proxy only ever applies from firstDirty onward, so
+    // every stage before the boundary ran at full resolution in both runs and
+    // was always reusable. Throwing them away forced firstDirty to 0 -- which
+    // then put the demosaic inside the dirty range, where it vetoes the proxy
+    // entirely. The measured effect was a locked UI: dragging a slider over a
+    // raw re-demosaiced the whole frame on the CPU every frame, because each
+    // run invalidated the cache the next one needed.
+    //
+    // And it was too LOOSE: it compared what the previous run REQUESTED, which
+    // differs from what it used whenever a Never stage vetoed.
+    //
+    // Every image already records the scale it was computed at, so the honest
+    // test is per stage: reuse a cached output when its scale is the one this
+    // stage needs. Below firstDirty that is full resolution, which is what
+    // those stages hold.
+    auto cachedAtRightScale = [&](const Stage& ps) {
+        for (const Data& d : ps.outputs)
+            if (const Image* im = std::get_if<Image>(&d)) {
+                const ImageDesc& sd = im->Desc();
+                if (std::fabs(sd.proxyScale - 1.0f) > 1e-6f)
+                    return false;   // a proxy result; only full-res is cacheable
+
+                // A REGION result is equally uncacheable, and for the same
+                // reason: it is a window onto the picture, so reusing it as a
+                // later run's input would silently process a fragment as
+                // though it were the whole frame. Full resolution is not
+                // enough to make a crop safe -- a region run at scale 1.0
+                // (zoomed to 1:1, which is the normal case) carries
+                // proxyScale 1.0 and would otherwise pass this test.
+                if (sd.originX != 0 || sd.originY != 0 ||
+                    sd.fullW   != 0 || sd.fullH   != 0)
+                    return false;
+            }
+        return true;
+    };
+
     if (prev) {
         const size_t n = std::min(m_stages.size(), prev->m_stages.size());
         while (firstDirty < n && SameStage(m_stages[firstDirty], prev->m_stages[firstDirty])) {
@@ -793,6 +967,12 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
             }
             if (!ps.valid) break;
 
+            // A stage whose cached output is a PROXY result cannot be reused:
+            // it holds a smaller image than the run needs, and handing it on
+            // would silently produce a soft final picture. Stop here and let it
+            // and everything after re-run.
+            if (!cachedAtRightScale(ps)) break;
+
             // Steal the cached outputs — Data is move-only, and the previous
             // pipeline is discarded right after this call. The compiled kernel
             // comes along too, so an unchanged stage never recompiles.
@@ -812,6 +992,84 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
 
     m_firstDirty = firstDirty;
 
+    // --- proxy resolution ---------------------------------------------------
+    //
+    // The scale applies only to the DIRTY RANGE, and that is what makes it work
+    // on raw files at all.
+    //
+    // A demosaic is ProxyBehaviour::Never -- downsampling a CFA mosaic destroys
+    // the pattern that IS the data -- and it sits at the front of every raw
+    // pipeline. If one Never stage anywhere disabled proxying, the feature
+    // would be useless on exactly the files it matters most for.
+    //
+    // But dragging a develop slider does not dirty the demosaic: it is cached
+    // and not re-run at all. So the question is never "does this pipeline
+    // contain a Never stage", it is "does the part being RE-RUN contain one".
+    // Dragging a demosaic parameter correctly disables proxying, because then
+    // the demosaic is itself dirty.
+    float runScale = m_proxyScale;
+    if (runScale < 1.0f) {
+        for (size_t i = firstDirty; i < m_stages.size(); ++i) {
+            if (!m_stages[i].algo) continue;
+            if (m_stages[i].algo->Proxy() ==
+                AlgorithmBase::ProxyBehaviour::Never) {
+                runScale = 1.0f;
+                break;
+            }
+        }
+    }
+    m_ranAtScale = runScale;
+
+    // --- region: how much of the frame does the viewer actually need? --------
+    //
+    // The other half of "compute what can be seen". Zooming in makes the scale
+    // axis useless -- at 1:1 the correct scale is 1.0 and nothing is saved --
+    // while most of the computed pixels are off screen.
+    //
+    // CROP ONCE, WITH A MARGIN, rather than tiling. Tiling would need stage
+    // outputs to be windows onto a larger raster, every algorithm addressing
+    // through an offset, and every algorithm distinguishing the image edge from
+    // the tile edge -- they all clamp at their input's border today, which on a
+    // tile produces exactly the seam the margin exists to prevent. Cropping the
+    // source and letting the dirty range run on it AS IF it were the whole
+    // picture needs none of that: the only thing wrong is a band of `margin`
+    // pixels at the cut, and that band is discarded.
+    //
+    // The margin is the SUM of the reaches over the dirty range, computed here
+    // by one backward-equivalent pass. A sum rather than a max because the
+    // reaches compose: a blur of 20 feeding a bloom of 60 means the bloom's
+    // input is already wrong 20 pixels in, so the crop must cover both.
+    // Reset per run: a margin left over from a previous drag would trim a
+    // result that has none, cutting a band off the whole frame.
+    m_marginLeft = m_marginTop = 0;
+    m_visibleW = m_visibleH = 0;
+
+    Rect region = m_requestRegion;
+    if (region.Valid()) {
+        int margin = 0;
+        bool safe = true;
+        for (size_t i = firstDirty; i < m_stages.size(); ++i) {
+            const Stage& st = m_stages[i];
+            if (!st.algo) continue;
+            if (!st.algo->RegionSafe()) { safe = false; break; }
+            // IN FULL-RESOLUTION PIXELS, because that is where the crop below
+            // is applied -- the region path runs before the downsample, so the
+            // margin has to be stated in the coordinates the crop uses.
+            //
+            // ReachPixels() reports the reach at full resolution (it reads the
+            // raw parameter), and the stage will later run on a proxy where
+            // that reach is smaller in its own pixels. Both are consistent: a
+            // margin of `reach` full-resolution pixels becomes `reach *
+            // runScale` proxy pixels after the downsample, which is exactly
+            // what the stage needs. Scaling it here as well applied the factor
+            // twice and left the margin short.
+            margin += std::max(0, st.algo->ReachPixels());
+        }
+        if (!safe) region = Rect{};
+        else       m_regionMargin = margin;
+    }
+    m_runRegion = region;
+
     // Dirty stages still reuse their compiled kernel when they are the same
     // algorithm as last run — a parameter change does not alter the HLSL, and
     // recompiling on every slider tick would defeat the point of the GPU path.
@@ -822,6 +1080,22 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
     // now that it is correctly freed. ExecuteGpuStage re-checks the descriptor
     // and reallocates if the size or format actually changed, so carrying a
     // stale one is safe.
+    // The proxy downsample carries over for the same reason the kernel does:
+    // it is expensive to produce and identical between runs. Taken even when
+    // the scale changed -- the entries record their own scale, so a stale one
+    // simply misses rather than being wrong.
+    if (prev) {
+        m_proxyCache     = std::move(prev->m_proxyCache);
+        m_proxyCacheData = std::move(prev->m_proxyCacheData);
+
+        // The GPU measurements, on the same terms: each entry records the
+        // input identity it was measured from, so one that no longer matches
+        // misses rather than being served wrongly. Carried even when the
+        // script changed -- a stage that is no longer there simply never
+        // matches its index again.
+        m_measureCache = std::move(prev->m_measureCache);
+    }
+
     if (prev) {
         for (size_t i = firstDirty; i < m_stages.size(); ++i) {
             if (i >= prev->m_stages.size()) break;
@@ -888,6 +1162,14 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
         fusedPlan.emplace(int(i), std::make_pair(std::move(chain), srcPort));
     }
 
+    // Downsampled copies of whatever crosses into the dirty range, owned for
+    // the whole run because the input vectors hold raw pointers into them.
+    //
+    // A deque rather than a vector: pushing into a vector can reallocate, and
+    // every pointer already handed to a stage would dangle. Nothing here is
+    // large enough for the difference in layout to matter.
+    std::deque<Data> proxyInputs;
+
     for (size_t i = firstDirty; i < m_stages.size(); ++i) {
         // Between stages as well as within them: a pipeline of several
         // moderately slow stages should abandon at the next boundary even if no
@@ -938,6 +1220,210 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
             }
             in.push_back(d);
         }
+
+        // Tell the algorithm what scale it is running at, for BOTH paths.
+        //
+        // RunCPU could read it from RunCtx, but GpuConstants() cannot -- by the
+        // time it is called the input descriptors are out of reach. Setting it
+        // here means the two paths read the same number from the same place,
+        // which is what keeps a GPU kernel and its CPU twin at the same
+        // strength during a drag.
+        //
+        // Read from the input AFTER any downsample below, so it reflects what
+        // the stage actually receives.
+        //
+        // PROXY: shrink whatever crosses INTO the dirty range.
+        //
+        // Only at the boundary. A stage inside the range already receives a
+        // proxy-sized image from the stage before it, and shrinking again would
+        // compound the scale -- so the test is on where the input CAME FROM,
+        // not on which stage is consuming it.
+        //
+        // The downsampled copies are owned here and live until the run ends,
+        // because `in` holds raw pointers into them.
+        // REGION: crop what crosses into the dirty range, before any
+        // downsample.
+        //
+        // In full-resolution coordinates, because that is what the viewer asked
+        // in and what the margin was computed in. Doing it before the scale
+        // means the two compose without either needing to know about the other.
+        if (m_runRegion.Valid() && i == firstDirty) {
+            for (size_t k = 0; k < in.size(); ++k) {
+                const Image* src = std::get_if<Image>(in[k]);
+                if (!src) continue;                    // sets are not cropped
+                const ImageDesc& sd = src->Desc();
+                if (!sd.Valid() || sd.IsMosaic()) continue;
+
+                // The visible rectangle, grown by the margin and clipped to the
+                // image. Clipping is what makes the edge cases free: near a
+                // border the crop simply includes less margin, and the
+                // algorithm's own clamping is then CORRECT there because that
+                // really is the picture's edge.
+                const int m  = m_regionMargin;
+
+                // THE MARGIN IS QUANTIZED TO THE PROXY GRID, which is what
+                // stops the picture twitching under the cursor.
+                //
+                // The origin is recorded here in full-resolution pixels and
+                // later scaled into the proxy's own pixels, with rounding. The
+                // margin depends on the algorithm's reach, so dragging a blur
+                // radius moves x0 -- and an odd-sized move of x0 rounds to a
+                // different proxy pixel, redrawing the whole image one pixel
+                // over. Visible on Orton's blur slider and on nothing else,
+                // because it is the only control there whose reach changes as
+                // it drags.
+                //
+                // Rounding the margin UP to a whole number of proxy pixels
+                // makes every x0 an exact multiple of the step, so scaling it
+                // is exact rather than rounded. The crop still grows and
+                // shrinks with the reach -- it must, that is what the margin is
+                // for -- but it does so in whole proxy pixels, so the drawn
+                // image lands on the same place every time.
+                //
+                // Also never SHORTENS the margin, which rounding down would.
+                const int step = (runScale < 1.0f && runScale > 0.0f)
+                                     ? std::max(1, int(std::lround(1.0 / double(runScale))))
+                                     : 1;
+                const int mg = ((m + step - 1) / step) * step;
+
+                // Snapped down for the same reason: an origin off the grid
+                // rounds, and then the margin quantisation above buys nothing.
+                auto snapDown = [step](int v) { return (std::max(0, v) / step) * step; };
+
+                // What the viewer actually asked for, kept so the margin can be
+                // trimmed back off at the end.
+                const int wantX = snapDown(m_runRegion.x);
+                const int wantY = snapDown(m_runRegion.y);
+
+                const int x0 = snapDown(std::max(0, m_runRegion.x - mg));
+                const int y0 = snapDown(std::max(0, m_runRegion.y - mg));
+                const int x1 = std::min(sd.width,  m_runRegion.x + m_runRegion.w + m);
+                const int y1 = std::min(sd.height, m_runRegion.y + m_runRegion.h + m);
+                const int cw = x1 - x0, chh = y1 - y0;
+                if (cw <= 0 || chh <= 0) continue;
+
+                // Not worth it when the margin has eaten the saving. A bloom
+                // with a 60 px reach in a small viewport asks for almost the
+                // whole frame, and cropping to 90% costs a copy to save 10%.
+                if (int64_t(cw) * int64_t(chh) >
+                    int64_t(sd.width) * int64_t(sd.height) * 3 / 4) continue;
+
+                Image cropped;
+                if (!CropImage(*src, x0, y0, cw, chh, &cropped)) continue;
+                proxyInputs.push_back(Data{std::move(cropped)});
+                in[k] = &proxyInputs.back();
+
+                // Record where the crop landed, so the caller can place the
+                // result. Without this the viewer would draw a window of the
+                // image as though it were the whole image.
+                m_runRegion.x = x0;
+                m_runRegion.y = y0;
+                m_runRegion.w = cw;
+                m_runRegion.h = chh;
+
+                // How much of this crop is MARGIN rather than picture the user
+                // asked for. Trimmed off again once the dirty range has run --
+                // see the note at the end of Execute().
+                m_marginLeft = wantX - x0;
+                m_marginTop  = wantY - y0;
+                m_visibleW   = std::min(cw - m_marginLeft,
+                                        std::max(1, m_requestRegion.w));
+                m_visibleH   = std::min(chh - m_marginTop,
+                                        std::max(1, m_requestRegion.h));
+            }
+        }
+
+        if (runScale < 1.0f && i == firstDirty) {
+            for (size_t k = 0; k < in.size(); ++k) {
+                // A SET IS NOT PROXIED, and that is a real limitation rather
+                // than an oversight.
+                //
+                // Downsampling every frame of a group is correct in principle
+                // -- merge_hdr reducing N proxies gives a proxy of the merge --
+                // but it is N downsamples of full-size raws, which is most of
+                // what the proxy was meant to avoid. So dragging an `align` or
+                // `merge_hdr` parameter runs at full resolution; dragging
+                // anything AFTER the merge proxies normally, because by then
+                // the group has become a single image.
+                //
+                // That covers the common case: the develop controls people
+                // actually drag all sit after the merge.
+                const Image* src = std::get_if<Image>(in[k]);
+                if (!src) continue;
+                const ImageDesc& sd = src->Desc();
+                if (!sd.Valid() || sd.IsMosaic()) continue;
+
+                const int nw = std::max(1, int(std::lround(double(sd.width)  * double(runScale))));
+                const int nh = std::max(1, int(std::lround(double(sd.height) * double(runScale))));
+                if (nw >= sd.width || nh >= sd.height) continue;
+
+                // REUSE THE PREVIOUS DOWNSAMPLE when it is genuinely the same.
+                //
+                // Producing the proxy is the proxy's own cost, and without this
+                // it dominates what it was meant to save: dragging a slider
+                // late in a chain leaves the upstream stages cached, so the
+                // same full-resolution image would be area-averaged again on
+                // every frame. Measured on a 45 MP raw, 12.0 ms then 1.2 ms.
+                //
+                // KEYED BY THE PRODUCING STAGE AND ITS HASH, never by the
+                // source's address -- see ProxyCacheEntry for why a pointer is
+                // not an identity, and for how keying on one both leaked and
+                // returned stale pixels.
+                const PortRef& sr = s.inputs[k];
+                const uint64_t key = InputIdentity(s, k);
+
+                if (m_proxyCache.valid &&
+                    m_proxyCache.stage == sr.stage &&
+                    m_proxyCache.port  == sr.port &&
+                    m_proxyCache.key   == key &&
+                    m_proxyCache.srcW  == sd.width &&
+                    m_proxyCache.srcH  == sd.height &&
+                    std::fabs(m_proxyCache.scale - runScale) < 1e-6f) {
+                    // THE CACHED IMAGE ITSELF, not a copy of it.
+                    //
+                    // Cloning drops GPU residency, so every frame allocated a
+                    // fresh texture for identical pixels, uploaded them again,
+                    // and freed it at the end of the run. That churn is what
+                    // eventually failed to allocate -- reported as "could not
+                    // make an input GPU-resident", which sounds like a driver
+                    // problem and is really this.
+                    //
+                    // Pointing at the cache keeps one texture alive across the
+                    // whole drag: allocated once, uploaded once, reused.
+                    // Nothing writes to a stage's input, so sharing it is safe.
+                    in[k] = &m_proxyCacheData;
+                    continue;
+                }
+
+                Image shrunk;
+                if (!DownsampleImage(*src, nw, nh, &shrunk)) continue;
+
+                // REPLACED, not appended. One boundary is downsampled per run,
+                // so a second entry serves nothing -- and appending is what
+                // exhausted VRAM when the upstream stage re-ran each frame.
+                m_proxyCache.stage = sr.stage;
+                m_proxyCache.port  = sr.port;
+                m_proxyCache.key   = key;
+                m_proxyCache.srcW  = sd.width;
+                m_proxyCache.srcH  = sd.height;
+                m_proxyCache.scale = runScale;
+                m_proxyCache.valid = true;
+
+                // Held as Data so it can be handed to a stage directly.
+                m_proxyCacheData = Data{std::move(shrunk)};
+                in[k] = &m_proxyCacheData;
+            }
+        }
+
+        // Now that the inputs are final, record the scale on the algorithm.
+        {
+            float sc = 1.0f;
+            if (!in.empty())
+                if (const Image* im = std::get_if<Image>(in[0]))
+                    sc = im->Desc().proxyScale;
+            if (s.algo) s.algo->SetProxyScale(sc);
+        }
+
         // A stage that says it would change nothing is skipped ENTIRELY: no
         // allocation, no dispatch, no copy.
         //
@@ -1094,6 +1580,56 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
         }
     }
 
+    // TRIM THE MARGIN BACK OFF, so what the viewer receives is exactly the
+    // rectangle it asked for.
+    //
+    // The margin is CONTEXT, not content: it exists so a neighbourhood
+    // algorithm has real pixels to read at the edge of the visible area
+    // instead of a clamped border. Handing it to the viewer as well makes the
+    // drawn image grow and shrink with the algorithm's reach -- and since the
+    // crop then starts further out, the picture shifts. Dragging Orton's blur
+    // slider moved it a pixel; a bigger reach would move it further.
+    //
+    // Trimming here rather than not cropping wide in the first place, because
+    // the wide crop is exactly what makes the result correct: the band is
+    // needed while the stages run and is worthless afterwards.
+    if (m_runRegion.Valid() && (m_marginLeft > 0 || m_marginTop > 0)) {
+        // Every stage output, not just the displayed ones. A viewer may resolve
+        // THROUGH a bypassed stage to an earlier stage's image, and two viewers
+        // can land on the same one -- trimming per viewer would then crop the
+        // same image twice. Walking the stages visits each exactly once.
+        for (Stage& st : m_stages) {
+            for (Data& od : st.outputs) {
+            Image* im = std::get_if<Image>(&od);
+            if (!im || !im->Desc().Valid()) continue;
+
+            // In the image's OWN pixels: the stages may have run on a proxy,
+            // so the full-resolution margin has to come down with them.
+            const float sc = std::max(im->Desc().proxyScale, 1e-6f);
+            const int ml = int(std::lround(double(m_marginLeft) * double(sc)));
+            const int mt = int(std::lround(double(m_marginTop)  * double(sc)));
+            const int vw = std::max(1, int(std::lround(double(m_visibleW) * double(sc))));
+            const int vh = std::max(1, int(std::lround(double(m_visibleH) * double(sc))));
+
+            const int cw = std::min(vw, im->Desc().width  - ml);
+            const int ch = std::min(vh, im->Desc().height - mt);
+            if (ml <= 0 && mt <= 0) continue;
+            if (cw <= 0 || ch <= 0) continue;
+
+            Image trimmed;
+            if (CropImage(*im, ml, mt, cw, ch, &trimmed))
+                *im = std::move(trimmed);
+            }
+        }
+
+        // The reported region is now the visible rectangle, which is what it
+        // always claimed to be.
+        m_runRegion.x += m_marginLeft;
+        m_runRegion.y += m_marginTop;
+        m_runRegion.w  = m_visibleW;
+        m_runRegion.h  = m_visibleH;
+    }
+
     // The last stage's contribution. Every publish above describes the stages
     // finished BEFORE it, so without this the final stage never appears in the
     // live tally -- on a one-stage pipeline the counts would stay at zero for
@@ -1133,7 +1669,64 @@ bool Pipeline::RunStageGpu(Stage& s, const std::vector<const Data*>& in,
         std::vector<const Image*> inImages;
         inImages.reserve(in.size());
         for (const Data* d : in) inImages.push_back(&std::get<Image>(*d));
-        s.algo->MeasureForGpu(inImages);
+
+        // CACHED WHEN THE ALGORITHM SAYS THE MEASUREMENT DEPENDS ONLY ON ITS
+        // INPUT, which is what makes dragging a slider real-time: the
+        // measurement is the expensive part and the slider cannot change it.
+        //
+        // The algorithm cannot cache this itself. The script is re-interpreted
+        // on every run and every stage rebuilt, so its members do not survive
+        // -- which is precisely why the entry lives here, keyed on an identity
+        // only the pipeline can compute.
+        bool measured = false;
+        if (s.algo->MeasurementDependsOnlyOnInput() && !inImages.empty() &&
+            inImages[0]) {
+            // Which stage this is. Stages do not move during a run, so the
+            // address identifies it; two dehaze stages in one script must not
+            // share an entry, which is what keying on the index prevents.
+            int si = -1;
+            for (size_t i = 0; i < m_stages.size(); ++i)
+                if (&m_stages[i] == &s) { si = int(i); break; }
+
+            const ImageDesc& id = inImages[0]->Desc();
+            const uint64_t key = InputIdentity(s, 0);
+
+            if (si >= 0) {
+                for (MeasureCacheEntry& e : m_measureCache) {
+                    if (e.valid && e.stage == si && e.key == key &&
+                        e.srcW == id.width && e.srcH == id.height) {
+                        // A restore that FAILS is not a hit: fall through and
+                        // measure, rather than dispatching passes against
+                        // whatever the constants happened to hold.
+                        measured = s.algo->RestoreMeasurement(e.blob);
+                        break;
+                    }
+                }
+
+                if (!measured) {
+                    s.algo->MeasureForGpu(inImages);
+                    std::vector<uint32_t> blob = s.algo->SaveMeasurement();
+                    if (!blob.empty()) {
+                        MeasureCacheEntry* slot = nullptr;
+                        for (MeasureCacheEntry& e : m_measureCache)
+                            if (e.stage == si) { slot = &e; break; }
+                        if (!slot) {
+                            m_measureCache.push_back(MeasureCacheEntry{});
+                            slot = &m_measureCache.back();
+                        }
+                        slot->stage = si;
+                        slot->key   = key;
+                        slot->srcW  = id.width;
+                        slot->srcH  = id.height;
+                        slot->blob  = std::move(blob);
+                        slot->valid = true;
+                    }
+                    measured = true;
+                }
+            }
+        }
+
+        if (!measured) s.algo->MeasureForGpu(inImages);
     }
 
     // Kernels are compiled once per stage and cached on the stage, so dragging

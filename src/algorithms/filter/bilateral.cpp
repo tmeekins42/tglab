@@ -45,7 +45,7 @@ public:
         if (!m_in.Valid()) return;
         m_out.AllocLike(m_in);
 
-        const float sigmaS = std::max(0.01f, float(m_sigmaSpace));
+        const float sigmaS = std::max(0.01f, ctx.ScaledPx(float(m_sigmaSpace)));
         // sigma_range is declared in 0..1 so it means the same thing whatever
         // the source format, then scaled to the buffer's own range.
         const float sigmaR = std::max(1e-4f, float(m_sigmaRange)) * m_in.ValueScale();
@@ -161,7 +161,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     }
 
     std::vector<uint32_t> GpuConstants(int) const override {
-        const float ss = std::max(0.01f, float(m_sigmaSpace));
+        const float ss = std::max(0.01f, GpuScaledPx(float(m_sigmaSpace)));
         // Textures are normalised 0..1 on the GPU, so sigma_range -- already a
         // fraction of the range -- passes through unscaled.
         const float sr = std::max(1e-4f, float(m_sigmaRange));
@@ -169,6 +169,11 @@ void main(uint3 tid : SV_DispatchThreadID) {
         std::memcpy(&a, &ss, sizeof(a));
         std::memcpy(&b, &sr, sizeof(b));
         return {a, b};
+    }
+
+    // The spatial kernel is truncated at 2.5 sigma, matching the loop bound.
+    int ReachPixels() const override {
+        return std::max(1, int(std::ceil(float(m_sigmaSpace) * 2.5f)));
     }
 
 private:

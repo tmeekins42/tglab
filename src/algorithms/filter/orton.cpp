@@ -80,13 +80,33 @@ float ScreenHDR(float a, float b) {
 }
 
 // An S-curve about mid-grey. Symmetric, so it neither brightens nor darkens
-// overall -- it only steepens.
+// overall -- it only steepens -- and it FADES OUT approaching white, so
+// scene-linear highlights above 1.0 pass through untouched.
 float SCurve(float v, float amount, float white) {
     if (amount == 0.0f) return v;
     const float t = v / std::max(white, 1e-6f);
-    // smoothstep is the S; blending toward it by `amount` keeps 0 as identity.
-    const float s = t * t * (3.0f - 2.0f * t);
-    const float mixed = t + (s - t) * amount;
+
+    // SMOOTHSTEP ONLY INSIDE 0..1. Past 1 its cubic turns over and dives:
+    // t = 1.5 gives exactly 0, t = 2 gives -4, t = 3 gives -27. At the default
+    // contrast of 0.2 that puts anything above about 2.4x white BELOW ZERO --
+    // which is why an overexposed cloud in a scene-linear raw came out black at
+    // every Orton strength. Highlights are routinely 4-8x white there, so this
+    // was not an edge case, it was the normal case for a bright sky.
+    //
+    // The curve is applied with a WEIGHT that fades out approaching white, so
+    // both the value and its slope stay continuous. Switching hard at t = 1
+    // also fixes the black clouds, but leaves a 25% slope jump exactly at the
+    // white point -- and a slope jump on a smooth sky gradient is a mach band,
+    // which is the same content that exposed the original bug.
+    const float clamped = std::min(t, 1.0f);
+    const float s = clamped * clamped * (3.0f - 2.0f * clamped);
+
+    // Fades from full effect at 0.7 to none at 1.0. smoothstep on that ramp so
+    // the weight's own derivative vanishes at both ends.
+    const float u = std::clamp((t - 0.7f) / 0.3f, 0.0f, 1.0f);
+    const float w = 1.0f - u * u * (3.0f - 2.0f * u);
+
+    const float mixed = t + (s - t) * amount * w;
     return mixed * white;
 }
 
@@ -117,7 +137,7 @@ public:
         if (w <= 0 || h <= 0) return;
 
         const float white    = m_in.ValueScale();
-        const float sigma    = std::max(0.01f, float(m_blur));
+        const float sigma    = std::max(0.01f, ctx.ScaledPx(float(m_blur)));
         const float strength = float(m_strength);
         const float bright   = float(m_brightness);
         const float contrast = float(m_contrast);
@@ -221,11 +241,16 @@ public:
         // vertical pass must not apply it a second time.
         const float dir    = (pass == 1) ? 1.0f : 0.0f;
         const float bright = (pass == 0) ? float(m_brightness) : 1.0f;
-        return {bits(std::max(0.01f, float(m_blur))),
+        return {bits(std::max(0.01f, GpuScaledPx(float(m_blur)))),
                 bits(float(m_strength)),
                 bits(bright),
                 bits(float(m_contrast)),
                 bits(dir)};
+    }
+
+    // The blurred layer, at the same 3-sigma extent the blur loop uses.
+    int ReachPixels() const override {
+        return std::clamp(int(std::ceil(float(m_blur) * 3.0f)), 1, 64);
     }
 
 private:
@@ -301,10 +326,18 @@ void main(uint3 tid : SV_DispatchThreadID) {
     float3 sandwich = ScreenHDR(c.rgb, soft);
     float3 mixed = lerp(c.rgb, sandwich, Strength());
 
-    // The same symmetric S-curve as the CPU path.
+    // The same S-curve as the CPU path, INCLUDING the fade-out above 0.7.
+    //
+    // smoothstep's cubic only steps on 0..1; past 1 it turns over and goes
+    // negative (t=2 gives -4), which turned overexposed cloud black. Weighting
+    // the curve out as the value approaches white keeps highlights monotonic
+    // and keeps the slope continuous, so a sky gradient does not band.
     float amount = Contrast();
-    float3 s = mixed * mixed * (3.0 - 2.0 * mixed);
-    float3 outv = lerp(mixed, s, amount);
+    float3 cl = min(mixed, 1.0);
+    float3 s  = cl * cl * (3.0 - 2.0 * cl);
+    float3 u  = saturate((mixed - 0.7) / 0.3);
+    float3 w  = 1.0 - u * u * (3.0 - 2.0 * u);
+    float3 outv = mixed + (s - mixed) * amount * w;
 
     Dst[tid.xy] = float4(outv, c.a);
 }

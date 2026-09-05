@@ -160,6 +160,14 @@ int main(int argc, char** argv) {
         auto ir = Interpret(prog, names, &ui, &pipe);
         if (!ir.ok) { std::printf("interpret failed: %s\n", ir.error.c_str()); return 1; }
 
+        // Optional proxy mode, which is where the app actually failed. A drag
+        // runs the dirty stages at reduced scale, and the downsampled input is
+        // what acquires a GPU texture -- so if the proxy cache hands out COPIES
+        // instead of the image itself, every frame allocates, uploads and frees
+        // one. That churn is what eventually could not allocate, reported as
+        // "could not make an input GPU-resident".
+        if (std::getenv("TGLAB_LEAK_PROXY")) pipe.SetProxyScale(0.25f);
+
         if (!pipe.Execute(&sources, havePrev ? &prev : nullptr, &err, &gpu,
                           ExecMode::ForceGPU)) {
             std::printf("run %d failed: %s\n", i, err.c_str());

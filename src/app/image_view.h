@@ -7,6 +7,7 @@
 
 #include "../gpu/texture.h"
 #include "view.h"
+#include "../core/image.h"
 
 namespace tglab {
 
@@ -28,6 +29,25 @@ public:
     // True when this viewer had focus at its last Draw(). Lets the info panel
     // describe what the user is actually looking at rather than a fixed image.
     bool Focused() const { return m_focused; }
+
+    // Screen pixels per FULL-RESOLUTION image pixel, as of the last Draw().
+    //
+    // This is what the proxy scale must be derived from, and deriving it from
+    // the panel width instead was wrong: that assumes the image is fitted, so
+    // zooming to 1:1 still asked for a 20% proxy and the picture went soft
+    // during every drag. Zoom answers the question directly -- at 1:1 it is
+    // 1.0 and no proxy is wanted; fitted it is small and a proxy is free.
+    //
+    // 0 until the panel has drawn once.
+    float LastZoom() const { return m_lastZoom; }
+
+    // The part of the full-resolution image this panel could see at its last
+    // Draw(), or an empty rect when it drew nothing.
+    //
+    // The app takes the UNION over visible panels before asking the pipeline
+    // for it: a second viewer showing the whole frame means the whole frame is
+    // needed however far this one is zoomed in.
+    ImageRect VisibleRect() const { return m_visRect; }
 
     // True when the panel was actually on screen at its last Draw(): its tab is
     // on top and it is not collapsed. Distinct from Focused(), which needs a
@@ -76,6 +96,8 @@ private:
     ViewCamera* m_shared  = nullptr;
     uint64_t    m_version = 0;
     bool        m_focused = false;
+    float       m_lastZoom = 0.0f;   // see LastZoom
+    ImageRect   m_visRect{};        // see VisibleRect
     bool        m_visible = false;
     bool        m_loupe   = false;
 };

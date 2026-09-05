@@ -607,6 +607,12 @@ public:
         return buf;
     }
 
+    // Sidecar coordinates are in IMAGE PIXELS and nothing rescales them, so a
+    // proxy run would hand every downstream stage positions that are wrong by
+    // the scale factor -- silently, since the sidecar is still present and
+    // still looks valid. See AlgorithmBase::Proxy.
+    ProxyBehaviour Proxy() const override { return ProxyBehaviour::Never; }
+
     bool HasGPU() const override { return false; }
 
 private:

@@ -4,6 +4,8 @@
 // so the script, the UI, and the stage cache all discover them the same way.
 #pragma once
 
+#include <cmath>
+#include <cstring>
 #include <memory>
 #include <span>
 #include <string>
@@ -99,6 +101,41 @@ public:
     // this as an optimisation that may decline rather than a capability.
     ComputeContext* Gpu() const { return m_gpu; }
 
+    // Converts a parameter expressed in PIXELS to this run's pixels.
+    //
+    // While a slider is dragged the pipeline may be running on a reduced-
+    // resolution proxy, and a radius stated in pixels means a different
+    // fraction of the picture there -- a blur of sigma 20 on a quarter-scale
+    // image must run at sigma 5 to look the same. Every algorithm whose
+    // parameters are lengths passes them through this.
+    //
+    // A HELPER RATHER THAN EACH SITE MULTIPLYING, because the failure mode is
+    // silence: an algorithm that forgets simply previews wrong, and "the blur
+    // looks too strong while dragging" is easy to dismiss as the preview being
+    // approximate. One named call is greppable, and reads as a decision rather
+    // than as arithmetic.
+    //
+    // Returns the value unchanged at full resolution, so it is always safe to
+    // apply.
+    float PixelScale(size_t port = 0) const {
+        const float s = InDesc(port).proxyScale;
+        return (s > 0.0f && s < 1.0f) ? s : 1.0f;
+    }
+
+    // The same, applied. `ctx.ScaledPx(m_sigma)` is the whole change for most
+    // algorithms.
+    float ScaledPx(float pixels, size_t port = 0) const {
+        return pixels * PixelScale(port);
+    }
+
+    // For an integer radius. Rounds rather than truncating, and never below 1:
+    // a radius of 0 is not a smaller blur, it is no blur at all, and a proxy
+    // that silently disables an effect is worse than one that approximates it.
+    int ScaledRadius(int pixels, size_t port = 0) const {
+        if (pixels <= 0) return pixels;
+        return std::max(1, int(std::lround(double(pixels) * double(PixelScale(port)))));
+    }
+
 private:
     std::span<const Data* const> m_in;
     std::span<Data>              m_out;
@@ -146,6 +183,7 @@ class AlgorithmBase {
     // constructed after the whole base, vector included. It is only the base's
     // own that needs this.
     std::vector<ParamBase*> m_params;
+    float m_proxyScale = 1.0f;   // see SetProxyScale
     friend class ParamBase;
 
 public:
@@ -221,6 +259,80 @@ public:
     // drops the effect.
     virtual bool IsNoOp() const { return false; }
 
+    // How this algorithm behaves when run on a reduced-resolution proxy.
+    //
+    //   Exact   Per-pixel. The proxy IS the answer, just smaller -- brightness,
+    //           a LUT, a tone curve. Nothing to adjust.
+    //   Scaled  Correct once pixel-unit parameters are multiplied by
+    //           ImageDesc::proxyScale. A blur, a bloom, a window radius.
+    //   Never   The output genuinely differs and no parameter fixes it, so the
+    //           pipeline must not proxy this stage at all. A demosaic reads a
+    //           CFA mosaic that downsampling destroys; a feature detector on a
+    //           proxy finds DIFFERENT keypoints rather than approximate ones.
+    //
+    // SCALED IS THE DEFAULT ON PURPOSE. It is right for most algorithms, and an
+    // algorithm that ignores proxyScale while claiming Scaled produces a
+    // slightly wrong PREVIEW -- visible, and fixable. Defaulting to Never would
+    // instead silently keep the pipeline slow, which is the failure nobody
+    // notices because nothing looks wrong.
+    // --- region processing --------------------------------------------------
+    //
+    // How far, in pixels, this algorithm reads outside the pixel it is writing.
+    //
+    // Zooming in makes the SCALE axis useless -- at 1:1 the correct scale is
+    // 1.0 and nothing is saved -- while 95% of the computed pixels are off
+    // screen. Computing only the visible rectangle is the other half of "what
+    // the viewer can actually see", and this is what makes it possible: to
+    // produce a correct tile, a stage needs its input grown by its own reach,
+    // and the pipeline grows the region backward through the chain by summing
+    // these.
+    //
+    // 0 means per-pixel, which needs no margin at all -- and that is the right
+    // DEFAULT because it is true of most algorithms. An algorithm that reads
+    // neighbours and forgets to say so produces visible SEAMS at tile edges,
+    // which is loud and immediately traceable to the stage that caused it. The
+    // opposite default would make every pipeline quietly refuse to tile.
+    //
+    // Stated in the pixels of THIS run, so it must scale like any other
+    // pixel-unit value -- see RunCtx::ScaledPx.
+    virtual int ReachPixels() const { return 0; }
+
+    // Whether this algorithm's output depends on pixels beyond any margin.
+    //
+    // A DIFFERENT QUESTION FROM ProxyBehaviour, and the distinction is the
+    // reason this is a separate declaration. `global_threshold` builds a
+    // histogram of the whole frame: at reduced SCALE that histogram is a good
+    // approximation, so it proxies happily. On a REGION it is a histogram of
+    // the wrong population -- the threshold chosen for a bright corner is not
+    // the threshold for the picture -- and no margin fixes it, because the
+    // dependency is on everything.
+    //
+    // The same is true of auto-exposure, dehaze's airlight estimate, and any
+    // percentile. They are safe to shrink and unsafe to crop.
+    virtual bool RegionSafe() const { return true; }
+
+    enum class ProxyBehaviour { Exact, Scaled, Never };
+    virtual ProxyBehaviour Proxy() const {
+        // DEMOSAIC IS DERIVED FROM THE CATEGORY, because there the category is
+        // exact: every demosaicer reads a CFA mosaic, which downsampling
+        // destroys -- the pattern IS the data. Deciding it here rather than
+        // per-file means the next demosaicer is safe without anyone
+        // remembering, and the failure it prevents (a mosaic averaged into
+        // mush) would look like a demosaic bug rather than a proxy one.
+        //
+        // THE SIDECAR ALGORITHMS OVERRIDE INDIVIDUALLY, and the reason is worth
+        // recording. Anything producing or consuming a sidecar is equally
+        // unsafe -- sidecar coordinates are in image pixels and nothing
+        // rescales them -- but they do NOT share a category. Measured:
+        // detect_* and draw_* say "features", match_* says "match",
+        // align_features and bundle_adjust say "merge". A category test for
+        // "features" read correctly and silently missed two thirds of them,
+        // which is exactly the quiet failure this default exists to avoid.
+        return std::strcmp(Category(), "demosaic") == 0
+                   ? ProxyBehaviour::Never
+                   : ProxyBehaviour::Scaled;
+    }
+
     // Restates the output descriptor for port `p`, given what the pipeline
     // would otherwise have allocated.
     //
@@ -273,6 +385,28 @@ public:
     // calls RunCPU, so without this the shader would use stale values.
     virtual void PrepareGpu(const std::vector<ImageDesc>& inputs) { (void)inputs; }
 
+    // The proxy scale of the input this stage is about to run on.
+    //
+    // Set by the pipeline before every run, so a GPU algorithm can convert its
+    // pixel-unit parameters in GpuConstants() -- where the input descriptors
+    // are already out of reach and there is no RunCtx to ask.
+    //
+    // Stored on the base rather than requiring a PrepareGpu override in every
+    // algorithm with a radius, because an algorithm that forgets to override
+    // does not fail: it silently previews at the wrong strength while dragging,
+    // and looks merely approximate. Making the value available by default means
+    // the only thing an algorithm has to remember is to USE it.
+    void SetProxyScale(float s) { m_proxyScale = (s > 0.0f) ? s : 1.0f; }
+
+    // Multiplies a pixel-unit parameter into this run's pixels. 1.0 at full
+    // resolution, so it is always safe to apply. Mirrors RunCtx::ScaledPx for
+    // the GPU side.
+    float GpuScaledPx(float pixels) const { return pixels * m_proxyScale; }
+    int   GpuScaledRadius(int pixels) const {
+        if (pixels <= 0) return pixels;
+        return std::max(1, int(std::lround(double(pixels) * double(m_proxyScale))));
+    }
+
     // True if this algorithm must MEASURE its input before the GPU path runs.
     //
     // Separate from PrepareGpu, and opt-in, because it costs something real: it
@@ -293,6 +427,36 @@ public:
     // any pass is dispatched. Whatever is measured here is expected to reach
     // the shader through GpuConstants/GpuPassConstants.
     virtual void MeasureForGpu(const std::vector<const Image*>& inputs) { (void)inputs; }
+
+    // --- caching a measurement across runs ----------------------------------
+    //
+    // MeasureForGpu runs on every slider tick, and for some algorithms the
+    // measurement depends only on the INPUT -- not on any parameter the user is
+    // dragging. Dehaze is the case: its airlight is a property of the
+    // photograph, so moving the strength slider re-measures an answer that
+    // cannot have changed.
+    //
+    // An algorithm that says so here gets its measurement cached by the
+    // pipeline, keyed on the identity of the input that produced it. The
+    // pipeline owns the key because only it knows when an input is genuinely
+    // the same image -- the algorithm object itself does not survive between
+    // runs, since the script is re-interpreted and every stage rebuilt.
+    //
+    // The contract is deliberately narrow: return true ONLY if the measurement
+    // is a pure function of the input pixels. An algorithm whose measurement
+    // also depends on a parameter must leave this false, or dragging that
+    // parameter will silently use a stale answer -- and a stale measurement
+    // does not look like a bug, it looks like a slightly wrong picture.
+    virtual bool MeasurementDependsOnlyOnInput() const { return false; }
+
+    // Serialise the last measurement, and restore one. Opaque to the pipeline,
+    // which only stores and returns the bytes.
+    //
+    // Empty means "nothing to cache", which is also what an algorithm that has
+    // not measured anything yet should return -- the pipeline then simply does
+    // not cache, rather than storing a blob that decodes to garbage.
+    virtual std::vector<uint32_t> SaveMeasurement() const { return {}; }
+    virtual bool RestoreMeasurement(const std::vector<uint32_t>&) { return false; }
 
     // Extra textures the ALGORITHM supplies, bound as SRVs after the port
     // inputs. An empty vector -- the default -- costs nothing.

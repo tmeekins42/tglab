@@ -92,6 +92,27 @@ int main(int argc, char** argv) {
         p->SetFromScript(Value(strength), &e);
     }
 
+    // Any parameter, by name, from the environment: BENCH_P_patch=1.
+    //
+    // Which stage dominates is decided by the two radii, so isolating a stage
+    // means shrinking the others rather than instrumenting the algorithm.
+    // Setting both radii to 1 leaves only the O(full pixels) work -- the
+    // downsample and the recovery -- so the difference from a normal run is
+    // what the map estimation actually costs. That is the number that decides
+    // what is worth moving to the GPU, and guessing it from the code was
+    // exactly the mistake the header of this file warns about.
+    for (ParamBase* p : algo->Params()) {
+        if (!p || !p->Name()) continue;
+        const std::string key = std::string("BENCH_P_") + p->Name();
+        if (const char* v = std::getenv(key.c_str())) {
+            std::string e;
+            if (p->SetFromScript(Value(std::atof(v)), &e))
+                std::printf("  %s = %s\n", p->Name(), v);
+            else
+                std::printf("  %s: %s\n", p->Name(), e.c_str());
+        }
+    }
+
     std::vector<Data> ins;
     ins.push_back(Data{src.Clone()});
     std::vector<const Data*> inPtrs{&ins[0]};

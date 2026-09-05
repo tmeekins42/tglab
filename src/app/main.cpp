@@ -8,6 +8,7 @@
 #include <dbghelp.h>    // stack trace in the crash handler
 
 #include <algorithm>
+#include <climits>
 #include <cctype>
 #include <cstdio>
 #include <chrono>
@@ -443,6 +444,66 @@ private:
     int         m_saveCount = 0;   // save() lines in the current script
     std::string m_loadError;    // script file could not be read (survives a re-run)
     bool        m_dirty = true; // re-run requested
+
+    // True while a control is held. Drives the proxy scale: run cheap while the
+    // value is moving, then once more at full resolution when it settles.
+    bool        m_dragging = false;
+
+    // The proxy scale of the most recently SUBMITTED run. Distinct from what
+    // the worker last finished, which lags by however long a run takes.
+    float       m_submittedScale = 1.0f;
+
+    // The largest viewer, in pixels, as of the last frame. The proxy scale is
+    // derived from this rather than fixed, because rendering more pixels than
+    // the screen can show is waste by definition.
+    //
+    // Capped because zooming IN does not make the image smaller -- at 1:1 the
+    // correct answer is no proxy at all. Making the preview *larger* than the
+    // source would cost more than the full-resolution run it was meant to
+    // avoid, which is the sort of optimisation that quietly makes things worse.
+    // FROM THE ZOOM, not from the panel width.
+    //
+    // The scale wanted is "screen pixels per image pixel", which is exactly
+    // what the camera's zoom already is. Deriving it from the panel width
+    // instead assumed the image was FITTED -- so zooming to 1:1 still asked for
+    // a 20% proxy, and the picture went soft during every drag while the status
+    // line honestly reported 4% of the pixels.
+    //
+    // Taken from the largest zoom across visible viewers: if any panel is
+    // showing detail, the preview has to carry it.
+    // The union of what every visible viewer can see, in full-resolution
+    // pixels. Empty means "all of it".
+    //
+    // Empty is also what a single fitted panel produces -- its visible rect IS
+    // the whole image -- so the common case costs nothing and needs no special
+    // handling.
+    ImageRect VisibleRegion() const {
+        int x0 = INT_MAX, y0 = INT_MAX, x1 = INT_MIN, y1 = INT_MIN;
+        for (const auto& v : m_views) {
+            if (!v || !v->Visible()) continue;
+            const ImageRect r = v->VisibleRect();
+            if (!r.Valid()) continue;
+            x0 = std::min(x0, r.x);
+            y0 = std::min(y0, r.y);
+            x1 = std::max(x1, r.x + r.w);
+            y1 = std::max(y1, r.y + r.h);
+        }
+        if (x0 > x1 || y0 > y1) return {};
+        return ImageRect{x0, y0, x1 - x0, y1 - y0};
+    }
+
+    float ProxyScaleForView() const {
+        float z = 0.0f;
+        for (const auto& v : m_views)
+            if (v && v->Visible()) z = std::max(z, v->LastZoom());
+        if (z <= 0.0f) return 1.0f;   // nothing drawn yet
+
+        // Never below an eighth: past that the preview stops resembling the
+        // result closely enough to judge a slider by, which defeats the point.
+        return std::clamp(z, 0.125f, 1.0f);
+    }
+
+    int         m_sourceWidth = 0;   // the image the viewers are showing
     bool        m_rebuildLayout = false;   // explicit "Reset layout" request
     int         m_layoutCountdown = 0;     // frames until the default layout is built
     int         m_switchCountdown = 0;     // self-test: frames until TGLAB_SWITCH fires
@@ -1074,6 +1135,52 @@ void App::RunScript() {
             m_saveCount = int(built.Saves().size());
             // The old report describes a script that is no longer running.
             if (m_saveCount == 0) m_saveReport.clear();
+
+            // PROXY WHILE DRAGGING.
+            //
+            // The scale is the VIEWER'S, not a fixed fraction: computing more
+            // pixels than the screen shows is waste by definition, and fewer is
+            // visibly soft. A 22 MP frame shown in a 1400 px panel needs about
+            // a sixth of its width, which is ~1/36 of the work.
+            //
+            // Clamped to 1.0 so a zoomed-in view never asks for MORE than the
+            // image has -- at 1:1 the right answer is simply no proxy, and the
+            // region half of this (see docs/proxy-resolution.md) is what would
+            // help there instead.
+            // The widest source, which is what the scale is measured against.
+            // GROUPS COUNT TOO. A palette entry is an Image or an ImageSet, and
+            // looking only at Images left m_sourceWidth at 0 for every
+            // group-based script -- so ProxyScaleForView() fell back to 1.0 and
+            // the proxy silently never engaged. That is exactly the failure the
+            // status line was added to expose: no size line, no clue why.
+            m_sourceWidth = 0;
+            if (m_sources) {
+                for (const Data& d : *m_sources) {
+                    if (const Image* im = std::get_if<Image>(&d)) {
+                        m_sourceWidth = std::max(m_sourceWidth, im->Desc().width);
+                    } else if (const ImageSet* set = std::get_if<ImageSet>(&d)) {
+                        for (const Image& m : set->images)
+                            m_sourceWidth = std::max(m_sourceWidth, m.Desc().width);
+                    }
+                }
+            }
+
+            m_submittedScale = m_dragging ? ProxyScaleForView() : 1.0f;
+            built.SetProxyScale(m_submittedScale);
+
+            // REGION: only while dragging, and only what every visible panel
+            // needs between them.
+            //
+            // The UNION rather than the focused panel's rectangle. A second
+            // viewer showing the whole frame means the whole frame has to be
+            // computed however far this one is zoomed in -- cropping to one
+            // panel would leave the others drawing a stale or partial image,
+            // which is a worse artefact than the wait it saves.
+            //
+            // A panel showing the whole frame therefore widens the union to
+            // everything and the pipeline declines, which is the correct
+            // outcome rather than a missed optimisation.
+            built.SetRegion(m_dragging ? VisibleRegion() : ImageRect{});
 
             m_pendingSeq = m_worker.Submit(std::move(built), m_sources,
                                            std::move(versions));
@@ -3173,6 +3280,15 @@ void App::Frame() {
             SplitLine(m_worker.LastRunMs(), m_worker.LastGpuMs());
         }
 
+        // The proxy, when one was used. Said out loud for the same reason the
+        // bypass count is: a preview that silently ran at full resolution looks
+        // exactly like one that proxied and did not help, and without this the
+        // only symptom of either is "it feels slow".
+        if (const float sc = m_worker.LastScale(); sc < 0.999f) {
+            ImGui::TextDisabled("preview at %.0f%% scale (%.0f%% of the pixels)",
+                                double(sc) * 100.0, double(sc) * double(sc) * 100.0);
+        }
+
         // Effects turned off. Said out loud, because the whole point of a
         // stacked script is that a disabled effect costs nothing, and "did
         // that actually skip?" is otherwise unanswerable from the outside.
@@ -3248,6 +3364,40 @@ void App::Frame() {
     // that call had no window to dock -- and both opened floating. Docking
     // them again now that they exist takes effect on the next frame.
     DockOnDemandPanels();
+
+    // --- proxy: is a control being held? ------------------------------------
+    //
+    // Sampled HERE, after every widget has been drawn, because
+    // IsAnyItemActive() reports on the items submitted this frame -- asking
+    // before they exist would always answer false.
+    //
+    // The RELEASE is the part that needs care. Ending a drag has to trigger one
+    // more run, at full resolution, or the last thing the user sees is the
+    // proxy: the picture would stay soft until something else happened to
+    // dirty the pipeline, which reads as "the app rendered it badly" rather
+    // than "the preview has not caught up yet".
+    {
+        const bool held = ImGui::IsAnyItemActive();
+
+        // Settle at full resolution when the drag ends -- but ONLY if the last
+        // run was not already there.
+        //
+        // Forcing it unconditionally was a real cost and easy to miss. The
+        // proxy declines to engage whenever the image is smaller than the
+        // window (the scale clamps to 1.0), which is the common case for a
+        // modest image -- so every release queued a second, byte-identical
+        // full-resolution run. On a 512 px script at 86 ms that is 86 ms of
+        // pure waste per gesture, and it presents as the app being sluggish to
+        // let go of rather than as a redundant run.
+        // Tested against what was SUBMITTED, not what the worker last
+        // finished. Asking the worker races: a release while a proxy run is
+        // still in flight would see the previous run's scale, skip the settle,
+        // and then display the proxy -- leaving the picture permanently soft,
+        // which is precisely the failure the settle exists to prevent.
+        if (m_dragging && !held && m_submittedScale < 0.999f)
+            m_dirty = true;
+        m_dragging = held;
+    }
 
     ImGui::Render();
     ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), cl);

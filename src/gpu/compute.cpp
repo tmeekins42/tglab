@@ -1,7 +1,8 @@
-#include <cstdlib>
 #include "compute.h"
 
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "device.h"
@@ -173,7 +174,27 @@ bool ComputeContext::CreateKernel(const std::string& hlsl, const std::string& en
     ID3D12PipelineState* pso = nullptr;
     if (FAILED(m_device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso)))) {
         root->Release();
-        *errors = "could not create compute pipeline state (unsigned DXIL?)";
+
+        // DISTINGUISH A LOST DEVICE FROM A BAD SHADER, because after a removal
+        // EVERY algorithm fails here and the DXIL message is a red herring --
+        // it sends you looking for a missing dxil.dll when the real event was a
+        // kernel that hung minutes earlier. Reported once per algorithm, so a
+        // run produces a wall of identical wrong diagnoses.
+        //
+        // The removal is normally caught on flush, but a kernel created AFTER
+        // the device is gone never reaches a flush.
+        const HRESULT removed = m_device->GetDeviceRemovedReason();
+        if (removed != S_OK) {
+            m_deviceLost = true;
+            char buf[160];
+            std::snprintf(buf, sizeof buf,
+                          "the GPU device was removed (0x%08lX) -- everything "
+                          "runs on the CPU until the app restarts",
+                          static_cast<unsigned long>(removed));
+            *errors = buf;
+        } else {
+            *errors = "could not create compute pipeline state (unsigned DXIL?)";
+        }
         return false;
     }
 
@@ -210,9 +231,20 @@ bool ComputeContext::CreateImage(const ImageDesc& d, GpuImage* out) {
                                                           D3D12_RESOURCE_STATE_COMMON,
                                                           nullptr, IID_PPV_ARGS(&res));
     if (FAILED(crhr)) {
-        if (GpuWhy())
-            std::fprintf(stderr, "[gpu] CreateCommittedResource 0x%08X %dx%d fmt=%d\n",
-                         unsigned(crhr), d.width, d.height, int(d.format));
+        // ALWAYS reported, not gated behind TGLAB_GPUWHY.
+        //
+        // A failed texture allocation is never normal, and the caller's message
+        // ("could not make an input GPU-resident") says what could not be done
+        // without saying why -- so an out-of-memory looks identical to a driver
+        // fault or an unsupported format. Silent by default, that turned a
+        // one-line answer into a hunt.
+        //
+        // 0x887A0005 is DXGI_ERROR_DEVICE_REMOVED; 0x8007000E is E_OUTOFMEMORY.
+        std::fprintf(stderr,
+                     "[gpu] could not allocate a %dx%d texture (fmt %d, %.1f MB): "
+                     "0x%08X\n",
+                     d.width, d.height, int(d.format),
+                     double(d.SizeInBytes()) / (1024.0 * 1024.0), unsigned(crhr));
         return false;
     }
 

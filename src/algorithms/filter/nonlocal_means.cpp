@@ -42,8 +42,8 @@ public:
         if (!m_in.Valid()) return;
         m_out.AllocLike(m_in);
 
-        const int patch  = std::max(1, int(m_patch));
-        const int search = std::max(1, int(m_search));
+        const int patch  = std::max(1, ctx.ScaledRadius(int(m_patch)));
+        const int search = std::max(1, ctx.ScaledRadius(int(m_search)));
         const float scale = m_in.ValueScale();
         // h is declared as a fraction of the range, then squared against the
         // per-pixel mean squared difference below.
@@ -113,6 +113,12 @@ public:
         }
 
         m_out.PackInto(dst);
+    }
+
+    // The search window plus the patch: a comparison at the far edge of the
+    // search still reads a patch beyond it.
+    int ReachPixels() const override {
+        return std::max(1, int(m_search)) + std::max(1, int(m_patch));
     }
 
 private:

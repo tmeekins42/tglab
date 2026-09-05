@@ -206,6 +206,11 @@ public:
 
     bool HasGPU() const override { return false; }
 
+    // Measure() takes percentiles over the whole image to place the curve. On
+    // a region those are percentiles of the wrong population, so a bright
+    // corner would be tone-mapped as though it were the entire scene.
+    bool RegionSafe() const override { return false; }
+
 private:
     // Roll off above middle grey, leaving everything below it alone.
     //

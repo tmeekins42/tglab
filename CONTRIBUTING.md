@@ -365,6 +365,82 @@ Two things that fell out of measuring this, both counter-intuitive:
   peak is a property of the scene. Nor can it be the image's own peak, which
   would make the same slider position mean something different on every shot.
 
+**A parameter measured in PIXELS must be scaled for the proxy.** While a slider
+is dragged the pipeline may run at reduced resolution, where a radius stated in
+pixels covers a different fraction of the picture — a blur of σ=20 on a
+quarter-scale image must run at σ=5 to look the same.
+
+```cpp
+// CPU, from RunCtx:
+const float sigma  = std::max(0.01f, ctx.ScaledPx(float(m_sigma)));
+const int   radius = ctx.ScaledRadius(int(m_radius));
+
+// GPU, from the base — GpuConstants() has no RunCtx and the input
+// descriptors are already out of reach by the time it runs:
+return {bits(GpuScaledPx(float(m_sigma)))};
+```
+
+Both return the value unchanged at full resolution, so they are always safe to
+apply. **Scale both paths or neither**: a GPU kernel and its CPU twin blurring
+by different amounts is a divergence that only appears mid-drag.
+
+**A value DERIVED from a pixel-unit parameter usually must not be scaled.**
+This is the subtle one, and it produced a real bug.
+
+`bloom` compensates its intensity by `spread² / 64`, so that "intensity 1"
+means one thing at every radius. Scaling the spread for the proxy scaled that
+compensation along with it — at a third scale, spread 24 becomes 8 and the gain
+drops **9×**. The glow vanished for the length of a drag and reappeared on
+release, which read as "the spread sliders do nothing until I let go".
+
+The test: *what is this expression a statement about?* The blur radius is about
+the raster, so it scales. The compensation is about the user's **setting** —
+the user changed nothing, only the resolution did — so it must be computed from
+the unscaled value.
+
+Three cases that are *not* a plain multiply, and each looks like an oversight
+until you know why:
+
+- **Screen furniture** — `crop`'s preview rectangle and grid. These are drawn
+  on the proxy and displayed at 1:1 with it, so scaling them down would make
+  the overlay nearly invisible during exactly the drag it exists to guide.
+- **Derived from the image** — `dehaze` computes its radii from the frame
+  dimensions, so it adapts on its own. Scaling again would apply the factor
+  twice.
+- **`film_grain`** — the multiply is right but for a different reason. Grain is
+  a random *field*, not a function of the image, so there is no full-resolution
+  answer to approximate. What the preview owes you is grain the same size *on
+  screen*, which works out to the same arithmetic — and degrades below size 1,
+  where the lattice cannot go finer than a pixel.
+
+`ProxyBehaviour::Never` is for algorithms where no parameter adjustment helps:
+demosaicers (downsampling destroys the CFA pattern that *is* the data) and
+anything touching a sidecar (keypoint coordinates are in image pixels and
+nothing rescales them).
+
+**Check every curve above 1.0 before shipping it.** A polynomial fitted to
+behave on `[0, 1]` says nothing about what it does past the end, and the usual
+ones misbehave badly. `smoothstep` is the trap: `t²(3−2t)` is a step only on
+`[0, 1]`, and beyond it the cubic turns over — `t=1.5` gives exactly 0, `t=2`
+gives −4, `t=3` gives −27.
+
+That shipped in `orton`. At its default contrast of 0.2 it drove anything above
+about 2.4× white *negative*, so overexposed cloud came back **black** — and
+scene-linear highlights are routinely 4–8× white, so the failing case was a
+bright sky, not an edge case.
+
+Two things made it survive review. The existing HDR test passed `contrast = 0`,
+which switches the S-curve off — **a test of an HDR path must use the default
+settings, not a configuration that avoids the arithmetic under suspicion**. And
+the fix wants a *weight* that fades the curve out approaching white rather than
+a hard switch at 1.0: switching also stops the black clouds, but leaves a 25%
+slope jump exactly at the white point, and a slope jump on a smooth sky gradient
+is a mach band — in the same content that exposed the original bug.
+
+The general check is monotonicity: feed values through the white point and
+assert the output keeps rising. That tests the shape of the curve rather than
+one sampled value.
+
 #### Point operations on the GPU
 
 `brightness` and `grayscale` are one fetch and a few instructions per pixel, so

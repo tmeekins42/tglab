@@ -22,6 +22,7 @@
 #include "../src/gpu/gpu_image.h"
 #include "../src/script/interp.h"
 #include "../src/script/parser.h"
+#include "../src/app/visible_rect.h"
 
 using namespace tglab;
 using clockt = std::chrono::steady_clock;
@@ -1043,6 +1044,23 @@ static void TestGpuAgreement(ID3D12Device* dev) {
          "o = bilateral(src, sigma_space = 3.0, sigma_range = 0.15)\n"
          "display(o)\n", 3.0, 1.0},
 
+        // crop in PREVIEW, rotated, with the grid on -- the mode where the two
+        // paths do the most independent drawing. Both have to place the
+        // rectangle, dim outside it, and lay the division grid in the
+        // rectangle's own rotated frame; that is three chances for the
+        // arithmetic to drift, and the grid was hand-written twice.
+        //
+        // Tight, because measurement says it can be: max 1.0 and mean 0.11 in
+        // 0..255 units, which is a single quantisation step. An antialiased
+        // grid edge landing on the other side of a pixel would show here, and
+        // it does not -- so these bounds are describing the real agreement
+        // rather than leaving room for a bug to hide in.
+        {"crop",
+         "src = image(\"test\")\n"
+         "o = crop(src, preview = 1, left = 0.1, right = 0.1, top = 0.1,\n"
+         "         bottom = 0.1, angle = 12, preview_grid = 2)\n"
+         "display(o)\n", 2.0, 0.3},
+
         // Ten controls fused into one kernel, so a mistake in any of them is
         // invisible in the others' output. Exercised with every control off its
         // default at once. If the two paths drift, compare mode is worthless
@@ -1397,6 +1415,39 @@ static void TestCompare(ID3D12Device* dev) {
         Check(r.diffImage.Valid(), "diff image produced");
     }
 
+    // DEHAZE, whose two paths are deliberately not identical.
+    //
+    // The GPU path estimates the airlight from a strided sample rather than a
+    // full scan, computes the map at full resolution rather than at 1/4 scale,
+    // and smooths it with a box rather than a guided filter. Each is a
+    // considered trade for a path that exists to be dragged.
+    //
+    // So this is not an equality check -- it is a check that the two are the
+    // same PICTURE. A tolerance this wide would hide a subtle error, but the
+    // failures that matter here are gross: a wrong airlight shifts every
+    // colour, and a mis-bound pass produces noise or black.
+    {
+        UiState ui; Pipeline pipe; std::vector<Data> src; std::string e;
+        BuildPipeline("src = image(\"test\")\nd = dehaze(src, strength = 0.7)\ndisplay(d)\n",
+                      512, &ui, &pipe, &src, &e);
+        const CompareResult r = CompareCpuGpu(pipe, &src, &gpu, -1);
+        Check(r.ok, "dehaze compares" + (r.ok ? "" : ": " + r.error));
+        if (r.ok) {
+            std::printf("       CPU %.1f ms   GPU %.1f ms   speedup %.1fx   maxdiff %.3f  mean %.4f\n",
+                        r.cpuMs, r.gpuMs, r.Speedup(), r.stats.maxAbsDiff,
+                        r.stats.meanAbsDiff);
+            // The mean is the honest measure of "same picture": a handful of
+            // pixels may differ a lot where the two paths pick different
+            // window minima, but the image as a whole must not drift.
+            Check(r.stats.meanAbsDiff <= 12.0,
+                  "dehaze CPU and GPU produce the same picture (mean " +
+                      std::to_string(r.stats.meanAbsDiff) + ")");
+            // And the GPU path must actually be doing the work, not passing
+            // the image through -- which would also produce a small diff.
+            Check(r.gpuImage.Valid(), "the GPU path produced an image");
+        }
+    }
+
     // A pipeline with nothing comparable must say so, rather than silently
     // comparing something against itself.
     {
@@ -1434,6 +1485,1110 @@ static void TestCompare(ID3D12Device* dev) {
     gpu.Shutdown();
 }
 
+// Proxy resolution: the interactive path that runs while a slider is dragged.
+//
+// Three properties, and the third is the one that would otherwise produce a
+// baffling bug rather than an obvious one.
+static void TestProxy() {
+    Section("proxy resolution");
+
+    const char* kScript =
+        "src = image(\"test\")\n"
+        "o = gaussian_blur(src, sigma = 3)\n"
+        "display(o)\n";
+    const int dim = 400;
+
+    auto run = [&](float scale, Pipeline* prev, Image* out, std::string* err) {
+        auto pipe = std::make_unique<Pipeline>();
+        UiState ui; std::vector<Data> src;
+        if (!BuildPipeline(kScript, dim, &ui, pipe.get(), &src, err)) return false;
+        pipe->SetProxyScale(scale);
+        if (!pipe->Execute(&src, prev, err)) return false;
+        const Data* d = pipe->Resolve(pipe->Viewers()[0].source, &src);
+        *out = const_cast<Image&>(std::get<Image>(*d)).Clone();
+        // Hand ownership back so the caller can chain a second run against it.
+        if (prev) *prev = std::move(*pipe);
+        return true;
+    };
+
+    // 1. A PROXY RUN PRODUCES A SMALLER IMAGE, and records the scale it used.
+    {
+        Image full, tiny;
+        std::string err;
+        Pipeline none;
+        const bool okFull  = run(1.0f,  nullptr, &full,  &err);
+        const bool okSmall = run(0.25f, nullptr, &tiny, &err);
+        Check(okFull && okSmall, "proxy runs" + (err.empty() ? "" : ": " + err));
+
+        if (okFull && okSmall) {
+            Check(full.Desc().width == dim,
+                  "a full run stays full size (" +
+                      std::to_string(full.Desc().width) + ")");
+            Check(tiny.Desc().width == dim / 4,
+                  "a proxy run shrinks the output (" +
+                      std::to_string(tiny.Desc().width) + " from " +
+                      std::to_string(dim) + ")");
+            Check(std::fabs(tiny.Desc().proxyScale - 0.25f) < 1e-5f,
+                  "the proxy result carries its scale (" +
+                      std::to_string(tiny.Desc().proxyScale) + ")");
+        }
+        (void)none;
+    }
+
+    // 2. A `Never` STAGE IN THE DIRTY RANGE VETOES THE PROXY.
+    //
+    // Not the whole pipeline -- the dirty range. That distinction is what lets
+    // a raw develop chain proxy at all, since its demosaic is Never and sits at
+    // the front. Here the detector IS dirty, so the veto must fire.
+    {
+        const char* kDetect =
+            "src = image(\"test\")\n"
+            "o = detect_orb(src)\n"
+            "display(o)\n";
+        UiState ui; Pipeline pipe; std::vector<Data> src; std::string err;
+        if (BuildPipeline(kDetect, dim, &ui, &pipe, &src, &err)) {
+            pipe.SetProxyScale(0.25f);
+            if (pipe.Execute(&src, nullptr, &err)) {
+                Check(std::fabs(pipe.RanAtScale() - 1.0f) < 1e-6f,
+                      "a Never stage vetoes the proxy (ran at " +
+                          std::to_string(pipe.RanAtScale()) + ")");
+                const Data* d = pipe.Resolve(pipe.Viewers()[0].source, &src);
+                const Image& im = std::get<Image>(*d);
+                Check(im.Desc().width == dim,
+                      "...and the output is full size (" +
+                          std::to_string(im.Desc().width) + ")");
+            } else {
+                Check(false, "detector proxy run: " + err);
+            }
+        }
+    }
+
+    // 3. A DRAG MUST NOT INVALIDATE THE STAGES AHEAD OF THE SLIDER.
+    //
+    // This is what locked the UI. The first version discarded the whole cache
+    // whenever the requested scale changed, so the first frame of a drag had
+    // firstDirty = 0 -- which put every upstream stage back in the dirty range,
+    // and on a raw that means re-demosaicing the frame on the CPU every frame.
+    //
+    // The property to hold: dragging a parameter of a LATE stage must leave the
+    // early ones cached. Measured by the pipeline's own cached-stage count,
+    // which is what would have made the original bug obvious.
+    {
+        const char* kChain =
+            "src = image(\"test\")\n"
+            "a = box_blur(src, radius = 3)\n"
+            "b = gaussian_blur(a, sigma = 2)\n"
+            "o = brightness(b, brightness = 0.1)\n"
+            "display(o)\n";
+
+        auto pipeA = std::make_unique<Pipeline>();
+        UiState uiA; std::vector<Data> srcA; std::string err;
+        if (BuildPipeline(kChain, dim, &uiA, pipeA.get(), &srcA, &err) &&
+            pipeA->Execute(&srcA, nullptr, &err)) {
+
+            // Now "drag" the LAST stage's parameter, at proxy scale.
+            const char* kChain2 =
+                "src = image(\"test\")\n"
+                "a = box_blur(src, radius = 3)\n"
+                "b = gaussian_blur(a, sigma = 2)\n"
+                "o = brightness(b, brightness = 0.4)\n"
+                "display(o)\n";
+
+            Pipeline pipeB;
+            UiState uiB; std::vector<Data> srcB;
+            if (BuildPipeline(kChain2, dim, &uiB, &pipeB, &srcB, &err)) {
+                pipeB.SetProxyScale(0.25f);
+                Check(pipeB.Execute(&srcB, pipeA.get(), &err),
+                      "the drag run executes" + (err.empty() ? "" : ": " + err));
+
+                // The two blurs were untouched, so both must have been reused.
+                // Zero here means the whole chain re-ran, which on a raw is the
+                // lockup.
+                Check(pipeB.CachedStageCount() >= 2,
+                      "a drag reuses the stages ahead of it (" +
+                          std::to_string(pipeB.CachedStageCount()) +
+                          " cached of 3)");
+            }
+        }
+    }
+
+    // 3b. THE DOWNSAMPLE ITSELF MUST NOT COST PER FRAME.
+    //
+    // The proxy's own cost, and it dominated everything it was meant to save.
+    // Dragging leaves the upstream stages cached, so the same full-resolution
+    // image was area-averaged again on every frame -- on a 45 MP raw that was
+    // ~90% of the run, and a drag took a second while the status line honestly
+    // reported "10% of the pixels".
+    //
+    // Measured as time, because that is the symptom. The first drag frame pays
+    // for the downsample; every later one must not.
+    {
+        const char* kChain =
+            "src = image(\"test\")\n"
+            "a = gaussian_blur(src, sigma = 2)\n"
+            "o = brightness(a, brightness = 0.1)\n"
+            "display(o)\n";
+
+        auto base = std::make_unique<Pipeline>();
+        UiState ui0; std::vector<Data> src0; std::string err;
+        if (BuildPipeline(kChain, 900, &ui0, base.get(), &src0, &err) &&
+            base->Execute(&src0, nullptr, &err)) {
+
+            auto dragFrame = [&](double bright, Pipeline* prev, double* ms) {
+                const std::string s =
+                    "src = image(\"test\")\n"
+                    "a = gaussian_blur(src, sigma = 2)\n"
+                    "o = brightness(a, brightness = " +
+                    std::to_string(bright) + ")\n"
+                    "display(o)\n";
+                auto p = std::make_unique<Pipeline>();
+                UiState ui; std::vector<Data> s2; std::string e;
+                if (!BuildPipeline(s.c_str(), 900, &ui, p.get(), &s2, &e)) return false;
+                p->SetProxyScale(0.25f);
+                const auto t0 = clockt::now();
+                const bool ok = p->Execute(&s2, prev, &e);
+                *ms = std::chrono::duration<double, std::milli>(clockt::now() - t0).count();
+                if (ok) *prev = std::move(*p);
+                return ok;
+            };
+
+            double first = 0.0, later = 0.0;
+            Pipeline chain = std::move(*base);
+            if (dragFrame(0.2, &chain, &first)) {
+                // Several more, taking the best: one sample could be a
+                // scheduling hiccup, and the claim is about the steady state.
+                later = 1e9;
+                for (int i = 0; i < 4; ++i) {
+                    double t = 0.0;
+                    if (dragFrame(0.3 + 0.02 * i, &chain, &t))
+                        later = std::min(later, t);
+                }
+
+                // A REAL MARGIN, because the obvious bound does not test
+                // anything. `later <= first` passes at 11.8 against 12.0 --
+                // which is exactly what the uncached version measures, since
+                // both frames do the same work. Verified by disabling the
+                // cache: 12.0 then 11.8, a passing test on broken code.
+                //
+                // Cached, the later frames measure 1.2 ms against 12.0. Half is
+                // far inside that gap and far outside the uncached one.
+                Check(later < first * 0.5,
+                      "a drag does not re-downsample every frame (" +
+                          std::to_string(first) + " ms then " +
+                          std::to_string(later) + " ms)");
+            }
+        }
+    }
+
+    // 3c. DRAGGING AN EARLY SLIDER MUST NOT ACCUMULATE PROXIES.
+    //
+    // The case that hung the app. Dragging a slider EARLY in a chain makes the
+    // upstream stage re-run every frame, so its output is a new buffer each
+    // time -- and the first cache keyed on that buffer's ADDRESS and appended.
+    // Every frame added a 40 MB proxy of a 45 MP raw; a few seconds of dragging
+    // exhausted VRAM and every algorithm collapsed into "could not make an
+    // input GPU-resident".
+    //
+    // Worse than the leak: a freed buffer's address can be REUSED, so the cache
+    // could report a hit for a different image and hand back a proxy of the
+    // previous frame's pixels. Correctness, not just memory.
+    //
+    // Measured as steady-state time over many frames. A cache that grows makes
+    // later frames slower, not faster; one that returns stale pixels would make
+    // the result wrong, which the fidelity test covers separately.
+    {
+        auto base = std::make_unique<Pipeline>();
+        UiState ui0; std::vector<Data> src0; std::string err;
+        const char* kFirst =
+            "src = image(\"test\")\n"
+            "a = brightness(src, brightness = 0.0)\n"
+            "b = gaussian_blur(a, sigma = 2)\n"
+            "display(b)\n";
+        if (BuildPipeline(kFirst, 700, &ui0, base.get(), &src0, &err) &&
+            base->Execute(&src0, nullptr, &err)) {
+
+            // Drag the FIRST stage's parameter, so everything downstream is
+            // dirty and the upstream buffer changes every frame.
+            auto frame = [&](double v, Pipeline* prev, double* ms) {
+                const std::string s =
+                    "src = image(\"test\")\n"
+                    "a = brightness(src, brightness = " + std::to_string(v) + ")\n"
+                    "b = gaussian_blur(a, sigma = 2)\n"
+                    "display(b)\n";
+                auto p = std::make_unique<Pipeline>();
+                UiState ui; std::vector<Data> s2; std::string e;
+                if (!BuildPipeline(s.c_str(), 700, &ui, p.get(), &s2, &e)) return false;
+                p->SetProxyScale(0.25f);
+                const auto t0 = clockt::now();
+                const bool ok = p->Execute(&s2, prev, &e);
+                *ms = std::chrono::duration<double, std::milli>(clockt::now() - t0).count();
+                if (ok) *prev = std::move(*p);
+                return ok;
+            };
+
+            Pipeline chain = std::move(*base);
+            double early = 0.0, late = 0.0;
+            bool ok = true;
+            for (int i = 0; i < 3 && ok; ++i) {
+                double t = 0.0;
+                ok = frame(0.05 * i, &chain, &t);
+                early = std::max(early, t);
+            }
+            for (int i = 0; i < 12 && ok; ++i) {
+                double t = 0.0;
+                ok = frame(0.5 + 0.01 * i, &chain, &t);
+                if (i >= 8) late = std::max(late, t);
+            }
+
+            Check(ok, "an early-slider drag keeps running");
+            // Fifteen frames in, a frame must cost about what it did at three.
+            // An accumulating cache shows up here as steady growth long before
+            // it becomes an out-of-memory failure.
+            Check(ok && late < early * 2.5,
+                  "an early-slider drag does not accumulate proxies (" +
+                      std::to_string(early) + " ms early, " +
+                      std::to_string(late) + " ms late)");
+        }
+    }
+
+    // 3d. A GROUP SOURCE MUST STILL PROXY.
+    //
+    // hdr.tgl and every other group script take an ImageSet from the palette
+    // rather than an Image. The app measured the source width by looking only
+    // for Images, so it stayed at 0, the scale fell back to 1.0, and the proxy
+    // silently never engaged -- with no size line in the status to say why.
+    //
+    // Tested through the pipeline rather than the app, because what has to hold
+    // is that a set-sourced script CAN proxy once it is asked to. The width
+    // calculation is one line; that it was never exercised is the gap.
+    {
+        ImageSet set;
+        for (int i = 0; i < 3; ++i) set.images.push_back(MakeSource(dim));
+        set.shape = Shape{{{"frame", 3}}};
+
+        // A DRAG, not a first run. The distinction matters and cost a test
+        // rewrite: on a first run firstDirty is 0, so the boundary IS the
+        // reduction, whose input is a set and therefore not proxied. Only once
+        // the merge is CACHED does the boundary move past it to a stage whose
+        // input is a single image -- which is what dragging a develop slider
+        // actually does, and the case that has to work.
+        auto build = [&](double bright) {
+            auto p = std::make_unique<Pipeline>();
+            p->AddStage(Registry::Get().Create("merge_mean"), "merge_mean",
+                        {{-1, 0}}, 1, 1, "frame");
+            auto b = Registry::Get().Create("brightness");
+            if (ParamBase* pb = b->FindParam("brightness")) {
+                std::string e; pb->SetFromScript(Value(bright), &e);
+            }
+            p->AddStage(std::move(b), "brightness", {{0, 0}}, 1, 2);
+            return p;
+        };
+
+        std::vector<Data> src;
+        src.push_back(Data{std::move(set)});
+
+        std::string err;
+        auto first = build(0.0);
+        if (!first->Execute(&src, nullptr, &err)) {
+            Check(false, "group first run: " + err);
+        } else {
+            auto drag = build(0.3);
+            drag->SetProxyScale(0.25f);
+            if (!drag->Execute(&src, first.get(), &err)) {
+                Check(false, "group proxy runs: " + err);
+            } else {
+                const Data* d = drag->Resolve({1, 0}, &src);
+                const auto* im = d ? std::get_if<Image>(d) : nullptr;
+                Check(im && im->Desc().width == dim / 4,
+                      "a group-sourced script proxies after the reduction (" +
+                          std::to_string(im ? im->Desc().width : 0) + " from " +
+                          std::to_string(dim) + ")");
+            }
+        }
+    }
+
+    // 4. A PROXY RESULT IS NEVER REUSED FOR A FULL-RESOLUTION RUN.
+    //
+    // THE failure this mechanism has to avoid, and the reason it is quiet: the
+    // parameters are identical, so the cache scan sees an unchanged stage and
+    // reuses it. The run succeeds, nothing is reported, and the final image is
+    // silently soft -- looking like a bad resample rather than a cache bug.
+    //
+    // Checked by running a proxy first and then a full run AGAINST IT, which is
+    // exactly the sequence a slider drag followed by its release produces.
+    {
+        Image tiny, full;
+        std::string err;
+
+        auto pipeA = std::make_unique<Pipeline>();
+        UiState uiA; std::vector<Data> srcA;
+        if (BuildPipeline(kScript, dim, &uiA, pipeA.get(), &srcA, &err)) {
+            pipeA->SetProxyScale(0.25f);
+            Check(pipeA->Execute(&srcA, nullptr, &err),
+                  "the drag run executes" + (err.empty() ? "" : ": " + err));
+
+            auto pipeB = std::make_unique<Pipeline>();
+            UiState uiB; std::vector<Data> srcB;
+            if (BuildPipeline(kScript, dim, &uiB, pipeB.get(), &srcB, &err)) {
+                pipeB->SetProxyScale(1.0f);
+                Check(pipeB->Execute(&srcB, pipeA.get(), &err),
+                      "the release run executes" + (err.empty() ? "" : ": " + err));
+
+                const Data* d = pipeB->Resolve(pipeB->Viewers()[0].source, &srcB);
+                const Image& im = std::get<Image>(*d);
+                Check(im.Desc().width == dim && im.Desc().height == dim,
+                      "the full run after a drag is FULL SIZE, not a reused "
+                      "proxy (" + std::to_string(im.Desc().width) + "x" +
+                          std::to_string(im.Desc().height) + ")");
+                Check(std::fabs(im.Desc().proxyScale - 1.0f) < 1e-6f,
+                      "...and its scale is 1.0 (" +
+                          std::to_string(im.Desc().proxyScale) + ")");
+            }
+        }
+    }
+}
+
+// Pass 2: does a proxy preview actually LOOK like the full-resolution result?
+//
+// The test the design called for first, because it is the only thing that
+// distinguishes "scaled correctly" from "ran without crashing". An algorithm
+// that ignores proxyScale still produces a plausible image -- just at the wrong
+// strength -- and nothing else in the suite would notice.
+//
+// The comparison: run at full resolution and downsample the result, versus run
+// on a downsampled input. Those should agree, because both are answering "what
+// does this look like at proxy size". They will not agree exactly -- resampling
+// order matters -- but a blur that forgot to scale its sigma is off by 4x, which
+// is nowhere near the resampling noise.
+static void TestProxyFidelity() {
+    Section("proxy fidelity");
+
+    const int dim = 320;
+    const float scale = 0.25f;
+
+    // Structure at several sizes, so a wrong radius shows. A flat field would
+    // look identical however badly the blur was scaled.
+    auto makeSrc = [&](int d) {
+        Image img;
+        img.Alloc({d, d, Format::RGBA32F});
+        ImageView v = img.MapCpuWrite();
+        for (int y = 0; y < d; ++y)
+            for (int x = 0; x < d; ++x) {
+                float* p = v.At<float>(x, y);
+                const bool a = ((x / 40) + (y / 40)) % 2 == 0;
+                const bool b = ((x / 8)  + (y / 8))  % 2 == 0;
+                const float g = (a ? 0.65f : 0.2f) + (b ? 0.12f : 0.0f);
+                p[0] = p[1] = p[2] = g;
+                p[3] = 1.0f;
+            }
+        return img;
+    };
+
+    auto meanOf = [](const Image& im) {
+        ImageView v = const_cast<Image&>(im).MapCpuRead();
+        double s = 0.0;
+        long long n = 0;
+        for (int y = 0; y < v.desc.height; ++y)
+            for (int x = 0; x < v.desc.width; ++x) { s += v.At<float>(x, y)[0]; ++n; }
+        return n ? s / double(n) : 0.0;
+    };
+
+    // Standard deviation is the measure that matters here: a blur REDUCES it,
+    // and by how much is exactly what the radius controls. A mean would be
+    // nearly unchanged by any blur and would pass whatever the sigma was.
+    auto stddevOf = [](const Image& im) {
+        ImageView v = const_cast<Image&>(im).MapCpuRead();
+        double s = 0.0, s2 = 0.0;
+        long long n = 0;
+        for (int y = 0; y < v.desc.height; ++y)
+            for (int x = 0; x < v.desc.width; ++x) {
+                const double g = v.At<float>(x, y)[0];
+                s += g; s2 += g * g; ++n;
+            }
+        if (!n) return 0.0;
+        const double m = s / double(n);
+        return std::sqrt(std::max(s2 / double(n) - m * m, 0.0));
+    };
+
+    struct Case { const char* name; const char* script; };
+    const Case cases[] = {
+        {"gaussian_blur", "o = gaussian_blur(src, sigma = 8)\n"},
+        {"box_blur",      "o = box_blur(src, radius = 12)\n"},
+        {"median_blur",   "o = median_blur(src, radius = 6)\n"},
+        {"kuwahara",      "o = kuwahara(src, radius = 8)\n"},
+        {"bilateral",     "o = bilateral(src, sigma_space = 8, sigma_range = 0.4)\n"},
+        {"orton",         "o = orton(src, blur = 16)\n"},
+
+        // bloom BRIGHTENS rather than smoothing, so its failure is invisible to
+        // a contrast check unless the glow is strong enough to move the
+        // statistics. The threshold is set low and the intensity high on
+        // purpose, so the glow dominates.
+        //
+        // This is the case that was actually broken: bloom compensates its
+        // intensity by spread^2, and scaling the spread for the proxy scaled
+        // the compensation with it -- a factor of nine at a third scale. The
+        // glow vanished for the length of a drag and came back on release.
+        {"bloom",         "o = bloom(src, threshold = 0.1, intensity = 2, "
+                          "spread_r = 24, spread_g = 24, spread_b = 24)\n"},
+    };
+
+    for (const Case& c : cases) {
+        const std::string script =
+            std::string("src = image(\"test\")\n") + c.script + "display(o)\n";
+
+        // Full resolution, then shrink the RESULT.
+        Image fullThenSmall;
+        {
+            UiState ui; Pipeline p; std::vector<Data> src; std::string err;
+            src.push_back(Data{makeSrc(dim)});
+            std::vector<SourceImage> names{{"test", 0}};
+            Program prog;
+            if (!Parse(script, &prog, &err)) { Check(false, err); continue; }
+            auto r = Interpret(prog, names, &ui, &p);
+            if (!r.ok) { Check(false, r.error); continue; }
+            if (!p.Execute(&src, nullptr, &err)) { Check(false, err); continue; }
+            const Data* d = p.Resolve(p.Viewers()[0].source, &src);
+            Image big = const_cast<Image&>(std::get<Image>(*d)).Clone();
+
+            // Shrink through the same resize the proxy path uses.
+            auto rz = Registry::Get().Create("resize");
+            if (ParamBase* pb = rz->FindParam("scale")) {
+                std::string e; pb->SetFromScript(Value(double(scale)), &e);
+            }
+            std::vector<Data> ins;
+            ins.push_back(Data{std::move(big)});
+            std::vector<const Data*> ip{&ins[0]};
+            ImageDesc od = rz->OutputDesc(0, std::get<Image>(ins[0]).Desc());
+            Image dst; dst.Alloc(od);
+            std::vector<Data> outs(1);
+            outs[0] = Data{std::move(dst)};
+            RunCtx rc(ip, outs);
+            rz->RunCPU(rc);
+            fullThenSmall = std::get<Image>(outs[0]).Clone();
+        }
+
+        // Proxy: the pipeline shrinks the INPUT and the algorithm scales itself.
+        Image proxied;
+        {
+            UiState ui; Pipeline p; std::vector<Data> src; std::string err;
+            src.push_back(Data{makeSrc(dim)});
+            std::vector<SourceImage> names{{"test", 0}};
+            Program prog;
+            if (!Parse(script, &prog, &err)) { Check(false, err); continue; }
+            auto r = Interpret(prog, names, &ui, &p);
+            if (!r.ok) { Check(false, r.error); continue; }
+            p.SetProxyScale(scale);
+            if (!p.Execute(&src, nullptr, &err)) { Check(false, err); continue; }
+            const Data* d = p.Resolve(p.Viewers()[0].source, &src);
+            proxied = const_cast<Image&>(std::get<Image>(*d)).Clone();
+        }
+
+        if (fullThenSmall.Desc().width != proxied.Desc().width) {
+            Check(false, std::string(c.name) + ": sizes differ (" +
+                             std::to_string(fullThenSmall.Desc().width) + " vs " +
+                             std::to_string(proxied.Desc().width) + ")");
+            continue;
+        }
+
+        const double sdA = stddevOf(fullThenSmall);
+        const double sdB = stddevOf(proxied);
+        const double ratio = (sdA > 1e-6) ? sdB / sdA : 0.0;
+
+        // Within 35%. Loose because resampling order genuinely differs -- one
+        // blurs then shrinks, the other shrinks then blurs -- but an unscaled
+        // radius is off by 1/scale = 4x, which this catches with room to spare.
+        Check(ratio > 0.65 && ratio < 1.45,
+              std::string(c.name) + ": the proxy preview matches the full-res "
+              "result (contrast ratio " + std::to_string(ratio) + ")");
+
+        // And the exposure is unchanged, which a wrong radius would not
+        // necessarily break but a wrong normalisation would.
+        const double mA = meanOf(fullThenSmall), mB = meanOf(proxied);
+        Check(std::fabs(mA - mB) < 0.05,
+              std::string(c.name) + ": ...at the same brightness (" +
+                  std::to_string(mA) + " vs " + std::to_string(mB) + ")");
+    }
+}
+
+// Region processing: computing only the visible rectangle.
+//
+// The property that matters is not "it ran" but "it produced the SAME PIXELS
+// the full run would have". A cropped blur that clamps at the cut looks
+// perfectly reasonable on its own and differs from the truth by a visible band
+// at every edge -- which is exactly what the margin exists to prevent and
+// exactly what a run-without-crashing test would miss.
+// WHERE THE REGION COMES FROM, which is not what TestRegion covers.
+//
+// TestRegion hands the pipeline a rectangle and checks it is honoured. That
+// left the other half untested: the viewer's job of turning a panel and a
+// camera into a rectangle. A unit error there passed every existing test and
+// still blacked the screen on every zoomed-in drag, because the rectangle the
+// pipeline faithfully computed was not the one the panel was looking at.
+static void TestVisibleRect() {
+    std::printf("\n--- visible rect ---\n");
+
+    // A 1000x800 image, fitted in a 500x400 panel at 50%: the panel sees all
+    // of it. The +1 is the outward rounding, which is deliberate.
+    {
+        VisibleRectInput in;
+        in.panelX = 0;   in.panelY = 0;   in.panelW = 500; in.panelH = 400;
+        in.imageX = 0;   in.imageY = 0;   in.imageW = 500; in.imageH = 400;
+        in.zoom = 0.5f;
+        const ImageRect r = ComputeVisibleRect(in);
+        Check(r.x == 0 && r.y == 0 && r.w >= 1000 && r.h >= 800,
+              "a fitted panel sees the whole image (" + std::to_string(r.w) +
+                  "x" + std::to_string(r.h) + ")");
+    }
+
+    // Zoomed to 1:1 and panned into the middle of a big picture: the panel
+    // shows 500x400 image pixels starting at (2000,1000).
+    {
+        VisibleRectInput in;
+        in.panelX = 100; in.panelY = 50; in.panelW = 500; in.panelH = 400;
+        // The whole image's top-left is off-screen up and left.
+        in.imageX = 100 - 2000; in.imageY = 50 - 1000;
+        in.imageW = 4000;       in.imageH = 3000;
+        in.zoom = 1.0f;
+        const ImageRect r = ComputeVisibleRect(in);
+        Check(r.x == 2000 && r.y == 1000,
+              "a panned view reports where it is looking (" +
+                  std::to_string(r.x) + "," + std::to_string(r.y) + ")");
+        Check(r.w >= 500 && r.h >= 400 && r.w <= 502 && r.h <= 402,
+              "...and how much it can see (" + std::to_string(r.w) + "x" +
+                  std::to_string(r.h) + ")");
+    }
+
+    // THE INVARIANT. What the panel shows does not change when the pipeline
+    // switches to a proxy, so neither may the rectangle. Anything else is a
+    // feedback loop -- the scale changes the request, the request changes the
+    // result, the result changes the scale.
+    //
+    // The caller states the image rect in SCREEN pixels against the FULL
+    // extent, so a proxy is already accounted for by the time it arrives here:
+    // the same picture at a quarter scale is a quarter-size raster drawn at
+    // four times the zoom, and both give the same screen rectangle. That is
+    // why proxyScale is absent from the input -- applying it here would be
+    // applying it twice, which asked for a differently scaled rectangle of a
+    // different part of the image, but only while dragging.
+    {
+        VisibleRectInput a;
+        a.panelX = 0; a.panelY = 0; a.panelW = 640; a.panelH = 480;
+        a.imageX = -300; a.imageY = -200; a.imageW = 3000; a.imageH = 2000;
+        a.zoom = 1.0f;
+        const ImageRect ra = ComputeVisibleRect(a);
+        Check(ra.x == 300 && ra.y == 200 && ra.w >= 640 && ra.h >= 480,
+              "a 1:1 view asks for what it shows (" + std::to_string(ra.x) +
+                  "," + std::to_string(ra.y) + " " + std::to_string(ra.w) +
+                  "x" + std::to_string(ra.h) + ")");
+    }
+
+    // A panel that does not overlap the image at all asks for nothing, rather
+    // than a negative or wrapped rectangle.
+    {
+        VisibleRectInput in;
+        in.panelX = 0;    in.panelY = 0;    in.panelW = 100; in.panelH = 100;
+        in.imageX = 500;  in.imageY = 500;  in.imageW = 100; in.imageH = 100;
+        in.zoom = 1.0f;
+        Check(!ComputeVisibleRect(in).Valid(),
+              "a panel showing none of the image asks for nothing");
+    }
+
+    // Degenerate zoom must not divide by ~zero and produce a garbage extent.
+    {
+        VisibleRectInput in;
+        in.panelX = 0; in.panelY = 0; in.panelW = 100; in.panelH = 100;
+        in.imageX = 0; in.imageY = 0; in.imageW = 100; in.imageH = 100;
+        in.zoom = 0.0f;
+        Check(!ComputeVisibleRect(in).Valid(), "a zero zoom asks for nothing");
+    }
+}
+
+// THE PICTURE MUST NOT MOVE WHEN A REACH CHANGES.
+//
+// The crop's origin is `visible - margin`, and the margin comes from the
+// algorithm's reach -- so dragging a blur radius moves the origin. That is
+// fine in full-resolution pixels, where the origin is exact. Scaled into a
+// proxy's own pixels it rounds, and a one-pixel move of the origin can land on
+// a different proxy pixel: the whole image then redraws one pixel over.
+//
+// Visible on Orton's blur slider and on nothing else, because it is the only
+// control there whose reach changes as it drags. The fix snaps the origin to
+// the proxy grid, making it a fixed point of that rounding.
+static void TestRegionOriginStable() {
+    std::printf("\n--- region origin stability ---\n");
+
+    const int dim = 600;
+    Image img;
+    img.Alloc({dim, dim, Format::RGBA32F});
+    {
+        ImageView v = img.MapCpuWrite();
+        for (int y = 0; y < dim; ++y)
+            for (int x = 0; x < dim; ++x) {
+                float* p = v.At<float>(x, y);
+                p[0] = p[1] = p[2] = ((x / 20) + (y / 20)) % 2 ? 0.7f : 0.25f;
+                p[3] = 1.0f;
+            }
+    }
+
+    const Pipeline::Rect want{200, 210, 160, 150};
+
+    // Two blur radii: different reaches, so different margins.
+    auto originFor = [&](int blurPx, int* ox, int* oy) {
+        const std::string script =
+            "src = image(\"test\")\n"
+            "o = orton(src, blur = " + std::to_string(blurPx) +
+            ", strength = 0.5)\n"
+            "display(o)\n";
+        UiState ui; Pipeline p; std::vector<Data> src;
+        src.push_back(Data{img.Clone()});
+        std::vector<SourceImage> names{{"test", 0}};
+        Program prog; std::string err;
+        if (!Parse(script, &prog, &err)) return false;
+        auto r = Interpret(prog, names, &ui, &p);
+        if (!r.ok) return false;
+        p.SetProxyScale(0.5f);
+        p.SetRegion(want);
+        if (!p.Execute(&src, nullptr, &err)) return false;
+        const Data* d = p.Resolve(p.Viewers()[0].source, &src);
+        const ImageDesc& sd = std::get<Image>(*d).Desc();
+        *ox = sd.originX;
+        *oy = sd.originY;
+        return true;
+    };
+
+    int ax = -1, ay = -1, bx = -1, by = -1;
+    const bool okA = originFor(6, &ax, &ay);
+    const bool okB = originFor(7, &bx, &by);
+    if (!okA || !okB) { Check(false, "orton runs on a region"); return; }
+
+    // The visible rectangle did not move, so neither may the drawn origin --
+    // whatever the margin did in between.
+    Check(ax == bx && ay == by,
+          "the origin holds still when only the reach changes (" +
+              std::to_string(ax) + "," + std::to_string(ay) + " vs " +
+              std::to_string(bx) + "," + std::to_string(by) + ")");
+}
+
+// THE MEASUREMENT CACHE, in both directions.
+//
+// A cache that never invalidates is fast and wrong, and the wrongness here is
+// the dangerous kind: a stale airlight does not crash or produce noise, it
+// produces a slightly wrong picture that looks entirely plausible. So the
+// misses matter more than the hits, and both are checked.
+//
+// Driven through the pipeline rather than by calling the algorithm directly,
+// because the cache is the PIPELINE's -- the algorithm object does not survive
+// between runs, which is the whole reason the facility exists.
+static void TestMeasureCache(ID3D12Device* dev) {
+    std::printf("\n--- gpu measurement cache ---\n");
+
+    ComputeContext gpu;
+    if (!gpu.Init(dev)) { Check(false, "compute context starts"); return; }
+
+    const int dim = 512;
+
+    // Two images that must measure differently: one hazy (a bright, low
+    // contrast wash) and one clear. If the cache leaked between them the
+    // airlight from the first would be used on the second.
+    auto make = [&](bool hazy) {
+        Image img;
+        img.Alloc({dim, dim, Format::RGBA32F});
+        ImageView v = img.MapCpuWrite();
+        for (int y = 0; y < dim; ++y)
+            for (int x = 0; x < dim; ++x) {
+                float* p = v.At<float>(x, y);
+                const float base = ((x / 32) + (y / 32)) % 2 ? 0.6f : 0.15f;
+                if (hazy) {
+                    // Washed toward a bright blue-grey: high floor, low range.
+                    p[0] = 0.55f + base * 0.25f;
+                    p[1] = 0.58f + base * 0.25f;
+                    p[2] = 0.70f + base * 0.25f;
+                } else {
+                    p[0] = p[1] = p[2] = base;
+                }
+                p[3] = 1.0f;
+            }
+        return img;
+    };
+
+    // Runs one script against one source and returns the reported airlight
+    // line, which is how the algorithm tells us which path it took.
+    // A version per source, bumped when the image changes -- exactly what the
+    // app supplies. Without it the pipeline cannot tell one palette image from
+    // another (sourceHash is only computed from these), so a swapped image
+    // reuses the whole cached STAGE and the measurement cache is never even
+    // consulted. That is a property of the harness, not of the cache, but it
+    // is worth stating: this cache is only as good as the identity the
+    // pipeline is given.
+    uint64_t version = 1;
+
+    auto run = [&](Pipeline* pipe, Pipeline* prev, const Image& srcImg,
+                   const std::string& args, std::string* note) {
+        UiState ui;
+        std::vector<Data> src;
+        src.push_back(Data{const_cast<Image&>(srcImg).Clone()});
+        std::vector<SourceImage> names{{"test", 0}};
+        const std::string script =
+            "src = image(\"test\")\n"
+            "d = dehaze(src, " + args + ")\n"
+            "display(d)\n";
+        Program prog; std::string err;
+        if (!Parse(script, &prog, &err)) return false;
+        auto r = Interpret(prog, names, &ui, pipe);
+        if (!r.ok) return false;
+        // `prev` is how a cache carries between runs -- the same argument the
+        // app passes, so this exercises the real path rather than a test-only
+        // door into the pipeline.
+        const std::vector<uint64_t> versions{version};
+        if (!pipe->Execute(&src, prev, &err, &gpu, ExecMode::ForceGPU, &versions))
+            return false;
+        for (const Stage& st : pipe->Stages())
+            if (st.algoName == "dehaze" && st.algo) *note = st.algo->RunReport();
+        return true;
+    };
+
+    const Image hazy = make(true), clear = make(false);
+
+    // First run measures; second, with only the strength changed, must reuse.
+    Pipeline p1, p2;
+    std::string n1, n2;
+    if (!run(&p1, nullptr, hazy, "strength = 0.7", &n1)) { Check(false, "dehaze runs on the GPU"); return; }
+    if (!run(&p2, &p1, hazy, "strength = 0.5", &n2))     { Check(false, "dehaze re-runs"); return; }
+
+    Check(n1.find("sampled") != std::string::npos,
+          "the first run measures (" + n1 + ")");
+    Check(n2.find("cached") != std::string::npos,
+          "dragging strength reuses the measurement (" + n2 + ")");
+
+    // A DIFFERENT IMAGE must not reuse it. This is the failure that would be
+    // invisible: the picture still dehazes, just with the wrong airlight.
+    ++version;   // a different image in the same palette slot
+    Pipeline p3; std::string n3;
+    if (run(&p3, &p2, clear, "strength = 0.5", &n3))
+        // "not cached" is NOT enough: an empty report also fails to contain
+        // it, so a run that produced nothing at all would pass. Require the
+        // positive evidence that it measured.
+        Check(n3.find("sampled") != std::string::npos,
+              "a different image re-measures (" + n3 + ")");
+    else
+        Check(false, "dehaze runs on a second image");
+
+    // And the airlights must actually differ, or the check above proves
+    // nothing -- two identical measurements would pass it either way.
+    Pipeline p4; std::string n4;
+    if (run(&p4, nullptr, clear, "strength = 0.5", &n4))
+        Check(n1 != n4, "the two images measure different airlights");
+
+    // WHAT THE CACHE IS ACTUALLY FOR: the second run must be materially
+    // cheaper, or the whole facility is bookkeeping for nothing.
+    //
+    // Timed at a size where the measurement dominates. The first run pays for
+    // it; every run after is the five dispatches alone.
+    {
+        const int big = 2400;
+        Image bigHazy;
+        bigHazy.Alloc({big, big, Format::RGBA32F});
+        {
+            ImageView v = bigHazy.MapCpuWrite();
+            for (int y = 0; y < big; ++y)
+                for (int x = 0; x < big; ++x) {
+                    float* p = v.At<float>(x, y);
+                    const float b = ((x / 32) + (y / 32)) % 2 ? 0.6f : 0.15f;
+                    p[0] = 0.55f + b * 0.25f;
+                    p[1] = 0.58f + b * 0.25f;
+                    p[2] = 0.70f + b * 0.25f;
+                    p[3] = 1.0f;
+                }
+        }
+
+        ++version;
+        Pipeline a, b;
+        std::string na, nb;
+        const auto t0 = clockt::now();
+        const bool oka = run(&a, nullptr, bigHazy, "strength = 0.7", &na);
+        const auto t1 = clockt::now();
+        const bool okb = run(&b, &a, bigHazy, "strength = 0.5", &nb);
+        const auto t2 = clockt::now();
+
+        if (oka && okb) {
+            const double first  = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            const double second = std::chrono::duration<double, std::milli>(t2 - t1).count();
+            // REPORTED, NOT ASSERTED ON.
+            //
+            // A wall-clock ratio is not a stable assertion here: the timings
+            // include upload and dispatch on a GPU shared with the desktop,
+            // and the same pair of runs measured 343/130 ms once and 267/210
+            // ms minutes later. A test that fails on a busy machine teaches
+            // people to ignore it.
+            //
+            // What is actually being claimed -- that the measurement is
+            // skipped -- is a fact about control flow, and the report string
+            // states it exactly. That is what gets asserted; the numbers are
+            // printed for a human to look at.
+            std::printf("       first %.0f ms   cached %.0f ms\n", first, second);
+            Check(na.find("sampled") != std::string::npos,
+                  "the first timed run measured");
+            Check(nb.find("cached") != std::string::npos,
+                  "the second timed run skipped the measurement");
+        }
+    }
+
+    // A parameter the measurement DEPENDS on must also miss. patch is the
+    // window the dark channel is minimised over, so an airlight measured with
+    // one is not the airlight for another.
+    {
+        Pipeline p5; std::string n5;
+        if (run(&p5, &p2, hazy, "strength = 0.7, patch = 30", &n5))
+            Check(n5.find("cached") == std::string::npos,
+                  "changing patch re-measures (" + n5 + ")");
+        else
+            Check(false, "dehaze runs with a changed patch");
+    }
+}
+
+// THE DESCRIPTOR INVARIANT THE VIEWER RELIES ON, checked on the descriptor
+// rather than through a window.
+//
+// A proxy states its origin and full extent in ITS OWN pixels, so both must
+// scale with the raster when the image is downsampled. Leaving them at
+// full-resolution values made a 68% proxy of an 8191 px frame claim to be a
+// window onto 8191 px while holding 5545 -- and the viewer, which lays out
+// against the full extent divided by the scale, drew 12088.
+static void TestProxyPlacement() {
+    std::printf("\n--- proxy placement ---\n");
+
+    auto algo = Registry::Get().Create("resize");
+    if (!algo) { Check(false, "resize is registered"); return; }
+    std::string e;
+    if (ParamBase* p = algo->FindParam("scale")) p->SetFromScript(Value(0.5), &e);
+
+    // A crop: a 400x300 window at (1000,500) onto a 4000x3000 frame.
+    ImageDesc in;
+    in.width = 400; in.height = 300; in.format = Format::RGBA32F;
+    in.originX = 1000; in.originY = 500;
+    in.fullW = 4000;   in.fullH = 3000;
+
+    const ImageDesc out = algo->OutputDesc(0, in);
+    Check(out.width == 200 && out.height == 150,
+          "the raster halves (" + std::to_string(out.width) + "x" +
+              std::to_string(out.height) + ")");
+    Check(out.fullW == 2000 && out.fullH == 1500,
+          "...and so does the full extent (" + std::to_string(out.fullW) + "x" +
+              std::to_string(out.fullH) + ")");
+    Check(out.originX == 500 && out.originY == 250,
+          "...and so does the origin (" + std::to_string(out.originX) + "," +
+              std::to_string(out.originY) + ")");
+
+    // WHAT THE VIEWER COMPUTES: full extent over the scale must recover the
+    // original frame, whatever the proxy scale happens to be. This is the
+    // number that was wrong on screen.
+    const float pscale = std::max(out.proxyScale, 1e-6f);
+    const int laidOut = int(std::lround(double(out.FullWidth()) / double(pscale)));
+    Check(laidOut == 4000,
+          "the viewer lays out at the original size (" +
+              std::to_string(laidOut) + ")");
+
+    // A whole image carries no placement, and must not acquire one.
+    ImageDesc whole;
+    whole.width = 400; whole.height = 300; whole.format = Format::RGBA32F;
+    const ImageDesc wout = algo->OutputDesc(0, whole);
+    Check(wout.fullW == 0 && wout.fullH == 0 && wout.originX == 0 &&
+              wout.originY == 0,
+          "a whole image stays unplaced after a resize");
+}
+
+static void TestRegion() {
+    Section("region processing");
+
+    const int dim = 400;
+
+    // Fine structure everywhere, so a wrong margin shows as a difference rather
+    // than being hidden by flat areas.
+    auto makeSrc = [&](int d) {
+        Image img;
+        img.Alloc({d, d, Format::RGBA32F});
+        ImageView v = img.MapCpuWrite();
+        uint32_t s = 0x1234567u;
+        for (int y = 0; y < d; ++y)
+            for (int x = 0; x < d; ++x) {
+                s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+                float* p = v.At<float>(x, y);
+                const float n = float(s & 0xFFFF) / 65535.0f * 0.3f;
+                const bool box = ((x / 25) + (y / 25)) % 2 == 0;
+                p[0] = p[1] = p[2] = (box ? 0.65f : 0.2f) + n;
+                p[3] = 1.0f;
+            }
+        return img;
+    };
+
+    struct Case { const char* name; const char* script; };
+    const Case cases[] = {
+        {"gaussian_blur", "o = gaussian_blur(src, sigma = 4)\n"},
+        {"box_blur",      "o = box_blur(src, radius = 6)\n"},
+        {"median_blur",   "o = median_blur(src, radius = 4)\n"},
+        {"kuwahara",      "o = kuwahara(src, radius = 5)\n"},
+        {"brightness",    "o = brightness(src, brightness = 0.2)\n"},
+
+        // GEOMETRIC, and the reason it is here. A vignette is anchored to the
+        // PICTURE, so a crop must not re-centre it on the visible rectangle.
+        // Every other case above is a neighbourhood operation that only needed
+        // a margin; this one is wrong by a whole frame if it reads its own
+        // extent instead of the full one, and the darkening then follows the
+        // viewport around as the user pans.
+        {"vignette",      "o = vignette(src, amount = -0.8, midpoint = 0.3)\n"},
+    };
+
+    // A window well inside the frame, so the margin is never clipped by an
+    // edge -- that case is separately fine (the algorithm's own clamping is
+    // then correct) but it would weaken this comparison.
+    const Pipeline::Rect want{120, 130, 150, 140};
+
+    for (const Case& c : cases) {
+        const std::string script =
+            std::string("src = image(\"test\")\n") + c.script + "display(o)\n";
+
+        auto run = [&](Pipeline::Rect region, Image* out,
+                       Pipeline::Rect* got, std::string* err) {
+            UiState ui; Pipeline p; std::vector<Data> src;
+            src.push_back(Data{makeSrc(dim)});
+            std::vector<SourceImage> names{{"test", 0}};
+            Program prog;
+            if (!Parse(script, &prog, err)) return false;
+            auto r = Interpret(prog, names, &ui, &p);
+            if (!r.ok) { *err = r.error; return false; }
+            p.SetRegion(region);
+            if (!p.Execute(&src, nullptr, err)) return false;
+            const Data* d = p.Resolve(p.Viewers()[0].source, &src);
+            *out = const_cast<Image&>(std::get<Image>(*d)).Clone();
+            *got = p.RanOnRegion();
+            return true;
+        };
+
+        Image full, part;
+        Pipeline::Rect fullRect, partRect;
+        std::string err;
+        if (!run(Pipeline::Rect{}, &full, &fullRect, &err) ||
+            !run(want, &part, &partRect, &err)) {
+            Check(false, std::string(c.name) + ": region run: " + err);
+            continue;
+        }
+
+        if (!partRect.Valid()) {
+            // Declining is legitimate -- a large margin makes cropping
+            // pointless -- but say so rather than passing silently.
+            Check(true, std::string(c.name) +
+                  ": declined the region (margin too large)");
+            continue;
+        }
+
+        Check(part.Desc().width == partRect.w && part.Desc().height == partRect.h,
+              std::string(c.name) + ": the result is the cropped size (" +
+                  std::to_string(part.Desc().width) + "x" +
+                  std::to_string(part.Desc().height) + ")");
+
+        // THE COMPARISON. Every pixel of the requested window must match what
+        // the full run produced there. The margin around it is scratch and is
+        // allowed to differ.
+        ImageView fv = full.MapCpuRead();
+        ImageView pv = part.MapCpuRead();
+        double worst = 0.0;
+        int wx = -1, wy = -1;
+        for (int y = want.y; y < want.y + want.h; ++y)
+            for (int x = want.x; x < want.x + want.w; ++x) {
+                const int px = x - partRect.x, py = y - partRect.y;
+                if (px < 0 || py < 0 ||
+                    px >= part.Desc().width || py >= part.Desc().height) continue;
+                for (int ch = 0; ch < 3; ++ch) {
+                    const double d2 = std::fabs(double(fv.At<float>(x, y)[ch]) -
+                                                double(pv.At<float>(px, py)[ch]));
+                    if (d2 > worst) { worst = d2; wx = x; wy = y; }
+                }
+            }
+
+        Check(worst < 1e-5,
+              std::string(c.name) + ": a region result matches the full run (" +
+                  "max diff " + std::to_string(worst) + " at " +
+                  std::to_string(wx) + "," + std::to_string(wy) + ")");
+    }
+
+    // THE RESULT MUST SAY WHERE IT CAME FROM.
+    //
+    // A crop that does not carry its origin and the full extent is drawn as
+    // though it were the whole picture -- the image jumps to the corner and
+    // changes size the moment a drag starts. The viewer lays out against
+    // FullWidth/FullHeight and draws at originX/originY, so both have to
+    // survive the chain rather than only the stage that did the cropping.
+    {
+        const std::string script =
+            "src = image(\"test\")\n"
+            "a = gaussian_blur(src, sigma = 3)\n"
+            "o = brightness(a, brightness = 0.1)\n"
+            "display(o)\n";
+        UiState ui; Pipeline p; std::vector<Data> src;
+        src.push_back(Data{makeSrc(dim)});
+        std::vector<SourceImage> names{{"test", 0}};
+        Program prog; std::string err;
+        if (Parse(script, &prog, &err)) {
+            auto r = Interpret(prog, names, &ui, &p);
+            if (r.ok) {
+                p.SetRegion(want);
+                if (p.Execute(&src, nullptr, &err)) {
+                    const Data* d = p.Resolve(p.Viewers()[0].source, &src);
+                    const Image& im = std::get<Image>(*d);
+                    const ImageDesc& sd = im.Desc();
+                    const Pipeline::Rect got = p.RanOnRegion();
+
+                    Check(sd.FullWidth() == dim && sd.FullHeight() == dim,
+                          "a cropped result knows the full extent (" +
+                              std::to_string(sd.FullWidth()) + "x" +
+                              std::to_string(sd.FullHeight()) + ")");
+                    Check(sd.originX == got.x && sd.originY == got.y,
+                          "...and where it starts (" +
+                              std::to_string(sd.originX) + "," +
+                              std::to_string(sd.originY) + " vs " +
+                              std::to_string(got.x) + "," +
+                              std::to_string(got.y) + ")");
+
+                    // Carried THROUGH a second stage, not just set by the crop.
+                    // brightness allocates its own output from the input's
+                    // descriptor, so this is what proves the metadata rides
+                    // along rather than being dropped at the first stage.
+                    Check(sd.originX > 0 || sd.originY > 0,
+                          "...and the origin survived the stage after the crop");
+                }
+            }
+        }
+    }
+
+    // An algorithm that measures the whole frame must DECLINE, not silently
+    // produce a threshold chosen for one corner.
+    {
+        const std::string script =
+            "src = image(\"test\")\n"
+            "o = threshold_otsu(src)\n"
+            "display(o)\n";
+        UiState ui; Pipeline p; std::vector<Data> src;
+        src.push_back(Data{makeSrc(dim)});
+        std::vector<SourceImage> names{{"test", 0}};
+        Program prog; std::string err;
+        if (Parse(script, &prog, &err)) {
+            auto r = Interpret(prog, names, &ui, &p);
+            if (r.ok) {
+                p.SetRegion(want);
+                if (p.Execute(&src, nullptr, &err)) {
+                    Check(!p.RanOnRegion().Valid(),
+                          "a whole-frame measurement declines the region");
+                    const Data* d = p.Resolve(p.Viewers()[0].source, &src);
+                    const Image& im = std::get<Image>(*d);
+                    Check(im.Desc().width == dim,
+                          "...and produces the full frame (" +
+                              std::to_string(im.Desc().width) + ")");
+                }
+            }
+        }
+    }
+}
+
 int main() {
     // Line-buffer stdout: when ctest or CI redirects it to a file the
     // default is block buffering, so a crash discards everything not yet
@@ -1447,6 +2602,13 @@ int main() {
     TestShaderCompilerSharing();
     TestShaderCompiler();
 
+    TestProxy();
+    TestProxyFidelity();
+    TestRegion();
+    TestVisibleRect();
+    TestProxyPlacement();
+    TestRegionOriginStable();
+
     ID3D12Device* dev = nullptr;
     if (SUCCEEDED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev)))) {
         TestGpuPipeline(dev);
@@ -1457,6 +2619,7 @@ int main() {
         TestGpuResultIsDrawable(dev);
         TestGpuHistogram(dev);
         TestGpuAgreement(dev);
+        TestMeasureCache(dev);
         dev->Release();
     } else {
         std::printf("\n(no D3D12 device — GPU tests skipped)\n");

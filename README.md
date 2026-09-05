@@ -113,6 +113,46 @@ Changing anything mid-run **abandons** the run in progress rather than queueing
 behind it, so the wait is always for the current settings. The finished part of
 the pipeline is kept, so only the stages after your change re-run.
 
+### Previews while you drag
+
+A 45 MP frame cannot be re-processed at 60 Hz, so while a slider is moving the
+pipeline computes **less of the image** rather than a worse version of it. Two
+independent reductions, both dropped the moment you let go — the settled result
+is always the full frame at full resolution.
+
+- **Scale.** The run drops to roughly the resolution you are actually looking
+  at. Fitted in a window, that is a small fraction of the pixels; the status bar
+  says which (`preview at 15% scale (2% of the pixels)`).
+- **Region.** Zoomed in, scale saves nothing — at 1:1 the correct scale is 1.0 —
+  but most of the frame is off screen, so the run is cropped to what the viewers
+  can see. The crop is the **union across every visible viewer**: a second panel
+  showing the whole frame means the whole frame is needed.
+
+Algorithms declare how they behave under this, and the declarations are
+audited by the test suite rather than inferred:
+
+- **Pixel-unit parameters scale with the image.** A blur of sigma 20 runs at
+  sigma 5 on a quarter-scale proxy, or the preview would not resemble the
+  result. `ImageDesc::proxyScale` carries the factor and `ScaledPx`/
+  `ScaledRadius` apply it.
+- **Some algorithms must not be proxied at all.** Demosaicing is the clear case
+  — the CFA pattern *is* the data, and downscaling destroys it. Feature
+  detectors and anything carrying sidecar coordinates are the same: nothing
+  rescales a keypoint list.
+- **Some cannot run on a region.** Anything measuring the whole frame to decide
+  something global: a threshold picking a level from the histogram, or `dehaze`
+  estimating its airlight. Given a crop they would measure whatever happens to
+  be on screen, so they decline the region and run whole.
+- **Neighbourhood algorithms get a margin.** A blur reading 20 pixels out needs
+  those pixels to exist, so the crop is grown by the summed reach of every stage
+  in the dirty range and **trimmed back afterwards** — the margin is context,
+  not content. Handing it to the viewer instead makes the picture shift as the
+  radius changes.
+
+A region result carries its own placement (`originX/originY`, `fullW/fullH`) so
+the viewer can draw a window onto the picture without it jumping to the corner
+or changing size.
+
 ---
 
 ## Scripting
@@ -293,7 +333,7 @@ so these names are the ones that matter in a script.
 
 | Category | Algorithms |
 |---|---|
-| **adjust** | `basic_adjust` (exposure, contrast, highlights, shadows, whites, blacks, vibrance, saturation, white balance), `brightness`, `crop` (trim and straighten, with a preview), `vignette`, `film_grain`, `dehaze` (dark channel prior) |
+| **adjust** | `basic_adjust` (exposure, contrast, highlights, shadows, whites, blacks, vibrance, saturation, white balance), `brightness`, `crop` (trim and straighten, with a preview), `vignette`, `film_grain`, `dehaze` (dark channel prior), `resize` (area-average on minify, bilinear on magnify) |
 | **tonemap** | `tonemap` (global), `tonemap_local` (illumination/detail split) |
 | **features** | `detect_sift`, `detect_surf`, `detect_akaze`, `detect_orb`, `detect_brisk`, `draw_features`, `draw_matches` |
 | **match** | `match_brute` (exact), `match_ann` (k-d forest / LSH) |
@@ -491,6 +531,24 @@ flat field or a seam-aware blend, not a better global fit.
   dark pixel in it — sky, snow, a white wall — looks exactly like haze and comes
   back darkened and grey. Set it to 0 to see the raw prior; over sky that is
   usually the most visible thing the algorithm does.
+
+  The **airlight is bounded at 1.0**, which matters on scene-linear raw. Values
+  above white live in the highlights, and an unbounded search lands on a blown
+  cloud edge — after which every sky pixel sits *below* the airlight, `I − A` is
+  negative, and the recovery drives it negative fastest in whichever channel has
+  the widest gap. Clamping the channels independently then removes them at
+  different rates and a grey cloud comes out **purple**. An airlight is a colour,
+  and a colour brighter than white is not one.
+
+  The GPU path is a deliberate approximation of the CPU one, not a translation
+  of it: the transmission map runs at full resolution rather than quarter scale,
+  a box smooth replaces the guided filter, and the airlight comes from a strided
+  sample of ~300k pixels. Each trade buys interactivity; the two agree to a mean
+  of about 0.6 on a 0–255 scale. Because the airlight depends only on the
+  *photograph* and not on any slider, it is **cached across a drag** — the
+  measurement is the whole remaining cost, and skipping it is what makes the
+  sliders live. `patch` is the exception, since it is the window the dark
+  channel is minimised over, so changing it re-measures.
 - **`align`** solves each frame of a group against a reference and attaches the
   transform as a sidecar; it warps nothing itself. Merges sample through it if
   present. A correction below half a pixel is skipped when there is no other
@@ -501,6 +559,12 @@ flat field or a seam-aware blend, not a better global fit.
   frame instead of returning the cropped raster — which is what makes it usable
   interactively, since the part being cut away is otherwise off screen the
   moment a slider moves.
+
+  `preview_grid` draws division lines inside the rectangle, and they **rotate
+  with the crop** — a horizon is level exactly when it lies along a line, which
+  turns straightening into a comparison instead of a guess. Screen-aligned lines
+  would keep their own angle while the rectangle turned under them, and matching
+  the two would mean nothing.
 - **`merge_hdr`** reads shutter, aperture and ISO from EXIF and divides them
   out, producing scene-linear radiance with real headroom.
 - **`tonemap` vs `tonemap_local`** — the global operator applies one curve to

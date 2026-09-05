@@ -35,6 +35,17 @@ class GlobalThresholdBase : public AlgorithmBase {
 public:
     const char* Category() const override { return "threshold"; }
 
+    // PickLevel measures the WHOLE frame -- Otsu, triangle and isodata all
+    // build a histogram of it -- so on a region they would choose the level for
+    // that corner rather than for the picture. Safe at reduced scale, where the
+    // histogram is a good approximation of the same population.
+    //
+    // On the BASE rather than on each subclass: the measurement is what the
+    // base exists to structure, so a new method added later inherits the right
+    // answer. `threshold` overrides it back, because a manually set level
+    // measures nothing.
+    bool RegionSafe() const override { return false; }
+
     PortList Inputs()  const override { return {{"src", DataType::Image, FormatSpec::Any}}; }
     PortList Outputs() const override { return {{"mask", DataType::Image, FormatSpec::R32F}}; }
 
@@ -57,6 +68,10 @@ protected:
 class Threshold : public GlobalThresholdBase {
 public:
     const char* Name() const override { return "threshold"; }
+
+    // The one member of this family that measures nothing: the level is set by
+    // hand, so it means the same thing on a region as on the whole frame.
+    bool RegionSafe() const override { return true; }
 
     bool HasGPU() const override { return true; }
     const char* GpuSource() const override {
@@ -90,6 +105,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
 
 protected:
     double PickLevel(const ImageView&) override { return double(float(m_level)); }
+
 
 private:
     Param<float> m_level{this, "level", 128.0f, 0.0f, 255.0f};
