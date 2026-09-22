@@ -482,10 +482,13 @@ bool Pipeline::RunFusedReduction(int reduceStage, const std::vector<int>& chain,
 
             const Data* one = &carried;
             std::vector<const Data*> csIn{one};
-            if (!RunStageOnce(cs, csIn, gpu, mode, cancel, err)) return false;
-            if (cs.outputs.size() != 1) { *err = Where() + "chain stage produced no result"; return false; }
-            carried = std::move(cs.outputs[0]);
-            cs.outputs[0] = Data{};
+            // A local rather than cs.outputs: the result is moved straight into
+            // `carried` on the next line, so the stage never needed to hold it.
+            std::vector<Data> chainOut;
+            if (!RunStageOnce(cs, csIn, &chainOut, gpu, mode, cancel, err))
+                return false;
+            if (chainOut.size() != 1) { *err = Where() + "chain stage produced no result"; return false; }
+            carried = std::move(chainOut[0]);
         }
 
         const auto* img = std::get_if<Image>(&carried);
@@ -637,8 +640,13 @@ bool Pipeline::RunReduction(Stage& s, const std::vector<const Data*>& in,
 // cancellation -- which is exactly what makes it the right unit to map across a
 // set rather than duplicating any of it.
 bool Pipeline::RunStageOnce(Stage& s, const std::vector<const Data*>& in,
+                            std::vector<Data>* out,
                             ComputeContext* gpu, ExecMode mode,
                             const CancelToken* cancel, std::string* err) {
+    // Sized here rather than by the caller: how many ports a stage has is the
+    // algorithm's business, and every caller would otherwise have to ask.
+    out->resize(s.algo->Outputs().size());
+
     // Allocate outputs. Every port is an image sized from input 0, with the
     // format resolved from the port's FormatSpec.
     const PortList outPorts = s.algo->Outputs();
@@ -657,7 +665,7 @@ bool Pipeline::RunStageOnce(Stage& s, const std::vector<const Data*>& in,
         }
     }
 
-    for (size_t p = 0; p < s.outputs.size(); ++p) {
+    for (size_t p = 0; p < out->size(); ++p) {
         ImageDesc d = base;
         switch (outPorts[p].format) {
             case FormatSpec::RGBA8:       d.format = Format::RGBA8;   break;
@@ -697,7 +705,7 @@ bool Pipeline::RunStageOnce(Stage& s, const std::vector<const Data*>& in,
         }
         Image img;
         img.Alloc(d);
-        s.outputs[p] = Data{std::move(img)};
+        (*out)[p] = Data{std::move(img)};
     }
 
     // GPU when asked for and available; otherwise CPU. A GPU failure falls back
@@ -712,7 +720,7 @@ bool Pipeline::RunStageOnce(Stage& s, const std::vector<const Data*>& in,
     bool ranOnGpu = false;
     if (wantGpu) {
         std::string gpuErr;
-        if (RunStageGpu(s, in, gpu, &gpuErr)) {
+        if (RunStageGpu(s, in, out, gpu, &gpuErr)) {
             ranOnGpu = true;
             ++m_gpuStages;
         } else {
@@ -735,7 +743,7 @@ bool Pipeline::RunStageOnce(Stage& s, const std::vector<const Data*>& in,
         // an inner loop and read the result back (a detector, whose product is
         // a sidecar rather than an image). ForceCPU withholds it, so the mode
         // means what it says -- otherwise "force CPU" would still dispatch.
-        RunCtx ctx(in, s.outputs, cancel,
+        RunCtx ctx(in, *out, cancel,
                    mode == ExecMode::ForceCPU ? nullptr : gpu);
         s.algo->RunCPU(ctx);
         ++m_cpuStages;
@@ -799,9 +807,12 @@ bool Pipeline::BroadcastStage(Stage& s, const std::vector<const Data*>& in,
         r.images.reserve(src.images.size());
     }
 
-    // s.outputs is the scalar working buffer for one frame. RunStageGpu reads
-    // and writes it, so each frame's result is moved out afterwards rather than
-    // the buffer being threaded through the GPU path.
+    // EACH FRAME GETS ITS OWN OUTPUT BUFFER, which is the point of this
+    // change. Previously the stage's own s.outputs was the working buffer and
+    // each frame's result was moved out of it afterwards -- correct while
+    // exactly one frame is in flight, and the reason more than one could not
+    // be. A local per iteration makes the loop body independent of the Stage
+    // except for what RunStageGpu still caches there.
     std::vector<Data> saved = std::move(s.outputs);
     s.outputs.clear();
     s.outputs.resize(nPorts);
@@ -825,14 +836,18 @@ bool Pipeline::BroadcastStage(Stage& s, const std::vector<const Data*>& in,
         std::vector<const Data*> frameIn = in;
         frameIn[size_t(setIdx)] = &frame;
 
-        if (!RunStageOnce(s, frameIn, gpu, mode, cancel, err)) { ok = false; break; }
+        std::vector<Data> frameOut;
+        if (!RunStageOnce(s, frameIn, &frameOut, gpu, mode, cancel, err)) {
+            ok = false;
+            break;
+        }
 
         for (size_t p = 0; p < nPorts; ++p) {
-            auto* img = std::get_if<Image>(&s.outputs[p]);
+            auto* img = (p < frameOut.size()) ? std::get_if<Image>(&frameOut[p])
+                                              : nullptr;
             if (!img) { *err = Where() + "produced no image for frame " + std::to_string(f);
                         ok = false; break; }
             results[p].images.push_back(std::move(*img));
-            s.outputs[p] = Data{};
         }
     }
 
@@ -841,6 +856,9 @@ bool Pipeline::BroadcastStage(Stage& s, const std::vector<const Data*>& in,
     s.outputs.clear();
     s.outputs.resize(nPorts);
     for (size_t p = 0; p < nPorts; ++p) s.outputs[p] = Data{std::move(results[p])};
+    // How many frames this stage mapped across -- the number any parallel
+    // dispatch would divide by, so it belongs next to the time it took.
+    s.ranFrames = int(src.images.size());
     return true;
 }
 
@@ -1182,6 +1200,27 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
         if (cancel && cancel->Cancelled()) { *err = kCancelled; return false; }
 
         Stage& s = m_stages[i];
+
+        // Times whatever this iteration turns out to do, on every exit path.
+        //
+        // A scope guard rather than a stop() call before each `continue`: the
+        // stage loop has seventeen of them -- cache hits, bypasses, crops,
+        // proxies, reductions, aligners, reconstructions -- and a timer that
+        // has to be remembered at each one would silently miss the path added
+        // next. This cannot.
+        struct StageTimer {
+            Stage& st;
+            std::chrono::steady_clock::time_point t0;
+            explicit StageTimer(Stage& s_)
+                : st(s_), t0(std::chrono::steady_clock::now()) {
+                st.lastMs = 0.0;
+                st.ranFrames = 0;
+            }
+            ~StageTimer() {
+                st.lastMs = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - t0).count();
+            }
+        } stageTimer(s);
 
         // Already consumed frame by frame by a fused reduction below.
         if (fused.count(int(i))) continue;
@@ -1608,8 +1647,13 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
 
         if (anySet) {
             if (!BroadcastStage(s, in, gpu, mode, cancel, progress, err)) return false;
-        } else if (!RunStageOnce(s, in, gpu, mode, cancel, err)) {
+        // The scalar path writes into the stage's own buffer, which is where a
+        // non-broadcast result belongs: later stages resolve their inputs from
+        // it and the cache keeps it between runs.
+        } else if (!RunStageOnce(s, in, &s.outputs, gpu, mode, cancel, err)) {
             return false;
+        } else {
+            s.ranFrames = 1;
         }
         s.valid = true;
     }
@@ -1688,12 +1732,13 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
 }
 
 bool Pipeline::RunStageGpu(Stage& s, const std::vector<const Data*>& in,
+                           std::vector<Data>* out,
                            ComputeContext* gpu, std::string* err) {
     // M3 supports the common shape: image inputs and image outputs, one
     // dispatch. Anything else stays on the CPU.
     for (const Data* d : in)
         if (!d || !std::holds_alternative<Image>(*d)) { *err = "non-image input"; return false; }
-    for (const Data& d : s.outputs)
+    for (const Data& d : *out)
         if (!std::holds_alternative<Image>(d)) { *err = "non-image output"; return false; }
 
     // Hand the algorithm its input descriptors before anything is bound. A
@@ -1813,7 +1858,7 @@ bool Pipeline::RunStageGpu(Stage& s, const std::vector<const Data*>& in,
     std::vector<const GpuImage*> gin;
     std::vector<GpuImage*>       gout;
     gin.reserve(in.size());
-    gout.reserve(s.outputs.size());
+    gout.reserve(out->size());
 
     const auto tAcq = std::chrono::steady_clock::now();
     for (const Data* d : in) {
@@ -1842,7 +1887,7 @@ bool Pipeline::RunStageGpu(Stage& s, const std::vector<const Data*>& in,
         std::fprintf(stderr, "[pass] %s.<input upload> %.0f ms\n", s.algoName.c_str(),
                      std::chrono::duration<double, std::milli>(
                          std::chrono::steady_clock::now() - tAcq).count());
-    for (Data& d : s.outputs) {
+    for (Data& d : *out) {
         Image& img = std::get<Image>(d);
         GpuResidency* g = img.AcquireGpuWrite(*gpu);
         if (!g) { *err = "could not allocate a GPU output"; return false; }
@@ -1853,7 +1898,7 @@ bool Pipeline::RunStageGpu(Stage& s, const std::vector<const Data*>& in,
     // hung after a script switch, the absence of these lines is what proved
     // the fault was not in compute at all, but in freeing view textures.
     if (GetEnvironmentVariableA("TGLAB_GPUDBG", nullptr, 0) > 0) {
-        const ImageDesc& od = std::get<Image>(s.outputs[0]).Desc();
+        const ImageDesc& od = std::get<Image>((*out)[0]).Desc();
         std::fprintf(stderr, "[gpu] dispatch %s %dx%d\n",
                      s.algoName.c_str(), od.width, od.height);
         std::fflush(stderr);
@@ -1861,7 +1906,7 @@ bool Pipeline::RunStageGpu(Stage& s, const std::vector<const Data*>& in,
     // Multi-pass: several DIFFERENT kernels over a shared pool of scratch
     // planes. See AlgorithmBase::GpuPasses.
     if (!passes.empty()) {
-        const ImageDesc outDesc = std::get<Image>(s.outputs[0]).Desc();
+        const ImageDesc outDesc = std::get<Image>((*out)[0]).Desc();
         ImageDesc planeDesc = outDesc;
         switch (s.algo->GpuScratchPlanes()) {
             case FormatSpec::RGBA8:   planeDesc.format = Format::RGBA8;   break;
@@ -2027,7 +2072,7 @@ bool Pipeline::RunStageGpu(Stage& s, const std::vector<const Data*>& in,
     // The scratch may deliberately differ from the output: see
     // AlgorithmBase::GpuScratchFormat. Only the format changes -- dimensions
     // always match, since every pass covers the same pixel grid.
-    ImageDesc desc = std::get<Image>(s.outputs[0]).Desc();
+    ImageDesc desc = std::get<Image>((*out)[0]).Desc();
     switch (s.algo->GpuScratchFormat()) {
         case FormatSpec::RGBA8:   desc.format = Format::RGBA8;   break;
         case FormatSpec::R32F:    desc.format = Format::R32F;    break;
@@ -2042,7 +2087,7 @@ bool Pipeline::RunStageGpu(Stage& s, const std::vector<const Data*>& in,
     // three or more passes the ping-pong would write the rich intermediate into
     // the single-channel output and lose it -- the same silent truncation this
     // hook exists to prevent, just moved. Refuse rather than corrupt.
-    if (desc.format != std::get<Image>(s.outputs[0]).Desc().format && iterations != 2) {
+    if (desc.format != std::get<Image>((*out)[0]).Desc().format && iterations != 2) {
         *err = "a GPU stage with its own scratch format must use exactly 2 passes";
         return false;
     }

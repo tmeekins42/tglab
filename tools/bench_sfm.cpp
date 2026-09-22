@@ -373,6 +373,48 @@ int main(int argc, char** argv) {
         if (!r.empty()) std::printf("  %s\n", r.c_str());
         else if (!st.valid) std::printf("  %s: did not run\n", st.algoName.c_str());
     }
+
+    // WHERE THE TIME WENT, in descending order.
+    //
+    // A total says a run took half a minute; it cannot say whether threading
+    // the detector would help. Amdahl caps any stage's contribution at its own
+    // share, so this listing is what orders the work: a stage at 5% of the
+    // runtime is not worth parallelising however many cores it could use.
+    //
+    // `frames` is how many images the stage mapped across, which is the number
+    // a parallel dispatch would divide by. A stage that ran over one frame --
+    // an aligner, a reconstruction -- gets no benefit from that kind of
+    // parallelism however slow it is, and needs its own inner loop threaded
+    // instead. The two cases look identical in a total and completely
+    // different here.
+    {
+        struct Row { std::string name; double ms; int frames; };
+        std::vector<Row> rows;
+        double sum = 0.0;
+        for (const Stage& st : p.Stages()) {
+            if (!st.algo || st.lastMs <= 0.0) continue;
+            rows.push_back({st.algoName, st.lastMs, st.ranFrames});
+            sum += st.lastMs;
+        }
+        std::sort(rows.begin(), rows.end(),
+                  [](const Row& a, const Row& b) { return a.ms > b.ms; });
+
+        if (!rows.empty()) {
+            std::printf("\nstage timings (%.0f ms accounted of %.0f ms total)\n",
+                        sum, total);
+            for (const Row& r : rows) {
+                // Built into a named string rather than a ternary on
+                // `.c_str()`: the temporary from std::to_string would be dead
+                // before printf read it.
+                const std::string span = (r.frames > 1)
+                                             ? std::to_string(r.frames) + " frames"
+                                             : std::string("whole group");
+                std::printf("  %-22s %8.0f ms  %5.1f%%  %s\n", r.name.c_str(),
+                            r.ms, 100.0 * r.ms / std::max(1.0, sum),
+                            span.c_str());
+            }
+        }
+    }
     std::printf("\n");
 
     if (!ok) {

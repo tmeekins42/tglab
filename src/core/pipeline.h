@@ -65,6 +65,23 @@ struct Stage {
     bool                 valid     = false;   // outputs hold a usable result
     int                  line      = 0;       // for error messages
 
+    // Wall-clock milliseconds this stage last spent running, and how many
+    // frames it ran over.
+    //
+    // MEASURED PER STAGE because a total cannot say where the time went, and
+    // "this is slow" is not actionable without that. It is also what any
+    // parallelism work has to be ordered by: a stage that is 5% of the runtime
+    // caps its own speedup at 5% however many threads it gets, and knowing
+    // which stages those are before optimising is the difference between a
+    // measured decision and a guess.
+    //
+    // Zero when the stage was skipped -- a cache hit, a bypass, or a fusion
+    // into a later reduction -- which is why `ranFrames` is carried alongside:
+    // zero milliseconds over zero frames is "did not run", and zero over
+    // nineteen is genuinely instant.
+    double               lastMs    = 0.0;
+    int                  ranFrames = 0;
+
     // Compiled kernel, cached so dragging a slider does not recompile HLSL
     // every frame. shared_ptr because Stage is moved between pipelines and the
     // kernel outlives any single run.
@@ -273,7 +290,23 @@ private:
                            ComputeContext* gpu, ExecMode mode,
                            const CancelToken* cancel, Progress* progress,
                            std::string* err);
+    // Runs one stage against one set of scalar inputs, writing into `out`.
+    //
+    // `out` IS A PARAMETER RATHER THAN `s.outputs` so that two frames of the
+    // same stage can run at once. The broadcast loop used to swap each frame's
+    // results in and out of the stage's own buffer around this call, which
+    // works only while exactly one frame is in flight. Handing the destination
+    // in makes the function reentrant with respect to the Stage, which is what
+    // any per-frame threading needs.
+    //
+    // What is still shared, and still not safe to run concurrently on one
+    // Stage: the GPU path (s.kernel, s.gpuScratch, s.passKernels, s.gpuPlanes
+    // are all cached on the Stage and written by RunStageGpu), and any
+    // algorithm holding accumulator state across frames. Hence `out` alone
+    // does not make a stage parallel -- it removes the first of three
+    // obstacles.
     bool RunStageOnce(Stage& s, const std::vector<const Data*>& in,
+                      std::vector<Data>* out,
                       ComputeContext* gpu, ExecMode mode,
                       const CancelToken* cancel, std::string* err);
     bool BroadcastStage(Stage& s, const std::vector<const Data*>& in,
@@ -282,7 +315,12 @@ private:
                         std::string* err);
     bool RunReduction(Stage& s, const std::vector<const Data*>& in,
                       const CancelToken* cancel, std::string* err);
+    // `out` for the same reason as RunStageOnce, which is its only caller.
+    // Note that this path remains single-threaded per Stage regardless: the
+    // compiled kernel and the scratch planes are cached ON the Stage and
+    // rewritten here.
     bool RunStageGpu(Stage& s, const std::vector<const Data*>& in,
+                     std::vector<Data>* out,
                      ComputeContext* gpu, std::string* err);
 
     std::vector<Stage>      m_stages;
