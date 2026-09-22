@@ -8,6 +8,7 @@
 
 #include <d3d12.h>
 
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -173,6 +174,28 @@ public:
     double GpuMs() const { return m_gpuMs; }
     void   ResetGpuMs() { m_gpuMs = 0.0; }
 
+    // --- concurrency --------------------------------------------------------
+    //
+    // NOTHING ELSE IN THIS CLASS IS THREAD-SAFE. One command queue, one
+    // allocator, one in-progress batch: two threads recording at once corrupt
+    // the batch, and two flushing at once deadlock on the fence. That was
+    // acceptable while only the pipeline worker ever touched the device.
+    //
+    // It stopped being acceptable when broadcast stages began running their
+    // frames in parallel, because the scale-space detectors are CPU algorithms
+    // that offload an inner loop through RunCtx::Gpu(). Nineteen threads
+    // entered one command queue and the application froze.
+    //
+    // A CALLER-HELD LOCK rather than locking each method, deliberately. The
+    // detectors do upload / dispatch / readback as one logical operation, and
+    // per-method locks would let another thread interleave between them --
+    // still correct for the queue, still wrong for the result. Holding it
+    // across the whole offload is what makes it one operation.
+    //
+    // So the rule is: any code reaching the device from somewhere other than
+    // the pipeline worker takes this first. See GpuLock below.
+    std::mutex& SubmitMutex() { return m_submitMtx; }
+
 private:
     // Opens the command list, reusing an in-progress batch rather than
     // discarding it. See the definition for why this matters.
@@ -225,6 +248,7 @@ private:
     std::vector<ID3D12Resource*> m_staging;   // upload/readback buffers, freed on flush
     ShaderCompiler               m_compiler;
     bool                         m_deviceLost = false;
+    std::mutex           m_submitMtx;   // see SubmitMutex()
     bool                 m_ready      = false;
 };
 

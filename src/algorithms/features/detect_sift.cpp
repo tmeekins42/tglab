@@ -121,10 +121,6 @@ public:
         return {{"out", DataType::Image, FormatSpec::SameAsInput}};
     }
 
-    // RunCPU offloads the diffusion loop through ctx.Gpu(), so its frames
-    // must not run concurrently: one command queue, no locking.
-    bool UsesGpuInRunCPU() const override { return true; }
-
     void RunCPU(RunCtx& ctx) override {
         const ImageView src = ctx.In(0);
         ImageView       dst = ctx.Out(0);
@@ -274,6 +270,12 @@ private:
             // normalisation, addressing, and pass order -- see its header.
             bool onGpu = false;
             if (ComputeContext* dev = ctx.Gpu()) {
+                // One command queue with no locking of its own, and this
+                // detector's frames run in parallel. Held across the whole
+                // offload so it is one operation. Everything outside this
+                // scope -- most of the detector's work -- stays concurrent.
+                GpuLock lock(dev);
+
                 GpuPlane gbase;
                 gbase.v = octaveBase.v;
                 gbase.w = octaveBase.w;

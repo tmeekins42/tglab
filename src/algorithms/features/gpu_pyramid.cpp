@@ -9,6 +9,17 @@
 #include "../../gpu/compute.h"
 
 namespace tglab {
+
+// See the header. Defined here so gpu_pyramid.h need not include compute.h --
+// it forward-declares ComputeContext and the detectors depend on that staying
+// true.
+GpuLock::GpuLock(ComputeContext* gpu) : m_gpu(gpu) {
+    if (m_gpu) m_gpu->SubmitMutex().lock();
+}
+
+GpuLock::~GpuLock() {
+    if (m_gpu) m_gpu->SubmitMutex().unlock();
+}
 namespace {
 
 // The blur, one axis per dispatch.

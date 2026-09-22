@@ -1591,8 +1591,20 @@ static void TestGpuUsersDeclareIt() {
         if (src.empty()) continue;
         ++scanned;
 
-        const bool calls   = src.find("ctx.Gpu()") != std::string::npos;
-        const bool says    = src.find("UsesGpuInRunCPU") != std::string::npos;
+        // Either guard is acceptable, and they mean different things:
+        //
+        //   GpuLock            serialises the offload and lets everything
+        //                      around it run in parallel. The better answer,
+        //                      and what the detectors use.
+        //   UsesGpuInRunCPU()  keeps the stage's frames serial entirely. The
+        //                      blunt answer, for an algorithm whose GPU work
+        //                      is most of its runtime.
+        //
+        // What is NOT acceptable is neither, which is what froze the
+        // application: nineteen threads inside one command queue.
+        const bool calls = src.find("ctx.Gpu()") != std::string::npos;
+        const bool says  = src.find("GpuLock") != std::string::npos ||
+                           src.find("UsesGpuInRunCPU") != std::string::npos;
         if (says) ++declared;
         if (calls && !says)
             offenders += "\n    " + it->path().filename().string();
@@ -1603,7 +1615,7 @@ static void TestGpuUsersDeclareIt() {
     Check(declared > 0, "and found the algorithms that declare it (" +
                             std::to_string(declared) + ")");
     Check(offenders.empty(),
-          "every algorithm calling ctx.Gpu() declares UsesGpuInRunCPU()" +
+          "every algorithm calling ctx.Gpu() guards it" +
               offenders +
               (offenders.empty()
                    ? ""

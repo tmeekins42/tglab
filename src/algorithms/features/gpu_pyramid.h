@@ -50,6 +50,38 @@ namespace tglab {
 
 class ComputeContext;
 
+// Holds the device's submission lock for a scope.
+//
+// WHY A CPU ALGORITHM NEEDS THIS. ComputeContext has one command queue, one
+// allocator and one in-progress batch, with no locking of its own -- which was
+// fine while only the pipeline worker ever reached the device. The detectors
+// below are CPU algorithms that offload an inner loop through RunCtx::Gpu(),
+// and a broadcast now runs their frames in parallel: nineteen threads entered
+// one command queue and the application froze.
+//
+// Held across the WHOLE offload rather than inside each call. Upload,
+// dispatch and readback are one logical operation; per-call locks would keep
+// the queue intact and still let another thread interleave between them.
+//
+// Scope it tightly. Everything outside the lock -- building the conductivity
+// map, the descriptors, the keypoint search, which is most of a detector's
+// work -- runs concurrently across frames, and that is where the speedup is.
+//
+// Null-tolerant: ctx.Gpu() legitimately returns null (no device, ForceCPU, a
+// GPU-less build) and every caller already has a CPU fallback, so a lock that
+// does nothing keeps the call site free of a second null check.
+class GpuLock {
+public:
+    explicit GpuLock(ComputeContext* gpu);
+    ~GpuLock();
+
+    GpuLock(const GpuLock&)            = delete;
+    GpuLock& operator=(const GpuLock&) = delete;
+
+private:
+    ComputeContext* m_gpu = nullptr;
+};
+
 // One level of the scale space, matching detect_sift.cpp's Plane.
 struct GpuPlane {
     std::vector<float> v;
