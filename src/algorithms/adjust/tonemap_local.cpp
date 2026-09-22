@@ -331,6 +331,17 @@ public:
         m_compression = k;
         m_spanBefore  = spanBefore;
 
+        // Per call rather than read back off the members below: one instance
+        // serves every frame of a group. The members stay because the GPU path
+        // (PrepareGpu) also sets them and that path is single-threaded.
+        if (spanBefore > 0.0f) {
+            char rbuf[128];
+            std::snprintf(rbuf, sizeof rbuf,
+                          "%.1f stops of scene compressed to %.1f (base x%.2f)",
+                          double(spanBefore), double(spanBefore * k), double(k));
+            ctx.SetReport(rbuf);
+        }
+
         // Where the compressed result should sit. The median lands on middle
         // grey, which is the anchor the display curve is built around, and the
         // exposure control offsets from there in stops.
@@ -382,8 +393,13 @@ public:
         dst.PackInto(out);
     }
 
+    // ONLY FOR THE GPU PATH, which sets these in PrepareGpu and stays
+    // single-threaded per stage. The CPU path reports per call instead (see
+    // RunCPU), because one instance serves every frame of a group. Without the
+    // m_gpuValid guard this would also answer for a CPU run and shadow the
+    // per-call note with the same numbers.
     std::string RunReport() const override {
-        if (m_spanBefore <= 0.0f) return {};
+        if (!m_gpuValid || m_spanBefore <= 0.0f) return {};
         char buf[128];
         std::snprintf(buf, sizeof buf,
                       "%.1f stops of scene compressed to %.1f (base x%.2f)",

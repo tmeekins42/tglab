@@ -206,7 +206,7 @@ public:
         if (ch < 3 || n == 0) {
             m_out.Data() = m_in.Data();
             m_out.PackInto(dst);
-            m_note = "dehaze needs colour: the prior is a minimum across channels";
+            ctx.SetReport("dehaze needs colour: the prior is a minimum across channels");
             return;
         }
 
@@ -487,7 +487,9 @@ public:
                       double(A[0]), double(A[1]), double(A[2]),
                       double(*std::min_element(t.begin(), t.end())),
                       double(*std::max_element(t.begin(), t.end())));
-        m_note = buf;
+        // Per call: one instance serves every frame of a group. The GPU sites
+        // below keep using m_note, since that path stays single-threaded.
+        ctx.SetReport(buf);
     }
 
     std::string RunReport() const override { return m_note; }

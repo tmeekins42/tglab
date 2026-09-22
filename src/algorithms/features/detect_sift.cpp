@@ -141,8 +141,6 @@ public:
             out.Data() = in.Data();
             out.PackInto(dst);
         }
-
-        m_found = 0;
         if (w < 16 || h < 16) return;    // nothing meaningful to find
 
         // Greyscale, normalised to 0..1 so the contrast threshold means the
@@ -184,9 +182,9 @@ public:
         // The 99th percentile rather than the max, because the max is one hot
         // pixel or one specular highlight; and the same statistic is used by
         // SURF, so a threshold means the same thing in both detectors.
-        m_level = Percentile99(base.v);
-        if (m_level > 1e-6f) {
-            const float inv = 1.0f / m_level;
+        const float level = Percentile99(base.v);
+        if (level > 1e-6f) {
+            const float inv = 1.0f / level;
             for (float& v : base.v) v *= inv;
         }
 
@@ -196,18 +194,22 @@ public:
         sidecar->descriptors.dim  = kDescDim;
 
         Detect(base, ctx, sidecar.get());
-        m_found = int(sidecar->keypoints.size());
+        const int found = int(sidecar->keypoints.size());
+
+        if (found > 0) {
+
+            char rbuf[64];
+
+            std::snprintf(rbuf, sizeof rbuf, "%d SIFT features (level %.3f)",
+
+                          found, level);
+
+            ctx.SetReport(rbuf);
+
+        }
 
         // Attach to the OUTPUT, which is what downstream stages resolve.
         if (Image* im = ctx.OutImage(0)) im->Sidecars().Set(kFeatureSidecar, sidecar);
-    }
-
-    std::string RunReport() const override {
-        if (m_found <= 0) return {};
-        char buf[64];
-        std::snprintf(buf, sizeof buf, "%d SIFT features (level %.3f)",
-                      m_found, m_level);
-        return buf;
     }
 
     // Sidecar coordinates are in IMAGE PIXELS and nothing rescales them, so a
@@ -721,12 +723,9 @@ private:
     Param<int> m_maxFeatures{this, "max_features", 5000, 10, 50000,
         {.help = "Stop after this many. A bound on time and memory rather "
                  "than a quality control -- the strongest are not found first."}};
-
-    int   m_found = 0;
     // Reported, because a detector that silently rescales its input is a
     // detector whose threshold no longer means what the slider says. Seeing
     // "level 0.16" next to a raw is what makes the normalisation checkable.
-    float m_level = 0.0f;
 };
 
 } // namespace

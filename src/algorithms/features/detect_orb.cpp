@@ -243,8 +243,6 @@ public:
             out.Data() = in.Data();
             out.PackInto(dst);
         }
-
-        m_found = 0;
         if (w < 64 || h < 64) return;
 
         Level base;
@@ -264,9 +262,9 @@ public:
         // a centre pixel and its ring, so on a raw whose p99 is 0.12 a
         // threshold meant for display-referred data rejects every corner in the
         // image.
-        m_level = Percentile99(base.v);
-        if (m_level > 1e-6f) {
-            const float inv = 1.0f / m_level;
+        const float level = Percentile99(base.v);
+        if (level > 1e-6f) {
+            const float inv = 1.0f / level;
             for (float& v : base.v) v *= inv;
         }
 
@@ -276,17 +274,24 @@ public:
         sidecar->descriptors.dim  = kDescBits;
 
         Detect(base, ctx, sidecar.get());
-        m_found = int(sidecar->keypoints.size());
+        const int found = int(sidecar->keypoints.size());
+
+        if (found > 0) {
+
+            char rbuf[80];
+
+            std::snprintf(rbuf, sizeof rbuf,
+
+                          "%d ORB features (%d bits, level %.3f)",
+
+                          found, kDescBits, level);
+
+            ctx.SetReport(rbuf);
+
+        }
+
 
         if (Image* im = ctx.OutImage(0)) im->Sidecars().Set(kFeatureSidecar, sidecar);
-    }
-
-    std::string RunReport() const override {
-        if (m_found <= 0) return {};
-        char buf[80];
-        std::snprintf(buf, sizeof buf, "%d ORB features (%d bits, level %.3f)",
-                      m_found, kDescBits, m_level);
-        return buf;
     }
 
     // Sidecar coordinates are in IMAGE PIXELS and nothing rescales them, so a
@@ -470,9 +475,7 @@ private:
                  "the scale-space detectors this really is a quality control: "
                  "FAST finds far more corners than are useful and the ranking "
                  "is what makes the cap meaningful."}};
-
-    int   m_found = 0;
-    float m_level = 0.0f;
+    float level = 0.0f;
 };
 
 REGISTER_ALGORITHM(DetectOrb);

@@ -2507,7 +2507,7 @@ static void TestMeasureCache(ID3D12Device* dev) {
         if (!pipe->Execute(&src, prev, &err, &gpu, ExecMode::ForceGPU, &versions))
             return false;
         for (const Stage& st : pipe->Stages())
-            if (st.algoName == "dehaze" && st.algo) *note = st.algo->RunReport();
+            if (st.algoName == "dehaze" && st.algo) *note = st.Report();
         return true;
     };
 

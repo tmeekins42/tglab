@@ -91,8 +91,11 @@ public:
         const int ch = in.Channels();
         if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return;
 
-        m_w = dw;
-        m_h = dh;
+        {
+            char rbuf[64];
+            std::snprintf(rbuf, sizeof rbuf, "resized to %dx%d", dw, dh);
+            ctx.SetReport(rbuf);
+        }
 
         const double xr = double(sw) / double(dw);
         const double yr = double(sh) / double(dh);
@@ -162,13 +165,6 @@ public:
         // output cannot be rescaled after the fact.
     }
 
-    std::string RunReport() const override {
-        if (m_w <= 0) return {};
-        char buf[64];
-        std::snprintf(buf, sizeof buf, "resized to %dx%d", m_w, m_h);
-        return buf;
-    }
-
     bool HasGPU() const override { return false; }
 
 private:
@@ -191,7 +187,6 @@ private:
                  "image does. Above 1 it is bilinear.",
          .softMin = 0.1, .softMax = 2.0}};
 
-    int m_w = 0, m_h = 0;
 };
 
 REGISTER_ALGORITHM(Resize);

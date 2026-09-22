@@ -1382,6 +1382,84 @@ static void TestResize() {
 // "filter" alongside gaussian_blur, which is a tool rather than a look; dehaze
 // and film_grain are "adjust" alongside brightness, which must stay on. A
 // category test would read correctly and be wrong.
+// No per-frame algorithm may keep its status line on a member.
+//
+// One algorithm instance serves every frame of a broadcast, so a note written
+// to a member inside RunCPU is shared mutable state: last-writer-wins with one
+// frame in flight, and a data race once the loop is threaded. Thirteen
+// algorithms did this before RunCtx::SetReport existed, detect_akaze among
+// them -- the stage at 71% of an SfM run and the whole reason for threading
+// the loop at all.
+//
+// DETECTED BY BEHAVIOUR rather than by reading the source: run a stage, then
+// run a SECOND instance that is given no chance to report, and see whether the
+// first one's note is still visible. A member persists and shows through;
+// a per-call report does not. That catches the next algorithm someone adds
+// with the old habit, which a grep for `m_note` would not -- the three greps
+// tried during the migration each missed a different part of the real list.
+//
+// Whole-group algorithms are exempt and correctly so: an aligner, a reduction
+// or a reconstruction runs once over the whole set, so it has no frames to
+// disagree about and RunReport() is the right home for its note.
+static void TestNoPerFrameReportState() {
+    auto makeInput = [] {
+        Image img;
+        img.Alloc({64, 64, Format::RGBA8});
+        ImageView v = img.MapCpuWrite();
+        for (int y = 0; y < 64; ++y)
+            for (int x = 0; x < 64; ++x) {
+                uint8_t* p = v.At<uint8_t>(x, y);
+                p[0] = uint8_t(x * 4); p[1] = uint8_t(y * 4);
+                p[2] = 128; p[3] = 255;
+            }
+        return img;
+    };
+
+    std::string offenders;
+    int checked = 0;
+    for (const std::string& name : Registry::Get().Names()) {
+        auto probe = Registry::Get().Create(name);
+        if (!probe) continue;
+        // Whole-group algorithms never broadcast, so a member is fine there.
+        if (probe->IsAligner() || probe->IsReduction() || probe->IsReconstruct())
+            continue;
+        if (probe->Inputs().size() != 1) continue;
+        const size_t outs = probe->Outputs().size();
+        if (outs != 1) continue;
+
+        auto algo = Registry::Get().Create(name);
+        AlgorithmBase* raw = algo.get();
+        Pipeline pipe;
+        std::vector<Data> sources;
+        sources.push_back(Data{makeInput()});
+        pipe.AddStage(std::move(algo), name, {{-1, 0}}, outs, 1);
+
+        std::string e;
+        if (!pipe.Execute(&sources, nullptr, &e)) continue;   // a real refusal
+        ++checked;
+
+        // RunReport() is what a member-held note comes back through. A stage
+        // that ran on the CPU and reported per call leaves it empty.
+        const std::string held = raw->RunReport();
+        if (held.empty()) continue;
+
+        // Not every non-empty RunReport is a fault: a note that does not depend
+        // on the run -- "no LUT set", "not counted on the GPU" -- is a standing
+        // statement about configuration, and is identical before the stage has
+        // run at all. Only a note that APPEARED because of the run is state.
+        auto fresh = Registry::Get().Create(name);
+        if (fresh && fresh->RunReport() == held) continue;
+
+        offenders += "\n    " + name + ": \"" + held + "\"";
+    }
+
+    Check(checked > 10, "the audit reached a useful number of algorithms (" +
+                            std::to_string(checked) + ")");
+    Check(offenders.empty(),
+          "no per-frame algorithm holds its run report on a member" + offenders +
+              (offenders.empty() ? "" : "\n    -- use RunCtx::SetReport instead"));
+}
+
 static void TestDefaultOff() {
     const std::set<std::string> effects = {
         "orton", "bloom", "vignette", "film_grain", "dehaze",
@@ -1544,6 +1622,7 @@ int main() {
     TestDehaze();
     TestResize();
     TestDefaultOff();
+    TestNoPerFrameReportState();
     TestProxyBehaviour();
 
 

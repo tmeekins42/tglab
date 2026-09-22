@@ -1078,7 +1078,7 @@ int main() {
                 }
             p.AddStage(std::move(a), name, {{-1, 0}}, 1, 1);
             if (!p.Execute(&s, nullptr, err)) return false;
-            lastReport = p.Stages()[0].algo->RunReport();
+            lastReport = p.Stages()[0].Report();
             const Data* d = p.Resolve({0, 0}, &s);
             const PointCloud* pc = d ? std::get_if<PointCloud>(d) : nullptr;
             if (!pc) { *err = "output is not a PointCloud"; return false; }
@@ -1795,7 +1795,7 @@ int main() {
                     // ambiguous between "not planar" and "the fit is broken",
                     // and only a known-planar case can tell those apart.
                     std::printf("       stage says: %s\n",
-                                p.Stages()[0].algo->RunReport().c_str());
+                                p.Stages()[0].Report().c_str());
                 } else {
                     // Also a legitimate outcome, and arguably the RIGHT one:
                     // refusing a pair it cannot solve beats returning an

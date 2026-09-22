@@ -98,6 +98,21 @@ public:
         m_w = cw;
         m_h = chh;
 
+        // Per call rather than read back off the members: one instance serves
+        // every frame of a group. The members stay because PrepareGpu also
+        // sets them and the GPU path is single-threaded per stage.
+        {
+            char rbuf[96];
+            if (bool(m_preview)) {
+                std::snprintf(rbuf, sizeof rbuf,
+                              "preview: the crop would be %dx%d -- turn preview "
+                              "off to apply", cw, chh);
+            } else {
+                std::snprintf(rbuf, sizeof rbuf, "cropped to %dx%d", cw, chh);
+            }
+            ctx.SetReport(rbuf);
+        }
+
         // The rotation, about the CENTRE OF THE CROP RECTANGLE rather than the
         // centre of the frame.
         //
@@ -134,17 +149,21 @@ public:
         out.PackInto(dst);
     }
 
+    // ONLY FOR THE GPU PATH. The CPU path reports per call (see RunCPU),
+    // because one instance serves every frame of a group; PrepareGpu sets
+    // m_w/m_h and the GPU path stays single-threaded per stage, so a member is
+    // safe there. m_gpuPrepared keeps this from also answering for a CPU run,
+    // where it would shadow the per-call note with the same numbers.
     std::string RunReport() const override {
+        if (!m_gpuPrepared || m_w <= 0) return {};
+        char buf[96];
         if (bool(m_preview)) {
-            char buf[96];
             std::snprintf(buf, sizeof buf,
                           "preview: the crop would be %dx%d -- turn preview off to apply",
                           m_w, m_h);
-            return buf;
+        } else {
+            std::snprintf(buf, sizeof buf, "cropped to %dx%d", m_w, m_h);
         }
-        if (m_w <= 0) return {};
-        char buf[64];
-        std::snprintf(buf, sizeof buf, "cropped to %dx%d", m_w, m_h);
         return buf;
     }
 
@@ -311,6 +330,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
         m_srcW = inputs[0].width;
         m_srcH = inputs[0].height;
         Rect(m_srcW, m_srcH, &m_x0, &m_y0, &m_w, &m_h);
+        m_gpuPrepared = true;
     }
 
     // The preview's line colour has to be MEASURED, and only the CPU can
@@ -601,6 +621,8 @@ private:
          .step = 0.05}};
 
     int m_w = 0, m_h = 0;
+    // Set only by PrepareGpu, so RunReport can tell a GPU run from a CPU one.
+    bool m_gpuPrepared = false;
     // The input size and rectangle origin, captured in PrepareGpu: the shader
     // needs them in pixels and cannot see the descriptors.
     int m_srcW = 0, m_srcH = 0;

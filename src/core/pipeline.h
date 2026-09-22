@@ -105,11 +105,19 @@ struct Stage {
     // features" nineteen times is noise -- but a frame that differs is shown
     // with its number, since a detector finding 200 features on frame 12 and
     // 20000 elsewhere is exactly what the line exists to surface.
+    //
+    // PER-FRAME NOTES WIN when there are any. Both sources can be non-empty at
+    // once: an algorithm with both a CPU and a GPU path may report a count per
+    // call and a standing note from a member -- hot_pixel_repair says "not
+    // counted on the GPU" from RunReport() and the actual count from RunCPU.
+    // The per-call note describes the run that just happened, so it wins.
     std::string Report() const {
         if (!algo) return {};
-        const std::string whole = algo->RunReport();
-        if (!whole.empty()) return whole;
-        if (frameReports.empty()) return {};
+
+        bool anyFrame = false;
+        for (const std::string& r : frameReports)
+            if (!r.empty()) { anyFrame = true; break; }
+        if (!anyFrame) return algo->RunReport();
 
         bool allSame = true;
         const std::string& first = frameReports[0];

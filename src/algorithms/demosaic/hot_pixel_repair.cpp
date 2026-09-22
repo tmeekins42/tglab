@@ -157,7 +157,13 @@ public:
                 ++repaired;
             }
         }
-        m_lastRepaired = repaired;
+        // Per-call rather than a member: one instance serves every frame of a
+        // group, so a member would be last-writer-wins across them.
+        ctx.SetReport(repaired == 0
+                          ? std::string("hot pixels: none found")
+                          : "hot pixels: " + std::to_string(repaired) +
+                                (repaired == 1 ? " sensel repaired"
+                                               : " sensels repaired"));
     }
 
     // How many sensels the last run replaced.
@@ -172,11 +178,14 @@ public:
     // nobody reads while dragging a slider is not a good trade -- so this says
     // plainly that it does not know rather than reporting a stale or zero
     // count as though it were the answer.
+    // The COUNT now travels per call (see RunCPU); only the "the GPU ran and
+    // therefore did not count" case is left here. That one is safe as a member
+    // because PrepareGpu is reached on the GPU path alone, which stays
+    // single-threaded per stage regardless -- the compiled kernel and scratch
+    // planes are cached on the Stage.
     std::string RunReport() const override {
         if (m_lastRepaired < 0) return "hot pixels: not counted on the GPU";
-        if (m_lastRepaired == 0) return "hot pixels: none found";
-        return "hot pixels: " + std::to_string(m_lastRepaired) +
-               (m_lastRepaired == 1 ? " sensel repaired" : " sensels repaired");
+        return {};
     }
 
     // --- GPU implementation -------------------------------------------------

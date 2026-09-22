@@ -102,7 +102,23 @@ public:
             }
         }
 
-        m_outOfDomain = double(outOfDomain) / (double(w) * double(h));
+        // Per call, because the clamped fraction is a property of THIS frame
+        // and one instance serves every frame of a group. Built from the same
+        // pieces RunReport() uses, with the fraction local rather than stored.
+        {
+            const double frac = double(outOfDomain) / (double(w) * double(h));
+            std::string s = Describe();
+            if (!s.empty() && frac > 0.005) {
+                char buf[192];
+                std::snprintf(buf, sizeof buf,
+                              " -- %.0f%% of pixels are above the table's domain "
+                              "and were clamped; tonemap before this stage",
+                              frac * 100.0);
+                s += buf;
+            }
+            ctx.SetReport(std::move(s));
+        }
+
         m_out.PackInto(dst);
     }
 
@@ -246,6 +262,15 @@ void main(uint3 tid : SV_DispatchThreadID) {
         // Strength 0 makes this a no-op, so the stage is skipped entirely and
         // the table is never loaded. Saying "not loaded" there would read as a
         // failure; say what actually happened.
+        // The out-of-domain fraction is NOT here any more: it belongs to one
+        // frame, and RunCPU reports it per call. What is left describes the
+        // table, which is the same for every frame of a group.
+        return Describe();
+    }
+
+    // Which table is loaded, or why none is. Shared by RunReport() and the
+    // per-call report so the two cannot drift.
+    std::string Describe() const {
         if (float(m_strength) == 0.0f) return "strength 0 -- stage skipped";
         if (!m_loadError.empty()) return "LUT: " + m_loadError;
         if (m_path.get().empty()) return "no LUT set -- passing through";
@@ -260,13 +285,6 @@ void main(uint3 tid : SV_DispatchThreadID) {
                       title.empty() ? "" : title.c_str());
         std::string s = buf;
         if (!title.empty()) s += "\"";
-        if (m_outOfDomain > 0.005) {
-            std::snprintf(buf, sizeof buf,
-                          " -- %.0f%% of pixels are above the table's domain and "
-                          "were clamped; tonemap before this stage",
-                          m_outOfDomain * 100.0);
-            s += buf;
-        }
         return s;
     }
 
@@ -334,7 +352,6 @@ private:
     float       m_gpuWhite = 1.0f;
     std::string m_loadedPath;
     std::string m_loadError;
-    double      m_outOfDomain = 0.0;
 
     PixelBuffer m_in, m_out;
 };

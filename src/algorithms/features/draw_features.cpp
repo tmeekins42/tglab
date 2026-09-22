@@ -66,8 +66,10 @@ public:
         if (dim < 1.0f)
             for (float& v : out.Data()) v *= dim;
 
-        m_drawn = 0;
-        m_kind.clear();
+        // All locals rather than members: one instance serves every frame of a
+        // group, so a member here would describe whichever frame finished last.
+        int drawn = 0;
+        std::string kind;
 
         const Image* im = ctx.InImage(0);
         const FeatureSidecar* fs = im ? FeaturesOf(*im) : nullptr;
@@ -75,17 +77,16 @@ public:
             // Distinguishable from "found none": see FeaturesOf. Reported
             // rather than silent, because a script whose detector is missing
             // otherwise looks like a detector that failed.
-            m_noSidecar = true;
+            ctx.SetReport("no features attached -- run a detector first");
             out.PackInto(dst);
             return;
         }
-        m_noSidecar = false;
-        m_detector  = fs->detector;
+        const std::string& detector = fs->detector;
 
         switch (fs->descriptors.kind) {
-            case DescriptorKind::Float:  m_kind = std::to_string(fs->descriptors.dim) + "f"; break;
-            case DescriptorKind::Binary: m_kind = std::to_string(fs->descriptors.dim) + " bits"; break;
-            case DescriptorKind::None:   m_kind = "no descriptor"; break;
+            case DescriptorKind::Float:  kind = std::to_string(fs->descriptors.dim) + "f"; break;
+            case DescriptorKind::Binary: kind = std::to_string(fs->descriptors.dim) + " bits"; break;
+            case DescriptorKind::None:   kind = "no descriptor"; break;
         }
 
         // Strongest first, so the cap keeps the features worth seeing rather
@@ -106,22 +107,20 @@ public:
         const float scale = in.ValueScale();
 
         for (const Keypoint* k : order) {
-            if (m_drawn >= cap) break;
+            if (drawn >= cap) break;
             DrawOne(out, *k, k->response / maxResp, scale);
-            ++m_drawn;
+            ++drawn;
+        }
+
+        if (drawn > 0) {
+            std::string r = "drew " + std::to_string(drawn) + " features";
+            if (!detector.empty()) r += " (" + detector;
+            if (!kind.empty())     r += ", " + kind;
+            if (!detector.empty()) r += ")";
+            ctx.SetReport(std::move(r));
         }
 
         out.PackInto(dst);
-    }
-
-    std::string RunReport() const override {
-        if (m_noSidecar) return "no features attached -- run a detector first";
-        if (m_drawn == 0) return {};
-        std::string r = "drew " + std::to_string(m_drawn) + " features";
-        if (!m_detector.empty()) r += " (" + m_detector;
-        if (!m_kind.empty())     r += ", " + m_kind;
-        if (!m_detector.empty()) r += ")";
-        return r;
     }
 
     // Sidecar coordinates are in IMAGE PIXELS and nothing rescales them, so a
@@ -212,10 +211,6 @@ private:
         {.help = "Cap on how many to draw, strongest first. Ten thousand marks "
                  "on one frame is a solid mask rather than a picture."}};
 
-    int         m_drawn = 0;
-    bool        m_noSidecar = false;
-    std::string m_detector;
-    std::string m_kind;
 };
 
 } // namespace

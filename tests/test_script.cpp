@@ -2391,7 +2391,7 @@ int main() {
             if (pl2.Execute(&sv, nullptr, &x2)) {
                 std::string report;
                 for (const Stage& st : pl2.Stages())
-                    if (st.algo && st.algoName == "merge_hdr") report = st.algo->RunReport();
+                    if (st.algo && st.algoName == "merge_hdr") report = st.Report();
                 Check(report.find("NO EXIF") != std::string::npos,
                       "and says so rather than merging as though exposures matched");
             }
@@ -5010,7 +5010,7 @@ int main() {
                 *inliers = ms ? int(ms->Matches().size()) : 0;
                 if (p.Stages().size() > 2 && p.Stages()[2].algo)
                     std::printf("        [dbg] %s\n",
-                                p.Stages()[2].algo->RunReport().c_str());
+                                p.Stages()[2].Report().c_str());
                 return true;
             };
 
@@ -5216,7 +5216,7 @@ int main() {
                     for (size_t st = 1; st < p.Stages().size(); ++st)
                         if (p.Stages()[st].algo)
                             std::printf("        [dbg] %s\n",
-                                        p.Stages()[st].algo->RunReport().c_str());
+                                        p.Stages()[st].Report().c_str());
                     const Data* out = p.Resolve({2, 0}, &s);
                     const auto* os = out ? std::get_if<ImageSet>(out) : nullptr;
                     if (os && os->images.size() == 3) {
@@ -5352,7 +5352,7 @@ int main() {
                     if (!p.Execute(&s, nullptr, err)) return false;
                     if (p.Stages().size() > 3 && p.Stages()[3].algo)
                         std::printf("        [dbg] %s\n",
-                                    p.Stages()[3].algo->RunReport().c_str());
+                                    p.Stages()[3].Report().c_str());
                     const Data* out = p.Resolve({3, 0}, &s);
                     const auto* im = out ? std::get_if<Image>(out) : nullptr;
                     if (!im) return false;
@@ -5363,7 +5363,7 @@ int main() {
                     // recomputed: the algorithm already measures it where the
                     // frames overlap, and a second implementation here could
                     // disagree with the one that matters.
-                    const std::string rep = p.Stages()[3].algo->RunReport();
+                    const std::string rep = p.Stages()[3].Report();
                     const size_t k = rep.find("disagreeing ");
                     *disagree = (k == std::string::npos)
                         ? -1.0f : float(atof(rep.c_str() + k + 12));
@@ -5485,7 +5485,7 @@ int main() {
 
                         if (!p.Execute(&s, nullptr, err)) return false;
 
-                        const std::string rep = p.Stages()[3].algo->RunReport();
+                        const std::string rep = p.Stages()[3].Report();
                         const size_t kd = rep.find("disagreeing ");
                         *disagree = (kd == std::string::npos)
                             ? -1.0f : float(atof(rep.c_str() + kd + 12));
@@ -5578,7 +5578,7 @@ int main() {
 
                     std::string e;
                     if (p.Execute(&s, nullptr, &e) && p.Stages().size() > 3) {
-                        const std::string rep = p.Stages()[3].algo->RunReport();
+                        const std::string rep = p.Stages()[3].Report();
                         std::printf("        [dbg] %s\n", rep.c_str());
                         const size_t k = rep.find("focal ");
                         const float got = (k == std::string::npos)
@@ -5667,7 +5667,7 @@ int main() {
 
                     std::string e;
                     if (p.Execute(&s, nullptr, &e) && p.Stages().size() > 3) {
-                        const std::string rep = p.Stages()[3].algo->RunReport();
+                        const std::string rep = p.Stages()[3].Report();
                         std::printf("        [dbg] %s\n", rep.c_str());
 
                         // No frame was dropped for being unreadable as a
@@ -5738,7 +5738,7 @@ int main() {
 
                     std::string e;
                     if (p.Execute(&s, nullptr, &e)) {
-                        const std::string rep = p.Stages()[0].algo->RunReport();
+                        const std::string rep = p.Stages()[0].Report();
                         std::printf("        [dbg] %s\n", rep.c_str());
                         Check(rep.find("not a rotation") != std::string::npos,
                               "a mirrored transform is rejected, not silently "
@@ -5856,7 +5856,7 @@ int main() {
                           "an unplaceable chained frame is an error that says "
                           "why: \"" + e + "\"");
                 } else if (p.Stages().size() > 2) {
-                    const std::string rep = p.Stages()[2].algo->RunReport();
+                    const std::string rep = p.Stages()[2].Report();
                     std::printf("        [dbg] %s\n", rep.c_str());
                     const bool refused =
                         rep.find("REJECTED") != std::string::npos ||
@@ -5927,7 +5927,7 @@ int main() {
                                "bundle_adjust", {{2, 0}}, 1, 4);
 
                     if (!p.Execute(&s, nullptr, err)) return false;
-                    const std::string rep = p.Stages()[3].algo->RunReport();
+                    const std::string rep = p.Stages()[3].Report();
                     std::printf("        [dbg] %s\n", rep.c_str());
                     // "rms A -> B px"
                     const size_t k = rep.find("rms ");
@@ -6621,7 +6621,7 @@ int main() {
         std::string e2;
         p2.Execute(&s2, nullptr, &e2);
         if (!p2.Stages().empty() && p2.Stages()[0].algo) {
-            const std::string r = p2.Stages()[0].algo->RunReport();
+            const std::string r = p2.Stages()[0].Report();
             Check(r.find("no matches") != std::string::npos,
                   "and reports when nothing is matched: \"" + r + "\"");
         }
@@ -6659,7 +6659,11 @@ int main() {
             "src => draw_features() => display(\"none\")\n", &ui2, &p2, &err, &src2);
         Check(ok2 && p2.Stages().size() == 1, "draw without a detector still runs");
         if (ok2 && !p2.Stages().empty() && p2.Stages()[0].algo) {
-            const std::string r = p2.Stages()[0].algo->RunReport();
+            // Stage::Report() rather than algo->RunReport(): a per-frame
+            // algorithm now reports through RunCtx::SetReport into the stage,
+            // because one algorithm instance serves every frame of a group and
+            // a member would be shared mutable state across them.
+            const std::string r = p2.Stages()[0].Report();
             Check(r.find("no features") != std::string::npos,
                   "and says there were none: \"" + r + "\"");
         }

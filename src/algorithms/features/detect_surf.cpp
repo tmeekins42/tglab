@@ -117,8 +117,6 @@ public:
             out.Data() = in.Data();
             out.PackInto(dst);
         }
-
-        m_found = 0;
         if (w < 32 || h < 32) return;
 
         std::vector<float> grey(size_t(w) * size_t(h));
@@ -139,9 +137,9 @@ public:
         // a PRODUCT of two second derivatives -- so it scales with the SQUARE
         // of the image level where SIFT's difference-of-Gaussian scales
         // linearly. At a p99 of 0.12 that is a factor of about 70, not 8.
-        m_level = Percentile99(grey);
-        if (m_level > 1e-6f) {
-            const float inv = 1.0f / m_level;
+        const float level = Percentile99(grey);
+        if (level > 1e-6f) {
+            const float inv = 1.0f / level;
             for (float& v : grey) v *= inv;
         }
 
@@ -154,17 +152,21 @@ public:
         sidecar->descriptors.dim  = bool(m_extended) ? 128 : 64;
 
         Detect(ii, w, h, ctx, sidecar.get());
-        m_found = int(sidecar->keypoints.size());
+        const int found = int(sidecar->keypoints.size());
+
+        if (found > 0) {
+
+            char rbuf[80];
+
+            std::snprintf(rbuf, sizeof rbuf, "%d SURF features (%df, level %.3f)",
+
+                          found, bool(m_extended) ? 128 : 64, level);
+
+            ctx.SetReport(rbuf);
+
+        }
 
         if (Image* im = ctx.OutImage(0)) im->Sidecars().Set(kFeatureSidecar, sidecar);
-    }
-
-    std::string RunReport() const override {
-        if (m_found <= 0) return {};
-        char buf[80];
-        std::snprintf(buf, sizeof buf, "%d SURF features (%df, level %.3f)",
-                      m_found, bool(m_extended) ? 128 : 64, m_level);
-        return buf;
     }
 
     // Sidecar coordinates are in IMAGE PIXELS and nothing rescales them, so a
@@ -518,11 +520,8 @@ private:
     Param<int> m_maxFeatures{this, "max_features", 5000, 10, 50000,
         {.help = "Stop after this many. A bound on time rather than a quality "
                  "control -- the strongest are not found first."}};
-
-    int   m_found = 0;
     // Reported for the same reason SIFT reports it: a detector that rescales
     // its own input silently is one whose threshold no longer matches its slider.
-    float m_level = 0.0f;
 };
 
 } // namespace

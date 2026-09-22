@@ -164,15 +164,23 @@ public:
 
             scale *= m_exposure;
         }
-        m_scale = scale;
-
         // How far above grey the highlights reach AFTER scaling, in stops.
         // This is what the shoulder has to absorb, and it is reported because
         // it is the number that says whether the compression is doing anything.
-        m_stopsAbove = (lv.valid && lv.high > 0.0f)
+        const float stopsAbove = (lv.valid && lv.high > 0.0f)
             ? std::log2(std::max(lv.high * scale, 1e-6f) / kGreyIn) : 0.0f;
-        m_stopsBelow = (lv.valid && lv.low > 0.0f)
+        const float stopsBelow = (lv.valid && lv.low > 0.0f)
             ? std::log2(kGreyIn / std::max(lv.low * scale, 1e-6f)) : 0.0f;
+
+        // Per call rather than on the algorithm: one instance serves every
+        // frame of a group. See RunCtx::SetReport.
+        if (scale > 0.0f) {
+            char rbuf[96];
+            std::snprintf(rbuf, sizeof rbuf,
+                          "scaled %.4gx, %.1f stops below grey / %.1f above",
+                          double(scale), double(stopsBelow), double(stopsAbove));
+            ctx.SetReport(rbuf);
+        }
 
         const float shoulder = std::max(0.1f, float(m_shoulder));
         const int   n  = src.Width() * src.Height();
@@ -195,14 +203,6 @@ public:
         dst.PackInto(out);
     }
 
-    std::string RunReport() const override {
-        if (m_scale <= 0.0f) return {};
-        char buf[96];
-        std::snprintf(buf, sizeof buf,
-                      "scaled %.4gx, %.1f stops below grey / %.1f above",
-                      double(m_scale), double(m_stopsBelow), double(m_stopsAbove));
-        return buf;
-    }
 
     bool HasGPU() const override { return false; }
 
@@ -264,9 +264,6 @@ private:
     // is what a scene with a genuinely blown sky wants.
     Param<float> m_shoulder{this, "shoulder", 100.0f, 1.0f, 400.0f, {.step = 1.0, .softMin = 4.0f, .softMax = 200.0f}};
 
-    mutable float m_scale      = 0.0f;
-    mutable float m_stopsAbove = 0.0f;
-    mutable float m_stopsBelow = 0.0f;
 };
 
 } // namespace
