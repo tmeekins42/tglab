@@ -46,8 +46,10 @@ class RunCtx {
 public:
     RunCtx(std::span<const Data* const> in, std::span<Data> out,
            const CancelToken* cancel = nullptr,
-           ComputeContext* gpu = nullptr)
-        : m_in(in), m_out(out), m_cancel(cancel), m_gpu(gpu) {}
+           ComputeContext* gpu = nullptr,
+           std::string* report = nullptr)
+        : m_in(in), m_out(out), m_cancel(cancel), m_gpu(gpu),
+          m_report(report) {}
 
     // True when this run has been superseded and should stop.
     //
@@ -89,6 +91,24 @@ public:
 
     size_t NumIn()  const { return m_in.size(); }
     size_t NumOut() const { return m_out.size(); }
+
+    // What this ONE call wants to say in the status line.
+    //
+    // WHY THIS IS NOT A MEMBER OF THE ALGORITHM, which is where thirteen
+    // algorithms used to keep it. One algorithm instance serves every frame of
+    // a broadcast, so `m_note = ...` inside RunCPU is shared mutable state:
+    // with one frame in flight it is merely last-writer-wins, and with several
+    // it is a data race. Every one of those thirteen was reporting only --
+    // "resized to 800x534", "20000 AKAZE features" -- so none of it feeds back
+    // into pixels, and moving it into the per-call context costs nothing.
+    //
+    // The pipeline collects these and joins them in FRAME ORDER, so the status
+    // line reads the same on every run whatever order the frames finish in.
+    // Null for the tests and tools that build a RunCtx directly, which is why
+    // this tolerates it rather than requiring every caller to supply one.
+    void SetReport(std::string note) const {
+        if (m_report) *m_report = std::move(note);
+    }
 
     // The compute device, or null when there is none.
     //
@@ -141,6 +161,7 @@ private:
     std::span<Data>              m_out;
     const CancelToken*           m_cancel = nullptr;
     ComputeContext*              m_gpu    = nullptr;
+    std::string*                 m_report = nullptr;
 };
 
 

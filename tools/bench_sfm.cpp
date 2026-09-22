@@ -239,7 +239,7 @@ int main(int argc, char** argv) {
 
         for (const Stage& st : sp.Stages()) {
             if (!st.algo) continue;
-            const std::string rep = st.algo->RunReport();
+            const std::string rep = st.Report();
             if (!rep.empty()) std::printf("  %s\n", rep.c_str());
             else if (!st.valid) std::printf("  %s: did not run\n", st.algoName.c_str());
         }
@@ -369,7 +369,7 @@ int main(int argc, char** argv) {
     // not.
     for (const Stage& st : p.Stages()) {
         if (!st.algo) continue;
-        const std::string r = st.algo->RunReport();
+        const std::string r = st.Report();
         if (!r.empty()) std::printf("  %s\n", r.c_str());
         else if (!st.valid) std::printf("  %s: did not run\n", st.algoName.c_str());
     }

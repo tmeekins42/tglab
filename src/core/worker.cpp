@@ -282,7 +282,7 @@ void PipelineWorker::Run() {
             std::vector<std::string> reports;
             for (const Stage& s : job->pipe.Stages()) {
                 if (!s.algo || !s.valid) continue;
-                std::string r = s.algo->RunReport();
+                std::string r = s.Report();
                 if (!r.empty()) reports.push_back(std::move(r));
             }
             // A GPU fallback belongs with the reports: it is the single most

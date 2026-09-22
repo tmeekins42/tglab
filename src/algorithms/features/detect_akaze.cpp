@@ -149,7 +149,6 @@ public:
             out.PackInto(dst);
         }
 
-        m_found = 0;
         if (w < 32 || h < 32) return;
 
         Plane base;
@@ -169,15 +168,17 @@ public:
         sidecar->descriptors.dim  = kDescBits;
 
         Detect(base, ctx, sidecar.get());
-        m_found = int(sidecar->keypoints.size());
+
+        // Reported through the per-call context rather than a member, because
+        // one detector instance serves every frame of a group and a member
+        // would be shared mutable state across them. See RunCtx::SetReport.
+        const int found = int(sidecar->keypoints.size());
+        if (found > 0) {
+            ctx.SetReport(std::to_string(found) + " AKAZE features (" +
+                          std::to_string(kDescBits) + " bits)");
+        }
 
         if (Image* im = ctx.OutImage(0)) im->Sidecars().Set(kFeatureSidecar, sidecar);
-    }
-
-    std::string RunReport() const override {
-        if (m_found <= 0) return {};
-        return std::to_string(m_found) + " AKAZE features (" +
-               std::to_string(kDescBits) + " bits)";
     }
 
     // Sidecar coordinates are in IMAGE PIXELS and nothing rescales them, so a
@@ -578,7 +579,6 @@ private:
     Param<int> m_maxFeatures{this, "max_features", 5000, 10, 50000,
         {.help = "Stop after this many."}};
 
-    int m_found = 0;
 };
 
 } // namespace

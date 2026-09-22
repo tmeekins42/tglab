@@ -82,6 +82,50 @@ struct Stage {
     double               lastMs    = 0.0;
     int                  ranFrames = 0;
 
+    // What the algorithm said about this run, one entry per frame.
+    //
+    // Collected here rather than in a member of the algorithm, because one
+    // algorithm instance serves every frame of a broadcast -- so a note kept
+    // on the algorithm is shared mutable state, which is last-writer-wins with
+    // one frame in flight and a data race with several. Filled in frame order
+    // whatever order the frames complete, so the status line is deterministic.
+    //
+    // Empty for a stage whose algorithm reports through RunReport() instead,
+    // which is every whole-group stage: an aligner or a reconstruction runs
+    // once and has no frames to disagree about.
+    std::vector<std::string> frameReports;
+
+    // What this stage has to say, from whichever of the two places it lives.
+    //
+    // A whole-group stage reports through RunReport(); a per-frame one reports
+    // through RunCtx::SetReport into frameReports. Callers should not have to
+    // know which, so this merges them.
+    //
+    // Identical notes across frames collapse to one, because "20000 AKAZE
+    // features" nineteen times is noise -- but a frame that differs is shown
+    // with its number, since a detector finding 200 features on frame 12 and
+    // 20000 elsewhere is exactly what the line exists to surface.
+    std::string Report() const {
+        if (!algo) return {};
+        const std::string whole = algo->RunReport();
+        if (!whole.empty()) return whole;
+        if (frameReports.empty()) return {};
+
+        bool allSame = true;
+        const std::string& first = frameReports[0];
+        for (const std::string& r : frameReports)
+            if (r != first) { allSame = false; break; }
+        if (allSame) return first;
+
+        std::string out;
+        for (size_t i = 0; i < frameReports.size(); ++i) {
+            if (frameReports[i].empty()) continue;
+            if (!out.empty()) out += "; ";
+            out += "[" + std::to_string(i) + "] " + frameReports[i];
+        }
+        return out;
+    }
+
     // Compiled kernel, cached so dragging a slider does not recompile HLSL
     // every frame. shared_ptr because Stage is moved between pipelines and the
     // kernel outlives any single run.
@@ -306,7 +350,7 @@ private:
     // does not make a stage parallel -- it removes the first of three
     // obstacles.
     bool RunStageOnce(Stage& s, const std::vector<const Data*>& in,
-                      std::vector<Data>* out,
+                      std::vector<Data>* out, std::string* report,
                       ComputeContext* gpu, ExecMode mode,
                       const CancelToken* cancel, std::string* err);
     bool BroadcastStage(Stage& s, const std::vector<const Data*>& in,

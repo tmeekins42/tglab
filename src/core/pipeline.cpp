@@ -485,7 +485,7 @@ bool Pipeline::RunFusedReduction(int reduceStage, const std::vector<int>& chain,
             // A local rather than cs.outputs: the result is moved straight into
             // `carried` on the next line, so the stage never needed to hold it.
             std::vector<Data> chainOut;
-            if (!RunStageOnce(cs, csIn, &chainOut, gpu, mode, cancel, err))
+            if (!RunStageOnce(cs, csIn, &chainOut, nullptr, gpu, mode, cancel, err))
                 return false;
             if (chainOut.size() != 1) { *err = Where() + "chain stage produced no result"; return false; }
             carried = std::move(chainOut[0]);
@@ -640,7 +640,7 @@ bool Pipeline::RunReduction(Stage& s, const std::vector<const Data*>& in,
 // cancellation -- which is exactly what makes it the right unit to map across a
 // set rather than duplicating any of it.
 bool Pipeline::RunStageOnce(Stage& s, const std::vector<const Data*>& in,
-                            std::vector<Data>* out,
+                            std::vector<Data>* out, std::string* report,
                             ComputeContext* gpu, ExecMode mode,
                             const CancelToken* cancel, std::string* err) {
     // Sized here rather than by the caller: how many ports a stage has is the
@@ -744,7 +744,8 @@ bool Pipeline::RunStageOnce(Stage& s, const std::vector<const Data*>& in,
         // a sidecar rather than an image). ForceCPU withholds it, so the mode
         // means what it says -- otherwise "force CPU" would still dispatch.
         RunCtx ctx(in, *out, cancel,
-                   mode == ExecMode::ForceCPU ? nullptr : gpu);
+                   mode == ExecMode::ForceCPU ? nullptr : gpu,
+                   report);
         s.algo->RunCPU(ctx);
         ++m_cpuStages;
 
@@ -817,6 +818,9 @@ bool Pipeline::BroadcastStage(Stage& s, const std::vector<const Data*>& in,
     s.outputs.clear();
     s.outputs.resize(nPorts);
 
+    // Sized up front so each frame writes its own slot; see frameReports.
+    s.frameReports.assign(src.images.size(), std::string());
+
     bool ok = true;
     for (size_t f = 0; f < src.images.size() && ok; ++f) {
         if (cancel && cancel->Cancelled()) { *err = kCancelled; ok = false; break; }
@@ -837,7 +841,10 @@ bool Pipeline::BroadcastStage(Stage& s, const std::vector<const Data*>& in,
         frameIn[size_t(setIdx)] = &frame;
 
         std::vector<Data> frameOut;
-        if (!RunStageOnce(s, frameIn, &frameOut, gpu, mode, cancel, err)) {
+        // Indexed by frame rather than appended, so the order is the frames'
+        // order whatever order they complete in once this loop is threaded.
+        if (!RunStageOnce(s, frameIn, &frameOut, &s.frameReports[f], gpu, mode,
+                          cancel, err)) {
             ok = false;
             break;
         }
@@ -1215,6 +1222,9 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
                 : st(s_), t0(std::chrono::steady_clock::now()) {
                 st.lastMs = 0.0;
                 st.ranFrames = 0;
+                // Cleared with the rest: a stage skipped this run must not
+                // show last run's note as though it were current.
+                st.frameReports.clear();
             }
             ~StageTimer() {
                 st.lastMs = std::chrono::duration<double, std::milli>(
@@ -1650,10 +1660,15 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
         // The scalar path writes into the stage's own buffer, which is where a
         // non-broadcast result belongs: later stages resolve their inputs from
         // it and the cache keeps it between runs.
-        } else if (!RunStageOnce(s, in, &s.outputs, gpu, mode, cancel, err)) {
-            return false;
         } else {
+            std::string scalarReport;
+            if (!RunStageOnce(s, in, &s.outputs, &scalarReport, gpu, mode,
+                              cancel, err)) {
+                return false;
+            }
             s.ranFrames = 1;
+            if (!scalarReport.empty())
+                s.frameReports.assign(1, std::move(scalarReport));
         }
         s.valid = true;
     }
