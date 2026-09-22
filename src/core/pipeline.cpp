@@ -840,8 +840,24 @@ bool Pipeline::BroadcastStage(Stage& s, const std::vector<const Data*>& in,
     // here. A GPU stage that FALLS BACK to the CPU mid-run therefore still runs
     // serially -- slower than it could be, and correct, which is the right way
     // round for a fallback nobody planned for.
-    const bool wantGpu = gpu && mode != ExecMode::ForceCPU && s.algo->HasGPU() &&
-                         (s.algo->GpuSource() || !s.algo->GpuPasses().empty());
+    const bool stageWantsGpu =
+        gpu && mode != ExecMode::ForceCPU && s.algo->HasGPU() &&
+        (s.algo->GpuSource() || !s.algo->GpuPasses().empty());
+
+    // ...and a CPU algorithm that submits GPU work of its OWN is equally
+    // unsafe to run concurrently, for the same reason: one command queue with
+    // no locking. HasGPU() does not cover this -- the scale-space detectors
+    // return false from it and still call ctx.Gpu() inside RunCPU, which hung
+    // the application at 9% of a nineteen-frame detect. See
+    // AlgorithmBase::UsesGpuInRunCPU.
+    //
+    // Only when a device is actually present and not withheld: under ForceCPU
+    // ctx.Gpu() is null, the algorithm takes its own CPU fallback, and the
+    // frames are independent after all.
+    const bool cpuTouchesGpu = gpu && mode != ExecMode::ForceCPU &&
+                               s.algo->UsesGpuInRunCPU();
+
+    const bool wantGpu = stageWantsGpu || cpuTouchesGpu;
 
     // BRING EVERY FRAME TO THE CPU FIRST, before any thread touches them.
     //

@@ -183,6 +183,7 @@ add_executable(tglab_filter_tests
     $<TARGET_OBJECTS:tglab_algorithms>
 )
 target_link_libraries(tglab_filter_tests PRIVATE tglab_core imgui d3d12 dxgi)
+target_compile_definitions(tglab_filter_tests PRIVATE TGLAB_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 if(MSVC)
     target_compile_definitions(tglab_filter_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()

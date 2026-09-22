@@ -121,6 +121,10 @@ public:
         return {{"out", DataType::Image, FormatSpec::SameAsInput}};
     }
 
+    // RunCPU offloads the diffusion loop through ctx.Gpu(), so its frames
+    // must not run concurrently: one command queue, no locking.
+    bool UsesGpuInRunCPU() const override { return true; }
+
     void RunCPU(RunCtx& ctx) override {
         const ImageView src = ctx.In(0);
         ImageView       dst = ctx.Out(0);

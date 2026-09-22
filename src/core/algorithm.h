@@ -416,6 +416,28 @@ public:
     // binding and dispatch, so an algorithm only writes the kernel itself.
     virtual bool HasGPU() const { return false; }
 
+    // True when RunCPU itself reaches for the device -- ctx.Gpu() -- rather
+    // than the framework dispatching a kernel on the algorithm's behalf.
+    //
+    // WHY THIS IS SEPARATE FROM HasGPU(). They sound like the same question
+    // and are not. HasGPU() says "the framework can run this as a compute
+    // kernel instead of calling RunCPU"; this says "RunCPU, when it runs, will
+    // submit GPU work of its own". The four scale-space detectors are the case
+    // that needs it: they are CPU algorithms -- HasGPU() is false -- that
+    // offload a diffusion loop through ctx.Gpu() and read the result back.
+    //
+    // It matters for exactly one reason: ComputeContext has one command queue,
+    // one allocator and no locking, so two RunCPU calls submitting at once
+    // deadlock. The broadcast loop reads this to decide whether a stage's
+    // frames may run concurrently. Measured the hard way -- parallelising
+    // detect_akaze on nineteen frames hung the application at 9%, with the UI
+    // frozen, because nineteen threads were inside one command queue.
+    //
+    // Defaults to false because most algorithms never touch the device, and an
+    // algorithm that calls ctx.Gpu() without saying so is the bug this exists
+    // to make impossible. TestGpuUsersDeclareIt checks the two agree.
+    virtual bool UsesGpuInRunCPU() const { return false; }
+
     // Compute shader source with a `main` entry point. Bindings by convention:
     //   t0..t3  inputs        u0..u3  outputs
     //   b0      uint Width, uint Height, then GpuConstants() below

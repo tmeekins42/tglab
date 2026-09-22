@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <set>
 #include <string>
 #include <vector>
@@ -1554,6 +1555,62 @@ static void TestNoSharedScratch() {
                                  : "\n    -- move PixelBuffer members into RunCPU"));
 }
 
+// An algorithm that reaches for the device inside RunCPU must SAY so.
+//
+// ComputeContext has one command queue, one allocator and no locking, so two
+// RunCPU calls submitting at once deadlock. The broadcast loop keeps such a
+// stage serial, but only if it knows -- and HasGPU() does not tell it: the
+// four scale-space detectors return false from HasGPU() (the framework cannot
+// run them as a kernel) and still call ctx.Gpu() to offload their diffusion
+// loop.
+//
+// This is a SOURCE check rather than a behavioural one, unusually, because the
+// behaviour cannot be reproduced where it matters: the test binaries have no
+// D3D12 device, so ctx.Gpu() is null and every such algorithm quietly takes
+// its CPU fallback. That is precisely why the deadlock reached the
+// application -- parallelising detect_akaze over nineteen frames froze the UI
+// at 9% -- while every suite passed. A test that can only pass is not a test,
+// so this reads the files instead.
+static void TestGpuUsersDeclareIt() {
+    namespace fs = std::filesystem;
+    const fs::path root = fs::path(TGLAB_SOURCE_DIR) / "src" / "algorithms";
+
+    std::string offenders;
+    int scanned = 0, declared = 0;
+
+    std::error_code ec;
+    for (auto it = fs::recursive_directory_iterator(root, ec);
+         it != fs::recursive_directory_iterator(); it.increment(ec)) {
+        if (ec) break;
+        if (!it->is_regular_file() || it->path().extension() != ".cpp") continue;
+
+        std::ifstream in(it->path(), std::ios::binary);
+        std::ostringstream ss;
+        ss << in.rdbuf();
+        const std::string src = ss.str();
+        if (src.empty()) continue;
+        ++scanned;
+
+        const bool calls   = src.find("ctx.Gpu()") != std::string::npos;
+        const bool says    = src.find("UsesGpuInRunCPU") != std::string::npos;
+        if (says) ++declared;
+        if (calls && !says)
+            offenders += "\n    " + it->path().filename().string();
+    }
+
+    Check(scanned > 20, "the GPU-use audit read the algorithm sources (" +
+                            std::to_string(scanned) + " files)");
+    Check(declared > 0, "and found the algorithms that declare it (" +
+                            std::to_string(declared) + ")");
+    Check(offenders.empty(),
+          "every algorithm calling ctx.Gpu() declares UsesGpuInRunCPU()" +
+              offenders +
+              (offenders.empty()
+                   ? ""
+                   : "\n    -- without it the broadcast loop will run its "
+                     "frames concurrently and deadlock on the command queue"));
+}
+
 static void TestDefaultOff() {
     const std::set<std::string> effects = {
         "orton", "bloom", "vignette", "film_grain", "dehaze",
@@ -1718,6 +1775,7 @@ int main() {
     TestDefaultOff();
     TestNoPerFrameReportState();
     TestNoSharedScratch();
+    TestGpuUsersDeclareIt();
     TestProxyBehaviour();
 
 
