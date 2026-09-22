@@ -9,11 +9,14 @@
 #include <sstream>
 #include <atomic>
 #include <thread>
+#include <set>
 #include <string>
+#include <map>
 #include <vector>
 
 #include "../src/core/algorithm.h"
 #include "../src/algo_util/features.h"
+#include "../src/algo_util/view_graph.h"
 #include "../src/algo_util/histogram.h"
 #include "../src/core/exif.h"
 #include "../src/algo_util/pixel_buffer.h"
@@ -40,7 +43,8 @@ static void Check(bool cond, const std::string& what) {
 
 // Runs a script against one 4x4 source image named "test".
 static bool RunScript(const std::string& src, UiState* ui, Pipeline* pipe,
-                      std::string* err, std::vector<Data>* sources) {
+                      std::string* err, std::vector<Data>* sources,
+                      const IncludeResolver& resolve = nullptr) {
     ImageDesc d{4, 4, Format::RGBA8};
     Image img;
     img.Alloc(d);
@@ -52,7 +56,7 @@ static bool RunScript(const std::string& src, UiState* ui, Pipeline* pipe,
     std::vector<SourceImage> names{{"test", 0}};
 
     Program prog;
-    if (!Parse(src, &prog, err)) return false;
+    if (!Parse(src, &prog, err, resolve, resolve ? "main.tgl" : "")) return false;
 
     InterpResult r = Interpret(prog, names, ui, pipe);
     if (!r.ok) { *err = r.error; return false; }
@@ -3283,6 +3287,23 @@ int main() {
     {
         namespace fs = std::filesystem;
         const fs::path dir = fs::path(TGLAB_SOURCE_DIR) / "scripts";
+
+        // Resolves includes from the same directory, exactly as the app does.
+        // Without it every script using a shared fragment fails here -- and
+        // this loop is the guard that shipped scripts stay valid, so it has to
+        // understand the whole language they are written in.
+        IncludeResolver shipped = [&](const std::string& name,
+                                      const std::string& from,
+                                      std::string* s, std::string* path) {
+            (void)from;
+            std::ifstream f((dir / name).string(), std::ios::binary);
+            if (!f) return false;
+            std::ostringstream os; os << f.rdbuf();
+            *s = os.str();
+            *path = name;
+            return true;
+        };
+
         int seen = 0;
         std::error_code ec;
         for (const fs::directory_entry& f : fs::directory_iterator(dir, ec)) {
@@ -3294,7 +3315,8 @@ int main() {
 
             Program prog;
             std::string err;
-            const bool ok = Parse(ss.str(), &prog, &err);
+            const bool ok = Parse(ss.str(), &prog, &err, shipped,
+                                  f.path().filename().string());
             Check(ok, "scripts/" + f.path().filename().string() + " parses" +
                           (ok ? "" : ": " + err));
         }
@@ -6112,6 +6134,9 @@ int main() {
                     std::string e; pb->SetFromScript(Value(val), &e);
                 }
             };
+            // bloom is an EFFECT, so it starts switched off; a behavioural
+            // test against a bypassed stage would measure a copy of its input.
+            set("enabled", 1.0);
             set("threshold", 1.0);
             set("intensity", 1.0);
             set("spread_r", sr);
@@ -6212,6 +6237,7 @@ int main() {
                     std::string e; pb->SetFromScript(Value(val), &e);
                 }
             };
+            set("enabled", 1.0);   // an effect starts off; see the note above
             set("threshold", 1.0);
             set("intensity", 1.0);
             set("spread_r", 8.0);
@@ -6636,6 +6662,267 @@ int main() {
             const std::string r = p2.Stages()[0].algo->RunReport();
             Check(r.find("no features") != std::string::npos,
                   "and says there were none: \"" + r + "\"");
+        }
+    }
+
+    // --- include ------------------------------------------------------------
+    //
+    // Resolved through a callback, so these run against an in-memory map with
+    // no temporary files and no dependency on where scripts happen to live.
+    {
+        std::printf("\n--- include ---\n");
+
+        std::map<std::string, std::string> files;
+        IncludeResolver resolve = [&](const std::string& name,
+                                      const std::string& from,
+                                      std::string* src, std::string* path) {
+            (void)from;
+            auto it = files.find(name);
+            if (it == files.end()) return false;
+            *src  = it->second;
+            *path = name;
+            return true;
+        };
+
+        // The motivating case: a develop fragment shared by two scripts.
+        files["develop.tgl"] =
+            "developed = brightness(src, brightness = 0.1)\n";
+        {
+            Program prog; std::string err;
+            const bool ok = Parse("src = image(\"test\")\n"
+                                  "include \"develop.tgl\"\n"
+                                  "display(developed)\n",
+                                  &prog, &err, resolve, "main.tgl");
+            Check(ok, "a script with an include parses" + (ok ? "" : ": " + err));
+            // Spliced IN PLACE: three statements, the middle one from the
+            // included file.
+            Check(prog.stmts.size() == 3,
+                  "the included statements are spliced in (" +
+                      std::to_string(prog.stmts.size()) + ")");
+            if (prog.stmts.size() == 3)
+                Check(prog.stmts[1].file == "develop.tgl",
+                      "and remember which file they came from");
+        }
+
+        // Sharing one namespace is the point: the fragment reads a variable
+        // the includer defined, and the includer reads one the fragment
+        // defined. Checked by RUNNING it, not by inspecting the AST.
+        {
+            UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+            const bool ok = RunScript("src = image(\"test\")\n"
+                                      "include \"develop.tgl\"\n"
+                                      "display(developed)\n",
+                                      &ui, &p, &err, &src, resolve);
+            Check(ok, "an included fragment shares the caller's variables" +
+                          (ok ? "" : ": " + err));
+            Check(p.Stages().size() == 1,
+                  "and its stages land in the pipeline (" +
+                      std::to_string(p.Stages().size()) + ")");
+        }
+
+        // A MISSING file is a script error naming the line, not a crash and
+        // not a silently-empty program.
+        {
+            Program prog; std::string err;
+            const bool ok = Parse("include \"nope.tgl\"\n", &prog, &err,
+                                  resolve, "main.tgl");
+            Check(!ok && err.find("nope.tgl") != std::string::npos,
+                  "a missing include is reported: \"" + err + "\"");
+        }
+
+        // A CYCLE must be caught. Without this it is an infinite loop at parse
+        // time -- before anything exists that could report it.
+        files["a.tgl"] = "include \"b.tgl\"\n";
+        files["b.tgl"] = "include \"a.tgl\"\n";
+        {
+            Program prog; std::string err;
+            const bool ok = Parse("include \"a.tgl\"\n", &prog, &err,
+                                  resolve, "main.tgl");
+            Check(!ok && err.find("cycle") != std::string::npos,
+                  "an include cycle is caught: \"" + err + "\"");
+        }
+
+        // A file including ITSELF is the same failure by a shorter route.
+        files["self.tgl"] = "include \"self.tgl\"\n";
+        {
+            Program prog; std::string err;
+            const bool ok = Parse("include \"self.tgl\"\n", &prog, &err,
+                                  resolve, "main.tgl");
+            Check(!ok && err.find("cycle") != std::string::npos,
+                  "a self-include is caught");
+        }
+
+        // An error INSIDE an included file must name that file. A bare line
+        // number would point at a line of whichever script is open, which is
+        // worse than no location at all.
+        files["bad.tgl"] = "x = gaussian_blur(src, sigmaa = 2)\n";
+        {
+            UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+            const bool ok = RunScript("src = image(\"test\")\ninclude \"bad.tgl\"\n",
+                                      &ui, &p, &err, &src, resolve);
+            Check(!ok && err.find("bad.tgl") != std::string::npos,
+                  "an error inside an include names that file: \"" + err + "\"");
+        }
+
+        // Including the same fragment twice is allowed and shares its
+        // controls -- both copies read one set of sliders.
+        files["knob.tgl"] = "k = slider(\"amount\", 0, 1, 0.5)\n";
+        {
+            UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+            const bool ok = RunScript("include \"knob.tgl\"\ninclude \"knob.tgl\"\n",
+                                      &ui, &p, &err, &src, resolve);
+            Check(ok, "a fragment can be included twice" + (ok ? "" : ": " + err));
+            Check(ui.Controls().size() == 1,
+                  "and its controls are shared, not duplicated (" +
+                      std::to_string(ui.Controls().size()) + ")");
+        }
+
+        // Without a resolver, include must FAIL rather than be ignored: a
+        // silently-dropped include produces a program missing half its stages.
+        {
+            Program prog; std::string err;
+            const bool ok = Parse("include \"develop.tgl\"\n", &prog, &err);
+            Check(!ok, "include without a resolver is an error, not a no-op");
+        }
+
+        // Assigning a variable THROUGH itself, which is the shape the shipped
+        // develop fragment relies on: it reads `developed` and writes it back,
+        // so the caller sets it up and reads the result from the same name.
+        {
+            UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+            files["chain.tgl"] =
+                "developed = developed => brightness(brightness = 0.1)\n";
+            const bool ok = RunScript("developed = image(\"test\")\n"
+                                      "include \"chain.tgl\"\n"
+                                      "display(developed)\n",
+                                      &ui, &p, &err, &src, resolve);
+            Check(ok, "a fragment can transform a variable in place" +
+                          (ok ? "" : ": " + err));
+            Check(p.Stages().size() == 1,
+                  "and the stage is recorded once (" +
+                      std::to_string(p.Stages().size()) + ")");
+        }
+
+        // THE SHIPPED FRAGMENT, parsed from disk against the real scripts
+        // directory. The tests above prove the mechanism; this proves the file
+        // people will actually include is valid -- a fragment that only exists
+        // in a test is not the one that ships.
+        {
+            const std::string dir = std::string(TGLAB_SOURCE_DIR) + "/scripts/";
+            IncludeResolver disk = [&](const std::string& name,
+                                       const std::string& from,
+                                       std::string* s, std::string* path) {
+                (void)from;
+                std::ifstream f(dir + name, std::ios::binary);
+                if (!f) return false;
+                std::ostringstream ss; ss << f.rdbuf();
+                *s = ss.str();
+                *path = name;
+                return true;
+            };
+            UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+            const bool ok = RunScript("developed = image(\"test\")\n"
+                                      "include \"_develop.tgl\"\n"
+                                      "display(developed, \"final\")\n",
+                                      &ui, &p, &err, &src, disk);
+            Check(ok, "the shipped _develop.tgl fragment runs" +
+                          (ok ? "" : ": " + err));
+            Check(!ui.Controls().empty(),
+                  "and contributes its controls (" +
+                      std::to_string(ui.Controls().size()) + ")");
+
+            // INCLUDING IT MUST NOT APPLY IT.
+            //
+            // This is the property that makes a shared develop chain safe to
+            // include: every effect in it starts switched off, so a script
+            // gains the controls without gaining a glow, a grain and a
+            // vignette on every photograph. Checked by counting the stages the
+            // pipeline actually kept -- an effect that fired would be one of
+            // them.
+            // Checked per stage by NAME rather than by counting, because the
+            // interesting claim is which ones ran, not how many. A count would
+            // pass just as happily with orton live and tonemap bypassed.
+            const std::set<std::string> mustBypass = {
+                "orton", "bloom", "vignette", "film_grain", "dehaze",
+            };
+            for (const Stage& st : p.Stages()) {
+                const bool live = st.bypassOf.stage == -2;
+                if (mustBypass.count(st.algoName))
+                    Check(!live, "  " + st.algoName + " is not applied");
+                else
+                    Check(live, "  " + st.algoName + " is applied");
+            }
+
+            // THE SCRIPTS THAT INCLUDE IT, parsed as shipped.
+            //
+            // Not run -- hdr and panorama need a GROUP of real photographs and
+            // this harness has one 4x4 image -- but parsing catches what
+            // actually breaks when a shared fragment changes: a renamed
+            // variable, a stage that moved, an include that no longer
+            // resolves. That is the failure mode this feature introduces, so
+            // it is the one worth a test.
+            const char* users[] = {"hdr.tgl", "panorama.tgl"};
+            for (const char* u : users) {
+                std::ifstream f(dir + u, std::ios::binary);
+                if (!f) { Check(false, std::string("can read ") + u); continue; }
+                std::ostringstream ss; ss << f.rdbuf();
+                Program prog; std::string perr;
+                const bool pok = Parse(ss.str(), &prog, &perr, disk, u);
+                Check(pok, std::string(u) + " parses with its include" +
+                               (pok ? "" : ": " + perr));
+            }
+        }
+
+        // A DIRECT CALL TURNS AN EFFECT ON, which is the other half of
+        // default-off. orton.tgl exists to demonstrate orton; if naming it
+        // with settings left it switched off, that script would render nothing
+        // and the feature would have broken five demos to fix one.
+        {
+            UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+            const bool ok = RunScript(
+                "src = image(\"test\")\n"
+                "o = orton(src, strength = 0.6)\n"
+                "display(o)\n", &ui, &p, &err, &src);
+            Check(ok, "a direct call to an effect runs" + (ok ? "" : ": " + err));
+            if (!p.Stages().empty())
+                Check(p.Stages()[0].bypassOf.stage == -2,
+                      "naming an effect with settings turns it on");
+        }
+
+        // ...but the script can still say otherwise. `enabled` is an ordinary
+        // parameter, so an explicit value wins over the convenience above.
+        {
+            UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+            const bool ok = RunScript(
+                "src = image(\"test\")\n"
+                "o = orton(src, strength = 0.6, enabled = 0)\n"
+                "display(o)\n", &ui, &p, &err, &src);
+            Check(ok, "an explicitly disabled effect runs" + (ok ? "" : ": " + err));
+            if (!p.Stages().empty())
+                Check(p.Stages()[0].bypassOf.stage != -2,
+                      "an explicit enabled = 0 still wins");
+        }
+
+        // A CORRECTION is unaffected either way -- it was already on.
+        {
+            UiState ui; Pipeline p; std::string err; std::vector<Data> src;
+            const bool ok = RunScript(
+                "src = image(\"test\")\n"
+                "o = brightness(src, brightness = 0.2)\n"
+                "display(o)\n", &ui, &p, &err, &src);
+            Check(ok && !p.Stages().empty() &&
+                      p.Stages()[0].bypassOf.stage == -2,
+                  "a correction still runs when called directly");
+        }
+
+        // `include` is recognised by shape, not reserved, so it stays usable
+        // as an ordinary name.
+        {
+            Program prog; std::string err;
+            const bool ok = Parse("include = 3\nx = include + 1\n", &prog, &err,
+                                  resolve, "main.tgl");
+            Check(ok, "'include' is still a usable identifier" +
+                          (ok ? "" : ": " + err));
         }
     }
 

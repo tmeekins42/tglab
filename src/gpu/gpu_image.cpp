@@ -1,5 +1,7 @@
 #include "gpu_image.h"
 
+#include "gpu_budget.h"
+
 #include <cstdio>
 
 namespace tglab {
@@ -38,6 +40,7 @@ GpuResidency* Image::AcquireGpuWrite(ComputeContext& ctx) {
     // the dispatch — is what lets a chain of GPU stages skip readback
     // entirely: nothing asks for CPU pixels in between.
     m_res = Residency::Gpu;
+    TouchGpuUse(*this);
     return m_gpu.get();
 }
 
@@ -82,6 +85,11 @@ GpuResidency* Image::AcquireGpuRead(ComputeContext& ctx) {
         }
         m_res = Residency::Both;
     }
+
+    // Stamped whether or not an upload happened: what the collector wants to
+    // know is when this copy was last NEEDED, and a cache hit is exactly the
+    // case worth protecting from eviction.
+    TouchGpuUse(*this);
     return m_gpu.get();
 }
 

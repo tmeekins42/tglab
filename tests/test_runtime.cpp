@@ -20,6 +20,7 @@
 #include "../src/core/worker.h"
 #include "../src/gpu/compute.h"
 #include "../src/gpu/gpu_image.h"
+#include "../src/gpu/gpu_budget.h"
 #include "../src/script/interp.h"
 #include "../src/script/parser.h"
 #include "../src/app/visible_rect.h"
@@ -2103,6 +2104,269 @@ static void TestVisibleRect() {
     }
 }
 
+// THE VRAM COLLECTOR: when it runs, what it frees, and what it refuses.
+//
+// Driven with synthetic used/budget numbers rather than a real device, because
+// the decisions worth testing -- the threshold, the eviction order, the safety
+// refusal -- are arithmetic over a list and have nothing to do with D3D12. A
+// device-backed test would be slower, flakier (the driver's reported usage
+// includes the desktop) and would cover less.
+static void TestGpuBudget() {
+    std::printf("\n--- vram collector ---\n");
+
+    const uint64_t kBudget = 1000;
+
+    // --- the threshold ------------------------------------------------------
+    {
+        GpuBudget b;
+        std::vector<Data*> empty;
+        const GpuCollectReport r = b.Collect(empty, 500, kBudget);
+        Check(!r.ran, "a comfortable budget collects nothing (50%)");
+
+        const GpuCollectReport r2 = b.Collect(empty, 850, kBudget);
+        Check(r2.ran, "a tight budget starts a collection (85%)");
+
+        const GpuCollectReport r3 = b.Collect(empty, 850, 0);
+        Check(!r3.ran, "a budget the driver did not report is left alone");
+    }
+
+    // --- what is safe to free ----------------------------------------------
+    //
+    // An image with pixels ONLY on the GPU must be refused: freeing it would
+    // destroy them, and silently -- the descriptor survives, so the image
+    // still looks valid and the next read returns zeros.
+    {
+        Image cpuOnly;
+        cpuOnly.Alloc({64, 64, Format::RGBA8});
+        Check(cpuOnly.DropGpuCopy() == 0,
+              "an image with no GPU copy frees nothing");
+        Check(cpuOnly.HasCpu(), "...and keeps its pixels");
+    }
+
+    // --- eviction order, against real GPU-resident images -------------------
+    //
+    // THE PART THAT MATTERS, and it needs a device: an image is only a
+    // candidate once it is genuinely resident on both sides, which nothing but
+    // a real upload produces. Freeing the wrong one is not a correctness bug
+    // -- every candidate is safe to free -- it is a performance one, and the
+    // failure is invisible: the collector frees the raw being dragged, the
+    // next frame uploads it again, and the app is mysteriously slow while
+    // reporting healthy VRAM.
+    ID3D12Device* dev = nullptr;
+    if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev)))) {
+        std::printf("  (no device — eviction order not checked)\n");
+        return;
+    }
+    ComputeContext gpu;
+    if (!gpu.Init(dev) || !gpu.Ready()) {
+        std::printf("  (no compute context — eviction order not checked)\n");
+        dev->Release();
+        return;
+    }
+
+    {
+        // Three images made GPU-resident in order, so their stamps run oldest
+        // to newest. Sizes INCREASE with recency on purpose: an implementation
+        // that freed the biggest first would pick exactly the wrong one, and
+        // this arrangement is what catches that rather than letting both
+        // orders look alike.
+        std::vector<Data> held;
+        const int dims[] = {64, 128, 256};
+        for (int d : dims) {
+            Image img;
+            img.Alloc({d, d, Format::RGBA8});
+            held.push_back(Data{std::move(img)});
+        }
+        for (Data& d : held) {
+            // One tick between each, so the ages are distinguishable and all
+            // of them are older than minAgeTicks by the time we collect.
+            GpuTickAdvance();
+            std::get<Image>(d).AcquireGpuRead(gpu);
+        }
+        for (int i = 0; i < 8; ++i) GpuTickAdvance();
+
+        int resident = 0;
+        for (Data& d : held)
+            if (std::get<Image>(d).HasGpu() && std::get<Image>(d).HasCpu()) ++resident;
+        Check(resident == 3, "three images are resident on both sides (" +
+                                 std::to_string(resident) + ")");
+
+        std::vector<Data*> pool;
+        for (Data& d : held) pool.push_back(&d);
+
+        // Ask for a small reclaim: enough to need ONE image, not all three.
+        // The smallest (oldest) is 64x64x4 = 16 KB, so a 1 KB shortfall is
+        // satisfied by it alone.
+        GpuBudget b;
+        GpuBudgetPolicy p;
+        p.startPct = 80.0;
+        p.targetPct = 79.9;
+        const uint64_t bud = 100000;
+        const GpuCollectReport r = b.Collect(pool, 80000, bud, p);
+
+        Check(r.imagesFreed == 1,
+              "a small shortfall frees one image, not the pool (" +
+                  std::to_string(r.imagesFreed) + ")");
+        Check(!std::get<Image>(held[0]).HasGpu(),
+              "and it is the OLDEST, not the largest");
+        Check(std::get<Image>(held[2]).HasGpu(),
+              "the most recently used keeps its copy");
+
+        // The freed one kept its pixels: that is the whole basis of the
+        // collector being safe.
+        Check(std::get<Image>(held[0]).HasCpu(),
+              "the freed image still has its pixels on the CPU");
+        Check(std::get<Image>(held[0]).MapCpuRead().Valid(),
+              "...and they are readable, not a descriptor with nothing behind it");
+
+        // And it can come back. A collection is a cache eviction, so the next
+        // use must simply re-upload rather than fail.
+        Check(std::get<Image>(held[0]).AcquireGpuRead(gpu) != nullptr,
+              "a freed image uploads again on its next use");
+    }
+
+    // --- THE REFUSAL, which is what stops silent data loss ------------------
+    //
+    // A stage output written on the GPU and never read back is resident ONLY
+    // there: its pixels exist nowhere else. Freeing it would not error -- the
+    // descriptor survives, so the image still reports Valid() and the next
+    // read hands back a buffer of zeros. That is the worst failure available
+    // here, so it gets its own check rather than riding on the pool tests,
+    // where a refused image simply looks like one that was not needed.
+    {
+        Image gpuOnly;
+        gpuOnly.Alloc({128, 128, Format::RGBA8});
+        gpuOnly.AcquireGpuWrite(gpu);   // marks it Gpu-only
+        Check(gpuOnly.HasGpu() && !gpuOnly.HasCpu(),
+              "a written-but-unread image is GPU-only");
+
+        Check(gpuOnly.DropGpuCopy() == 0,
+              "a GPU-ONLY image refuses to drop its copy");
+        Check(gpuOnly.HasGpu(),
+              "...and still has it, because those pixels exist nowhere else");
+
+        // And the collector honours the same rule through the pool path, where
+        // it would otherwise be free bytes for the taking.
+        std::vector<Data> held;
+        Image g2;
+        g2.Alloc({256, 256, Format::RGBA8});
+        g2.AcquireGpuWrite(gpu);
+        held.push_back(Data{std::move(g2)});
+        for (int i = 0; i < 8; ++i) GpuTickAdvance();
+
+        std::vector<Data*> pool{&held[0]};
+        GpuBudget b;
+        const GpuCollectReport r = b.Collect(pool, 99000, 100000);
+        Check(r.imagesFreed == 0,
+              "the collector will not free a GPU-only image under pressure");
+        Check(std::get<Image>(held[0]).HasGpu(),
+              "...which is what keeps its pixels from vanishing");
+    }
+
+    // --- recency protection -------------------------------------------------
+    //
+    // An image used within minAgeTicks must survive even under pressure, or
+    // the collector frees what is about to be needed and pays to upload it
+    // back on the very next frame.
+    {
+        std::vector<Data> held;
+        Image img;
+        img.Alloc({128, 128, Format::RGBA8});
+        held.push_back(Data{std::move(img)});
+        std::get<Image>(held[0]).AcquireGpuRead(gpu);   // stamped: right now
+
+        std::vector<Data*> pool{&held[0]};
+        GpuBudget b;
+        const GpuCollectReport r = b.Collect(pool, 99000, 100000);
+        Check(r.imagesFreed == 0,
+              "an image used this moment is not evicted, however tight it is");
+        Check(std::get<Image>(held[0]).HasGpu(), "...and keeps its GPU copy");
+    }
+
+    gpu.Shutdown();
+    dev->Release();
+}
+
+// A REGION RUN MUST NOT LEAVE A CROP BEHIND.
+//
+// The app runs cropped while a slider is dragged and full-frame when it is
+// released. That second run has to actually replace the first: if the cropped
+// stage output were reused, the viewer would keep drawing a window onto the
+// picture, and zooming out would reveal it as a small image floating in an
+// empty panel.
+//
+// Reported from use: zoom in, adjust denoise, zoom out -- and the zoomed-out
+// view still showed only the part that had been visible. The app-side cause
+// was a settle run that never fired (it tested the proxy SCALE, which is
+// correctly 1.0 when zoomed in, and not the region). This covers the half that
+// can be tested without a window: that the full run really does produce a full
+// frame after a cropped one, rather than reusing the crop from cache.
+static void TestRegionThenFull() {
+    std::printf("\n--- region then full ---\n");
+
+    const int dim = 400;
+    Image img;
+    img.Alloc({dim, dim, Format::RGBA32F});
+    {
+        ImageView v = img.MapCpuWrite();
+        for (int y = 0; y < dim; ++y)
+            for (int x = 0; x < dim; ++x) {
+                float* p = v.At<float>(x, y);
+                p[0] = p[1] = p[2] = ((x / 16) + (y / 16)) % 2 ? 0.7f : 0.2f;
+                p[3] = 1.0f;
+            }
+    }
+
+    const std::string script =
+        "src = image(\"test\")\n"
+        "o = gaussian_blur(src, sigma = 3)\n"
+        "display(o)\n";
+
+    auto run = [&](Pipeline* p, Pipeline* prev, Pipeline::Rect region,
+                   ImageDesc* got) {
+        UiState ui;
+        std::vector<Data> src;
+        src.push_back(Data{img.Clone()});
+        std::vector<SourceImage> names{{"test", 0}};
+        Program prog; std::string err;
+        if (!Parse(script, &prog, &err)) return false;
+        auto r = Interpret(prog, names, &ui, p);
+        if (!r.ok) return false;
+        p->SetRegion(region);
+        if (!p->Execute(&src, prev, &err)) return false;
+        const Data* d = p->Resolve(p->Viewers()[0].source, &src);
+        if (!d) return false;
+        *got = std::get<Image>(*d).Desc();
+        return true;
+    };
+
+    // Dragging, zoomed in: a crop.
+    Pipeline a;
+    ImageDesc da;
+    if (!run(&a, nullptr, Pipeline::Rect{120, 130, 150, 140}, &da)) {
+        Check(false, "the cropped run succeeds");
+        return;
+    }
+    Check(da.width == 150 && da.height == 140,
+          "the drag produces a crop (" + std::to_string(da.width) + "x" +
+              std::to_string(da.height) + ")");
+
+    // Released: no region. Carries the previous pipeline, so this is exactly
+    // the cache path the settle run takes.
+    Pipeline b;
+    ImageDesc db;
+    if (!run(&b, &a, Pipeline::Rect{}, &db)) {
+        Check(false, "the settle run succeeds");
+        return;
+    }
+    Check(db.width == dim && db.height == dim,
+          "and the settle run restores the whole frame (" +
+              std::to_string(db.width) + "x" + std::to_string(db.height) + ")");
+    Check(db.originX == 0 && db.originY == 0,
+          "...at the origin, not still offset (" + std::to_string(db.originX) +
+              "," + std::to_string(db.originY) + ")");
+}
+
 // THE PICTURE MUST NOT MOVE WHEN A REACH CHANGES.
 //
 // The crop's origin is `visible - margin`, and the margin comes from the
@@ -2608,6 +2872,8 @@ int main() {
     TestVisibleRect();
     TestProxyPlacement();
     TestRegionOriginStable();
+    TestRegionThenFull();
+    TestGpuBudget();
 
     ID3D12Device* dev = nullptr;
     if (SUCCEEDED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev)))) {

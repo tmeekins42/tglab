@@ -375,6 +375,11 @@ std::vector<int> Pipeline::FusableChain(int reduceStage, PortRef* srcPort) const
         // the reshape check above exists to prevent.
         if (s.algo->IsAligner()) break;
 
+        // Nor is a reconstruction stage, for the same reason and more so: it
+        // reads every frame's features and matches to build one answer about
+        // all of them.
+        if (s.algo->IsReconstruct()) break;
+
         // Exactly one input, so the frame identity is unambiguous. A stage
         // combining a set with a second image is legitimate but needs the
         // scalar input held across frames, which is a further step.
@@ -1439,8 +1444,13 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
         // even at settings that "do nothing", because the TYPE changes and
         // downstream would receive a mosaic where it expects RGB. The
         // algorithm does not get to opt out of this check.
+        // IsReconstruct is excluded for a stronger reason than the others: a
+        // bypassed stage ALIASES its input as its output, and a reconstruction
+        // stage's input is an ImageSet where its output is a PointCloud.
+        // Aliasing across that would hand a group to whatever expected a cloud.
         if (s.algo->ShouldBypass() && s.inputs.size() == 1 && s.outputs.size() == 1 &&
-            !s.algo->IsReduction() && !s.algo->IsReshape() && !s.algo->IsAligner()) {
+            !s.algo->IsReduction() && !s.algo->IsReshape() && !s.algo->IsAligner() &&
+            !s.algo->IsReconstruct()) {
             const PortList outPorts = s.algo->Outputs();
             const bool sameFormat =
                 outPorts.size() == 1 &&
@@ -1488,6 +1498,43 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
         // warping anything. Nothing downstream is obliged to use them -- a merge
         // that samples through TransformOf() gets aligned pixels, and one that
         // does not behaves exactly as before.
+        // A RECONSTRUCTION stage: ImageSet -> PointCloud, or PointCloud ->
+        // PointCloud for the refinement stages that follow.
+        //
+        // Handled here rather than through RunCPU for the same reason a reshape
+        // is: RunCPU is handed per-image views, and a reconstruction is a
+        // property of the whole group. Unlike an aligner it changes the data
+        // TYPE, so it cannot reuse that path -- the aligner allocates its
+        // ImageSet output before the algorithm runs.
+        if (s.algo->IsReconstruct()) {
+            PointCloud cloud;
+            const std::vector<Image>* frames = nullptr;
+
+            if (const auto* set = std::get_if<ImageSet>(in[0])) {
+                frames = &set->images;
+                cloud.shape = set->shape;
+            } else if (const auto* prev = std::get_if<PointCloud>(in[0])) {
+                // Carried forward, so each stage refines what the last
+                // produced rather than starting over.
+                cloud = *prev;
+            } else {
+                *err = "line " + std::to_string(s.line) + ": '" + s.algoName +
+                       "' needs a group or a reconstruction";
+                return false;
+            }
+
+            std::string rerr;
+            if (!s.algo->RunReconstruct(frames, &cloud, &rerr)) {
+                *err = "line " + std::to_string(s.line) + ": " + rerr;
+                return false;
+            }
+            s.outputs.clear();
+            s.outputs.resize(1);
+            s.outputs[0] = Data{std::move(cloud)};
+            s.valid = true;
+            continue;
+        }
+
         if (s.algo->IsAligner()) {
             const auto* src = std::get_if<ImageSet>(in[0]);
             if (!src) {

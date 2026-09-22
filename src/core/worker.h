@@ -83,6 +83,19 @@ struct ViewerImage {
     // frees a stage's outputs on its own thread whenever the cache is replaced
     // -- possibly while the UI is still drawing the previous frame from it.
     std::shared_ptr<SharedGpuTexture> gpu;
+
+    // A RECONSTRUCTION, when that is what the viewer's source produced.
+    //
+    // Carried beside `image` rather than replacing it, so every existing view
+    // keeps working unchanged: an image viewer reads `image` and ignores this,
+    // a 3D viewport reads this and ignores `image`. Widening View::Draw to
+    // take a Data* instead would have touched every view for the benefit of
+    // one.
+    //
+    // shared_ptr because a cloud is large -- tens of thousands of tracks, each
+    // with its observations -- and the UI holds it across frames while the
+    // worker may already be building the next one.
+    std::shared_ptr<const PointCloud> cloud;
 };
 
 struct PipelineOutcome {

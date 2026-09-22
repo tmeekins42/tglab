@@ -204,6 +204,28 @@ one out — is a different thing again: see `Reducer` in
 the one reduction that *must* hold every frame, because its canvas size depends
 on where the last one lands.
 
+A third case appeared with Structure from Motion: a stage whose output belongs
+to **no single image**. A point cloud, the tracks and the camera poses are
+properties of the group as a whole, so they cannot be sidecars. Those return
+true from `IsReconstruct()`:
+
+```cpp
+bool IsReconstruct() const override { return true; }
+bool RunReconstruct(const std::vector<Image>* images, PointCloud* cloud,
+                    std::string* err) override;
+```
+
+`images` is null once the frames have served their purpose — `build_tracks` is
+the last stage that needs them, and everything after it reads and writes the
+`PointCloud` alone. That is why `Observation` copies the pixel position in
+rather than storing only a keypoint index: after the first reconstruction
+stage there are no frames left to look it up in.
+
+`PointCloud` is the third member of the `Data` variant, alongside `Image` and
+`ImageSet`, which is what lets `display()` route a reconstruction to a 3D
+viewport rather than an image panel — the decision is made from the declared
+port types at build time.
+
 ### Changing the output's size
 
 The pipeline allocates each output from input 0 before the algorithm runs,

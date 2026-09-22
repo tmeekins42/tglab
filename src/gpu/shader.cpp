@@ -79,7 +79,8 @@ bool ShaderCompiler::CompileCompute(const std::string& source,
                                     const std::string& entryPoint,
                                     const std::string& debugName,
                                     ShaderBlob* out,
-                                    std::string* errors) {
+                                    std::string* errors,
+                                    const char* target) {
     errors->clear();
     if (!m_ready) { *errors = "shader compiler not initialised"; return false; }
 
@@ -90,11 +91,12 @@ bool ShaderCompiler::CompileCompute(const std::string& source,
 
     const std::wstring wEntry = Widen(entryPoint);
     const std::wstring wName  = Widen(debugName.empty() ? "shader" : debugName);
+    const std::wstring wTarget = Widen(target ? target : "cs_6_0");
 
     std::vector<LPCWSTR> args = {
         wName.c_str(),              // shows up in diagnostics
         L"-E", wEntry.c_str(),
-        L"-T", L"cs_6_0",
+        L"-T", wTarget.c_str(),
         L"-HV", L"2021",
     };
 #ifdef _DEBUG

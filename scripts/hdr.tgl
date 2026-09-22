@@ -19,39 +19,36 @@
 #               midtones near 2.0. That is why it is displayed raw as well --
 #               it is the data worth keeping, not yet a picture.
 #
-#   tonemap     brings that arbitrary scale into the range the display curve
-#               expects. A separate stage on purpose: any scene-linear image
-#               can need it, and swapping the operator should be one word.
+#   _develop.tgl  everything after the merge -- tone mapping, the develop
+#               controls, denoise, and the creative effects -- lives in a
+#               shared fragment that panorama.tgl includes too. The stage order
+#               matters and is explained there; having one copy is what stops
+#               the two scripts from drifting apart, which they already had.
 #
-#   basic_adjust and wavelet_denoise are the ordinary develop controls, after
-#               the tone mapping rather than before it. Denoise runs last
-#               because a shrinkage threshold is a fixed distance in the value
-#               domain, so ahead of a tone curve it thresholds in linear scene
-#               space where shadow detail is compressed into almost nothing.
-#
-# The dropdown picks between the two tone mappers, which is the comparison
-# worth having in front of you:
-#
-#   tonemap        one curve for every pixel. No halos, trivially fast, and
-#                  structurally unable to give the sky more of the display
-#                  without taking the same from the land.
-#   tonemap_local  splits illumination from detail, compresses only the
-#                  illumination. Recovers local contrast the global operator
-#                  cannot -- watch strong edges for halos, which is its own
-#                  failure mode.
+# It reads and writes `developed`, so the merge assigns to that name and the
+# display below reads it back.
 #
 # params() gives every stage its own group of sliders, so the whole pipeline
 # is tunable from one panel.
 
+# The tone mapper is a dropdown rather than a fixed stage, because which one to
+# use is the comparison worth having in front of you:
+#
+#   tonemap        one curve for every pixel. No halos, trivially fast, and
+#                  structurally unable to give the sky more of the display
+#                  without taking the same from the land.
+#   tonemap_local  splits illumination from detail and compresses only the
+#                  illumination, recovering local contrast the global operator
+#                  cannot. Watch strong edges for halos, which is its own
+#                  failure mode.
+
 tonemap_op = choose("tonemapper", [tonemap, tonemap_local])
 
-image("group") => params( align )()
-               => params( merge_hdr )()
-               => display( "raw merged hdr" )
-               => params( tonemap_op )()
-               => params( basic_adjust, auto_exposure = 1 )()
-               => params( wavelet_denoise )()
-               => params( dehaze )()
-               => params( orton )()
-               => params( vignette )()
-               => display( "final" )
+developed = image("group")
+         => params( align )()
+         => params( merge_hdr )()
+         => params( tonemap_op )()         
+
+include "_develop.tgl"
+
+display( developed, "final" )

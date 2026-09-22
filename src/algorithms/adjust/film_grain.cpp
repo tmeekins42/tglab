@@ -167,6 +167,9 @@ public:
         m_out.PackInto(dst);
     }
 
+    // An EFFECT, not a correction: added grain is a look; the sensor's own noise is what denoise removes.
+    bool DefaultOff() const override { return true; }
+
     bool IsNoOp() const override { return float(m_strength) == 0.0f; }
 
     // --- GPU implementation -------------------------------------------------

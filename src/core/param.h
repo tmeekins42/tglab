@@ -203,6 +203,20 @@ public:
         return true;
     }
 
+    // Replaces the declared default, moving the current value with it when the
+    // value is still the old default -- the same contract as the numeric
+    // Param::SetDefault above.
+    //
+    // Needed for AlgorithmBase::DefaultOff(): a stage that starts switched off
+    // must have OFF as its default, or double-clicking the switch to reset it
+    // would turn the effect on, and the panel would count a disabled stage as
+    // modified.
+    void SetDefault(bool d) {
+        if (m_v == m_def) m_v = d;
+        m_def = d;
+    }
+    bool Default() const { return m_def; }
+
     ParamType Type() const override { return ParamType::Bool; }
     bool      SetFromScript(const Value& v, std::string* err) override;
     bool      DrawWidget() override;

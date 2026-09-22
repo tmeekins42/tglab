@@ -58,6 +58,8 @@ add_library(tglab_core STATIC
     src/gpu/texture.cpp
     src/gpu/shader.cpp
     src/gpu/gpu_image.cpp
+    src/gpu/gpu_budget.cpp
+    src/gpu/render_target.cpp
     src/gpu/compute.cpp
 )
 target_include_directories(tglab_core PUBLIC
@@ -86,6 +88,7 @@ add_executable(tglab
     src/app/main.cpp
     src/app/about.cpp
     src/app/image_view.cpp
+    src/app/viewport3d.cpp
     src/app/file_watch.cpp
     $<TARGET_OBJECTS:tglab_algorithms>
 )
@@ -184,6 +187,21 @@ if(MSVC)
     target_compile_definitions(tglab_filter_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
 
+# Structure from Motion: tracks, relative pose, rotation averaging, and
+# whatever later phases add. Its own binary because the subject matter is
+# distinct -- synthetic geometry with knowable ground truth -- and because
+# test_script.cpp had grown past seven thousand lines.
+add_executable(tglab_sfm_tests
+    tests/test_sfm.cpp
+    $<TARGET_OBJECTS:tglab_algorithms>
+)
+target_link_libraries(tglab_sfm_tests PRIVATE tglab_core imgui d3d12 dxgi)
+# So it can read the shipped scripts/ wherever ctest runs it from.
+target_compile_definitions(tglab_sfm_tests PRIVATE TGLAB_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+if(MSVC)
+    target_compile_definitions(tglab_sfm_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
 # Demosaic behaviour: reconstruction against a known scene, CFA phase, and
 # the metadata rules that keep a demosaiced image from being demosaiced twice.
 add_executable(tglab_demosaic_tests
@@ -214,6 +232,7 @@ tglab_copy_dxc(tglab_pyramid_tests)
 enable_testing()
 add_test(NAME script_spine COMMAND tglab_tests)
 add_test(NAME filters      COMMAND tglab_filter_tests)
+add_test(NAME sfm          COMMAND tglab_sfm_tests)
 add_test(NAME demosaic     COMMAND tglab_demosaic_tests)
 add_test(NAME runtime      COMMAND tglab_runtime_tests)
 add_test(NAME denoise      COMMAND tglab_denoise_tests)
@@ -235,6 +254,7 @@ add_executable(dbg_hang
     tests/dbg_hang.cpp
     src/app/about.cpp
     src/app/image_view.cpp
+    src/app/viewport3d.cpp
     src/app/file_watch.cpp
     $<TARGET_OBJECTS:tglab_algorithms>
 )
@@ -438,6 +458,9 @@ endif()
 
 # Dehaze timing on a real image. The radius scales with the picture, so which
 # stage dominates is a question about size rather than about the code.
+add_executable(bench_sfm tools/bench_sfm.cpp $<TARGET_OBJECTS:tglab_algorithms>)
+target_link_libraries(bench_sfm PRIVATE tglab_core imgui d3d12 dxgi)
+
 add_executable(bench_dehaze tools/bench_dehaze.cpp $<TARGET_OBJECTS:tglab_algorithms>)
 target_link_libraries(bench_dehaze PRIVATE tglab_core)
 if(MSVC)

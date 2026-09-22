@@ -208,6 +208,9 @@ public:
     }
 
     // Strength 0 leaves the image alone whatever the other controls say.
+    // An EFFECT, not a correction: nobody wants a dreamy glow on every photograph a shared develop chain touches.
+    bool DefaultOff() const override { return true; }
+
     bool IsNoOp() const override { return float(m_strength) == 0.0f; }
 
     // --- GPU implementation -------------------------------------------------

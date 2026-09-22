@@ -58,6 +58,15 @@ struct Stmt {
     std::vector<Target> targets;   // empty => expression statement
     ExprPtr             value;
     int                 line = 0;
+
+    // WHICH FILE THIS LINE CAME FROM, empty for the main script.
+    //
+    // Only meaningful once include() exists, and then it is essential: an
+    // included file's statements are spliced into the including program, so a
+    // bare "line 12" would name a line in the wrong file. Carried per statement
+    // rather than per program because one program legitimately holds
+    // statements from several files.
+    std::string         file;
 };
 
 struct Program {

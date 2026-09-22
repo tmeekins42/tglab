@@ -24,11 +24,16 @@ public:
 
     // Compiles `source` as a compute shader. On failure returns false and puts
     // DXC's diagnostics (with line numbers) in `errors`.
+    // `target` is the DXC profile. Defaults to compute, which every existing
+    // caller wants; a 3D viewport passes "vs_6_0" and "ps_6_0" for the point
+    // pipeline, since tglab's own GPU code was compute-only until one needed
+    // to rasterise.
     bool CompileCompute(const std::string& source,
                         const std::string& entryPoint,
                         const std::string& debugName,
                         ShaderBlob* out,
-                        std::string* errors);
+                        std::string* errors,
+                        const char* target = "cs_6_0");
 
     // Reads and compiles a .hlsl file.
     bool CompileFile(const std::string& path,

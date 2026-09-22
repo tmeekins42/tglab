@@ -85,6 +85,34 @@ private:
     bool ParseStmt(Stmt* out) {
         out->line = Cur().line;
 
+        // include "name"
+        //
+        // A statement form of its own rather than a call, because that is how
+        // it reads -- `include "develop.tgl"`, not `include("develop.tgl")` --
+        // and because an include is not an expression: it produces no value
+        // and cannot appear inside one.
+        //
+        // Recognised by SHAPE (the identifier `include` followed immediately
+        // by a string), not by reserving the word, so `include` stays usable
+        // as an ordinary variable name. A script that already used it keeps
+        // working, since `include = 3` is an assignment and `include + 1` is
+        // not followed by a string.
+        if (At(Tok::Ident) && Cur().text == "include" &&
+            m_i + 1 < m_toks.size() && m_toks[m_i + 1].kind == Tok::String) {
+            Advance();
+            auto inc = Make(ExprKind::Call);
+            inc->lhs = Make(ExprKind::Ident);
+            inc->lhs->text = "include";
+            auto name = Make(ExprKind::String);
+            name->text = Cur().text;
+            Advance();
+            inc->args.push_back(Arg{"", std::move(name)});
+            out->value = std::move(inc);
+            if (!At(Tok::End) && !At(Tok::Newline))
+                return Fail("unexpected " + Describe(Cur()) + " after include");
+            return true;
+        }
+
         if (LooksLikeAssignment()) {
             for (;;) {
                 Target t;
@@ -380,17 +408,106 @@ private:
 
 } // namespace
 
-bool Parse(std::string_view src, Program* out, std::string* err) {
+namespace {
+
+// Parses one file's statements into `out`, expanding any `include` it contains.
+//
+// TEXTUALLY, at parse time: an included file's statements are spliced in where
+// the include appears, sharing one namespace with the including script. That is
+// what makes the feature worth having -- a develop fragment can assign to `src`
+// and the including script reads the result -- and it is also why every
+// statement carries its own `file`, since after splicing a bare line number
+// would name a line in whichever file happened to be open.
+//
+// `stack` is the chain of files currently being parsed, which does double duty:
+// it detects cycles (a file including itself, directly or through others) and
+// bounds the depth. Without it a two-file cycle is an infinite loop at PARSE
+// time, before anything could report an error.
+bool ParseInto(std::string_view src, const std::string& selfPath,
+               Program* out, std::string* err,
+               const IncludeResolver& resolve,
+               std::vector<std::string>* stack) {
     std::vector<Token> toks;
     if (!Lex(src, &toks, err)) return false;
 
-    out->stmts.clear();
+    Program local;
     Parser p(std::move(toks));
-    if (!p.ParseProgram(out)) {
+    if (!p.ParseProgram(&local)) {
         *err = p.Error();
+        // Name the file when it is not the one the user opened. "line 12" is
+        // unhelpful when the line is in a file they did not think they were
+        // editing.
+        if (!selfPath.empty()) *err = selfPath + ": " + *err;
         return false;
     }
+
+    for (Stmt& s : local.stmts) {
+        // An include is a statement of the form `include "name"`, which parses
+        // as a call. Recognised here rather than in the grammar so the lexer
+        // needs no new keyword and `include` stays a usable identifier
+        // everywhere else.
+        const bool isInclude =
+            s.targets.empty() && s.value && s.value->kind == ExprKind::Call &&
+            s.value->lhs && s.value->lhs->kind == ExprKind::Ident &&
+            s.value->lhs->text == "include";
+
+        if (!isInclude) {
+            if (s.file.empty()) s.file = selfPath;
+            out->stmts.push_back(std::move(s));
+            continue;
+        }
+
+        const int line = s.line;
+        auto fail = [&](const std::string& m) {
+            *err = (selfPath.empty() ? "" : selfPath + ": ") +
+                   "line " + std::to_string(line) + ": " + m;
+            return false;
+        };
+
+        if (s.value->args.size() != 1 || !s.value->args[0].name.empty() ||
+            !s.value->args[0].value ||
+            s.value->args[0].value->kind != ExprKind::String)
+            return fail("include takes one quoted script name, as "
+                        "include \"develop.tgl\"");
+
+        const std::string name = s.value->args[0].value->text;
+
+        if (!resolve)
+            return fail("include is not available here (no script directory)");
+
+        if (stack->size() >= 8)
+            return fail("includes are nested too deeply (limit 8)");
+
+        std::string incSrc, incPath;
+        if (!resolve(name, selfPath, &incSrc, &incPath))
+            return fail("could not read included script '" + name + "'");
+
+        // A file that is already being parsed is a cycle. Reported with the
+        // chain, because "develop.tgl includes itself" is rarely the whole
+        // story -- it is usually a includes b includes a.
+        for (const std::string& f : *stack)
+            if (f == incPath) {
+                std::string chain;
+                for (const std::string& g : *stack) chain += g + " -> ";
+                return fail("include cycle: " + chain + incPath);
+            }
+
+        stack->push_back(incPath);
+        const bool ok = ParseInto(incSrc, incPath, out, err, resolve, stack);
+        stack->pop_back();
+        if (!ok) return false;
+    }
     return true;
+}
+
+}  // namespace
+
+bool Parse(std::string_view src, Program* out, std::string* err,
+           const IncludeResolver& resolve, const std::string& selfPath) {
+    out->stmts.clear();
+    std::vector<std::string> stack;
+    if (!selfPath.empty()) stack.push_back(selfPath);
+    return ParseInto(src, selfPath, out, err, resolve, &stack);
 }
 
 } // namespace tglab

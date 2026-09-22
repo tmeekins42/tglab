@@ -366,7 +366,28 @@ void PipelineWorker::Run() {
             const size_t firstDirty = job->pipe.FirstDirtyStage();
             for (const ViewerDecl& vd : job->pipe.Viewers()) {
                 const Data* d = job->pipe.Resolve(vd.source, job->sources.get());
-                if (!d || !std::holds_alternative<Image>(*d)) continue;
+                if (!d) continue;
+
+                // A RECONSTRUCTION takes its own path: there are no pixels to
+                // read back, convert or upload, so none of the machinery below
+                // applies. Handed over as a shared pointer and drawn by a 3D
+                // viewport.
+                if (const PointCloud* pc = std::get_if<PointCloud>(d)) {
+                    const bool moved = (vd.source.stage < 0)
+                                           ? sourcesChanged
+                                           : size_t(vd.source.stage) >= firstDirty;
+                    uint64_t& cver = m_viewerVersions[vd.name];
+                    if (moved || cver == 0) ++cver;
+
+                    ViewerImage vi;
+                    vi.name    = vd.name;
+                    vi.version = cver;
+                    vi.cloud   = std::make_shared<const PointCloud>(*pc);
+                    outcome->viewers.push_back(std::move(vi));
+                    continue;
+                }
+
+                if (!std::holds_alternative<Image>(*d)) continue;
 
                 // A palette source (stage < 0) changes only when the file
                 // behind it is replaced, which arrives as a new source version.

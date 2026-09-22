@@ -110,6 +110,9 @@ public:
 
     // Amount 0 is exactly the identity whatever the other controls say, so the
     // stage is skipped outright -- no allocation, no dispatch, no copy.
+    // An EFFECT, not a correction: darkened corners are a stylistic choice, not a correction.
+    bool DefaultOff() const override { return true; }
+
     bool IsNoOp() const override { return float(m_amount) == 0.0f; }
 
     // --- GPU implementation -------------------------------------------------

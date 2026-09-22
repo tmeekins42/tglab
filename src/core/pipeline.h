@@ -225,6 +225,26 @@ public:
 
     std::vector<Stage>&       Stages()       { return m_stages; }
     const std::vector<Stage>& Stages() const { return m_stages; }
+
+    // What a port will produce, from the DECLARATION rather than from a result.
+    //
+    // The app needs this to decide what kind of panel a viewer wants -- an
+    // image viewer or a 3D viewport -- and it needs to decide at build time,
+    // so the layout settles immediately instead of flickering when the first
+    // result arrives. A stage declares its output types, so the answer is
+    // available the moment the pipeline is built.
+    //
+    // DataType::None for a port that does not exist; a palette source is
+    // always an Image or an ImageSet, and both draw in an image panel.
+    DataType PortType(PortRef r) const {
+        if (r.stage < 0) return DataType::Image;
+        if (size_t(r.stage) >= m_stages.size()) return DataType::None;
+        const Stage& s = m_stages[size_t(r.stage)];
+        if (!s.algo) return DataType::None;
+        const PortList outs = s.algo->Outputs();
+        if (r.port < 0 || size_t(r.port) >= outs.size()) return DataType::None;
+        return outs[size_t(r.port)].type;
+    }
     const std::vector<ViewerDecl>& Viewers() const { return m_viewers; }
     const std::vector<SaveDecl>&   Saves()   const { return m_saves; }
 

@@ -182,6 +182,9 @@ public:
         return {{"out", DataType::Image, FormatSpec::SameAsInput}};
     }
 
+    // An EFFECT, not a correction: it estimates depth from a prior that fails indoors and on snow, so it must be asked for.
+    bool DefaultOff() const override { return true; }
+
     bool IsNoOp() const override { return float(m_strength) <= 0.0f; }
 
     void RunCPU(RunCtx& ctx) override {

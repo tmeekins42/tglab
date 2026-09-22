@@ -9,9 +9,8 @@
 #
 # Drop a raw file (.CR3, .ARW, .NEF, ...) onto the "test" row to develop it.
 
-src = image("test")
+developed = image("test")
 
-developed = params(basic_adjust)(src)
+include "_develop.tgl"
 
-display(src,       "1 original")
-display(developed, "2 developed")
+display( developed, "final" )

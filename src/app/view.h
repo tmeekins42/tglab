@@ -33,6 +33,14 @@ public:
     // readback. A 3D viewport, for instance, wants neither.
     virtual void SetContentVersion(uint64_t) {}
     virtual void SetGpuSource(std::shared_ptr<SharedGpuTexture>) {}
+
+    // The reconstruction this view is showing, when its source produced one.
+    //
+    // Another optional hint rather than a second Draw() overload or a widened
+    // signature: an image viewer ignores it, a 3D viewport reads it and
+    // ignores the Image* it is handed. That keeps every existing view
+    // untouched by the arrival of a data type it will never display.
+    virtual void SetPointCloud(std::shared_ptr<const PointCloud>) {}
 };
 
 } // namespace tglab

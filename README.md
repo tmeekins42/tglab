@@ -113,6 +113,31 @@ Changing anything mid-run **abandons** the run in progress rather than queueing
 behind it, so the wait is always for the current settings. The finished part of
 the pipeline is kept, so only the stages after your change re-run.
 
+### Video memory
+
+A 45 MP raw is ~358 MB in RGBA16F, and every palette image a pipeline touches
+gains a GPU copy on first use. Half a dozen loaded frames is two gigabytes
+before any intermediate exists, and past the card's budget the driver starts
+paging — which presents as everything being slow for no visible reason.
+
+So the app reclaims. When usage crosses **80%** of the driver's reported budget
+it frees GPU copies until back under **65%**, picking **least recently used**
+first. Two thresholds rather than one, or freeing a single texture would drop
+usage just below the line and the next allocation would cross it again, with
+the collector running every frame while the picture re-uploads.
+
+What it frees is only ever a *cache*: an image resident on both the CPU and the
+GPU keeps its pixels in system memory, so releasing the texture loses nothing
+and the next use uploads again. An image resident **only** on the GPU — a stage
+output written and never read back — is refused, because its pixels exist
+nowhere else and freeing it would destroy them silently.
+
+Collection runs on the UI thread and only while the worker is idle. The
+palette's sources are shared with the worker, which touches their residency as
+it runs, so freeing one mid-run would be a use-after-free rather than merely a
+wrong picture. **Status** reports what was freed, since the cost of a
+collection is a re-upload on the next use.
+
 ### Previews while you drag
 
 A 45 MP frame cannot be re-processed at 60 Hz, so while a slider is moving the
@@ -221,6 +246,48 @@ gx, gy, mag = sobel(src => gaussian_blur(sigma = 2))
 | `shape(group, axis=n, ...)` | Gives a group named axes (see *Groups*). |
 | `display(data)` / `display(data, "name")` | Opens a viewer panel; returns its input. |
 
+`include "name.tgl"` is a statement rather than a builtin — see below.
+
+### Sharing a chain between scripts
+
+`include "develop.tgl"` splices another script's statements in where the
+include appears. They share one namespace, so the included file reads variables
+the caller set and the caller reads what it defined:
+
+```
+# _develop.tgl — a fragment, not a script to open
+developed = developed
+         => params( tonemap_op )()
+         => params( basic_adjust, auto_exposure = 1 )()
+         => params( vignette )()
+```
+
+```
+# hdr.tgl
+developed = image("group") => params( align )() => params( merge_hdr )()
+include "_develop.tgl"
+display(developed, "final")
+```
+
+That is the point of it: a develop chain written once and used by the HDR and
+panorama scripts, which previously each carried their own copy and had already
+drifted apart. Shipped fragments are named with a leading underscore, since a
+file that calls no `image()` and no `display()` does nothing on its own.
+
+- The path is relative to the **including** file, so a fragment that includes
+  another works wherever the pair is dropped. A name with no extension gets
+  `.tgl`.
+- Included files are **watched for changes** like the main script, so editing a
+  shared fragment re-runs whatever includes it.
+- Including the same fragment twice is allowed and its **controls are shared** —
+  one set of sliders drives both copies.
+- A cycle is an error naming the whole chain, not a hang. So is a missing file.
+- Errors inside an included file **name that file**, because a bare line number
+  would point into whichever script happens to be open.
+
+`include` is recognised by its shape — the word followed by a string — rather
+than reserved, so it remains usable as an ordinary variable name.
+
 ### Choosing algorithms at run time
 
 `choose()` returns an algorithm as a value, which can then be called:
@@ -274,6 +341,18 @@ skipped.
 
 This is what makes a long stack practical — twenty effects with three in use
 allocates three intermediates, not twenty.
+
+**Effects start switched off.** `orton`, `bloom`, `vignette`, `film_grain` and
+`dehaze` are looks rather than corrections, so they do nothing until you tick
+their `enabled` box; their control group starts collapsed to match, and opens
+if you want to look inside. Corrections — `basic_adjust`, `tonemap`,
+`wavelet_denoise` and the rest — start on and doing something sensible.
+
+The distinction is what makes a shared develop chain safe to `include`: a
+script picks up the controls for a dozen stages without picking up a glow and a
+vignette on every photograph. The categories do not line up with it (`orton` is
+a *filter* like `gaussian_blur`; `dehaze` is an *adjust* like `brightness`), so
+the list is explicit in the code and audited by name in the tests.
 
 ### Groups
 
@@ -514,6 +593,72 @@ and corrects no seam. The remaining residual is within-frame variation (lens
 falloff plus the scene's own gradient), and fixing it needs either a measured
 flat field or a seam-aware blend, not a better global fit.
 
+### Structure from Motion
+
+Where a panorama recovers camera *rotation*, SfM recovers where the camera
+**was** — a full 3D reconstruction with translation and a sparse point cloud.
+The chain is longer because every stage solves a genuinely different problem,
+and each one is a separate algorithm so it can be swapped:
+
+```
+frames => detect_akaze(max_features = 10000)
+       => match_ann(chain = 1, window = 1)
+       => relative_pose(fov_deg = 50)      # essential matrix per pair
+       => build_tracks()                   # union-find over the matches
+       => rotation_average()               # one orientation per camera
+       => global_position()                # where the cameras are
+       => triangulate()
+       => bundle_adjust_sfm()
+       => display("reconstruction")        # a 3D viewport, orbit camera
+```
+
+The reconstruction is a `PointCloud` rather than an image, so `display()`
+routes it to a 3D viewport with its own graphics pipeline — depth testing on,
+points drawn as camera-facing quads, mouse-orbit camera.
+
+**`relative_pose` has two estimators.** The eight-point algorithm is a linear
+solve, and `method = 1` selects Nistér's five-point instead. The difference is
+not academic, measured on synthetic fixtures with known ground truth:
+
+| condition | 8-point | 5-point |
+|---|---|---|
+| general, exact | 0.000° | 0.000° |
+| general, 1 px noise, 30% outliers | 1.321° | **0.458°** |
+| planar, exact | 6.547° | **0.005°** |
+| planar, 0.3 px noise | **4.180°** | 11.434° |
+
+Five-point needs five correspondences per RANSAC sample rather than eight, and
+the chance of a clean draw is the inlier rate raised to that power — on a pair
+with a 30% inlier rate, roughly 35× as many usable samples. Neither method
+should be trusted on a near-planar pair: eight-point is degenerate there, and
+five-point is degenerate *in a different way* (the essential matrix is not
+unique on a plane, so noise makes the solve pick an arbitrary member of a
+one-parameter family). The stage reports a measured planarity per pair so you
+can tell when you are in that situation.
+
+**Run triangulate and bundle adjustment twice.** The first triangulation judges
+every track against cameras nothing has refined yet, and bundle adjustment then
+moves them a long way. Re-running the pair re-judges the rejects against the
+refined cameras. Measured on a 19-frame courtyard walk: 2889 points at a 10.6 px
+reprojection median after one round, **7659 points at 1.1 px** after two.
+
+**Read the field of view off the pipeline, not off the lens.** `fov_deg` is the
+most consequential number in an SfM script — a wrong focal biases every
+recovered rotation, and the errors are inconsistent between pairs, so the view
+graph becomes contradictory rather than merely imprecise. Bundle adjustment
+solves for the focal against reprojection error, so its report says what the
+lens actually was: run the chain, read `focal refined to fov`, set `fov_deg` to
+that. On the stock test set it converges to 50.0° from starting guesses of 36,
+45, 52 and 58 — four independent starts agreeing is what makes it trustworthy.
+Reasoning from the sensor size and an assumed lens gave 36°, and was wrong.
+
+**Do not tune `fov_deg` by the rotation residual.** It falls monotonically as
+the assumed field of view rises, all the way to physically impossible values,
+because too long a focal shrinks every recovered rotation toward the identity
+and near-identity rotations agree with each other trivially. The residual
+rewards the collapse. A closed walk-around also gives a free ground truth with
+no ground-truth file: the relative rotations should sum to about 360°.
+
 ### Notes on a few
 
 - **`dehaze`** inverts the atmospheric scattering model, `I = J·t + A·(1−t)`,
@@ -741,6 +886,28 @@ src/
   sequence's parallax — the camera centre does move a little when handheld —
   as anything in the solver. Worth revisiting against a tripod set and a
   second scene, where the two can be told apart.
+- **SfM needs imagery with texture variety, and says so loudly when it lacks
+  it.** On a 19-frame courtyard walk the first twelve frames reconstruct well
+  — 0.51° mean ray residual, 86% of tracks triangulated, a smooth camera path
+  — while the last seven fail *on their own*, with no bad link between them to
+  blame: 6.80° residual and 41% of tracks. Those frames are dominated by flat
+  plastered wall with five near-identical window bays repeating across it.
+  Matches land on the wrong bay, are self-consistent enough that RANSAC cannot
+  reject them, and never chain across three frames: exactly **one** track
+  longer than four views survives across the seven. Nothing constrains the
+  geometry, and no choice of estimator, field of view or filter recovers
+  information the imagery does not contain. The fix is either capture (texture
+  variety, or a loop closure so the view graph has a second path) or
+  track-guided matching, where a bay already resolved constrains the next
+  frame rather than each pair being matched blind.
+- **Sequential matching caps mean track length near 2.** Measured across five
+  configurations — feature count 4×, resolution 1.5×, ratio loosened,
+  cross-check disabled — the mean never left 2.2, and 83–87% of tracks are
+  bare pairs. That is the arithmetic of independent pairwise matching rather
+  than a defect: per-link survival is ~16%, so length-4 tracks should be
+  ~0.16² ≈ 2.6% and are measured at 2.7%. Disabling cross-check tripled the
+  chaining rate and still did not move it, because the extra merges were wrong
+  (1156 physically impossible tracks, ray residual doubled).
 
 ---
 

@@ -36,8 +36,10 @@
 #include "../script/interp.h"
 #include "../script/parser.h"
 #include "../gpu/device.h"
+#include "../gpu/gpu_budget.h"
 #include "file_watch.h"
 #include "image_view.h"
+#include "viewport3d.h"
 
 #include "imgui.h"
 #include "imgui_internal.h"   // DockBuilder* for the default layout
@@ -326,6 +328,7 @@ public:
     // drop handler, which only has the App pointer.
     std::string SlotNameAt(int sx, int sy) const;
     bool SlotIsGroup(const std::string& name) const;
+    IncludeResolver MakeIncludeResolver();
     void SetScriptPath(const std::string& path);
 
     // Moves the first slider and re-runs, as dragging one does. Exists for the
@@ -426,6 +429,28 @@ private:
 
     std::vector<std::unique_ptr<ImageViewPanel>> m_views;
 
+    // 3D viewports, kept in a SEPARATE list from the image panels.
+    //
+    // Not one list of View* -- which was the first instinct -- because the app
+    // calls seven methods on m_views that have no meaning for a reconstruction:
+    // VisibleRect and LastZoom drive the proxy and region paths, Focused and
+    // SetSharedCamera drive the info panel and 2D camera sync, SetSaveHandler
+    // drives image export. Hoisting all of them onto View would put image
+    // concepts in the base interface so that one subclass could return
+    // nothing from them.
+    //
+    // Two lists costs a second retirement loop and nothing else, since the
+    // names come from the same declaration list.
+    std::vector<std::unique_ptr<Viewport3D>> m_views3d;
+
+    // Which declared viewers want a 3D panel, by name. Decided from the
+    // pipeline's DECLARED port types at build time, so the layout settles
+    // immediately rather than changing when the first result lands.
+    std::vector<std::string> m_viewer3dNames;
+
+    // Shared across 3D panels, as m_sharedCam is across image panels.
+    OrbitCamera m_sharedCam3d;
+
     // Viewers a script switch removed. Held for a few frames so the GPU is
     // done with their textures before the destructor frees them.
     struct RetiredView {
@@ -452,6 +477,16 @@ private:
     // The proxy scale of the most recently SUBMITTED run. Distinct from what
     // the worker last finished, which lags by however long a run takes.
     float       m_submittedScale = 1.0f;
+
+    // Whether that run was also limited to a REGION. The scale above does not
+    // imply it: zoomed to 1:1 the scale is correctly 1.0 while the region is
+    // the whole saving, so a settle test that reads only the scale misses
+    // exactly the case where cropping was doing all the work.
+    bool        m_submittedRegion = false;
+
+    // Video-memory reclamation; see gpu/gpu_budget.h.
+    GpuBudget   m_gpuBudget;
+    std::string m_gpuCollectReport;   // last pass, for the status line
 
     // The largest viewer, in pixels, as of the last frame. The proxy scale is
     // derived from this rather than fixed, because rendering more pixels than
@@ -561,6 +596,14 @@ private:
 
     // Script browser: the .tgl files sitting beside the current script.
     std::string              m_scriptDir;
+
+    // Scripts pulled in by `include`, in the order they were first parsed.
+    // Rebuilt by every parse and watched alongside the main script, so editing
+    // a shared develop fragment re-runs whatever includes it -- otherwise the
+    // one file people would edit most is the one file hot reload ignores.
+    std::vector<std::string> m_included;
+    std::vector<std::string> m_watchedIncludes;   // what m_includeWatches holds
+    std::vector<FileWatch>   m_includeWatches;
     std::string              m_scriptName;
     std::vector<std::string> m_scriptList;
     bool                     m_scriptListDirty = true;
@@ -704,6 +747,47 @@ void App::Shutdown() {
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
     m_dev.Shutdown();
+}
+
+// Resolves `include "name"` to a file beside the INCLUDING script.
+//
+// Relative to the includer rather than to the top-level script, so a fragment
+// that includes another fragment works wherever the pair is dropped. A name
+// with no extension gets ".tgl", since `include "develop"` is what people
+// write and failing on it teaches nothing.
+//
+// Records every resolved path in m_included so the caller can watch them.
+IncludeResolver App::MakeIncludeResolver() {
+    m_included.clear();
+    return [this](const std::string& name, const std::string& from,
+                  std::string* source, std::string* resolvedPath) {
+        // The directory of whichever file is doing the including.
+        std::string dir = m_scriptDir;
+        if (!from.empty()) {
+            const size_t slash = from.find_last_of("/\\");
+            if (slash != std::string::npos) dir = from.substr(0, slash);
+        }
+
+        std::string leaf = name;
+        if (leaf.find('.') == std::string::npos) leaf += ".tgl";
+
+        // An absolute or explicitly-relative path is taken as written; a bare
+        // name is looked up beside the includer.
+        const bool rooted =
+            leaf.size() > 1 && (leaf[0] == '/' || leaf[0] == '\\' ||
+                                (leaf.size() > 2 && leaf[1] == ':'));
+        const std::string full = rooted ? leaf : dir + "\\" + leaf;
+
+        if (!ReadTextFile(full, source)) return false;
+        *resolvedPath = full;
+
+        // Deduplicated: a diamond (two scripts including the same fragment)
+        // resolves it twice, and watching it twice would fire two reloads.
+        if (std::find(m_included.begin(), m_included.end(), full) ==
+            m_included.end())
+            m_included.push_back(full);
+        return true;
+    };
 }
 
 void App::SetScriptPath(const std::string& path) {
@@ -1110,7 +1194,7 @@ void App::RunScript() {
     // reason; the viewers are only replaced when a run succeeds.
     Program prog;
     std::string err;
-    if (!Parse(m_source, &prog, &err)) {
+    if (!Parse(m_source, &prog, &err, MakeIncludeResolver(), m_scriptPath)) {
         m_error = err;
     } else {
         Pipeline built;
@@ -1121,7 +1205,17 @@ void App::RunScript() {
             // Viewer panels are created from the declarations now, so the
             // layout settles immediately rather than waiting for the result.
             m_viewerNames.clear();
-            for (const ViewerDecl& d : built.Viewers()) m_viewerNames.push_back(d.name);
+            m_viewer3dNames.clear();
+            for (const ViewerDecl& d : built.Viewers()) {
+                // Split by DECLARED type, not by what arrives: a viewer whose
+                // source produces a reconstruction gets a 3D panel from the
+                // first frame, so the layout does not rearrange itself when
+                // the first result lands.
+                if (built.PortType(d.source) == DataType::PointCloud)
+                    m_viewer3dNames.push_back(d.name);
+                else
+                    m_viewerNames.push_back(d.name);
+            }
             SyncViews();
 
             // Stage list for the compare panel's picker.
@@ -1180,7 +1274,19 @@ void App::RunScript() {
             // A panel showing the whole frame therefore widens the union to
             // everything and the pipeline declines, which is the correct
             // outcome rather than a missed optimisation.
-            built.SetRegion(m_dragging ? VisibleRegion() : ImageRect{});
+            const ImageRect region = m_dragging ? VisibleRegion() : ImageRect{};
+            built.SetRegion(region);
+
+            // Recorded for the same reason m_submittedScale is: the settle run
+            // on release has to know whether what it is replacing was a
+            // PARTIAL result, and the region is the other way a run can be
+            // partial. Tracking only the scale meant a zoomed-in drag -- where
+            // the scale correctly clamps to 1.0 and the REGION is what shrank
+            // -- looked like a full run, so no settle was queued and the crop
+            // stayed on screen until something else happened to dirty the
+            // pipeline. Zooming out then revealed it, which is where it was
+            // noticed.
+            m_submittedRegion = region.Valid();
 
             m_pendingSeq = m_worker.Submit(std::move(built), m_sources,
                                            std::move(versions));
@@ -1201,7 +1307,7 @@ void App::RequestCompare() {
 
     Program prog;
     std::string err;
-    if (!Parse(m_source, &prog, &err)) { m_error = err; return; }
+    if (!Parse(m_source, &prog, &err, MakeIncludeResolver(), m_scriptPath)) { m_error = err; return; }
 
     Pipeline built;
     InterpResult r = Interpret(prog, names, &m_ui, &built);
@@ -1353,6 +1459,26 @@ void App::SyncViews() {
     m_views = std::move(next);
     for (auto& v : m_views) v->SetSharedCamera(m_syncCameras ? &m_sharedCam : nullptr);
 
+    // The 3D panels, reused by name for the same reason: a re-run must not
+    // reset the orbit the user just set up.
+    //
+    // NOT retired through m_retiredViews, which is typed for image panels. A
+    // Viewport3D releases its own GPU resources through Device::DeferRelease,
+    // which is the same deferral by a different route -- so dropping one here
+    // is safe where dropping an ImageViewPanel would not be.
+    {
+        std::vector<std::unique_ptr<Viewport3D>> next3d;
+        for (const std::string& name : m_viewer3dNames) {
+            std::unique_ptr<Viewport3D> panel;
+            for (auto& v : m_views3d)
+                if (v && v->Name() == name) { panel = std::move(v); break; }
+            if (!panel) panel = std::make_unique<Viewport3D>(name);
+            panel->ShareCamera(&m_sharedCam3d);
+            next3d.push_back(std::move(panel));
+        }
+        m_views3d = std::move(next3d);
+    }
+
     DockLooseViewers();
 }
 
@@ -1384,6 +1510,16 @@ void App::DockLooseViewers() {
     for (auto& v : m_views) {
         ImGuiWindow* w = ImGui::FindWindowByName(v->Name().c_str());
         // Never seen before, or known but not docked anywhere.
+        if (w == nullptr || w->DockId == 0) {
+            ImGui::DockBuilderDockWindow(v->Name().c_str(), target);
+            newest = v.get();
+        }
+    }
+
+    // The 3D viewports dock into the same node, so a reconstruction opens as a
+    // tab beside the frames it was built from rather than floating loose.
+    for (auto& v : m_views3d) {
+        ImGuiWindow* w = ImGui::FindWindowByName(v->Name().c_str());
         if (w == nullptr || w->DockId == 0) {
             ImGui::DockBuilderDockWindow(v->Name().c_str(), target);
             newest = v.get();
@@ -1702,7 +1838,34 @@ void App::DrawControlsPanel() {
         bool open = true;
         if (!group.empty()) {
             ImGui::PushID(group.c_str());
-            open = ImGui::CollapsingHeader(group.c_str(), ImGuiTreeNodeFlags_DefaultOpen);
+
+            // A GROUP WHOSE STAGE IS OFF STARTS COLLAPSED.
+            //
+            // Once a shared develop chain stacks a dozen stages, most of them
+            // switched off, an all-open panel is a wall of controls that do
+            // nothing -- and the two or three that matter are lost in it. The
+            // switched-off ones fold away to a single line each, so the panel
+            // shows what is actually acting on the picture.
+            //
+            // A DEFAULT, not a rule: this only sets the initial state, so
+            // opening a disabled group to look at its settings works and
+            // sticks. ImGui remembers the open state per header from then on,
+            // which is why SetNextItemOpen passes ImGuiCond_Once -- doing it
+            // every frame would slam the header shut under a user who had just
+            // opened it.
+            // Found by GROUP rather than by label: the label is keyed on the
+            // params() instance key, while the group is the display string
+            // ("A (bilateral)" for an instanced stage), so composing a label
+            // from the group would miss exactly the scripts that use two
+            // instances of one algorithm.
+            bool on = true;
+            for (const UiControl& c : m_ui.Controls())
+                if (c.group == group && c.display == "enabled") {
+                    on = c.value != 0.0;
+                    break;
+                }
+            ImGui::SetNextItemOpen(on, ImGuiCond_Once);
+            open = ImGui::CollapsingHeader(group.c_str());
         }
 
         if (open) {
@@ -3064,9 +3227,56 @@ void App::Frame() {
         }
     } frameTimer{frameStart};
 
+    // RECLAIM VIDEO MEMORY, but only while the worker is idle.
+    //
+    // The palette's sources are shared with the worker by shared_ptr and it
+    // touches their residency as it runs, so freeing a texture here mid-run is
+    // a data race on the pointer the worker is reading -- a use-after-free
+    // rather than a wrong picture. Idle is also the only moment "what is still
+    // needed" has a stable answer.
+    //
+    // Every frame rather than on a timer: Collect() returns immediately when
+    // usage is below the threshold, which is a division and a comparison, and
+    // a timer would mean the one frame that allocates past the budget is the
+    // one that has to wait for the next tick.
+    if (!m_worker.Busy()) {
+        m_gpuBudget.Tick();
+        if (m_sources) {
+            uint64_t used = 0, budget = 0;
+            m_dev.VideoMemory(&used, &budget);
+            if (budget > 0) {
+                std::vector<Data*> pool;
+                pool.reserve(m_sources->size());
+                for (Data& d : *m_sources) pool.push_back(&d);
+
+                const GpuCollectReport r = m_gpuBudget.Collect(pool, used, budget);
+                if (r.imagesFreed > 0) {
+                    m_gpuCollectReport = r.Summary();
+                    std::fprintf(stderr, "[vram] %s\n", m_gpuCollectReport.c_str());
+                }
+            }
+        }
+    }
+
     if (m_watch.Poll()) {
         if (ReadTextFile(m_watch.Path(), &m_source)) m_dirty = true;
     }
+
+    // Included scripts are watched too, or the one file people edit most --
+    // a shared develop fragment -- would be the one file hot reload ignores.
+    //
+    // Rebuilt whenever the include list changes, since a parse can add or drop
+    // an include. Only the main script is re-read: the includes are pulled in
+    // by the parser, so marking the run dirty is enough.
+    if (m_watchedIncludes != m_included) {
+        m_watchedIncludes = m_included;
+        m_includeWatches.clear();
+        m_includeWatches.resize(m_included.size());
+        for (size_t i = 0; i < m_included.size(); ++i)
+            m_includeWatches[i].Watch(m_included[i]);
+    }
+    for (FileWatch& w : m_includeWatches)
+        if (w.Poll()) m_dirty = true;
 
     // Re-run before NewFrame() so that viewers declared by the script exist
     // when the dock layout is built. This is only phase 1 (parse + interpret);
@@ -3323,6 +3533,13 @@ void App::Frame() {
                 ImGui::TextColored(colour, "vram %.0f / %.0f MB  (%.0f%%)",
                                    double(used) / (1024.0 * 1024.0),
                                    double(budget) / (1024.0 * 1024.0), pct);
+
+                // What the collector last did. Said out loud because the cost
+                // of a collection is a re-upload on the next use, so a run
+                // that suddenly pauses to re-upload a 358 MB raw should be
+                // explicable rather than mysterious.
+                if (!m_gpuCollectReport.empty())
+                    ImGui::TextDisabled("   %s", m_gpuCollectReport.c_str());
             }
         }
     }
@@ -3348,6 +3565,19 @@ void App::Frame() {
         v->SetContentVersion(ver);
         v->SetGpuSource(std::move(gpuSrc));
         v->Draw(m_dev, img);
+    }
+
+    // The 3D viewports. Drawn in the same place and for the same reason: they
+    // render into an offscreen target using the open command list, then hand
+    // its SRV to ImGui.
+    for (auto& v : m_views3d) {
+        std::shared_ptr<const PointCloud> cloud;
+        uint64_t ver = 0;
+        for (const ViewerImage& vi : m_viewerImages)
+            if (vi.name == v->Name()) { cloud = vi.cloud; ver = vi.version; break; }
+        v->SetContentVersion(ver);
+        v->SetPointCloud(std::move(cloud));
+        v->Draw(m_dev, nullptr);
     }
 
     // These upload textures, so they belong here rather than with the other
@@ -3394,7 +3624,12 @@ void App::Frame() {
         // still in flight would see the previous run's scale, skip the settle,
         // and then display the proxy -- leaving the picture permanently soft,
         // which is precisely the failure the settle exists to prevent.
-        if (m_dragging && !held && m_submittedScale < 0.999f)
+        //
+        // A run is partial in TWO ways -- reduced scale and a cropped region --
+        // and either one has to be replaced. Testing only the scale left a
+        // zoomed-in drag with no settle at all, because there the scale is
+        // legitimately 1.0 and the region is what shrank.
+        if (m_dragging && !held && (m_submittedScale < 0.999f || m_submittedRegion))
             m_dirty = true;
         m_dragging = held;
     }

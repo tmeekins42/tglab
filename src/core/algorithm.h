@@ -230,6 +230,31 @@ public:
     // pipeline handles it directly. See algorithms/merge/align.cpp.
     virtual bool IsAligner() const { return false; }
 
+    // Reads a whole group and produces a RECONSTRUCTION rather than images.
+    //
+    // Distinct from an aligner, which also sees the whole group but hands back
+    // the same images with sidecars attached. A reconstruction stage changes
+    // the data TYPE: ImageSet in, PointCloud out. That is why it cannot reuse
+    // the aligner path, which allocates an ImageSet for its output before the
+    // algorithm ever runs.
+    //
+    // The chain after the first such stage is PointCloud -> PointCloud, since
+    // rotation averaging, positioning, triangulation and bundle adjustment each
+    // refine the same reconstruction. `images` is null for those -- it carries
+    // the source frames only when there are frames to read, which is the first
+    // stage in the chain.
+    virtual bool IsReconstruct() const { return false; }
+
+    // Builds or refines `cloud`. Called only when IsReconstruct() is true.
+    //
+    // `images` is the source group for a stage consuming one (build_tracks), or
+    // null for a stage refining a reconstruction that already exists. `cloud`
+    // is empty on the first and carries the previous stage's result after.
+    virtual bool RunReconstruct(const std::vector<Image>* /*images*/,
+                                PointCloud* /*cloud*/, std::string* /*err*/) {
+        return true;
+    }
+
     // True when this stage's settings would leave the image unchanged, so the
     // pipeline can skip it ENTIRELY -- no allocation, no dispatch, no copy.
     //
@@ -621,6 +646,43 @@ public:
         "skipped entirely -- no allocation, no dispatch, no copy -- and passes "
         "its input straight through."};
 
+public:
+    // OPT-IN: this stage starts switched off and does nothing until asked for.
+    //
+    // The distinction is between a CORRECTION and an EFFECT. A develop chain
+    // wants exposure, tone mapping and denoise available and doing something
+    // sensible; it does not want a glow, a grain and a vignette applied to
+    // every photograph because they happened to be in the script. Once a
+    // shared develop fragment stacks a dozen stages, the difference between
+    // the two is what decides whether including it is safe.
+    //
+    // Expressed as a switch rather than as a neutral default value for two
+    // reasons. A neutral default only works when a stage HAS one, and it makes
+    // "turn this on" mean "find the right slider and guess a value" -- where
+    // the switch turns the effect on at settings someone chose. And the
+    // pipeline already skips a disabled stage entirely: no allocation, no
+    // dispatch, no copy, so an unused effect in a shared chain is free.
+    virtual bool DefaultOff() const { return false; }
+
+    // Applies DefaultOff() once the object is fully constructed.
+    //
+    // Not an initialiser on m_enabled, because that is a BASE member and the
+    // value depends on a virtual the derived class overrides -- during the
+    // base constructor the override does not exist yet. Called by the registry
+    // after construction instead, which is the first moment the answer is
+    // knowable, and every algorithm is built through Registry::Create so there
+    // is no path that skips it.
+    //
+    // Public only because the registry is not a friend; nothing else should
+    // call it.
+    void ApplyDefaultOff() {
+        if (DefaultOff()) {
+            m_enabled.set(false);
+            m_enabled.SetDefault(false);
+        }
+    }
+
+public:
     // True when the stage should not run at all: switched off, or at settings
     // that would change nothing. The pipeline asks this rather than IsNoOp
     // directly, so an algorithm overriding IsNoOp never has to remember the

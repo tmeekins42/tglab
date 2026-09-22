@@ -1,0 +1,183 @@
+# Structure from Motion: photographs in, a 3D reconstruction out.
+#
+# Drop a folder of images on the palette as a GROUP -- hold ALT while dropping
+# several -- then right-click the group and "Sort by filename" so the order is
+# the capture order. The matchers chain against neighbours, so order matters.
+#
+# WHAT EACH STAGE DOES, because the chain is long and every stage solves a
+# genuinely different problem:
+#
+#   detect_akaze     finds features. AKAZE because it measures the most
+#                    repeatable of the detectors here (96% on the stock
+#                    fixture against SIFT's 70%), and repeatability is the
+#                    whole game: a point that is not found again in the next
+#                    frame contributes nothing.
+#
+#   match_ann        pairs them. `chain` matches each frame against its
+#                    neighbours rather than against frame 0, and `window` says
+#                    how many neighbours. More than one is what gives the view
+#                    graph loops, and loops are what let rotation averaging
+#                    remove drift instead of merely accumulating it.
+#
+#   relative_pose    the ESSENTIAL matrix for each pair, and the relative
+#                    rotation inside it. This is the stage that turns pixel
+#                    correspondences into 3D geometry.
+#
+#                    `fov` is the most consequential setting in the script.
+#                    The essential matrix is only an essential matrix in
+#                    CALIBRATED coordinates, so a wrong field of view biases
+#                    every recovered rotation. Read it off the lens where you
+#                    can; sweep it and watch the rotation residual where you
+#                    cannot.
+#
+#   build_tracks     chains pairwise matches into TRACKS -- one 3D point and
+#                    every image that saw it -- by union-find. Global SfM needs
+#                    the whole correspondence graph before it can solve
+#                    anything, which is why this is a stage rather than a
+#                    by-product the way it is in incremental pipelines.
+#
+#   rotation_average one global orientation per camera, consistent with every
+#                    relative rotation at once. L1-IRLS reweights an edge by
+#                    how far it disagrees with the rest of the graph, so a
+#                    mismatched pair that survived RANSAC stops pulling every
+#                    camera connected through it.
+#
+#   global_position  where the cameras ARE. Two views fix a translation only in
+#                    DIRECTION, never in length, so this has to recover the
+#                    consistent set of lengths from the graph as a whole. The
+#                    joint method solves for camera and point positions
+#                    together, which stays determined when the cameras are
+#                    collinear -- a dolly or a straight transect -- where
+#                    classic translation averaging is ill-posed.
+#
+#   triangulate      3D points from the solved cameras, with three rejections:
+#                    too little parallax (the depth would be arbitrary), behind
+#                    a camera, or reprojecting too far from where it was seen.
+#
+#   bundle_adjust_sfm  moves EVERYTHING at once -- cameras, points, focal --
+#                    to minimise reprojection error in pixels. That is the only
+#                    measure that says a reconstruction is right; every stage
+#                    before it minimises a proxy.
+#
+# READING THE STATUS LINE, in the order things go wrong:
+#
+#   * matches per pair below ~100: the view graph is too thin to average.
+#   * mean track length near 2: nothing is chaining, so every point is a bare
+#     pair and the geometry has no redundancy.
+#   * rotation residual above a degree or two: some edges are wrong. It climbs
+#     with the matching window, because wide baselines share less and the
+#     eight-point algorithm is weaker there.
+#   * reprojection rms after bundle: under a pixel is good.
+
+frames = image("group")
+
+# Downscale first. A detector's thresholds were calibrated around a megapixel;
+# on a 20 MP frame the same settings find tens of thousands of features on
+# texture too fine to repeat between views. Every reference pipeline does this.
+small = params( resize, scale = 0.5 )( frames )
+
+# MORE FEATURES THAN THE DETECTOR'S DEFAULT, because 5000 is a cap tuned for
+# a single image and SfM is not that.
+#
+# A detector that hits its cap is discarding candidates, and what it discards
+# is decided by response ranking rather than by which points the NEXT frame
+# will also find. Measured on castle-P19 at 1536 px, window 1, fov 58:
+#
+#    cap     inliers/pair  cameras  points  ray residual
+#    5000        200        16/19     618      3.30 deg
+#   10000        537        19/19    1120      2.95 deg
+#   20000       1063        19/19    1506      3.40 deg
+#
+# 10000 is the knee. The jump from 5000 is what registers all 19 cameras;
+# going on to 20000 doubles the matcher's work for more points that are no
+# better placed -- the ray residual gets WORSE, because the extra features
+# are low-response texture that matches ambiguously.
+#
+# The cost is quadratic in the matcher, so this is the first control to lower
+# if a large set is slow.
+feat  = params( detect_akaze, max_features = 10000 )( small )
+
+# CHAIN IS NOT THE DEFAULT, and leaving it off is the single easiest way to
+# get nothing out of this script.
+#
+# Without it every frame matches against frame 0, which is right for a bracket
+# of one scene and useless for a walk-around: frame 18 and frame 0 of a circuit
+# share no view at all. Measured on castle-P19 with chain off, 17 of 18 pairs
+# were rejected for want of correspondences and triangulation had nothing left
+# to work with.
+#
+# window = 1 matches each frame to the one before it. Raising it adds loop
+# closures, which is what lets rotation averaging remove drift -- but on this
+# data the rotation residual climbs with it (0, 4 and 15 degrees at windows 1,
+# 2 and 3), because wide baselines share less and the eight-point algorithm is
+# weaker there. Start at 1.
+pairs = params( match_ann, chain = 1, window = 1 )( feat )
+
+# NO align_features here, unlike the panorama script. It fits a homography,
+# which describes a pure camera ROTATION -- exactly what SfM does not have.
+# relative_pose runs its own RANSAC against the essential matrix instead, and
+# writes those inliers back for build_tracks.
+# FOV IS THE MOST CONSEQUENTIAL NUMBER IN THIS SCRIPT, and a guess here biases
+# every recovered rotation.
+#
+# HOW TO FIND IT, since guessing from the lens is unreliable: run the chain and
+# read `focal refined to fov` off the bundle_adjust_sfm report. Bundle
+# adjustment solves for the focal against reprojection error in pixels, so
+# where it settles is a measurement rather than an assumption. On castle-P19 it
+# converges to 50.0 degrees from starting guesses of 36, 45, 52 and 58 -- four
+# independent starts landing on the same value, which is what makes it
+# trustworthy. Set fov_deg to that and the upstream stages stop fighting it.
+#
+# An earlier version of this script said 36 degrees, reasoning from a Canon D60
+# APS-C sensor and an assumed 35 mm lens. The measurement says the lens was
+# nearer 24 mm. Reasoning about the equipment was the wrong move when the
+# pipeline can measure it.
+#
+# DO NOT TUNE THIS BY THE ROTATION RESIDUAL. It falls monotonically as the fov
+# rises, all the way to physically impossible values, because too long a focal
+# shrinks every recovered rotation toward the identity (34 deg at fov 30, 15.6
+# at fov 115) and near-identity rotations agree with each other trivially. The
+# residual rewards the collapse.
+posed = params( relative_pose, fov_deg = 50 )( pairs )
+
+# max_distance = 4 BECAUSE THIS IS A WALK AROUND A SUBJECT. The stages default
+# to 20, which is loose enough for a scene shot from outside -- cameras
+# clustered together, subject in front, every point legitimately ten or more
+# camera radii away. Here the cameras ring the courtyard, so the real structure
+# sits within a few radii and anything beyond is a stray.
+#
+# Measured on castle-P19: bundle adjustment returned a cloud 65.9 units across
+# where triangulation had handed it one 13.3 across, from about 45 points of
+# 1129. Minimising reprojection error alone lets a point on nearly parallel
+# rays slide a long way outward while the error FALLS, so the check has to
+# happen after the solve as well as before it. At 4 the extent is 9.3 with the
+# 2-98 percentile untouched at 4.4 -- the strays go and nothing real does.
+# TRIANGULATE AND BUNDLE TWICE, which is worth more than any single parameter
+# in this script.
+#
+# The first triangulation judges every track against cameras that global
+# positioning placed and nothing has yet refined. Bundle adjustment then moves
+# those cameras a long way -- rms 2.09 to 0.45 px on castle-P19 -- so tracks
+# rejected for reprojecting badly were often rejected against the wrong
+# cameras rather than for being wrong.
+#
+# Running the pair again re-judges them against the refined cameras. Measured:
+#
+#     round 1:  2889 points, reprojection median 10.6 px
+#     round 2:  7659 points, reprojection median  1.1 px
+#     round 3:  8324 points, reprojection median  0.5 px
+#
+# 2.6x the structure from re-running two stages that were already written to
+# support it -- triangulate's header describes this explicitly, and COLMAP
+# alternates the two until neither improves. A third round still helps but is
+# clearly converging, and costs another full bundle solve.
+cloud = params( build_tracks )( posed )
+     => params( rotation_average )()
+     => params( global_position )()
+     => params( triangulate, max_distance = 4 )()
+     => params( bundle_adjust_sfm, max_distance = 4 )()
+     => params( triangulate, max_distance = 4 )()
+     => params( bundle_adjust_sfm, max_distance = 4 )()
+
+display( small, "frames" )
+display( cloud, "reconstruction" )

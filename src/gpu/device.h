@@ -37,6 +37,20 @@ public:
     // into this list so they complete before ImGui samples them.
     ID3D12GraphicsCommandList* CurrentCommandList() const { return m_cmdList; }
 
+    // Re-binds the back buffer and the shader-visible heap, WITHOUT clearing.
+    //
+    // For anything that renders into its own target mid-frame -- a 3D viewport
+    // drawing a point cloud offscreen -- and then needs the rest of the frame
+    // to go to the screen again. BeginFrame() binds these once; a panel that
+    // calls OMSetRenderTargets steals the binding for every draw that follows,
+    // and since ImGui draws last, the symptom is the ENTIRE UI disappearing
+    // into an offscreen texture nobody displays. A black window, no error.
+    //
+    // Deliberately separate from BeginFrame() rather than a flag on it: the
+    // clear must NOT be repeated, or everything drawn earlier in the frame is
+    // erased.
+    void RestoreBackBuffer();
+
     // Which frame-in-flight slot is being recorded. Per-frame staging
     // resources index by this; BeginFrame() has already waited on its fence.
     UINT FrameSlot() const { return m_frameIndex; }

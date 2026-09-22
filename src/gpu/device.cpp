@@ -438,6 +438,32 @@ ID3D12GraphicsCommandList* Device::BeginFrame() {
     return m_cmdList;
 }
 
+void Device::RestoreBackBuffer() {
+    if (!m_cmdList) return;
+
+    // No clear: everything already drawn this frame must survive. The viewport
+    // is restored too, because a panel that rendered offscreen set it to its
+    // own size and ImGui's draws would otherwise be clipped to that rectangle.
+    m_cmdList->OMSetRenderTargets(1, &m_rtvHandles[m_backBufferIndex], FALSE, nullptr);
+
+    // Size read off the back buffer rather than cached: it is the authority,
+    // it is already here, and it cannot go stale across a resize.
+    if (ID3D12Resource* bb = m_backBuffers[m_backBufferIndex]) {
+        const D3D12_RESOURCE_DESC rd = bb->GetDesc();
+        D3D12_VIEWPORT vp = {};
+        vp.Width    = float(rd.Width);
+        vp.Height   = float(rd.Height);
+        vp.MaxDepth = 1.0f;
+        m_cmdList->RSSetViewports(1, &vp);
+
+        D3D12_RECT sc = {0, 0, LONG(rd.Width), LONG(rd.Height)};
+        m_cmdList->RSSetScissorRects(1, &sc);
+    }
+
+    ID3D12DescriptorHeap* heaps[] = {m_srv.Heap()};
+    m_cmdList->SetDescriptorHeaps(1, heaps);
+}
+
 void Device::DrainValidationMessages() {
     if (!m_device) return;
     ID3D12InfoQueue* iq = nullptr;

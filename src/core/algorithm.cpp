@@ -7,9 +7,10 @@ namespace tglab {
 
 const char* DataTypeName(DataType t) {
     switch (t) {
-        case DataType::ImageSet: return "ImageSet";
-        case DataType::Image: return "Image";
-        case DataType::None:  return "None";
+        case DataType::ImageSet:   return "ImageSet";
+        case DataType::Image:      return "Image";
+        case DataType::PointCloud: return "PointCloud";
+        case DataType::None:       return "None";
     }
     return "?";
 }
@@ -77,7 +78,19 @@ void Registry::Add(const char* name, Factory f) {
 
 std::unique_ptr<AlgorithmBase> Registry::Create(std::string_view name) const {
     for (const Entry& e : m_entries)
-        if (e.name == name) return e.factory();
+        if (e.name == name) {
+            std::unique_ptr<AlgorithmBase> a = e.factory();
+            // An opt-in stage starts switched off. Applied HERE rather than in
+            // the constructor because the answer comes from a virtual the
+            // derived class overrides, and during the base constructor that
+            // override does not exist yet -- the call would resolve to the
+            // base and every stage would default on.
+            //
+            // Every algorithm is built through this one function, so there is
+            // no path that skips it.
+            if (a) a->ApplyDefaultOff();
+            return a;
+        }
     return nullptr;
 }
 

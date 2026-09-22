@@ -163,13 +163,21 @@ ghostfix = check("winner takes all (parallax)", 0)
 # looked far worse than the seams it was meant to remove.
 gain = check("gain compensation", 0)
 
-frames => det()
+# Crop before developing: a stitch leaves ragged edges where the frames did not
+# overlap, and there is no reason to develop pixels that are about to be thrown
+# away.
+developed = frames
+       => det()
        => match_ann(chain = 1, window = 2)
        => align_features(model = 2)
        => align()
        => bundle_adjust()
        => stitch_panorama(projection = proj, focal = focal, winner_takes_all = ghostfix, gain_compensation = gain)
-       => display("panorama")       
-       => params( crop ) ()       
-       => params( basic_adjust , auto_exposure = 1)()       
-       => display("final")
+       => display("panorama")
+       => params( crop )()
+
+# The shared develop chain -- the same one hdr.tgl uses, so the two cannot
+# drift apart. See _develop.tgl for the stage order and why it is that order.
+include "_develop.tgl"
+
+display(developed, "final")

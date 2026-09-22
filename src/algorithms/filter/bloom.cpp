@@ -186,6 +186,9 @@ public:
 
     // At intensity 0 nothing is added back, so the pipeline can alias this
     // stage away rather than running four passes to produce its input.
+    // An EFFECT, not a correction: a glow is a look, chosen per image, not a default state.
+    bool DefaultOff() const override { return true; }
+
     bool IsNoOp() const override { return float(m_intensity) <= 0.0f; }
 
     void RunCPU(RunCtx& ctx) override;

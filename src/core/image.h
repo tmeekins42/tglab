@@ -301,6 +301,35 @@ public:
     void MarkGpuResident();
     GpuResidency* RawGpu() const { return m_gpu.get(); }
 
+    // --- reclaiming video memory --------------------------------------------
+    //
+    // Frees the GPU copy, KEEPING the CPU one. Returns the bytes released, or
+    // 0 when there was nothing safe to free.
+    //
+    // This is the whole basis of the VRAM collector: once an image is resident
+    // on both sides the GPU copy is a cache, not the data, and dropping it
+    // loses nothing -- the next AcquireGpuRead simply uploads again. What it
+    // costs is that upload, which is why the collector picks its victims by
+    // how long ago they were used rather than freeing indiscriminately.
+    //
+    // REFUSES when the GPU copy is the only one. That image's pixels exist
+    // nowhere else, so freeing it would silently destroy them; anything
+    // holding GPU-only data has to be read back first, which is a blocking
+    // sync point and a decision for the caller rather than for a collector
+    // running on a budget.
+    size_t DropGpuCopy();
+
+    // When this image's GPU copy was last acquired, in the collector's own
+    // tick count. Zero means never. See GpuBudget.
+    //
+    // Stamped by AcquireGpuRead/Write, which run on the WORKER thread, and read
+    // by the collector on the UI thread -- but never at the same time, because
+    // the collector only runs while the worker is idle. That is the same
+    // invariant that makes freeing the texture safe at all, so this needs no
+    // synchronisation of its own; see gpu_budget.h.
+    uint64_t GpuLastUsed() const { return m_gpuLastUsed; }
+    void     TouchGpu(uint64_t tick) { m_gpuLastUsed = tick; }
+
     // Writable view of the CPU buffer WITHOUT touching residency. Used by the
     // readback path, which is filling the CPU cache rather than authoring new
     // pixels — MapCpuWrite() there would clear the GPU bit mid-readback and
@@ -331,6 +360,10 @@ private:
     std::vector<uint8_t> m_cpu;
     Residency            m_res = Residency::None;
     std::unique_ptr<GpuResidency, GpuResidencyDeleter> m_gpu;
+
+    // Collector bookkeeping; see GpuLastUsed. Not part of the image's value,
+    // so it is deliberately NOT compared or hashed anywhere.
+    uint64_t m_gpuLastUsed = 0;
     SidecarTable         m_sidecars;
 };
 

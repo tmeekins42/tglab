@@ -21,6 +21,7 @@
 #include "../src/algo_util/pixel_buffer.h"
 #include "../src/core/algorithm.h"
 #include "../src/core/pipeline.h"
+#include "../src/script/interp.h"
 #include "../src/gpu/compute.h"
 #include <d3d12.h>
 
@@ -77,6 +78,17 @@ bool RunFilterV(const std::string& name, Image&& input,
     auto algo = Registry::Get().Create(name);
     if (!algo) { *err = "no such algorithm: " + name; return false; }
 
+    // Switched ON, because an effect now starts off and these are behavioural
+    // tests -- asking one what it does to an image while it is bypassed
+    // measures a copy. This mirrors what the interpreter does for a direct
+    // script call: naming an algorithm with settings is asking for it. A test
+    // that wants the off behaviour sets `enabled` explicitly below, which
+    // still wins because it is applied after this.
+    if (ParamBase* en = algo->FindParam("enabled")) {
+        std::string ignored;
+        en->SetFromScript(Value(1.0), &ignored);
+    }
+
     for (const auto& [key, value] : params) {
         bool found = false;
         for (ParamBase* p : algo->Params()) {
@@ -105,6 +117,13 @@ bool RunFilter(const std::string& name, Image&& input,
                Image* out, std::string* err) {
     auto algo = Registry::Get().Create(name);
     if (!algo) { *err = "no such algorithm: " + name; return false; }
+
+    // Switched on for the same reason as RunFilterV above: an effect starts
+    // off, and a behavioural test run against a bypassed stage measures a copy.
+    if (ParamBase* en = algo->FindParam("enabled")) {
+        std::string ignored;
+        en->SetFromScript(Value(1.0), &ignored);
+    }
 
     for (const auto& [key, value] : params) {
         bool found = false;
@@ -1350,6 +1369,69 @@ static void TestResize() {
 // like a demosaic bug; a detector run on one produces keypoints in the wrong
 // coordinate system and looks like an alignment bug. Neither points at the
 // proxy machinery that caused it.
+// WHICH STAGES START SWITCHED OFF, audited by name.
+//
+// The distinction is between a CORRECTION and an EFFECT: a develop chain wants
+// exposure and denoise doing something sensible, and does not want a glow, a
+// grain and a vignette on every photograph it touches. That matters once a
+// shared fragment stacks a dozen stages, because then "included" must not mean
+// "applied".
+//
+// Listed by name rather than derived from the category, for the same reason
+// the proxy audit is: the categories do not line up. orton and bloom are
+// "filter" alongside gaussian_blur, which is a tool rather than a look; dehaze
+// and film_grain are "adjust" alongside brightness, which must stay on. A
+// category test would read correctly and be wrong.
+static void TestDefaultOff() {
+    const std::set<std::string> effects = {
+        "orton", "bloom", "vignette", "film_grain", "dehaze",
+    };
+
+    int off = 0, on = 0;
+    for (const std::string& name : Registry::Get().Names()) {
+        auto a = Registry::Get().Create(name);
+        if (!a) continue;
+        const bool isOff = a->DefaultOff();
+        if (effects.count(name)) {
+            Check(isOff, name + " is an effect and must start off");
+            ++off;
+        } else {
+            Check(!isOff, name + " is a correction and must start on");
+            ++on;
+        }
+    }
+    Check(off == int(effects.size()) && on > 30,
+          "the default-off audit covered the registry (" + std::to_string(off) +
+              " off, " + std::to_string(on) + " on)");
+
+    // THE SWITCH IS ACTUALLY THROWN, not merely declared. DefaultOff() is a
+    // statement of intent; what matters is that the stage really is bypassed,
+    // and that the enabled parameter's DEFAULT moved with it -- otherwise
+    // resetting the switch would turn the effect on, and the panel would count
+    // an untouched stage as modified.
+    for (const std::string& name : effects) {
+        auto a = Registry::Get().Create(name);
+        if (!a) { Check(false, name + " is registered"); continue; }
+        Check(a->ShouldBypass(), name + " is bypassed as created");
+
+        ParamBase* p = a->FindParam("enabled");
+        Check(p != nullptr, name + " has an enabled switch");
+        if (!p) continue;
+        UiControl c;
+        if (p->DescribeControl(&c)) {
+            Check(c.value == 0.0, name + "'s switch reads off");
+            Check(c.def == 0.0,
+                  name + "'s switch DEFAULTS to off, so resetting it stays off");
+        }
+    }
+
+    // And a correction is untouched by all of this.
+    {
+        auto a = Registry::Get().Create("basic_adjust");
+        if (a) Check(!a->ShouldBypass(), "basic_adjust runs as created");
+    }
+}
+
 static void TestProxyBehaviour() {
     using PB = AlgorithmBase::ProxyBehaviour;
 
@@ -1375,7 +1457,14 @@ static void TestProxyBehaviour() {
         // A CFA mosaic cannot survive being downscaled -- the pattern IS the
         // data. Sidecar coordinates are in image pixels and nothing rescales
         // them.
-        if (cat == "demosaic" || sidecar.count(name)) {
+        //
+        // The "sfm" CATEGORY is checked wholesale rather than by name, unlike
+        // the list above. Every stage there reads keypoint positions or a
+        // reconstruction built from them, so the rule holds for the category
+        // itself rather than happening to hold for its current members -- and
+        // a phase that adds triangulation and bundle adjustment should not
+        // also have to remember to edit a list here.
+        if (cat == "demosaic" || cat == "sfm" || sidecar.count(name)) {
             Check(pb == PB::Never,
                   name + " (" + cat + ") must not run on a proxy");
             ++never;
@@ -1454,6 +1543,7 @@ int main() {
     TestLut();
     TestDehaze();
     TestResize();
+    TestDefaultOff();
     TestProxyBehaviour();
 
 

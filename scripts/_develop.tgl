@@ -1,0 +1,68 @@
+# The develop chain, as a shared fragment.
+#
+# Included rather than copied, which is the point of it: the same tail was
+# hand-written in hdr.tgl, panorama.tgl and autodevelop.tgl, and had already
+# drifted -- hdr had six stages, the other two had one. Changing the order of
+# denoise and tone mapping meant editing three files and noticing the third.
+#
+#   include "_develop.tgl"
+#
+# CONTRACT, and it is a convention rather than something the language enforces:
+#
+#   in   `developed` must already hold the image to develop.
+#   out  `developed` is left holding the developed image.
+#
+# Named for both so the fragment reads as a transformation of one variable, and
+# so a caller can include it twice in a chain if it ever wants to.
+#
+# The leading underscore marks it as a fragment rather than a script worth
+# opening: it calls no image() and no display(), so on its own it does nothing.
+#
+# WHY THIS ORDER, since it is the part that is easy to get wrong and the reason
+# having one copy matters:
+#
+#   tonemap        first, because everything after it wants display-referred
+#                  values. A scene-linear merge can reach 900 with the midtones
+#                  near 2.0, and no adjustment below is meaningful on that
+#                  scale.
+#
+#   basic_adjust   the ordinary exposure/contrast/colour controls, fused into
+#                  one GPU pass rather than chained -- at 36 MP each separate
+#                  stage would read and write a 144 MB intermediate.
+#
+#   dehaze         before the local contrast and grain, because it inverts a
+#                  physical mixing of light and wants the picture still clean.
+#
+#   wavelet_denoise  after the tone curve, NOT before it. A shrinkage threshold
+#                  is a fixed distance in the value domain, so ahead of a tone
+#                  curve it thresholds in linear scene space where shadow
+#                  detail is compressed into almost nothing -- it would erase
+#                  exactly what it is meant to preserve.
+#
+#   orton          a creative effect, so it goes after the corrections.
+#
+#   vignette       last, because it is a property of the lens rather than of
+#                  the scene: darkening applied before the tone curve would be
+#                  partly undone by it.
+#
+# Every stage is params(), so each contributes its own group of sliders.
+#
+# THE EFFECTS START SWITCHED OFF -- dehaze, orton and vignette here, plus bloom
+# and film_grain wherever they appear. That is what makes this fragment safe to
+# include: a script gains the controls without gaining a glow and a vignette on
+# every photograph it touches. Tick a stage's `enabled` box to turn it on; its
+# group is collapsed until you do, so the panel shows what is actually acting
+# on the picture rather than a wall of controls that are not.
+#
+# The corrections -- tonemap, basic_adjust, wavelet_denoise -- stay on, because
+# a develop chain that does not develop is not useful.
+#
+# A switched-off stage costs nothing at all: it is skipped entirely, with no
+# allocation, no dispatch and no copy, and passes its input straight through.
+
+developed = developed
+         => params( basic_adjust, auto_exposure = 1 )()
+         => params( dehaze )()
+         => params( wavelet_denoise )()
+         => params( orton )()
+         => params( vignette )()

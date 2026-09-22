@@ -116,6 +116,12 @@ public:
 
     bool Run(const Program& prog) {
         for (const Stmt& s : prog.stmts) {
+            // Which file this statement came from, so an error inside an
+            // included script names that script. Tracked here rather than
+            // threaded through every Fail() call site: the file is a property
+            // of the statement being executed, and there are some sixty places
+            // that report an error.
+            m_file = s.file;
             if (!ExecStmt(s)) return false;
         }
         return true;
@@ -125,7 +131,9 @@ public:
 
 private:
     bool Fail(int line, const std::string& msg) {
-        if (m_err.empty()) m_err = "line " + std::to_string(line) + ": " + msg;
+        if (m_err.empty())
+            m_err = (m_file.empty() ? "" : m_file + ": ") +
+                    "line " + std::to_string(line) + ": " + msg;
         return false;
     }
 
@@ -1005,6 +1013,31 @@ private:
             }
         }
 
+        // NAMING AN EFFECT IN A SCRIPT IS ASKING FOR IT.
+        //
+        // An effect starts switched off so that including a shared develop
+        // chain does not apply a glow and a vignette to every photograph. But
+        // a script that writes `orton(src, strength = 0.6)` has said exactly
+        // what it wants, and leaving it off would make orton.tgl -- a script
+        // whose entire purpose is demonstrating orton -- render nothing.
+        //
+        // So a direct call with settings turns the stage on, and `enabled` is
+        // an ordinary parameter the script can still set explicitly to
+        // override this. The panel-driven path is deliberately NOT covered:
+        // params() supplies every value including `enabled`, so it flows
+        // through the block above and the switch stays whatever the panel
+        // says.
+        if (paramsKey.empty() && !a.named.empty()) {
+            const bool setsEnabled =
+                std::any_of(a.named.begin(), a.named.end(),
+                            [](const auto& kv) { return kv.first == "enabled"; });
+            if (!setsEnabled)
+                if (ParamBase* p = algo->FindParam("enabled")) {
+                    std::string perr;
+                    p->SetFromScript(Value(1.0), &perr);
+                }
+        }
+
         // Named arguments bind to parameters, except over=, which the framework
         // owns: the axis decides the SHAPE of the result, so it has to be known
         // while the pipeline is built rather than when the stage runs.
@@ -1124,6 +1157,10 @@ private:
     }
 
     std::string                            m_err;
+
+    // The file the statement being executed came from; empty for the main
+    // script. Prefixed onto errors by Fail().
+    std::string                            m_file;
 };
 
 } // namespace

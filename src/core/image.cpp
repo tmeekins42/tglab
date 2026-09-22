@@ -203,6 +203,32 @@ void Image::MarkGpuResident() {
     m_res = Residency::Gpu;
 }
 
+size_t Image::DropGpuCopy() {
+    // Nothing to free.
+    if (!m_gpu) return 0;
+
+    // THE GPU COPY IS THE ONLY COPY. Freeing it would destroy the pixels, and
+    // silently: the descriptor survives, so the image still looks valid and
+    // the next read returns a buffer of zeros rather than an error. Recovering
+    // one of these means a readback, which blocks on a fence -- a decision for
+    // whoever owns the image, not for a collector running against a budget.
+    if (!HasCpu()) return 0;
+
+    const size_t freed = m_desc.SizeInBytes();
+
+    // The deleter releases the texture; see GpuResidency's destructor. Safe
+    // here in core/ because the deleter is the indirection that keeps
+    // GpuResidency incomplete in the header.
+    m_gpu.reset();
+
+    // CPU-only again. Deliberately assigned rather than masked: Residency::Cpu
+    // IS the whole truth now, and clearing the bit would leave None on an
+    // image that was somehow marked Gpu-only despite the check above.
+    m_res = Residency::Cpu;
+    m_gpuLastUsed = 0;
+    return freed;
+}
+
 ImageView Image::CpuBufferForFill() {
     EnsureCpuStorage();
     ImageView v;
