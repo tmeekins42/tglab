@@ -129,6 +129,12 @@ public:
         ImageView       dst = ctx.Out(0);
         if (!src.Valid() || !dst.Valid()) return;
 
+        // LOCAL, NOT MEMBERS. One instance is mapped across every frame of a
+        // group, so scratch on the instance is shared between the threads
+        // running those frames. See TestNoSharedScratch.
+        PixelBuffer        m_in, m_out;
+        std::vector<float> m_tmp, m_soft;
+
         m_in.Unpack(src);
         if (!m_in.Valid()) return;
         m_out.AllocLike(m_in);
@@ -374,8 +380,6 @@ void main(uint3 tid : SV_DispatchThreadID) {
                  "so a little of this puts the bite back.",
          .step = 0.01}};
 
-    PixelBuffer        m_in, m_out;
-    std::vector<float> m_tmp, m_soft;
 };
 
 REGISTER_ALGORITHM(Orton);

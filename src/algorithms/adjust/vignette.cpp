@@ -58,6 +58,11 @@ public:
     PortList Outputs() const override { return {{"out", DataType::Image, FormatSpec::SameAsInput}}; }
 
     void RunCPU(RunCtx& ctx) override {
+        // LOCAL, NOT A MEMBER. One algorithm instance is mapped across every
+        // frame of a group, so scratch kept on the instance is shared between
+        // the threads running those frames -- and the symptom is not a crash
+        // but frames holding each other's pixels. See TestNoSharedScratch.
+        PixelBuffer m_in, m_out;
         const ImageView src = ctx.In(0);
         ImageView       dst = ctx.Out(0);
         if (!src.Valid() || !dst.Valid()) return;
@@ -298,7 +303,6 @@ private:
                  "frame lighter than its long edges.",
          .step = 0.01}};
 
-    PixelBuffer m_in, m_out;
 
     // Set by PrepareGpu from the input descriptor; the identity for a whole
     // full-resolution image.

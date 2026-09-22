@@ -1922,6 +1922,81 @@ int main() {
                 }
             }
 
+            // --- A BROADCAST KEEPS FRAME ORDER, AND REPEATS ITSELF ----------
+            //
+            // The frames of a broadcast run across several threads, so they
+            // finish in whatever order the scheduler produces. Two things must
+            // not depend on that: which output slot a frame lands in, and what
+            // the run produces at all.
+            //
+            // Enough frames to actually engage the pool -- one per core less a
+            // couple, so a handful would run inline and prove nothing -- and
+            // each frame carries a DIFFERENT value, so a frame written to the
+            // wrong slot shows up immediately. A test with identical frames
+            // would pass however badly they were shuffled.
+            //
+            // Run twice and compared, because a race that reorders results is
+            // usually intermittent: one pass could be luck.
+            {
+                constexpr int kN = 32;
+                auto buildSet = [&] {
+                    ImageSet s;
+                    for (int i = 0; i < kN; ++i) s.images.push_back(Flat(i + 1));
+                    s.shape = Shape::Of("frame", kN);
+                    return s;
+                };
+
+                std::vector<SourceImage> namesN{{"test", 0}};
+                SourceImage gn;
+                gn.name = "g"; gn.index = 1; gn.shape = Shape::Of("frame", kN);
+                namesN.push_back(gn);
+
+                auto runOnce = [&](std::vector<int>* got) {
+                    Program pr; std::string e;
+                    Parse("g = image(\"g\")\nb = brightness(g, gain = 2.0)\n"
+                          "display(b)\n", &pr, &e);
+                    UiState u; Pipeline pl;
+                    if (!Interpret(pr, namesN, &u, &pl).ok) return false;
+                    std::vector<Data> ss;
+                    ss.push_back(Data{});
+                    ss.push_back(Data{buildSet()});
+                    std::string xe;
+                    if (!pl.Execute(&ss, nullptr, &xe)) return false;
+                    const auto* os = std::get_if<ImageSet>(&pl.Stages().back().outputs[0]);
+                    if (!os) return false;
+                    for (const Image& im : os->images) {
+                        ImageView v = const_cast<Image&>(im).MapCpuRead();
+                        got->push_back(v.data ? int(v.data[0]) : -1);
+                    }
+                    return true;
+                };
+
+                std::vector<int> a, b;
+                const bool ranA = runOnce(&a);
+                const bool ranB = runOnce(&b);
+                Check(ranA && ranB, "a many-frame broadcast runs twice");
+
+                if (ranA && ranB) {
+                    Check(a.size() == size_t(kN),
+                          "every frame comes back (" + std::to_string(a.size()) + ")");
+
+                    bool ordered = a.size() == size_t(kN);
+                    for (size_t i = 0; i < a.size() && ordered; ++i)
+                        if (a[i] != int((i + 1) * 2)) ordered = false;
+                    Check(ordered,                          "each frame's result lands in that frame's slot, "
+                          "whatever order the threads finished in");
+
+                    std::string diff;
+                    for (size_t i = 0; i < a.size() && i < b.size(); ++i)
+                        if (a[i] != b[i])
+                            diff += " [" + std::to_string(i) + "] " +
+                                    std::to_string(a[i]) + "vs" +
+                                    std::to_string(b[i]);
+                    Check(a == b,
+                          "and two runs of the same input agree exactly" + diff);
+                }
+            }
+
             // Broadcast then reduce, which is the whole point: develop each
             // frame, then merge them. 20,40,60 -> mean 40.
             Program p2; std::string e2;

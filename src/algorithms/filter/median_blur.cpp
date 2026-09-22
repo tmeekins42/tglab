@@ -34,15 +34,23 @@ public:
         ImageView       dst = ctx.Out(0);
         if (!src.Valid() || !dst.Valid()) return;
 
-        m_in.Unpack(src);
-        if (!m_in.Valid()) return;
-        m_out.AllocLike(m_in);
+        // LOCAL, NOT A MEMBER. One algorithm instance is mapped across every
+        // frame of a group, so scratch kept on the instance is shared between
+        // the threads running those frames -- and the symptom is not a crash
+        // but frames holding each other's pixels. See TestNoSharedScratch.
+        //
+        // Passed to the helpers rather than reached through `this`, which is
+        // what keeps them independent of the instance too.
+        PixelBuffer pin, pout;
+        pin.Unpack(src);
+        if (!pin.Valid()) return;
+        pout.AllocLike(pin);
 
         const int radius = std::max(1, ctx.ScaledRadius(int(m_radius)));
-        if (src.desc.format == Format::RGBA8) RunHistogram(radius, ctx);
-        else                                  RunSelection(radius, ctx);
+        if (src.desc.format == Format::RGBA8) RunHistogram(radius, ctx, pin, pout);
+        else                                  RunSelection(radius, ctx, pin, pout);
 
-        m_out.PackInto(dst);
+        pout.PackInto(dst);
     }
 
     // Reads a window of this radius, so a tile needs that much margin.
@@ -51,7 +59,8 @@ public:
 private:
     // Huang's sliding histogram. Values are 0..255, so 256 bins suffice and the
     // median is found by walking bins until half the window's weight is passed.
-    void RunHistogram(int radius, const RunCtx& ctx) {
+    void RunHistogram(int radius, const RunCtx& ctx,
+                      const PixelBuffer& m_in, PixelBuffer& m_out) {
         const int w = m_in.Width(), h = m_in.Height(), ch = m_in.Channels();
         const int windowCount = (radius * 2 + 1) * (radius * 2 + 1);
         const int half = windowCount / 2;
@@ -70,7 +79,7 @@ private:
                 // Seed the histogram with the window at x = 0.
                 for (int dy = -radius; dy <= radius; ++dy)
                     for (int dx = -radius; dx <= radius; ++dx)
-                        ++hist[Bin(dx, y + dy, c, w, h)];
+                        ++hist[Bin(m_in, dx, y + dy, c)];
 
                 for (int x = 0; x < w; ++x) {
                     // Walk bins until the cumulative count passes the midpoint.
@@ -84,8 +93,8 @@ private:
                     if (x + 1 >= w) continue;
                     // Slide one column: drop x-radius, add x+radius+1.
                     for (int dy = -radius; dy <= radius; ++dy) {
-                        --hist[Bin(x - radius, y + dy, c, w, h)];
-                        ++hist[Bin(x + radius + 1, y + dy, c, w, h)];
+                        --hist[Bin(m_in, x - radius, y + dy, c)];
+                        ++hist[Bin(m_in, x + radius + 1, y + dy, c)];
                     }
                 }
             }
@@ -95,7 +104,8 @@ private:
     }
 
     // nth_element selects the median without fully sorting the window.
-    void RunSelection(int radius, const RunCtx& ctx) {
+    void RunSelection(int radius, const RunCtx& ctx,
+                      const PixelBuffer& m_in, PixelBuffer& m_out) {
         const int w = m_in.Width(), h = m_in.Height(), ch = m_in.Channels();
         const int filtered = (ch == 1) ? 1 : 3;
 
@@ -120,7 +130,7 @@ private:
         }
     }
 
-    int Bin(int x, int y, int c, int w, int h) const {
+    static int Bin(const PixelBuffer& m_in, int x, int y, int c) {
         const float v = m_in.AtClamped(x, y)[c];
         return std::clamp(int(v + 0.5f), 0, 255);
     }
@@ -131,7 +141,6 @@ private:
                  "Higher removes larger specks but rounds off fine corners.",
          .softMin = 1, .softMax = 10}};
 
-    PixelBuffer m_in, m_out;
 };
 
 REGISTER_ALGORITHM(MedianBlur);

@@ -42,6 +42,11 @@ public:
     PortList Outputs() const override { return {{"out", DataType::Image, FormatSpec::SameAsInput}}; }
 
     void RunCPU(RunCtx& ctx) override {
+        // LOCAL, NOT A MEMBER. One algorithm instance is mapped across every
+        // frame of a group, so scratch kept on the instance is shared between
+        // the threads running those frames -- and the symptom is not a crash
+        // but frames holding each other's pixels. See TestNoSharedScratch.
+        PixelBuffer m_in, m_out;
         const ImageView src = ctx.In(0);
         ImageView       dst = ctx.Out(0);
         if (!src.Valid() || !dst.Valid()) return;
@@ -60,6 +65,10 @@ public:
         const int filtered = (ch == 1) ? 1 : 3;
         const size_t n = size_t(w) * size_t(h);
 
+        // LOCAL, NOT MEMBERS. One instance is mapped across every frame of a
+        // group, so scratch on the instance is shared between the threads
+        // running those frames. See TestNoSharedScratch.
+        std::vector<float> m_mean, m_meanSq, m_a, m_b, m_scratch, m_plane;
         m_mean.assign(n, 0.0f);
         m_meanSq.assign(n, 0.0f);
         m_a.assign(n, 0.0f);
@@ -116,6 +125,9 @@ private:
     // Separable running-sum box mean: O(1) per pixel, which is the whole point.
     void BoxMean(const std::vector<float>& in, std::vector<float>& out,
                  int w, int h, int radius) {
+        // Local: this helper is called from several threads at once when a
+        // broadcast maps the stage across a group. See TestNoSharedScratch.
+        std::vector<float> m_rowTmp;
         m_rowTmp.assign(in.size(), 0.0f);
         const float normX = 1.0f / float(radius * 2 + 1);
 
@@ -160,8 +172,6 @@ private:
                  "edges, higher smooths through them.",
          .step = 0.005, .softMin = 0.01, .softMax = 0.4}};
 
-    std::vector<float> m_mean, m_meanSq, m_a, m_b, m_scratch, m_plane, m_rowTmp;
-    PixelBuffer m_in, m_out;
 };
 
 REGISTER_ALGORITHM(GuidedFilter);

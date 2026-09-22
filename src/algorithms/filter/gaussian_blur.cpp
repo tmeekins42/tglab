@@ -46,6 +46,10 @@ public:
         // branch and the separable passes touch it (2r+1) times per pixel per
         // channel -- at 8 MP with sigma 8 that is billions of calls, and it is
         // where the time actually went.
+        // LOCAL, NOT MEMBERS. One instance is mapped across every frame of a
+        // group, so scratch on the instance is shared between the threads
+        // running those frames. See TestNoSharedScratch.
+        std::vector<float> m_input, m_scratch;
         m_input.assign(size_t(w) * size_t(h) * size_t(ch), 0.0f);
         for (int y = 0; y < h; ++y)
             for (int x = 0; x < w; ++x)
@@ -240,8 +244,6 @@ private:
          .step = 0.1, .softMin = 0.0, .softMax = 5.0}};
 
     // Reused across runs to avoid reallocating on every slider drag.
-    std::vector<float> m_scratch;
-    std::vector<float> m_input;
 };
 
 REGISTER_ALGORITHM(GaussianBlur);

@@ -7,9 +7,13 @@
 #include <cstdio>
 #include <functional>
 #include <cassert>
+#include <atomic>
 #include <deque>
 #include <map>
+#include <mutex>
 #include <set>
+
+#include "parallel.h"
 
 #include "../gpu/compute.h"
 #include "../gpu/gpu_image.h"
@@ -821,16 +825,66 @@ bool Pipeline::BroadcastStage(Stage& s, const std::vector<const Data*>& in,
     // Sized up front so each frame writes its own slot; see frameReports.
     s.frameReports.assign(src.images.size(), std::string());
 
-    bool ok = true;
-    for (size_t f = 0; f < src.images.size() && ok; ++f) {
-        if (cancel && cancel->Cancelled()) { *err = kCancelled; ok = false; break; }
+    const size_t nFrames = src.images.size();
 
-        if (progress) {
-            char what[64];
-            std::snprintf(what, sizeof what, "%s  frame %d/%d", s.algoName.c_str(),
-                          int(f) + 1, int(src.images.size()));
-            progress->Set(int(f), int(src.images.size()), what);
-            PublishStats(progress, gpu);   // same reason as the fused loop
+    // WHICH FRAMES GO IN PARALLEL, and why the GPU ones do not.
+    //
+    // RunStageGpu caches the compiled kernel, the scratch planes and their
+    // descriptors ON THE STAGE, and rewrites them as it runs. Two frames
+    // through it at once would race on all of that, and beyond the Stage there
+    // is a single command queue underneath. So a stage that will take the GPU
+    // path runs frame by frame exactly as before; the CPU path is what this
+    // spreads out.
+    //
+    // The condition is the same one RunStageOnce uses to choose, evaluated once
+    // here. A GPU stage that FALLS BACK to the CPU mid-run therefore still runs
+    // serially -- slower than it could be, and correct, which is the right way
+    // round for a fallback nobody planned for.
+    const bool wantGpu = gpu && mode != ExecMode::ForceCPU && s.algo->HasGPU() &&
+                         (s.algo->GpuSource() || !s.algo->GpuPasses().empty());
+
+    // BRING EVERY FRAME TO THE CPU FIRST, before any thread touches them.
+    //
+    // Image::Clone() const-casts and calls MapCpuRead() when the pixels live
+    // only on the GPU, which allocates the CPU buffer and flips m_res on the
+    // SOURCE image. Cloning the same source from several threads therefore
+    // races on that readback, and the symptom is not a crash: frames come back
+    // holding each other's pixels, or an uninitialised buffer.
+    //
+    // Measured before this: a 32-frame broadcast disagreed between two runs of
+    // identical input on 8 of 12 attempts, with frames reporting values that
+    // belonged to their neighbours -- exactly the shape of a torn read.
+    //
+    // Done serially here rather than locking inside Clone(): the readback is a
+    // GPU sync point, so it could not proceed in parallel anyway, and a lock
+    // in Clone() would make every unrelated caller pay for this one.
+    if (!wantGpu && nFrames > 1) {
+        for (const Image& im : src.images) {
+            if (cancel && cancel->Cancelled()) { *err = kCancelled; return false; }
+            const_cast<Image&>(im).MapCpuRead();
+        }
+    }
+
+    // Every frame's outputs, gathered by index rather than appended, so the
+    // result is in frame order however the work was distributed.
+    std::vector<std::vector<Data>> frameOuts(nFrames);
+
+    // FAILURE ACROSS THREADS. The first frame to fail wins, and the rest stop
+    // as soon as they notice: `failed` is checked at the top of each item, so a
+    // failure costs at most one more frame per thread rather than the whole
+    // remaining set. The message is guarded because two frames can fail at
+    // once and std::string is not atomic.
+    std::atomic<bool> failed{false};
+    std::mutex errMtx;
+    std::string firstErr;
+    std::atomic<size_t> done{0};
+
+    auto runFrame = [&](size_t f) {
+        if (failed.load(std::memory_order_relaxed)) return;
+        if (cancel && cancel->Cancelled()) {
+            std::lock_guard<std::mutex> lock(errMtx);
+            if (!failed.exchange(true)) firstErr = kCancelled;
+            return;
         }
 
         // Swap this frame in for the set input; every other input is passed
@@ -840,20 +894,48 @@ bool Pipeline::BroadcastStage(Stage& s, const std::vector<const Data*>& in,
         std::vector<const Data*> frameIn = in;
         frameIn[size_t(setIdx)] = &frame;
 
-        std::vector<Data> frameOut;
-        // Indexed by frame rather than appended, so the order is the frames'
-        // order whatever order they complete in once this loop is threaded.
-        if (!RunStageOnce(s, frameIn, &frameOut, &s.frameReports[f], gpu, mode,
-                          cancel, err)) {
-            ok = false;
-            break;
+        std::string fErr;
+        if (!RunStageOnce(s, frameIn, &frameOuts[f], &s.frameReports[f], gpu,
+                          mode, cancel, &fErr)) {
+            std::lock_guard<std::mutex> lock(errMtx);
+            if (!failed.exchange(true)) firstErr = std::move(fErr);
+            return;
         }
 
+        // COUNTED, NOT NUMBERED. "frame 7/19" is meaningless when seven are in
+        // flight at once, so this reports how many have FINISHED -- which is
+        // both true and the thing a progress bar is actually showing.
+        if (progress) {
+            const size_t n = done.fetch_add(1, std::memory_order_relaxed) + 1;
+            char what[64];
+            std::snprintf(what, sizeof what, "%s  %d/%d frames",
+                          s.algoName.c_str(), int(n), int(nFrames));
+            progress->Set(int(n), int(nFrames), what);
+            PublishStats(progress, gpu);   // same reason as the fused loop
+        }
+    };
+
+    if (wantGpu || nFrames <= 1) {
+        for (size_t f = 0; f < nFrames && !failed.load(); ++f) runFrame(f);
+    } else {
+        ParallelFor(nFrames, runFrame);
+    }
+
+    bool ok = !failed.load();
+    if (!ok) *err = firstErr;
+
+    // Gathered after the work, in frame order, so the output set is identical
+    // whatever order the frames completed in.
+    for (size_t f = 0; ok && f < nFrames; ++f) {
         for (size_t p = 0; p < nPorts; ++p) {
-            auto* img = (p < frameOut.size()) ? std::get_if<Image>(&frameOut[p])
-                                              : nullptr;
-            if (!img) { *err = Where() + "produced no image for frame " + std::to_string(f);
-                        ok = false; break; }
+            auto* img = (p < frameOuts[f].size())
+                            ? std::get_if<Image>(&frameOuts[f][p])
+                            : nullptr;
+            if (!img) {
+                *err = Where() + "produced no image for frame " + std::to_string(f);
+                ok = false;
+                break;
+            }
             results[p].images.push_back(std::move(*img));
         }
     }

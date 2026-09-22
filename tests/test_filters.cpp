@@ -25,7 +25,10 @@
 #include "../src/gpu/compute.h"
 #include <d3d12.h>
 
+#include <atomic>
+
 #include "../src/core/lut.h"
+#include "../src/core/parallel.h"
 #include "../src/script/value.h"
 
 using namespace tglab;
@@ -1460,6 +1463,97 @@ static void TestNoPerFrameReportState() {
               (offenders.empty() ? "" : "\n    -- use RunCtx::SetReport instead"));
 }
 
+// No per-frame algorithm may keep SCRATCH on the instance either.
+//
+// The report audit above covers status text. This covers the other half, and
+// it was the more damaging one: sixteen algorithms held `PixelBuffer m_in,
+// m_out` as scratch reused between calls. One instance is mapped across every
+// frame of a group, so two threads unpacked into the same buffer -- measured
+// as 8 failures in 12 runs of a 32-frame broadcast, with frames coming back
+// holding their neighbours' pixels and occasional zeros.
+//
+// DETECTED BY RUNNING THE SAME INSTANCE ON TWO DIFFERENT IMAGES AT ONCE, which
+// is exactly what a broadcast does. An algorithm whose scratch is local gives
+// each thread its own answer; one sharing a buffer gives at least one of them
+// the wrong image. Repeated, because a race that needs a particular
+// interleaving will not show on a single attempt.
+//
+// Cheaper and more honest than parsing the source for member declarations: a
+// member is not automatically a fault (a Param is one, and so is a GPU cache
+// written only by PrepareGpu), and what matters is the behaviour under
+// concurrency rather than the declaration.
+static void TestNoSharedScratch() {
+    auto solid = [](uint8_t v) {
+        Image img;
+        img.Alloc({32, 32, Format::RGBA8});
+        ImageView iv = img.MapCpuWrite();
+        for (int y = 0; y < 32; ++y)
+            for (int x = 0; x < 32; ++x) {
+                uint8_t* p = iv.At<uint8_t>(x, y);
+                p[0] = v; p[1] = v; p[2] = v; p[3] = 255;
+            }
+        return img;
+    };
+
+    std::string offenders;
+    int checked = 0;
+
+    for (const std::string& name : Registry::Get().Names()) {
+        auto algo = Registry::Get().Create(name);
+        if (!algo) continue;
+        if (algo->IsAligner() || algo->IsReduction() || algo->IsReconstruct()) continue;
+        if (algo->Inputs().size() != 1 || algo->Outputs().size() != 1) continue;
+
+        // What the algorithm produces for each input on its own, serially.
+        // Anything else is the race, not a property of the algorithm.
+        auto runOne = [&](AlgorithmBase* a, uint8_t v) -> int {
+            Image in = solid(v);
+            std::vector<Data> ins;
+            ins.push_back(Data{std::move(in)});
+            std::vector<const Data*> inPtr{&ins[0]};
+
+            Image out;
+            out.Alloc(a->OutputDesc(0, std::get<Image>(ins[0]).Desc()));
+            std::vector<Data> outs;
+            outs.push_back(Data{std::move(out)});
+
+            RunCtx ctx(inPtr, outs);
+            a->RunCPU(ctx);
+
+            Image* o = std::get_if<Image>(&outs[0]);
+            if (!o || !o->Valid()) return -1;
+            ImageView ov = o->MapCpuRead();
+            return ov.data ? int(ov.At<uint8_t>(16, 16)[0]) : -1;
+        };
+
+        const int wantA = runOne(algo.get(), 60);
+        const int wantB = runOne(algo.get(), 200);
+        if (wantA < 0 || wantB < 0) continue;      // did not produce an image
+        if (wantA == wantB) continue;              // cannot tell them apart
+        ++checked;
+
+        // The same instance, both inputs at once, several times.
+        bool raced = false;
+        for (int attempt = 0; attempt < 6 && !raced; ++attempt) {
+            std::atomic<int> gotA{-2}, gotB{-2};
+            ParallelFor(2, [&](size_t i) {
+                const int r = runOne(algo.get(), i == 0 ? 60 : 200);
+                (i == 0 ? gotA : gotB).store(r);
+            });
+            if (gotA.load() != wantA || gotB.load() != wantB) raced = true;
+        }
+        if (raced) offenders += "\n    " + name;
+    }
+
+    Check(checked > 5, "the scratch audit reached a useful number of "
+                       "algorithms (" + std::to_string(checked) + ")");
+    Check(offenders.empty(),
+          "no per-frame algorithm shares scratch between concurrent calls" +
+              offenders +
+              (offenders.empty() ? ""
+                                 : "\n    -- move PixelBuffer members into RunCPU"));
+}
+
 static void TestDefaultOff() {
     const std::set<std::string> effects = {
         "orton", "bloom", "vignette", "film_grain", "dehaze",
@@ -1623,6 +1717,7 @@ int main() {
     TestResize();
     TestDefaultOff();
     TestNoPerFrameReportState();
+    TestNoSharedScratch();
     TestProxyBehaviour();
 
 

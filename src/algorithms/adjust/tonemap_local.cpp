@@ -276,6 +276,8 @@ public:
         // channel separately would let the three bases diverge near an edge and
         // shift hue there -- the same reason the develop path scales all three
         // channels by one factor.
+        // LOCAL, NOT MEMBERS. See TestNoSharedScratch.
+        std::vector<float> m_log, m_base;
         m_log.assign(n, 0.0f);
         const std::vector<float>& sp = m_in.Data();
         for (size_t i = 0; i < n; ++i) {
@@ -328,12 +330,14 @@ public:
         const float spanBefore = lv.high - lv.low;
         const float target     = float(m_range);
         const float k = (spanBefore > target) ? (target / spanBefore) : 1.0f;
-        m_compression = k;
-        m_spanBefore  = spanBefore;
 
-        // Per call rather than read back off the members below: one instance
-        // serves every frame of a group. The members stay because the GPU path
-        // (PrepareGpu) also sets them and that path is single-threaded.
+        // NOT written back to m_compression / m_spanBefore. Nothing on this
+        // path reads them again -- they existed to feed RunReport(), which now
+        // answers only for the GPU path -- and writing them here made every
+        // frame of a broadcast race on two floats for no benefit. The members
+        // remain for PrepareGpu, which is single-threaded per stage.
+        //
+        // Reported per call, because one instance serves every frame.
         if (spanBefore > 0.0f) {
             char rbuf[128];
             std::snprintf(rbuf, sizeof rbuf,
@@ -551,6 +555,8 @@ private:
     void GuidedSelf(const std::vector<float>& in, std::vector<float>& out,
                     int w, int h, int radius, float epsStops) {
         const size_t n = in.size();
+        // Local, for the same reason as BoxMean below.
+        std::vector<float> m_mean, m_meanSq, m_a, m_b, m_scratch;
         m_mean.assign(n, 0.0f);
         m_meanSq.assign(n, 0.0f);
         m_a.assign(n, 0.0f);
@@ -588,6 +594,9 @@ private:
     // radius be large enough to be a genuine illumination estimate.
     void BoxMean(const std::vector<float>& in, std::vector<float>& out,
                  int w, int h, int radius) {
+        // Local: called from several threads at once when a broadcast maps
+        // this stage across a group. See TestNoSharedScratch.
+        std::vector<float> m_rowTmp;
         m_rowTmp.assign(in.size(), 0.0f);
         const float norm = 1.0f / float(radius * 2 + 1);
 
@@ -651,8 +660,6 @@ private:
          .step = 0.05, .softMin = -2.0, .softMax = 2.0}};
 
     PixelBuffer        m_in;
-    std::vector<float> m_log, m_base;
-    std::vector<float> m_mean, m_meanSq, m_a, m_b, m_scratch, m_rowTmp;
 
     float m_compression = 1.0f;
     float m_spanBefore  = 0.0f;

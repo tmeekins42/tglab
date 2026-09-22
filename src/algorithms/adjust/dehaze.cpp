@@ -188,6 +188,11 @@ public:
     bool IsNoOp() const override { return float(m_strength) <= 0.0f; }
 
     void RunCPU(RunCtx& ctx) override {
+        // LOCAL, NOT A MEMBER. One algorithm instance is mapped across every
+        // frame of a group, so scratch kept on the instance is shared between
+        // the threads running those frames -- and the symptom is not a crash
+        // but frames holding each other's pixels. See TestNoSharedScratch.
+        PixelBuffer m_in, m_out;
         const ImageView src = ctx.In(0);
         ImageView       dst = ctx.Out(0);
         if (!src.Valid() || !dst.Valid()) return;
@@ -1069,7 +1074,6 @@ void main(uint3 tid : SV_DispatchThreadID) {
                  "often grey. Set to 0 to see the raw prior.",
          .step = 0.05f}};
 
-    PixelBuffer m_in, m_out;
     std::string m_note;
 
     // Measured in MeasureForGpu and handed to the passes as root constants.

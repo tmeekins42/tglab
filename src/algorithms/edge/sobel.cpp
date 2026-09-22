@@ -42,6 +42,11 @@ public:
     }
 
     void RunCPU(RunCtx& ctx) override {
+        // LOCAL, NOT A MEMBER. One algorithm instance is mapped across every
+        // frame of a group, so scratch kept on the instance is shared between
+        // the threads running those frames -- and the symptom is not a crash
+        // but frames holding each other's pixels. See TestNoSharedScratch.
+        PixelBuffer m_in;
         const ImageView src = ctx.In(0);
         ImageView gx  = ctx.Out(0);
         ImageView gy  = ctx.Out(1);
@@ -86,7 +91,6 @@ public:
 private:
     Param<float> m_scale{this, "scale", 1.0f, 0.0f, 8.0f};
 
-    PixelBuffer m_in;
 };
 
 REGISTER_ALGORITHM(Sobel);
