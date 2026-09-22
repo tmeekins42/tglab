@@ -1020,6 +1020,25 @@ static void TestGpuAgreement(ID3D12Device* dev) {
          "o = grayscale(src, r_weight = 0.4, g_weight = 0.4, b_weight = 0.2)\n"
          "display(o)\n", 2.0, 1.0},
 
+        // BOTH DIRECTIONS, because resize is the one algorithm here whose two
+        // paths do genuinely different arithmetic depending on the scale: an
+        // area average going down, bilinear going up. A single case would
+        // leave half the kernel unchecked.
+        //
+        // A non-integer ratio on purpose. At 0.5 every output pixel covers
+        // exactly 2x2 sources and a footprint computed the wrong way still
+        // lands right; at 0.37 it does not, which is what makes this a test of
+        // the edge-based footprint rather than of the averaging.
+        {"resize",
+         "src = image(\"test\")\n"
+         "o = resize(src, scale = 0.37)\n"
+         "display(o)\n", 2.0, 1.0},
+
+        {"resize",
+         "src = image(\"test\")\n"
+         "o = resize(src, scale = 2.3)\n"
+         "display(o)\n", 2.0, 1.0},
+
         {"box_blur",
          "src = image(\"test\")\n"
          "o = box_blur(src, radius = 3)\n"
