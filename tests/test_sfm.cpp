@@ -1436,6 +1436,60 @@ int main() {
                                     std::to_string(uy) + ")");
         }
 
+        // --- THE PROJECTION IS RIGID AS THE CAMERA TURNS --------------------
+        //
+        // Everything above checks ONE orientation. A projection can be right
+        // at yaw 0 and wrong everywhere else -- a basis that is not
+        // orthonormal, or an aspect applied in the wrong space, shears the
+        // scene as it rotates rather than displacing it. Tim saw exactly that:
+        // "really weird warping when I try to rotate the camera".
+        //
+        // Rigidity is testable without knowing what the right picture is: a
+        // rotation preserves DISTANCES between points, so if the camera turns
+        // and the view-space separation of two fixed points changes, the
+        // transform is not a rotation. Checked in view space rather than on
+        // screen, because the perspective divide legitimately changes screen
+        // distances with depth.
+        {
+            auto viewSpace = [](const OrbitCamera& c, const Vec3& p) {
+                float m[16];
+                c.ViewProj(m);
+                // The w row is the view-space forward component, and the
+                // basis rows are the view axes scaled by the projection
+                // terms. Undoing those scales recovers the view-space point.
+                const double f = 1.0 / std::tan(c.fovY * 0.5);
+                const double w = p.x * m[3] + p.y * m[7] + p.z * m[11] + m[15];
+                const double x = (p.x * m[0] + p.y * m[4] + p.z * m[8]  + m[12]) / f;
+                const double y = (p.x * m[1] + p.y * m[5] + p.z * m[9]  + m[13]) / f;
+                return Vec3{x, y, w};
+            };
+
+            const Vec3 a{0.3, -0.2, 0.7}, b{-0.5, 0.4, -0.1};
+            const double truth = (a - b).Norm();
+
+            double worst = 0.0;
+            double worstYaw = 0.0, worstPitch = 0.0;
+            for (double yaw = -3.0; yaw <= 3.0; yaw += 0.37) {
+                for (double pitch = -1.2; pitch <= 1.2; pitch += 0.31) {
+                    OrbitCamera c;
+                    c.target = Vec3{0, 0, 0};
+                    c.distance = 5.0;
+                    c.yaw = yaw;
+                    c.pitch = pitch;
+
+                    const double d = (viewSpace(c, a) - viewSpace(c, b)).Norm();
+                    const double err = std::fabs(d - truth);
+                    if (err > worst) { worst = err; worstYaw = yaw; worstPitch = pitch; }
+                }
+            }
+
+            Check(worst < 1e-4,
+                  "the view transform is rigid at every orientation (worst "
+                  "separation error " + std::to_string(worst) + " at yaw " +
+                      std::to_string(worstYaw) + ", pitch " +
+                      std::to_string(worstPitch) + ")");
+        }
+
         // Framing: a box must end up fully on screen, whatever its scale.
         // Scale is a gauge freedom in a reconstruction (see global_position),
         // so a viewer that only works at one scale is broken for half of them.
