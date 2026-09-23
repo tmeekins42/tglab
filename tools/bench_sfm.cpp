@@ -119,6 +119,8 @@ int main(int argc, char** argv) {
     double maxDistance = -1.0;   // negative: leave the stages' own defaults
     int poseMethod = -1;         // negative: leave relative_pose's own default
     int baIters = -1;            // negative: leave bundle_adjust_sfm's default
+    int minLen  = -1;            // negative: leave build_tracks's default
+    double minAngle = -1.0;      // negative: leave triangulate's default
     std::string script;
 
     for (int i = 1; i < argc; ++i) {
@@ -137,6 +139,8 @@ int main(int argc, char** argv) {
         else if (a == "--max-distance" && i + 1 < argc) maxDistance = std::atof(argv[++i]);
         else if (a == "--pose-method" && i + 1 < argc) poseMethod = std::atoi(argv[++i]);
         else if (a == "--ba-iters" && i + 1 < argc) baIters = std::atoi(argv[++i]);
+        else if (a == "--min-length" && i + 1 < argc) minLen = std::atoi(argv[++i]);
+        else if (a == "--min-angle" && i + 1 < argc) minAngle = std::atof(argv[++i]);
         else if (a == "--script" && i + 1 < argc)   script = argv[++i];
         else files.push_back(a);
     }
@@ -322,6 +326,7 @@ int main(int argc, char** argv) {
     // and build_tracks fills in the camera slots everything downstream reads.
     auto bt = Registry::Get().Create("build_tracks");
     SetParam(bt.get(), "fov_deg", fov);
+    if (minLen > 0) SetParam(bt.get(), "min_length", double(minLen));
     p.AddStage(std::move(bt), "build_tracks", {{sPose, 0}}, 1, ++stage);
     const int sTracks = stage - 1;
 
@@ -341,6 +346,7 @@ int main(int argc, char** argv) {
 
     auto tri = Registry::Get().Create("triangulate");
     if (maxDistance > 0.0) SetParam(tri.get(), "max_distance", maxDistance);
+    if (minAngle > 0.0) SetParam(tri.get(), "min_angle", minAngle);
     p.AddStage(std::move(tri), "triangulate", {{sPos, 0}}, 1, ++stage);
     const int sTri = stage - 1;
 
@@ -357,6 +363,7 @@ int main(int argc, char** argv) {
     // describe a pipeline nobody runs.
     auto tri2 = Registry::Get().Create("triangulate");
     if (maxDistance > 0.0) SetParam(tri2.get(), "max_distance", maxDistance);
+    if (minAngle > 0.0) SetParam(tri2.get(), "min_angle", minAngle);
     p.AddStage(std::move(tri2), "triangulate", {{sBa1, 0}}, 1, ++stage);
     const int sTri2 = stage - 1;
 
