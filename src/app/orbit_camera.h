@@ -34,6 +34,11 @@
 
 namespace tglab {
 
+// The axis the orbit turns about. Kept as +Y so the basis is right-handed and
+// "right" means right; which way is UP on screen is handled in ViewProj, for
+// the reason given there.
+inline Vec3 WorldUp() { return Vec3{0, 1, 0}; }
+
 struct OrbitCamera {
     // What the camera looks at, and how far away it sits.
     Vec3   target;
@@ -77,7 +82,7 @@ struct OrbitCamera {
     // the same fraction of the screen however far out the camera is.
     void Pan(double dx, double dy) {
         const Vec3 fwd = (target - Eye()).Normalized();
-        const Vec3 worldUp{0, 1, 0};
+        const Vec3 worldUp = WorldUp();
         const Vec3 right = fwd.Cross(worldUp).Normalized();
         const Vec3 up = right.Cross(fwd).Normalized();
         const double s = distance * 0.002;
@@ -136,7 +141,7 @@ struct OrbitCamera {
     void ViewProj(float out[16]) const {
         const Vec3 eye = Eye();
         const Vec3 fwd = (target - eye).Normalized();
-        const Vec3 worldUp{0, 1, 0};
+        const Vec3 worldUp = WorldUp();
         Vec3 right = fwd.Cross(worldUp).Normalized();
         if (right.Norm() < 0.5) right = Vec3{1, 0, 0};   // degenerate; pick one
         const Vec3 up = right.Cross(fwd).Normalized();
@@ -144,9 +149,31 @@ struct OrbitCamera {
         // View: rotate into the camera basis, then translate.
         const double vx = -right.Dot(eye), vy = -up.Dot(eye), vz = fwd.Dot(eye);
 
+        // THE SCREEN Y IS FLIPPED, and it belongs here rather than in the
+        // basis.
+        //
+        // The reconstruction is in OpenCV's convention -- +X right, +Y DOWN,
+        // camera along +Z -- because that is COLMAP's, and geometry.h states
+        // it at the top. A viewer built with the graphics habit of +Y up shows
+        // every reconstruction VERTICALLY MIRRORED, which is what this did:
+        // the fountain rendered upside down, and it took a recognisable object
+        // to notice, since a point cloud has no obvious top.
+        //
+        // NEGATING worldUp DOES NOT FIX IT, which was tried first. `right` is
+        // fwd x worldUp and `up` is right x fwd, so negating worldUp negates
+        // right and leaves up UNCHANGED -- it mirrors the image horizontally,
+        // exactly the wrong axis. Both orientation tests flipped together,
+        // which is how that showed.
+        //
+        // Negating the projection's y term flips the screen and nothing else:
+        // the basis stays right-handed, "right" still means right, and the
+        // orbit still turns about +Y.
         const double f = 1.0 / std::tan(fovY * 0.5);
         const double aspect = 1.0;   // the caller scales x by width/height
         const double a = f / aspect;
+        // Only the y term is negated; x keeps its sign, or the image would be
+        // mirrored left-to-right as well.
+        const double fy = -f;
         const double zn = nearZ, zf = farZ;
         const double q = zf / (zf - zn);
 
@@ -158,10 +185,10 @@ struct OrbitCamera {
         // what the perspective divide needs, and what the first version got
         // backwards by copying an OpenGL-style -Z convention.
         const double m[16] = {
-            right.x * a,  up.x * f,  fwd.x * q,        fwd.x,
-            right.y * a,  up.y * f,  fwd.y * q,        fwd.y,
-            right.z * a,  up.z * f,  fwd.z * q,        fwd.z,
-            vx * a,       vy * f,    -vz * q - zn * q, -vz,
+            right.x * a,  up.x * fy,  fwd.x * q,        fwd.x,
+            right.y * a,  up.y * fy,  fwd.y * q,        fwd.y,
+            right.z * a,  up.z * fy,  fwd.z * q,        fwd.z,
+            vx * a,       vy * fy,    -vz * q - zn * q, -vz,
         };
         for (int i = 0; i < 16; ++i) out[i] = float(m[i]);
     }

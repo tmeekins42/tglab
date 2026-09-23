@@ -1430,10 +1430,20 @@ int main() {
             if (project(cam, cam.target + right * 0.5, &sx, &sy, &sz))
                 Check(sx > 0.0, "a point to the right projects right (" +
                                     std::to_string(sx) + ")");
+            // +Y IS DOWN in the reconstruction -- OpenCV's convention, which
+            // geometry.h states and COLMAP shares -- so a point at +0.5 y is
+            // BELOW the target and must project below centre. Screen y is
+            // positive upward, hence the negative expectation.
+            //
+            // This test previously asserted the opposite and passed, because
+            // the viewer was flipping the scene to match: the fountain
+            // rendered upside down and nothing caught it, since a point cloud
+            // has no obvious top and the test agreed with the bug.
             double ux, uy, uz;
             if (project(cam, cam.target + Vec3{0, 0.5, 0}, &ux, &uy, &uz))
-                Check(uy > 0.0, "a point above projects up (" +
-                                    std::to_string(uy) + ")");
+                Check(uy < 0.0,
+                      "a point at +Y -- which is DOWN -- projects below centre (" +
+                          std::to_string(uy) + ")");
         }
 
         // --- THE PROJECTION IS RIGID AS THE CAMERA TURNS --------------------
