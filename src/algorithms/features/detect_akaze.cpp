@@ -151,16 +151,68 @@ public:
 
         if (w < 32 || h < 32) return;
 
+        // --- THE DETECTOR WORKS AT A BOUNDED SIZE ---------------------------
+        //
+        // A detector's thresholds describe a CONTRAST, not a pixel count, so
+        // the same settings find proportionally more extrema on a bigger
+        // image. Past a few thousand features per frame that stops being a
+        // gain and becomes a loss, because it is MATCHING that breaks:
+        // measured on fountain-P11, at 3072 px the ratio test kept 4.2% of
+        // candidates and 5 of 19 pairs solved, where at 1228 px it kept 12.3%
+        // and all 19 solved. Every feature has near-duplicate neighbours at
+        // that density, so the best and second-best descriptor distances
+        // converge and the ratio test cannot separate them.
+        //
+        // So the detector shrinks its own input rather than the script doing
+        // it. Two things follow, and the second is the reason to do it here:
+        //
+        //   * The tuning stops depending on input resolution. A threshold
+        //     that works on a 12 MP phone photograph works on a 45 MP raw,
+        //     because both are detected at the same working size.
+        //   * THE FULL-RESOLUTION PIXELS STAY AVAILABLE. A script-level
+        //     resize throws them away for every later stage; this affects only
+        //     what the detector looks at. Anything downstream that wants real
+        //     detail -- a texture map, a dense stage -- still has it.
+        //
+        // Keypoint coordinates are mapped back to INPUT pixels below, so a
+        // sidecar produced here is indistinguishable from one detected at full
+        // resolution. That is what keeps the rest of the pipeline unaware.
+        const int maxDim = std::max(64, int(m_maxDim));
+        const int longest = std::max(w, h);
+        const double det = (longest > maxDim) ? (double(maxDim) / double(longest))
+                                              : 1.0;
+        const int dw = std::max(32, int(std::lround(double(w) * det)));
+        const int dh = std::max(32, int(std::lround(double(h) * det)));
+
         Plane base;
-        base.w = w; base.h = h;
-        base.v.assign(size_t(w) * size_t(h), 0.0f);
-        for (int y = 0; y < h; ++y)
-            for (int x = 0; x < w; ++x) {
-                const float* p = in.At(x, y);
-                base.v[size_t(y) * size_t(w) + size_t(x)] = (ch >= 3)
-                    ? (0.2126f * p[0] + 0.7152f * p[1] + 0.0722f * p[2]) / scale
-                    : p[0] / scale;
+        base.w = dw; base.h = dh;
+        base.v.assign(size_t(dw) * size_t(dh), 0.0f);
+
+        // Box-averaged when shrinking, for the reason resize states: point
+        // sampling a minification aliases, and aliased detail MOVES between
+        // frames, which is precisely what a detector must not chase.
+        const double xr = double(w) / double(dw);
+        const double yr = double(h) / double(dh);
+        for (int y = 0; y < dh; ++y) {
+            const int y0 = std::clamp(int(double(y) * yr), 0, h - 1);
+            const int y1 = std::clamp(int(std::ceil(double(y + 1) * yr)), y0 + 1, h);
+            for (int x = 0; x < dw; ++x) {
+                const int x0 = std::clamp(int(double(x) * xr), 0, w - 1);
+                const int x1 = std::clamp(int(std::ceil(double(x + 1) * xr)), x0 + 1, w);
+                double acc = 0.0;
+                int n = 0;
+                for (int sy = y0; sy < y1; ++sy)
+                    for (int sx = x0; sx < x1; ++sx) {
+                        const float* p = in.At(sx, sy);
+                        acc += (ch >= 3)
+                                   ? (0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2])
+                                   : p[0];
+                        ++n;
+                    }
+                base.v[size_t(y) * size_t(dw) + size_t(x)] =
+                    float(acc / (double(n ? n : 1) * double(scale)));
             }
+        }
 
         auto sidecar = std::make_shared<FeatureSidecar>();
         sidecar->detector = "akaze";
@@ -168,6 +220,23 @@ public:
         sidecar->descriptors.dim  = kDescBits;
 
         Detect(base, ctx, sidecar.get());
+
+        // BACK TO INPUT COORDINATES. Everything downstream -- the matcher, the
+        // essential matrix, triangulation -- reads these as pixels of the image
+        // the sidecar is attached to, so a position left in the working
+        // raster's pixels would be wrong by the scale factor and silently:
+        // the sidecar would still be present and still look valid.
+        //
+        // `scale` multiplies too, since a keypoint's scale is a radius in
+        // pixels and is used to size the region a descriptor covers.
+        if (det < 1.0) {
+            const float inv = float(1.0 / det);
+            for (Keypoint& kp : sidecar->keypoints) {
+                kp.x *= inv;
+                kp.y *= inv;
+                kp.scale *= inv;
+            }
+        }
 
         // Reported through the per-call context rather than a member, because
         // one detector instance serves every frame of a group and a member
@@ -621,6 +690,33 @@ private:
     Param<bool> m_upright{this, "upright", false,
         "Skip orientation and assume the camera is level. Faster and more "
         "repeatable when the images really are not rotated."};
+
+    // THE WORKING SIZE, and the single most important control on a large
+    // image. The detector shrinks its input so its longest side is at most
+    // this before looking for features, then maps what it finds back to input
+    // pixels -- so the rest of the pipeline, and any later stage wanting full
+    // detail, is unaffected.
+    //
+    // 1200 because that is where matching works. Measured on fountain-P11:
+    // at 3072 px the ratio test keeps 4.2%% of candidates and 5 of 19 pairs
+    // solve; at 1228 px it keeps 12.3%% and all 19 solve. The extra features a
+    // larger raster yields are not better ones, they are denser ones, and
+    // density is what defeats the ratio test.
+    //
+    // Raise it for a scene whose detail is genuinely fine -- and watch the
+    // inlier RATE from relative_pose rather than the feature count, since the
+    // count always rises and the rate is what says whether they are usable.
+    Param<int> m_maxDim{this, "max_dim", 1200, 256, 8192,
+        {.help = "Longest side the detector works at. Bigger images are "
+                 "shrunk to this before detection and the keypoints mapped "
+                 "back, so the full-resolution pixels stay available to every "
+                 "later stage. Feature thresholds describe a contrast rather "
+                 "than a pixel count, so without this the same settings find "
+                 "proportionally more features on a bigger image -- and past a "
+                 "few thousand per frame that breaks MATCHING, because every "
+                 "feature acquires near-duplicate neighbours and the ratio "
+                 "test can no longer separate them.",
+         .softMax = 2400}};
 
     Param<int> m_maxFeatures{this, "max_features", 5000, 10, 50000,
         {.help = "Stop after this many."}};
