@@ -140,18 +140,30 @@ pairs = params( match_ann, chain = 1, window = 1 )( feat )
 # residual rewards the collapse.
 posed = params( relative_pose, fov_deg = 50 )( pairs )
 
-# max_distance = 4 BECAUSE THIS IS A WALK AROUND A SUBJECT. The stages default
+# max_distance = 3 BECAUSE THIS IS A WALK AROUND A SUBJECT. The stages default
 # to 20, which is loose enough for a scene shot from outside -- cameras
 # clustered together, subject in front, every point legitimately ten or more
-# camera radii away. Here the cameras ring the courtyard, so the real structure
+# camera radii away. Here the cameras ring the subject, so the real structure
 # sits within a few radii and anything beyond is a stray.
 #
 # Measured on castle-P19: bundle adjustment returned a cloud 65.9 units across
 # where triangulation had handed it one 13.3 across, from about 45 points of
 # 1129. Minimising reprojection error alone lets a point on nearly parallel
 # rays slide a long way outward while the error FALLS, so the check has to
-# happen after the solve as well as before it. At 4 the extent is 9.3 with the
-# 2-98 percentile untouched at 4.4 -- the strays go and nothing real does.
+# happen after the solve as well as before it.
+#
+# TIGHTENED FROM 4 TO 3 on fountain-P11, where a phantom cluster appeared off
+# to one side that no camera was looking at. The limit is a multiple of the
+# camera radius, and on that set 4 allowed points twice as far out as the real
+# structure:
+#
+#   limit  points   raw Z extent   2-98% Z extent
+#     4     7434        9.64            3.80
+#     3     7258        5.76            3.21
+#     2.5   6939        4.20            1.34   <- eating real structure
+#
+# 3 is the knee: the raw extent nearly halves while the robust extent barely
+# moves, for 176 points. castle-P19 is unchanged at 4019 points either way.
 # TRIANGULATE AND BUNDLE TWICE, which is worth more than any single parameter
 # in this script.
 #
@@ -180,10 +192,10 @@ posed = params( relative_pose, fov_deg = 50 )( pairs )
 cloud = params( build_tracks, fov_deg = 50 )( posed )
      => params( rotation_average )()
      => params( global_position )()
-     => params( triangulate, max_distance = 4 )()
-     => params( bundle_adjust_sfm, max_distance = 4 )()
-     => params( triangulate, max_distance = 4 )()
-     => params( bundle_adjust_sfm, max_distance = 4 )()
+     => params( triangulate, max_distance = 3 )()
+     => params( bundle_adjust_sfm, max_distance = 3 )()
+     => params( triangulate, max_distance = 3 )()
+     => params( bundle_adjust_sfm, max_distance = 3 )()
 
 display( small, "frames" )
 display( cloud, "reconstruction" )
