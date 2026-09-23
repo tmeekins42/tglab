@@ -499,11 +499,18 @@ private:
     // blobs; a photograph is not that, and where the two disagree the
     // photograph decides. The default stays where Bay put it, and the fixture's
     // expectation was corrected instead.
-    Param<float> m_threshold{this, "threshold", 0.0004f, 0.0f, 0.02f,
+    // Ceiling raised from 0.02 for the reason given on detect_akaze's
+    // threshold: the extrema count grows with the pixel count, and 0.02 is not
+    // high enough to keep a multi-megapixel frame under the feature cap. ORB
+    // and BRISK already allowed 0.5.
+    Param<float> m_threshold{this, "threshold", 0.0004f, 0.0f, 0.5f,
         {.help = "Minimum Hessian determinant, relative to the image's own "
                  "99th percentile. Raise it to keep only strong, round blobs; "
                  "SURF finds fewer features than SIFT at comparable settings "
-                 "and they are individually more reliable.",
+                 "and they are individually more reliable.\n\n"
+                 "RAISE IT FOR A LARGE IMAGE, or the feature cap discards most "
+                 "of what is found -- and it discards by response, which "
+                 "concentrates what survives on the highest-contrast region.",
          .step = 0.0001, .softMax = 0.004}};
 
     Param<bool> m_extended{this, "extended", false,

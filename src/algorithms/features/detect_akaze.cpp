@@ -433,6 +433,21 @@ private:
         //
         // ORB already did this correctly, which is why it was the one detector
         // that did not fail. SURF and SIFT had the same bug.
+        // A GLOBAL RESPONSE RANK, and a spatial one was tried and measured
+        // WORSE. See CapSpatially in features.h, which is kept for the
+        // reasoning but is not used: capping per grid cell took fountain-P11
+        // from 3238 points to 1644 at the working scale, and did nothing at
+        // all at full resolution (626 tracks against 625).
+        //
+        // The premise was wrong. Full resolution does not collapse because the
+        // cap discards the wrong features -- it collapses because MATCHING
+        // fails at that feature density. Measured: at 3072 px the ratio test
+        // keeps 4.2% of candidates and 5 of 19 pairs solve, where at 1228 px
+        // it keeps 12.3% and all 19 solve. Ten thousand features in one frame
+        // means every one has near-duplicate neighbours, the best and
+        // second-best distances converge, and the ratio test cannot separate
+        // them. Spreading the same number out does not help; there need to be
+        // fewer.
         const int cap = std::max(1, int(m_maxFeatures));
         if (int(cands.size()) > cap) {
             std::nth_element(cands.begin(), cands.begin() + cap, cands.end(),
@@ -570,11 +585,30 @@ private:
     Param<int> m_scales{this, "scales_per_octave", 3, 1, 4,
         {.help = "Diffusion levels within each octave."}};
 
-    Param<float> m_threshold{this, "threshold", 0.0008f, 0.0f, 0.02f,
+    // THE RANGE HAS TO REACH THE VALUES A LARGE IMAGE NEEDS.
+    //
+    // This stopped at 0.02, which is the wrong ceiling once the input is more
+    // than a megapixel or two: the number of extrema grows with the pixel
+    // count, so a threshold that yields a few thousand features at 1200 px
+    // yields tens of thousands at 3072, and the cap then discards most of them
+    // by RESPONSE RANK -- which is not spatially uniform and starves the flat
+    // regions. Measured on fountain-P11 at full resolution, the old maximum of
+    // 0.02 still produced 16k-37k features per frame with the cap binding.
+    //
+    // ORB and BRISK already allowed 0.5; AKAZE and SURF did not, for no reason
+    // anyone recorded. The soft maximum stays low so the slider is still
+    // usable at the ordinary scale.
+    Param<float> m_threshold{this, "threshold", 0.0008f, 0.0f, 0.5f,
         {.help = "Minimum scale-normalised Hessian determinant. AKAZE's edges "
                  "stay sharp at every scale, so a feature found coarsely sits "
                  "where the fine-scale one does -- which is the reason to use "
-                 "it over SIFT.",
+                 "it over SIFT.\n\n"
+                 "RAISE IT FOR A LARGE IMAGE. The extrema count grows with the "
+                 "pixel count, so a value that gives a few thousand features "
+                 "at 1200 px gives tens of thousands at 3000 and the feature "
+                 "cap starts discarding them -- by response, which is not "
+                 "spatially uniform. Measured on a 3072 px frame: 0.02 gives "
+                 "about 20000, 0.05 about 8500, 0.1 about 3900.",
          .step = 0.0002, .softMax = 0.005}};
 
     Param<float> m_contrastPercentile{this, "contrast_k", 1.0f, 0.2f, 3.0f,

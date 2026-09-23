@@ -288,4 +288,89 @@ inline const FeatureSidecar* FeaturesOf(const Image& img) {
     return img.Sidecars().Get<FeatureSidecar>(kFeatureSidecar);
 }
 
+// Reduces a candidate list to `cap` keypoints, spread ACROSS THE FRAME.
+//
+// WHY A GLOBAL RESPONSE RANK IS THE WRONG CAP, which is what every detector
+// here did before.
+//
+// Ranking all candidates by response and keeping the top N sounds obviously
+// right: keep the strongest. But response measures local contrast, and
+// contrast is not uniform across a photograph. On a frame containing an
+// ornate relief against a flat plastered wall, the top ten thousand extrema
+// are all on the relief -- so the wall, which is most of the frame and most
+// of what the next view also sees, contributes nothing.
+//
+// The loss is SPATIAL, and it is why a full-resolution reconstruction
+// collapses. Measured on fountain-P11 at 3072 px: 10000 features gave 625
+// tracks, where raising the cap to 30000 gave 2785 of the same quality. The
+// features existed; the cap threw away the ones that mattered.
+//
+// A GRID FIXES IT. Divide the frame into cells and keep the best few from
+// each, so every region that has features keeps some. This is what ORB does
+// (its "grid-based retention") and what makes it usable at full resolution
+// where the others are not.
+//
+// Cells are sized so the grid holds roughly four times the cap, which leaves
+// each cell a handful of slots -- enough to prefer the stronger feature within
+// a region without letting one region take the whole budget. A cell with
+// fewer candidates than its share simply yields fewer, and the leftover
+// budget is not redistributed: doing so would reintroduce exactly the
+// concentration this exists to prevent.
+//
+// `GetKp` reads the Keypoint out of whatever the caller's candidate type is,
+// since each detector carries its own extra fields alongside it.
+template <typename Cand, typename GetKp>
+void CapSpatially(std::vector<Cand>& cands, int cap, int width, int height,
+                  GetKp getKp) {
+    if (cap < 1 || int(cands.size()) <= cap) return;
+    if (width < 1 || height < 1) return;
+
+    // Roughly 4x the cap in cells, so about four candidates survive per cell.
+    // Square cells rather than a fixed count, so a panoramic frame gets a
+    // proportionally wider grid rather than tall thin cells.
+    const double area = double(width) * double(height);
+    const double cellArea = area / std::max(1.0, double(cap) * 0.25);
+    const int cell = std::max(8, int(std::sqrt(cellArea)));
+    const int cols = std::max(1, (width  + cell - 1) / cell);
+    const int rows = std::max(1, (height + cell - 1) / cell);
+
+    // How many each cell may keep. At least one, so a sparse cell still
+    // contributes rather than being crowded out entirely.
+    const int perCell = std::max(1, cap / std::max(1, cols * rows));
+
+    std::vector<std::vector<Cand>> bins(size_t(cols) * size_t(rows));
+    for (Cand& c : cands) {
+        const Keypoint& kp = getKp(c);
+        const int cx = std::clamp(int(kp.x) / cell, 0, cols - 1);
+        const int cy = std::clamp(int(kp.y) / cell, 0, rows - 1);
+        bins[size_t(cy) * size_t(cols) + size_t(cx)].push_back(std::move(c));
+    }
+
+    std::vector<Cand> kept;
+    kept.reserve(size_t(cap));
+    for (std::vector<Cand>& bin : bins) {
+        if (bin.empty()) continue;
+        const int take = std::min(perCell, int(bin.size()));
+        if (int(bin.size()) > take) {
+            std::nth_element(bin.begin(), bin.begin() + take, bin.end(),
+                             [&](const Cand& a, const Cand& b) {
+                                 return getKp(a).response > getKp(b).response;
+                             });
+        }
+        for (int i = 0; i < take; ++i) kept.push_back(std::move(bin[size_t(i)]));
+    }
+
+    // The per-cell quota is a floor rather than an exact division, so the
+    // total can overshoot slightly. Trim by response, which at this point is
+    // a choice between already spatially-spread candidates.
+    if (int(kept.size()) > cap) {
+        std::nth_element(kept.begin(), kept.begin() + cap, kept.end(),
+                         [&](const Cand& a, const Cand& b) {
+                             return getKp(a).response > getKp(b).response;
+                         });
+        kept.resize(size_t(cap));
+    }
+    cands.swap(kept);
+}
+
 } // namespace tglab

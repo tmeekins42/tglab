@@ -121,6 +121,7 @@ int main(int argc, char** argv) {
     int baIters = -1;            // negative: leave bundle_adjust_sfm's default
     int minLen  = -1;            // negative: leave build_tracks's default
     double minAngle = -1.0;      // negative: leave triangulate's default
+    double detThresh = -1.0;     // negative: leave the detector's default
     std::string script;
 
     for (int i = 1; i < argc; ++i) {
@@ -141,6 +142,7 @@ int main(int argc, char** argv) {
         else if (a == "--ba-iters" && i + 1 < argc) baIters = std::atoi(argv[++i]);
         else if (a == "--min-length" && i + 1 < argc) minLen = std::atoi(argv[++i]);
         else if (a == "--min-angle" && i + 1 < argc) minAngle = std::atof(argv[++i]);
+        else if (a == "--threshold" && i + 1 < argc) detThresh = std::atof(argv[++i]);
         else if (a == "--script" && i + 1 < argc)   script = argv[++i];
         else files.push_back(a);
     }
@@ -282,6 +284,7 @@ int main(int argc, char** argv) {
     {
         auto det = Registry::Get().Create(detector);
         if (features > 0) SetParam(det.get(), "max_features", double(features));
+        if (detThresh > 0.0) SetParam(det.get(), "threshold", detThresh);
         p.AddStage(std::move(det), detector.c_str(), {{-1, 0}}, 1, ++stage);
     }
     const int sDetect = stage - 1;
