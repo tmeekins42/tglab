@@ -195,7 +195,22 @@ public:
     // that the timing above does not capture -- the standalone comparison
     // charges this path for a transfer the chained case does not pay. The
     // proxy path, which is what this algorithm exists for, is always chained.
-    bool HasGPU() const override { return true; }
+    // DISABLED. The kernel below is verified correct -- it matches the CPU
+    // path to quantisation in both directions, see the agreement test -- but
+    // enabling it removed the device on a nineteen-frame group:
+    //
+    //   [gpu] could not allocate a 3072x2048 texture: 0x887A0005
+    //
+    // which is DXGI_ERROR_DEVICE_REMOVED, not out of memory. Something in
+    // this path hangs the GPU and every later allocation then fails
+    // identically. I could not find it by reading, and guessing twice was
+    // worse than useless, so the path is off until it can be reproduced
+    // under a debugger.
+    //
+    // Little is lost meanwhile: measured, the GPU wins 5.8x upscaling and
+    // LOSES at 0.8x downscaling, and downscaling is what the proxy path and
+    // sfm.tgl actually do.
+    bool HasGPU() const override { return false; }
 
     void PrepareGpu(const std::vector<ImageDesc>& inputs) override {
         if (inputs.empty()) return;
