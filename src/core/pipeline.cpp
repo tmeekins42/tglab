@@ -906,6 +906,13 @@ bool Pipeline::BroadcastStage(Stage& s, const std::vector<const Data*>& in,
         // Swap this frame in for the set input; every other input is passed
         // through unchanged, which is what lets a broadcast stage still take
         // ordinary scalar parameters from earlier stages.
+        //
+        // THE CLONE IS RELEASED AS SOON AS THE STAGE IS DONE WITH IT, which
+        // matters because AcquireGpuRead makes it GPU-RESIDENT: a 3072x2048
+        // RGBA8 source is 24 MB of VRAM, and holding nineteen of those plus
+        // their destinations exhausted an 11 GB card and fell back to the CPU
+        // on every frame. The scope below is what bounds it to the frames
+        // actually in flight.
         Data frame{src.images[f].Clone()};
         std::vector<const Data*> frameIn = in;
         frameIn[size_t(setIdx)] = &frame;
@@ -931,30 +938,48 @@ bool Pipeline::BroadcastStage(Stage& s, const std::vector<const Data*>& in,
         }
     };
 
-    if (wantGpu || nFrames <= 1) {
-        for (size_t f = 0; f < nFrames && !failed.load(); ++f) runFrame(f);
-    } else {
-        ParallelFor(nFrames, runFrame);
-    }
-
-    bool ok = !failed.load();
-    if (!ok) *err = firstErr;
-
-    // Gathered after the work, in frame order, so the output set is identical
-    // whatever order the frames completed in.
-    for (size_t f = 0; ok && f < nFrames; ++f) {
+    // One frame's results moved into the output set and its working buffer
+    // released. Called as each frame finishes in the serial case and after the
+    // join in the parallel one.
+    auto harvest = [&](size_t f, bool* okOut) {
         for (size_t p = 0; p < nPorts; ++p) {
             auto* img = (p < frameOuts[f].size())
                             ? std::get_if<Image>(&frameOuts[f][p])
                             : nullptr;
             if (!img) {
                 *err = Where() + "produced no image for frame " + std::to_string(f);
-                ok = false;
-                break;
+                *okOut = false;
+                return;
             }
             results[p].images.push_back(std::move(*img));
         }
+        // The Data that held it, and with it any GPU residency the stage
+        // attached. See the note on the clone above.
+        frameOuts[f].clear();
+    };
+
+    bool ok = true;
+    if (wantGpu || nFrames <= 1) {
+        // SERIAL: harvest as we go, so exactly one frame's worth of source and
+        // destination is live at a time. Holding all of them until the end --
+        // which the first version of this loop did -- kept nineteen
+        // GPU-resident textures alive at once and exhausted the card, falling
+        // back to the CPU on every frame with "residency: allocation failed".
+        for (size_t f = 0; f < nFrames && !failed.load() && ok; ++f) {
+            runFrame(f);
+            if (!failed.load()) harvest(f, &ok);
+        }
+    } else {
+        ParallelFor(nFrames, runFrame);
+        // Gathered after the join, in frame order, so the output set is
+        // identical whatever order the frames completed in. The peak here is
+        // genuinely all of them, which is the cost of running them at once --
+        // but the CPU path holds pixels, not VRAM.
+        for (size_t f = 0; f < nFrames && ok && !failed.load(); ++f)
+            harvest(f, &ok);
     }
+
+    if (failed.load()) { ok = false; *err = firstErr; }
 
     if (!ok) { s.outputs = std::move(saved); return false; }
 
