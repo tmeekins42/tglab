@@ -74,7 +74,22 @@ frames = image("group")
 # Downscale first. A detector's thresholds were calibrated around a megapixel;
 # on a 20 MP frame the same settings find tens of thousands of features on
 # texture too fine to repeat between views. Every reference pipeline does this.
-small = params( resize, scale = 0.5 )( frames )
+#
+# 0.4 RATHER THAN 0.5, because at 0.5 the detector still hits its feature cap
+# and what it discards is decided by RESPONSE RANK, which is not spatially
+# uniform: the strongest extrema cluster on high-contrast detail and the flat
+# regions that carry most of the frame get nothing. Measured on fountain-P11,
+# the scale sweep peaks here: 3102 points at 0.3, 3238 at 0.4, 2602 at 0.5 --
+# denser both ways, because 0.3 starts losing real detail.
+#
+# DO NOT SIMPLY TURN THIS OFF. At full resolution the reconstruction COLLAPSES
+# -- 357 points against 2602 at 0.5 -- and the cause is the same cap: AKAZE
+# finds far more than max_features at 3072 px, so nearly everything is thrown
+# away and what survives is concentrated on the sharpest relief. Raising the
+# cap to 30000 takes the tracks from 625 to 2785, which confirms it. The real
+# fix is a spatially-aware cap (best N per grid cell, as ORB does) rather than
+# a global response rank; until that exists, downscale.
+small = params( resize, scale = 0.4 )( frames )
 
 # MORE FEATURES THAN THE DETECTOR'S DEFAULT, because 5000 is a cap tuned for
 # a single image and SfM is not that.
@@ -106,12 +121,27 @@ feat  = params( detect_akaze, max_features = 10000 )( small )
 # were rejected for want of correspondences and triangulation had nothing left
 # to work with.
 #
-# window = 1 matches each frame to the one before it. Raising it adds loop
-# closures, which is what lets rotation averaging remove drift -- but on this
-# data the rotation residual climbs with it (0, 4 and 15 degrees at windows 1,
-# 2 and 3), because wide baselines share less and the eight-point algorithm is
-# weaker there. Start at 1.
-pairs = params( match_ann, chain = 1, window = 1 )( feat )
+# window = 2 MATCHES EACH FRAME TO THE TWO BEFORE IT, which is what gives a
+# track more than two views -- and the number of views per track is what
+# decides whether the depths are any good.
+#
+# A two-view point is a bare ray intersection with nothing to contradict it,
+# and at triangulate's 2-degree parallax threshold its DEPTH uncertainty is 29
+# times its lateral uncertainty. Half a pixel of match error then becomes a
+# large depth error, and a flat wall reconstructs as several parallel sheets at
+# different depths -- which is exactly how this presented on fountain-P11,
+# looking down at a brick wall that had become three walls.
+#
+# Measured there: window 2 removes most of the phantom planes.
+#
+# THIS IS NOT UNIVERSALLY BETTER. On castle-P19 the rotation residual climbs
+# with the window (0, 4 and 15 degrees at 1, 2 and 3) because that capture
+# turns ~22 degrees per frame, so frames two apart share very little and the
+# extra edges are mostly bad. fountain-P11 turns ~12 degrees per frame and the
+# skip edges are good. Match the window to how fast the camera turns: check
+# `mean rotation` in the relative_pose report, and if frames two apart are more
+# than about 30 degrees apart, stay at 1.
+pairs = params( match_ann, chain = 1, window = 2 )( feat )
 
 # NO align_features here, unlike the panorama script. It fits a homography,
 # which describes a pure camera ROTATION -- exactly what SfM does not have.
@@ -189,7 +219,30 @@ posed = params( relative_pose, fov_deg = 50 )( pairs )
 # geometry and measure it in another -- and it is silent, because both are
 # plausible numbers. This stage used to hardcode 50, which quietly overrode
 # whatever relative_pose was told.
-cloud = params( build_tracks, fov_deg = 50 )( posed )
+# min_length = 3 REJECTS TWO-VIEW TRACKS, and on a well-connected capture it
+# is the single largest improvement in this script.
+#
+# A track seen by only two cameras is triangulated from one ray intersection.
+# It reprojects perfectly -- it was placed to -- and its depth is whatever the
+# match noise decided. Requiring a third view means the depth has to satisfy
+# something it was not fitted to.
+#
+# Measured on fountain-P11 with window 2: the reconstruction's extent falls
+# from 4.95 to 1.42 units, and the phantom planes and most of the stray
+# structure go with it.
+#
+# DO NOT JUDGE THIS BY THE REPROJECTION RMS, which gets WORSE (0.93 to 1.18).
+# That number is computed over the points that SURVIVE, and this filter keeps
+# the hard ones -- a long track spans a wide baseline and is harder to fit --
+# while discarding the easy two-view ones that fit trivially. A filter that
+# removes difficult data always improves the average of what is left. I
+# initially read that as the filter being harmful and was wrong; the cloud is
+# plainly better on screen.
+#
+# NEEDS A CAPTURE THAT CHAINS. castle-P19's mean track length is 2.2, so this
+# leaves it 399 points of 4019 -- it deletes the reconstruction. Check the
+# len2 percentage in the build_tracks report: two thirds or less, use 3.
+cloud = params( build_tracks, fov_deg = 50, min_length = 3 )( posed )
      => params( rotation_average )()
      => params( global_position )()
      => params( triangulate, max_distance = 3 )()
