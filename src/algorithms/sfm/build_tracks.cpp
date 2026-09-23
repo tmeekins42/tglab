@@ -247,11 +247,20 @@ public:
             c.height = d.height;
             c.cx = 0.5 * d.width;
             c.cy = 0.5 * d.height;
-            // A 50-degree horizontal field of view, which is an ordinary lens.
-            // Only a starting point: the view graph refines it, and bundle
-            // adjustment solves it. Stated rather than left at 1.0 so a
-            // reprojection before any solve is merely wrong rather than absurd.
-            c.focal = 0.5 * d.width / std::tan(0.5 * 50.0 * 3.14159265358979 / 180.0);
+            // THE STARTING FOCAL, and it has to match what relative_pose used.
+            //
+            // This was hardcoded at 50 degrees, which silently overrode the
+            // fov_deg set on relative_pose: that stage normalised its
+            // correspondences with one focal and every later stage then worked
+            // with another. Measured on fountain-P11, the refined focal came
+            // back as exactly 50.0 from several different starting guesses --
+            // which read as a solve with multiple minima and was really this
+            // value being reinstated here.
+            //
+            // Still only a starting point -- bundle adjustment solves it --
+            // but a starting point the rest of the chain agrees with.
+            c.focal = 0.5 * d.width /
+                      std::tan(0.5 * double(m_fovDeg) * 3.14159265358979 / 180.0);
         }
 
         // The view graph, if relative_pose has already run. Carried on the
@@ -394,6 +403,21 @@ public:
     bool HasGPU() const override { return false; }
 
 private:
+    // MUST MATCH relative_pose's fov_deg. That stage normalises its
+    // correspondences with this focal, and every stage after it reads the
+    // camera slots filled in here -- so two different values mean the
+    // reconstruction is solved in one geometry and measured in another.
+    //
+    // Not read from relative_pose directly because the stages are
+    // independent by design: a chain may run build_tracks without it. Set
+    // both in the script, which sfm.tgl does.
+    Param<float> m_fovDeg{this, "fov_deg", 50.0f, 5.0f, 150.0f,
+        {.help = "Starting horizontal field of view, in degrees, for the "
+                 "camera slots this stage fills in. Set it to the same value "
+                 "as relative_pose's fov_deg: that stage solves in this "
+                 "geometry and everything downstream measures in it. Bundle "
+                 "adjustment refines it afterwards."}};
+
     Param<int> m_minLength{this, "min_length", 2, 2, 20,
         {.help = "Fewest frames a track must appear in. Two is the minimum "
                  "that says anything -- one point seen once constrains "

@@ -171,7 +171,13 @@ posed = params( relative_pose, fov_deg = 50 )( pairs )
 # support it -- triangulate's header describes this explicitly, and COLMAP
 # alternates the two until neither improves. A third round still helps but is
 # clearly converging, and costs another full bundle solve.
-cloud = params( build_tracks )( posed )
+# fov_deg HERE MUST MATCH relative_pose's, above. That stage normalises its
+# correspondences with this focal; build_tracks fills in the camera slots every
+# later stage reads. Two different values solve the reconstruction in one
+# geometry and measure it in another -- and it is silent, because both are
+# plausible numbers. This stage used to hardcode 50, which quietly overrode
+# whatever relative_pose was told.
+cloud = params( build_tracks, fov_deg = 50 )( posed )
      => params( rotation_average )()
      => params( global_position )()
      => params( triangulate, max_distance = 4 )()

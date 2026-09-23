@@ -118,6 +118,7 @@ int main(int argc, char** argv) {
     int crossCheck = -1;
     double maxDistance = -1.0;   // negative: leave the stages' own defaults
     int poseMethod = -1;         // negative: leave relative_pose's own default
+    int baIters = -1;            // negative: leave bundle_adjust_sfm's default
     std::string script;
 
     for (int i = 1; i < argc; ++i) {
@@ -135,6 +136,7 @@ int main(int argc, char** argv) {
         else if (a == "--cross-check" && i + 1 < argc) crossCheck = std::atoi(argv[++i]);
         else if (a == "--max-distance" && i + 1 < argc) maxDistance = std::atof(argv[++i]);
         else if (a == "--pose-method" && i + 1 < argc) poseMethod = std::atoi(argv[++i]);
+        else if (a == "--ba-iters" && i + 1 < argc) baIters = std::atoi(argv[++i]);
         else if (a == "--script" && i + 1 < argc)   script = argv[++i];
         else files.push_back(a);
     }
@@ -316,8 +318,11 @@ int main(int argc, char** argv) {
     }
     const int sPose = stage - 1;
 
-    p.AddStage(Registry::Get().Create("build_tracks"), "build_tracks",
-               {{sPose, 0}}, 1, ++stage);
+    // fov_deg must match relative_pose's: that stage solves in this geometry
+    // and build_tracks fills in the camera slots everything downstream reads.
+    auto bt = Registry::Get().Create("build_tracks");
+    SetParam(bt.get(), "fov_deg", fov);
+    p.AddStage(std::move(bt), "build_tracks", {{sPose, 0}}, 1, ++stage);
     const int sTracks = stage - 1;
 
     {
@@ -341,6 +346,7 @@ int main(int argc, char** argv) {
 
     auto ba = Registry::Get().Create("bundle_adjust_sfm");
     if (maxDistance > 0.0) SetParam(ba.get(), "max_distance", maxDistance);
+    if (baIters > 0) SetParam(ba.get(), "iterations", double(baIters));
     p.AddStage(std::move(ba), "bundle_adjust_sfm", {{sTri, 0}}, 1, ++stage);
     const int sBa1 = stage - 1;
 
@@ -356,6 +362,7 @@ int main(int argc, char** argv) {
 
     auto ba2 = Registry::Get().Create("bundle_adjust_sfm");
     if (maxDistance > 0.0) SetParam(ba2.get(), "max_distance", maxDistance);
+    if (baIters > 0) SetParam(ba2.get(), "iterations", double(baIters));
     p.AddStage(std::move(ba2), "bundle_adjust_sfm", {{sTri2, 0}}, 1, ++stage);
     const int sBundle = stage - 1;
 
