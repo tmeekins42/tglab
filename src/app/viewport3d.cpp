@@ -236,7 +236,14 @@ bool Viewport3D::EnsurePipeline(Device& dev) {
 
 bool Viewport3D::UploadGeometry(Device& dev) {
     if (!m_cloud) return false;
-    if (m_points && m_uploadedVersion == m_version) return m_pointCount > 0;
+    // THE CACHE KEY IS EVERYTHING THE BUFFER DEPENDS ON, not just the content
+    // version. `m_showCameras` changes which points are written, so a rebuild
+    // keyed on the version alone left the cameras baked in and the checkbox
+    // did nothing -- it flipped a bool that no longer reached the geometry.
+    if (m_points && m_uploadedVersion == m_version &&
+        m_uploadedCameras == m_showCameras) {
+        return m_pointCount > 0;
+    }
 
     std::vector<GpuPoint> pts;
     pts.reserve(m_cloud->tracks.size() + m_cloud->cameras.size() * 2);
@@ -311,6 +318,7 @@ bool Viewport3D::UploadGeometry(Device& dev) {
 
     m_pointCount = int(pts.size());
     m_uploadedVersion = m_version;
+    m_uploadedCameras = m_showCameras;
     m_dev = &dev;
     return true;
 }

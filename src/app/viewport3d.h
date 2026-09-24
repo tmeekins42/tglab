@@ -65,6 +65,10 @@ private:
 
     std::shared_ptr<const PointCloud> m_cloud;
     uint64_t m_uploadedVersion = 0;   // which version the buffers hold
+    
+    // ...and whether that upload included the cameras. Part of the cache key
+    // because the toggle changes which points are written; see UploadGeometry.
+    bool     m_uploadedCameras = true;
 
     RenderTarget m_target;
     OrbitCamera  m_own;

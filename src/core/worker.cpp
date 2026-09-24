@@ -387,7 +387,28 @@ void PipelineWorker::Run() {
                     continue;
                 }
 
-                if (!std::holds_alternative<Image>(*d)) continue;
+                // A GROUP shows its FIRST frame rather than nothing.
+                //
+                // This used to `continue`, so `display(group, "frames")` --
+                // which is the obvious thing to write, and what sfm.tgl does
+                // -- produced a panel stuck on "computing..." forever. The
+                // pipeline had finished; the viewer was simply never handed
+                // anything, and there was no way to tell those apart from
+                // outside.
+                //
+                // The first frame is a placeholder for a frame SELECTOR, which
+                // is what this panel eventually wants: a group of nineteen
+                // photographs has nineteen things worth looking at. Showing
+                // one is a poor answer and showing none is a bug report.
+                const Data* shown = d;
+                Data firstFrame;
+                if (const ImageSet* set = std::get_if<ImageSet>(d)) {
+                    if (set->images.empty()) continue;
+                    firstFrame = Data{const_cast<Image&>(set->images[0]).Clone()};
+                    shown = &firstFrame;
+                }
+
+                if (!std::holds_alternative<Image>(*shown)) continue;
 
                 // A palette source (stage < 0) changes only when the file
                 // behind it is replaced, which arrives as a new source version.
@@ -397,7 +418,7 @@ void PipelineWorker::Run() {
                 uint64_t& ver = m_viewerVersions[vd.name];
                 if (changed || ver == 0) ++ver;
 
-                const Image& result = std::get<Image>(*d);
+                const Image& result = std::get<Image>(*shown);
 
                 // Still on the GPU: hand over a reference and do NOT read it
                 // back. Clone() would map the pixels, which is the 86 ms this
