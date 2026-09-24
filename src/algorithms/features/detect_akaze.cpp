@@ -188,6 +188,16 @@ public:
         base.w = dw; base.h = dh;
         base.v.assign(size_t(dw) * size_t(dh), 0.0f);
 
+        // The opponent-colour planes, only when there is colour to read and
+        // the parameter asks for it. Kept at the same size as `base` so
+        // Describe indexes all three identically.
+        const bool wantColour = bool(m_colour) && ch >= 3;
+        Plane op1, op2;
+        if (wantColour) {
+            op1.w = dw; op1.h = dh; op1.v.assign(size_t(dw) * size_t(dh), 0.0f);
+            op2.w = dw; op2.h = dh; op2.v.assign(size_t(dw) * size_t(dh), 0.0f);
+        }
+
         // Box-averaged when shrinking, for the reason resize states: point
         // sampling a minification aliases, and aliased detail MOVES between
         // frames, which is precisely what a detector must not chase.
@@ -199,27 +209,40 @@ public:
             for (int x = 0; x < dw; ++x) {
                 const int x0 = std::clamp(int(double(x) * xr), 0, w - 1);
                 const int x1 = std::clamp(int(std::ceil(double(x + 1) * xr)), x0 + 1, w);
-                double acc = 0.0;
+                double acc = 0.0, accO1 = 0.0, accO2 = 0.0;
                 int n = 0;
                 for (int sy = y0; sy < y1; ++sy)
                     for (int sx = x0; sx < x1; ++sx) {
                         const float* p = in.At(sx, sy);
-                        acc += (ch >= 3)
-                                   ? (0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2])
-                                   : p[0];
+                        if (ch >= 3) {
+                            acc += 0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2];
+                            // Opponent axes, carried at the same resolution as
+                            // the grey plane so Describe can read them with the
+                            // same coordinates. See kColourBits.
+                            accO1 += double(p[0]) - double(p[1]);
+                            accO2 += 2.0 * double(p[2]) - double(p[0]) - double(p[1]);
+                        } else {
+                            acc += p[0];
+                        }
                         ++n;
                     }
-                base.v[size_t(y) * size_t(dw) + size_t(x)] =
-                    float(acc / (double(n ? n : 1) * double(scale)));
+                const double inv = 1.0 / (double(n ? n : 1) * double(scale));
+                base.v[size_t(y) * size_t(dw) + size_t(x)] = float(acc * inv);
+                if (wantColour) {
+                    op1.v[size_t(y) * size_t(dw) + size_t(x)] = float(accO1 * inv);
+                    op2.v[size_t(y) * size_t(dw) + size_t(x)] = float(accO2 * inv);
+                }
             }
         }
 
         auto sidecar = std::make_shared<FeatureSidecar>();
         sidecar->detector = "akaze";
         sidecar->descriptors.kind = DescriptorKind::Binary;
-        sidecar->descriptors.dim  = kDescBits;
+        sidecar->descriptors.dim  = wantColour ? (kDescBits + kColourBits)
+                                               : kDescBits;
 
-        Detect(base, ctx, sidecar.get());
+        Detect(base, wantColour ? &op1 : nullptr, wantColour ? &op2 : nullptr,
+               ctx, sidecar.get());
 
         // BACK TO INPUT COORDINATES. Everything downstream -- the matcher, the
         // essential matrix, triangulation -- reads these as pixels of the image
@@ -261,7 +284,31 @@ public:
 private:
     // 3 grids (2x2, 3x3, 4x4) x 3 channels (intensity, dx, dy) x pairs.
     // 2x2 gives 6 pairs, 3x3 gives 36, 4x4 gives 120: (6+36+120)*3 = 486.
+    // 486 bits: three grids (2x2, 3x3, 4x4), every cell pair compared on three
+    // channels -- intensity and the two gradients.
     static constexpr int kDescBits = 486;
+
+    // ...plus the colour bits, when colour is on.
+    //
+    // WHY OPPONENT COLOUR RATHER THAN RGB. The three RGB channels are strongly
+    // correlated -- a shadow darkens all of them together -- so comparing them
+    // pairwise mostly re-measures the intensity the descriptor already has.
+    // The opponent axes separate what intensity does not carry:
+    //
+    //     R - G        red against green
+    //     2B - R - G   blue against yellow
+    //
+    // These are the axes human vision uses, and they are what a "green feature
+    // must not match a red one" test actually needs. A shadow moves both
+    // hardly at all, which is the point: colour should add discrimination
+    // without adding sensitivity to lighting.
+    //
+    // Same pairwise-comparison form as the rest of the descriptor, so the bits
+    // are directly comparable by Hamming distance and nothing downstream
+    // changes. 2x2 and 3x3 only -- 4x4 on a colour channel is mostly noise at
+    // the patch sizes involved, and each grid costs cells*(cells-1)/2 bits per
+    // channel.
+    static constexpr int kColourBits = 2 * (6 + 36);   // (2x2: 6, 3x3: 36) x 2 axes
 
     struct Level {
         Plane img;        // the diffused image at this scale
@@ -271,7 +318,8 @@ private:
         int   step = 1;      // pixels in the input per pixel here
     };
 
-    void Detect(const Plane& base, RunCtx& ctx, FeatureSidecar* out) {
+    void Detect(const Plane& base, const Plane* op1, const Plane* op2,
+                RunCtx& ctx, FeatureSidecar* out) {
         const int octaves = std::clamp(int(m_octaves), 1, 4);
         const int perOct  = std::clamp(int(m_scales), 1, 4);
         const float sigma0 = 1.6f;
@@ -385,7 +433,7 @@ private:
             }
         }
 
-        FindExtrema(levels, ctx, out);
+        FindExtrema(levels, op1, op2, ctx, out);
     }
 
     // Halves a plane by point sampling. The source has already been diffused to
@@ -430,7 +478,8 @@ private:
         int      level;
     };
 
-    void FindExtrema(const std::vector<Level>& levels, RunCtx& ctx,
+    void FindExtrema(const std::vector<Level>& levels,
+                     const Plane* op1, const Plane* op2, RunCtx& ctx,
                      FeatureSidecar* out) {
         const float thresh = float(m_threshold);
         std::vector<Cand> cands;
@@ -534,8 +583,13 @@ private:
             kp.angle = m_upright ? 0.0f : Orientation(levels[size_t(c.level)].img, kp);
             out->keypoints.push_back(kp);
 
-            std::vector<uint8_t> desc(size_t((kDescBits + 7) / 8), 0);
+            // Sized for colour when it is on, so DescribeColour has room.
+            const int bits = (op1 && op2) ? (kDescBits + kColourBits) : kDescBits;
+            std::vector<uint8_t> desc(size_t((bits + 7) / 8), 0);
             Describe(levels[size_t(c.level)].img, kp, desc.data());
+            if (op1 && op2)
+                DescribeColour(*op1, *op2, kp, levels[size_t(c.level)].step,
+                               desc.data());
             out->descriptors.b.insert(out->descriptors.b.end(),
                                       desc.begin(), desc.end());
         }
@@ -643,6 +697,70 @@ private:
         }
     }
 
+    // The colour half of the descriptor: the same pairwise-comparison form as
+    // Describe, on the two opponent axes. See kColourBits.
+    //
+    // Reads the BASE-resolution colour planes rather than the octave's
+    // diffused one, so `step` converts the keypoint back into their pixels.
+    // Colour is not diffused at all: the scale space exists to find extrema at
+    // multiple scales, and averaging a colour over a patch is already the
+    // smoothing that matters here.
+    void DescribeColour(const Plane& c1, const Plane& c2, const Keypoint& kp,
+                        int step, uint8_t* desc) const {
+        const float cosA = std::cos(kp.angle), sinA = std::sin(kp.angle);
+        const float s = std::max(1.0f, kp.scale);
+        const float patch = 12.0f * s;
+
+        // Into the colour planes' coordinates. kp.x is in the octave's pixels
+        // at this point (Describe is called before the mapping back to input),
+        // so multiplying by the octave step lands on the base plane.
+        const float bx = kp.x * float(step), by = kp.y * float(step);
+
+        int bit = kDescBits;
+        for (int grid : {2, 3}) {
+            const int cells = grid * grid;
+            std::vector<float> m1(size_t(cells), 0.0f);
+            std::vector<float> m2(size_t(cells), 0.0f);
+            std::vector<int>   n(size_t(cells), 0);
+
+            const int span = std::max(2, int(patch * 0.5f * float(step)));
+            for (int dy = -span; dy <= span; ++dy)
+                for (int dx = -span; dx <= span; ++dx) {
+                    const float rx = float(dx) * cosA + float(dy) * sinA;
+                    const float ry = -float(dx) * sinA + float(dy) * cosA;
+                    const float u = (rx / (patch * float(step)) + 0.5f) * float(grid);
+                    const float v = (ry / (patch * float(step)) + 0.5f) * float(grid);
+                    if (u < 0.0f || v < 0.0f || u >= float(grid) || v >= float(grid))
+                        continue;
+                    const int cx = std::clamp(int(u), 0, grid - 1);
+                    const int cy = std::clamp(int(v), 0, grid - 1);
+                    const int ci = cy * grid + cx;
+                    const int px = int(bx) + dx, py = int(by) + dy;
+                    m1[size_t(ci)] += c1.At(px, py);
+                    m2[size_t(ci)] += c2.At(px, py);
+                    ++n[size_t(ci)];
+                }
+
+            for (int i = 0; i < cells; ++i)
+                if (n[size_t(i)] > 0) {
+                    m1[size_t(i)] /= float(n[size_t(i)]);
+                    m2[size_t(i)] /= float(n[size_t(i)]);
+                }
+
+            for (int i = 0; i < cells; ++i)
+                for (int j = i + 1; j < cells; ++j) {
+                    SetBitAt(desc, bit++, m1[size_t(i)] > m1[size_t(j)]);
+                    SetBitAt(desc, bit++, m2[size_t(i)] > m2[size_t(j)]);
+                }
+        }
+    }
+
+    // As SetBit, but bounded by the FULL descriptor length including colour.
+    static void SetBitAt(uint8_t* d, int bit, bool on) {
+        if (bit < 0 || bit >= kDescBits + kColourBits) return;
+        if (on) d[bit / 8] |= uint8_t(1u << (bit % 8));
+    }
+
     static void SetBit(uint8_t* d, int bit, bool on) {
         if (bit < 0 || bit >= kDescBits) return;
         if (on) d[bit / 8] |= uint8_t(1u << (bit % 8));
@@ -686,6 +804,26 @@ private:
                  "the image rather than fixed: a value tuned on a contrasty "
                  "frame stops all diffusion on a flat one.",
          .step = 0.05}};
+
+    // COLOUR IN THE DESCRIPTOR, as an experiment with a measurable question:
+    // does distinguishing a green corner from a red one with the same
+    // gradients improve matching?
+    //
+    // Every classical detector is greyscale, so two features with identical
+    // local structure are indistinguishable however different their colour.
+    // On architectural scenes -- repeated windows, repeated brick -- that is
+    // exactly the ambiguity that defeats the ratio test.
+    //
+    // Adds 84 bits on two OPPONENT axes (R-G and 2B-R-G) rather than on RGB,
+    // which are correlated with intensity and would mostly re-measure what the
+    // descriptor already has. Off by default until it is measured to help; the
+    // descriptor length changes when it is on, so a set detected with it
+    // cannot be matched against one detected without.
+    Param<bool> m_colour{this, "colour", false,
+        "Add opponent-colour bits to the descriptor, so two features with the "
+        "same local structure but different colour no longer match. Costs 84 "
+        "bits of descriptor and a little detection time. Greyscale input "
+        "ignores it."};
 
     Param<bool> m_upright{this, "upright", false,
         "Skip orientation and assume the camera is level. Faster and more "
