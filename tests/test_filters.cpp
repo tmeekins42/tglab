@@ -1684,7 +1684,8 @@ static void TestProxyBehaviour() {
     // list is written out, and why the test exists at all.
     const std::set<std::string> sidecar = {
         "detect_sift", "detect_surf", "detect_akaze", "detect_orb",
-        "detect_brisk", "match_brute", "match_ann", "align_features",
+        "detect_brisk", "match_brute", "match_ann", "match_guided",
+        "align_features",
         "bundle_adjust", "draw_features", "draw_matches",
     };
 
