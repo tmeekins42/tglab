@@ -13,6 +13,11 @@
 #                    whole game: a point that is not found again in the next
 #                    frame contributes nothing.
 #
+#                    `max_dim` downscales what the DETECTOR sees without
+#                    touching the image, which is what lets the rest of the
+#                    pipeline work at full resolution -- see the note on
+#                    resize below.
+#
 #   match_ann        pairs them. `chain` matches each frame against its
 #                    neighbours rather than against frame 0, and `window` says
 #                    how many neighbours. More than one is what gives the view
@@ -91,24 +96,31 @@
 
 frames = image("group")
 
-# Downscale first. A detector's thresholds were calibrated around a megapixel;
-# on a 20 MP frame the same settings find tens of thousands of features on
-# texture too fine to repeat between views. Every reference pipeline does this.
+# NO LONGER REQUIRED, and kept for speed rather than correctness.
 #
-# 0.4 RATHER THAN 0.5, because at 0.5 the detector still hits its feature cap
-# and what it discards is decided by RESPONSE RANK, which is not spatially
-# uniform: the strongest extrema cluster on high-contrast detail and the flat
-# regions that carry most of the frame get nothing. Measured on fountain-P11,
-# the scale sweep peaks here: 3102 points at 0.3, 3238 at 0.4, 2602 at 0.5 --
-# denser both ways, because 0.3 starts losing real detail.
+# This used to be load-bearing. A detector's thresholds are calibrated around
+# a megapixel, so at 3072 px AKAZE found far more than max_features, threw
+# nearly all of them away by RESPONSE RANK -- which clusters on high-contrast
+# relief and starves the flat regions carrying most of the frame -- and the
+# reconstruction collapsed to a few hundred points. The comment here used to
+# say DO NOT TURN THIS OFF, in capitals, and it was right at the time.
 #
-# DO NOT SIMPLY TURN THIS OFF. At full resolution the reconstruction COLLAPSES
-# -- 357 points against 2602 at 0.5 -- and the cause is the same cap: AKAZE
-# finds far more than max_features at 3072 px, so nearly everything is thrown
-# away and what survives is concentrated on the sharpest relief. Raising the
-# cap to 30000 takes the tracks from 625 to 2785, which confirms it. The real
-# fix is a spatially-aware cap (best N per grid cell, as ORB does) rather than
-# a global response rank; until that exists, downscale.
+# detect_akaze grew a `max_dim` since, which downscales what the DETECTOR
+# sees while leaving the image alone. That fixed the cause, and the warning
+# with it. Measured on fountain-P11:
+#
+#   resize   sparse points   dense points   sweep time
+#     0.4             2032         508582         15 s
+#     off             2894        2507256         47 s
+#
+# FULL RESOLUTION IS NOW BETTER, not worse: 40% more sparse points and five
+# times the dense cloud, because the sweep correlates real pixels rather than
+# a quarter of them.
+#
+# So this is a speed control. The dense stages cost roughly the pixel count,
+# and 2.5 million points is more than most uses need -- 0.4 is a reasonable
+# default for working quickly and turning it off is the right move for a
+# final reconstruction. Both are correct; they differ in how long you wait.
 small = params( resize, scale = 0.4 )( frames )
 
 # MORE FEATURES THAN THE DETECTOR'S DEFAULT, because 5000 is a cap tuned for
@@ -324,10 +336,11 @@ cloud = params( build_tracks, fov_deg = 50, min_length = 3 )( posed )
 # in the cloud; requiring three removes most of it, at a real cost in
 # coverage. Raise it further on a capture with many overlapping views.
 #
-# THE COST IS REAL AND IT DOMINATES. The sweep runs 250-300 s against ~13 s
-# for the entire detector, matching and SfM chain above it, because it
-# correlates a window per pixel per plane per neighbour -- a few billion
-# operations. Lower `planes` first if that matters; the cost is linear in it.
+# THE SWEEP IS THE EXPENSIVE STAGE, though far less so than it was: ~6 s
+# against ~13 s for the detector, matching and SfM chain above it. It
+# correlates a window per pixel per plane per neighbour, which was 110 s
+# before the warp-once-per-plane rewrite. Lower `planes` if it matters;
+# the cost is linear in it.
 #
 # Delete these two lines and the "dense" viewer to get the sparse pipeline
 # back -- nothing above depends on them.

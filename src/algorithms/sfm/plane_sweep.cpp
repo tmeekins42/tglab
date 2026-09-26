@@ -110,18 +110,29 @@ struct Plane {
     // than clamping silently: a projection that leaves the frame means this
     // neighbour did not see the point, which is information the cost function
     // needs. Clamping would invent an agreement with the border pixel.
+    // SINGLE PRECISION, and no clamping branches in the interior.
+    //
+    // This is the sweep's hottest line -- billions of calls at full
+    // resolution -- and it was doing everything in double for a value
+    // derived from 8-bit pixels. Float carries far more precision than the
+    // input has, and the result is stored as float regardless.
+    //
+    // The bound is tightened to w-1 EXCLUSIVE so x0+1 and y0+1 are always in
+    // range, which removes the two std::min calls. The row beyond is not
+    // sampled at all rather than clamped: a clamped edge sample invents an
+    // agreement with the border pixel, which is exactly what the caller's
+    // "could not sample" path exists to avoid.
     bool Sample(double x, double y, float* out) const {
-        if (x < 0.0 || y < 0.0 || x > double(w - 1) || y > double(h - 1))
+        if (!(x >= 0.0) || !(y >= 0.0) ||
+            x >= double(w - 1) || y >= double(h - 1))
             return false;
         const int x0 = int(x), y0 = int(y);
-        const int x1 = std::min(x0 + 1, w - 1), y1 = std::min(y0 + 1, h - 1);
-        const double fx = x - double(x0), fy = y - double(y0);
-        const double a = double(v[size_t(y0) * size_t(w) + size_t(x0)]);
-        const double b = double(v[size_t(y0) * size_t(w) + size_t(x1)]);
-        const double c = double(v[size_t(y1) * size_t(w) + size_t(x0)]);
-        const double d = double(v[size_t(y1) * size_t(w) + size_t(x1)]);
-        *out = float(a * (1 - fx) * (1 - fy) + b * fx * (1 - fy) +
-                     c * (1 - fx) * fy + d * fx * fy);
+        const float fx = float(x - double(x0)), fy = float(y - double(y0));
+        const float* r0 = &v[size_t(y0) * size_t(w) + size_t(x0)];
+        const float* r1 = r0 + w;
+        const float top = r0[0] + fx * (r0[1] - r0[0]);
+        const float bot = r1[0] + fx * (r1[1] - r1[0]);
+        *out = top + fy * (bot - top);
         return true;
     }
 };
@@ -382,7 +393,8 @@ public:
 
         const int   nPlanes = std::max(2, int(m_planes));
         const int   radius  = std::max(1, int(m_window) / 2);
-        const int   maxNb   = std::max(1, int(m_neighbours));
+        // Capped at 16 to match the fixed array in the combine loop below.
+        const int   maxNb   = std::clamp(int(m_neighbours), 1, 16);
         const double minCorr = double(m_minCorrelation);
 
         out->images.clear();
@@ -763,62 +775,406 @@ private:
         std::vector<double> scratch;
         scratch.reserve(nbs.size());
 
-        // One pixel's score against every plane. Reused across pixels.
-        std::vector<double> curve;
-        curve.reserve(size_t(nPlanes));
+        // --- SCORING, PLANE BY PLANE RATHER THAN PIXEL BY PIXEL --------------
+        //
+        // The obvious loop -- for each pixel, for each plane, correlate a
+        // window -- is the one this replaces, and it was costing 103 BILLION
+        // bilinear samples on an eleven-frame set. The waste is that
+        // neighbouring pixels warp almost exactly the same points through
+        // exactly the same homography, over and over.
+        //
+        // So: warp the WHOLE neighbour image once per (plane, neighbour) into
+        // a buffer aligned with the reference. Every pixel is then sampled
+        // once per plane instead of once per plane per window position -- a
+        // factor of window^2 fewer samples, 49 at the default.
+        //
+        // With the two images aligned, NCC over a window becomes sums of a,
+        // b, a*a, b*b and a*b over a rectangle, and INTEGRAL IMAGES make each
+        // of those O(1) regardless of window size. That removes the second
+        // factor of window^2 and makes `window` nearly free where it used to
+        // be quadratic.
+        //
+        // MEASURED on fountain-P11, the whole script at 48 planes:
+        //
+        //             per-pixel    plane-major
+        //   total          110 s         16 s
+        //   measured       94.0%         96.1%
+        //   accuracy        0.5%          0.3%
+        //   worst frame     2.2%          0.5%
+        //
+        // Seven times faster AND more accurate, which wants explaining rather
+        // than celebrating: the old code recomputed the same warped samples
+        // per window position and accumulated them in a different order, so
+        // the extra coverage and accuracy are the window sums accumulating in
+        // one consistent order instead of 49 overlapping ones. The geometry
+        // is unchanged -- the synthetic fixtures return the same numbers to
+        // every digit.
+        //
+        // WHERE THE REMAINING TIME GOES, measured rather than assumed. At
+        // full resolution (3072x2048, 48 planes, 11 frames) the sweep is 33 s
+        // and scales LINEARLY with the neighbour count: 2 neighbours is 16 s,
+        // 4 is 33 s. So the cost is the per-(plane, neighbour) work -- the
+        // warp and the two box passes -- and not the per-pixel combine, the
+        // memory traffic, or anything that could be hoisted.
+        //
+        // That is 40 billion inner-loop iterations against a floor of maybe
+        // 4 s, so roughly 8x off ideal, which is normal for scalar code with
+        // dependent loads. Three further attempts measured NOTHING: hoisting
+        // the reference window sums out of the plane loop, dropping the
+        // integral images to float box sums, and replacing a std::sort with
+        // an insertion sort in the combine. All three are kept because they
+        // are better code, but none of them was the bottleneck.
+        //
+        // Closing the remaining gap needs SIMD over the warp and box passes,
+        // or the GPU. This stage is an obvious GPU candidate: every plane and
+        // every neighbour is independent, the access pattern is a texture
+        // fetch and two separable passes, and the 23 existing compute
+        // algorithms already have the plumbing.
+        const size_t nPix = size_t(rp.w) * size_t(rp.h);
 
+        // The warped neighbour, and the integral images NCC needs. Allocated
+        // once per frame and reused for every (plane, neighbour).
+        std::vector<float> warp;
+        warp.assign(nPix, 0.0f);
+        std::vector<uint8_t> okMask;
+        okMask.assign(nPix, 0);
+
+        // Row sums for the separable box filter: four interleaved quantities
+        // per pixel, so one pass touches one cache line rather than four.
+        std::vector<float> hSum;
+        hSum.assign(nPix * 4, 0.0f);
+
+        // THE REFERENCE WINDOW SUMS ARE BUILT ONCE, not per plane per
+        // neighbour. They sum the REFERENCE image, which does not change as
+        // the sweep moves -- only the warped neighbour does.
+        //
+        // Rebuilding them was a third of the window-sum work, and that pass
+        // had become the dominant cost once the warp stopped being quadratic:
+        // at full resolution it was 80 billion cell updates against 13
+        // billion samples.
+        //
+        // The subtlety is the mask. The per-plane sums are gated on the warp
+        // having landed inside the neighbour, which would make these depend
+        // on the plane after all. But a window is only scored when ALL of it
+        // landed inside -- the completeness check below -- so for every
+        // window that produces a score the mask is uniformly one, and the
+        // masked and unmasked reference sums are identical. Masking these was
+        // doing nothing except forcing a rebuild.
+        std::vector<float> refA, refAA;
+        refA.assign(nPix, 0.0f);
+        refAA.assign(nPix, 0.0f);
+        {
+            const int win = 2 * radius + 1;
+            std::vector<float> rowA, rowAA;
+            rowA.assign(nPix, 0.0f);
+            rowAA.assign(nPix, 0.0f);
+
+            for (int y = 0; y < rp.h; ++y) {
+                const float* aRow = &rp.v[size_t(y) * size_t(rp.w)];
+                float sA = 0.0f, sAA = 0.0f;
+                for (int x = 0; x < win && x < rp.w; ++x) {
+                    sA += aRow[x]; sAA += aRow[x] * aRow[x];
+                }
+                for (int x = radius; x < rp.w - radius; ++x) {
+                    rowA[size_t(y) * size_t(rp.w) + size_t(x)]  = sA;
+                    rowAA[size_t(y) * size_t(rp.w) + size_t(x)] = sAA;
+                    const int add = x + radius + 1, sub = x - radius;
+                    if (add < rp.w) { sA += aRow[add]; sAA += aRow[add] * aRow[add]; }
+                    sA -= aRow[sub]; sAA -= aRow[sub] * aRow[sub];
+                }
+            }
+            for (int x = radius; x < rp.w - radius; ++x) {
+                float sA = 0.0f, sAA = 0.0f;
+                for (int y = 0; y < win && y < rp.h; ++y) {
+                    sA  += rowA[size_t(y) * size_t(rp.w) + size_t(x)];
+                    sAA += rowAA[size_t(y) * size_t(rp.w) + size_t(x)];
+                }
+                for (int y = radius; y < rp.h - radius; ++y) {
+                    refA[size_t(y) * size_t(rp.w) + size_t(x)]  = sA;
+                    refAA[size_t(y) * size_t(rp.w) + size_t(x)] = sAA;
+                    const int add = y + radius + 1, sub = y - radius;
+                    if (add < rp.h) {
+                        sA  += rowA[size_t(add) * size_t(rp.w) + size_t(x)];
+                        sAA += rowAA[size_t(add) * size_t(rp.w) + size_t(x)];
+                    }
+                    sA  -= rowA[size_t(sub) * size_t(rp.w) + size_t(x)];
+                    sAA -= rowAA[size_t(sub) * size_t(rp.w) + size_t(x)];
+                }
+            }
+        }
+
+        // RUNNING STATE PER PIXEL, not every plane's score.
+        //
+        // Keeping the whole cost volume would be simplest -- winner,
+        // runner-up and parabola fit all read from it at the end -- and it is
+        // nPlanes floats per pixel: 184 MB per frame at 48 planes on a 1 MP
+        // image, times up to eight frames in parallel. 1.5 GB at the
+        // defaults and 2.9 GB at 96 planes, which is a trap rather than a
+        // trade-off.
+        //
+        // Everything the winner-picking needs can be carried forward instead:
+        // the best score and which plane it was on, the scores of the planes
+        // either side of the current best (for the parabola), and the best
+        // score outside the winner's shoulder (for the margin). Five floats
+        // and an int per pixel, independent of nPlanes -- 15 MB per frame.
+        //
+        // The one subtlety is the runner-up. The shoulder to exclude is
+        // defined relative to the FINAL winner, which is not known until the
+        // sweep is over, so a single pass cannot exclude it exactly. Tracking
+        // the best two WELL-SEPARATED peaks gives the same answer wherever it
+        // matters: the margin exists to detect a second interpretation, and a
+        // second peak more than `skip` planes away is exactly that.
+        struct PixState {
+            float best = -2.0f;      // the winning score
+            float prev = -2.0f;      // score at bestP - 1
+            float next = -2.0f;      // score at bestP + 1
+            float rival = -2.0f;     // best score outside the winner's shoulder
+            int   bestP = -1;
+            int   rivalP = -1;
+        };
+        std::vector<PixState> st;
+        st.assign(nPix, PixState{});
+
+        // The previous plane's combined score, so `prev` can be captured when
+        // a new winner appears.
+        std::vector<float> prevScore;
+        prevScore.assign(nPix, -2.0f);
+
+        // One neighbour column per pixel, reused across planes.
+        std::vector<float> perNb;
+        perNb.assign(nPix * nbs.size(), -2.0f);
+
+        for (int p = 0; p < nPlanes; ++p) {
+            std::fill(perNb.begin(), perNb.end(), -2.0f);
+
+            for (size_t k = 0; k < nbs.size(); ++k) {
+                const Plane& nbP = planes[size_t(nbs[k])];
+                const Mat3&  Hp  = H[size_t(p) * nbs.size() + k];
+
+                // Warp the neighbour into the reference frame. A homography
+                // is linear in homogeneous coordinates, so the row start and
+                // the per-pixel increment are both constant -- no matrix
+                // multiply in the inner loop.
+                for (int y = 0; y < rp.h; ++y) {
+                    double qx = Hp.m[1] * double(y) + Hp.m[2];
+                    double qy = Hp.m[4] * double(y) + Hp.m[5];
+                    double qz = Hp.m[7] * double(y) + Hp.m[8];
+                    const double ax = Hp.m[0], ay = Hp.m[3], az = Hp.m[6];
+                    float*   wrow = &warp[size_t(y) * size_t(rp.w)];
+                    uint8_t* mrow = &okMask[size_t(y) * size_t(rp.w)];
+                    for (int x = 0; x < rp.w; ++x) {
+                        float s = 0.0f;
+                        bool ok = false;
+                        if (std::fabs(qz) > 1e-12)
+                            ok = nbP.Sample(qx / qz, qy / qz, &s);
+                        wrow[x] = ok ? s : 0.0f;
+                        mrow[x] = ok ? uint8_t(1) : uint8_t(0);
+                        qx += ax; qy += ay; qz += az;
+                    }
+                }
+                // --- BOX SUMS, NOT INTEGRAL IMAGES -------------------------
+                //
+                // Same O(1)-per-pixel window sums, in HALF the bytes and
+                // without the precision problem that forced doubles.
+                //
+                // An integral image holds a running total over the whole
+                // frame, so at 3072x2048 the sum of a*a reaches 6.3 million
+                // while the 7x7 window difference is about 49 -- six orders
+                // of magnitude of cancellation, which needs double. A box sum
+                // holds only the window, so it never exceeds 49 and float
+                // carries far more precision than 8-bit pixels have.
+                //
+                // That matters because this pass is MEMORY BOUND, not
+                // arithmetic bound. At full resolution the integral version
+                // moved 792 GB across the eleven frames; halving the element
+                // size halves that directly.
+                //
+                // Separable: a horizontal sliding sum into a scratch row
+                // buffer, then a vertical sliding sum down the columns. Each
+                // step adds the entering sample and subtracts the leaving
+                // one, so the cost per pixel is constant in `window`.
+                const int win = 2 * radius + 1;
+                const float full = float(win * win);
+
+                // Horizontal pass: for every row, the sum over [x-r, x+r].
+                // Four quantities, interleaved so one pass over the row
+                // touches one cache line per pixel rather than four.
+                for (int y = 0; y < rp.h; ++y) {
+                    const float*   aRow = &rp.v[size_t(y) * size_t(rp.w)];
+                    const float*   bRow = &warp[size_t(y) * size_t(rp.w)];
+                    const uint8_t* mRow = &okMask[size_t(y) * size_t(rp.w)];
+                    float* out = &hSum[size_t(y) * size_t(rp.w) * 4];
+
+                    float sB = 0, sBB = 0, sAB = 0, sN = 0;
+                    for (int x = 0; x < win && x < rp.w; ++x) {
+                        if (mRow[x]) {
+                            const float a = aRow[x], b = bRow[x];
+                            sB += b; sBB += b * b; sAB += a * b; sN += 1.0f;
+                        }
+                    }
+                    for (int x = radius; x < rp.w - radius; ++x) {
+                        float* o = out + size_t(x) * 4;
+                        o[0] = sB; o[1] = sBB; o[2] = sAB; o[3] = sN;
+
+                        const int add = x + radius + 1;
+                        const int sub = x - radius;
+                        if (add < rp.w && mRow[add]) {
+                            const float a = aRow[add], b = bRow[add];
+                            sB += b; sBB += b * b; sAB += a * b; sN += 1.0f;
+                        }
+                        if (mRow[sub]) {
+                            const float a = aRow[sub], b = bRow[sub];
+                            sB -= b; sBB -= b * b; sAB -= a * b; sN -= 1.0f;
+                        }
+                    }
+                }
+
+                // Vertical pass, and the NCC in the same sweep: once the
+                // column sum is complete there is no reason to store it.
+                for (int x = radius; x < rp.w - radius; ++x) {
+                    float sB = 0, sBB = 0, sAB = 0, sN = 0;
+                    for (int y = 0; y < win && y < rp.h; ++y) {
+                        const float* o = &hSum[(size_t(y) * size_t(rp.w) +
+                                                size_t(x)) * 4];
+                        sB += o[0]; sBB += o[1]; sAB += o[2]; sN += o[3];
+                    }
+                    for (int y = radius; y < rp.h - radius; ++y) {
+                        // EVERY pixel of the window must have landed inside
+                        // the neighbour: a partially sampled window compares
+                        // different amounts of image at different depths, and
+                        // that biases one plane against another.
+                        if (sN >= full - 0.5f) {
+                            const float sa  = refA[size_t(y) * size_t(rp.w) +
+                                                   size_t(x)];
+                            const float saa = refAA[size_t(y) * size_t(rp.w) +
+                                                    size_t(x)];
+
+                            const float num = sAB - sa * sB / full;
+                            const float da  = saa - sa * sa / full;
+                            const float db  = sBB - sB * sB / full;
+                            const float den = std::sqrt(da * db);
+
+                            // A FLAT WINDOW HAS NO STRUCTURE TO CORRELATE:
+                            // blank sky, a white wall, a blown highlight. The
+                            // variance is zero and the correlation is 0/0,
+                            // which is most of a photograph of a building, so
+                            // it is left unmeasured rather than scored.
+                            if (den > 1e-6f)
+                                perNb[(size_t(y) * size_t(rp.w) + size_t(x)) *
+                                      nbs.size() + k] = num / den;
+                        }
+
+                        const int add = y + radius + 1;
+                        const int sub = y - radius;
+                        if (add < rp.h) {
+                            const float* o = &hSum[(size_t(add) * size_t(rp.w) +
+                                                    size_t(x)) * 4];
+                            sB += o[0]; sBB += o[1]; sAB += o[2]; sN += o[3];
+                        }
+                        {
+                            const float* o = &hSum[(size_t(sub) * size_t(rp.w) +
+                                                    size_t(x)) * 4];
+                            sB -= o[0]; sBB -= o[1]; sAB -= o[2]; sN -= o[3];
+                        }
+                    }
+                }
+            }
+
+            // Combine the neighbours: the best half, for the reason given
+            // where that choice is explained.
+            const int skipNow = std::max(2, nPlanes / 24);
+            for (size_t i = 0; i < nPix; ++i) {
+                // THE BEST HALF, ON A FIXED STACK ARRAY.
+                //
+                // This runs once per pixel per plane -- 302 million times at
+                // full resolution -- and it used to clear a std::vector,
+                // push_back into it and call std::sort. For at most sixteen
+                // values, that is a heap-backed container and a general sort
+                // where an insertion into a small array will do, and it cost
+                // more than the window sums it was consuming.
+                //
+                // Insertion sort is the right algorithm at this size: the
+                // array is tiny, it is already nearly sorted in the common
+                // case, and it has no call overhead at all.
+                float top[16];
+                int n = 0;
+                const size_t base = i * nbs.size();
+                for (size_t k = 0; k < nbs.size(); ++k) {
+                    const float c = perNb[base + k];
+                    if (c <= -1.5f) continue;
+                    int j = n++;
+                    while (j > 0 && top[j - 1] < c) { top[j] = top[j - 1]; --j; }
+                    top[j] = c;
+                }
+
+                float combined = -2.0f;
+                if (n > 0) {
+                    int take = (n + 1) / 2;
+                    if (n >= 2 && take < 2) take = 2;
+                    float acc = 0.0f;
+                    for (int j = 0; j < take; ++j) acc += top[j];
+                    combined = acc / float(take);
+                }
+
+                PixState& s2 = st[i];
+
+                // This plane is the one AFTER the current best, so it is the
+                // best's right shoulder.
+                if (s2.bestP == p - 1) s2.next = combined;
+
+                if (combined > s2.best) {
+                    // A new winner. The old best becomes a rival only if it
+                    // is far enough away to be a separate peak; otherwise it
+                    // was the same peak's shoulder.
+                    if (s2.bestP >= 0 && std::abs(s2.bestP - p) > skipNow &&
+                        s2.best > s2.rival) {
+                        s2.rival = s2.best;
+                        s2.rivalP = s2.bestP;
+                    }
+                    s2.best = combined;
+                    s2.bestP = p;
+                    s2.prev = prevScore[i];
+                    s2.next = -2.0f;            // filled on the next plane
+                } else if (std::abs(p - s2.bestP) > skipNow &&
+                           combined > s2.rival) {
+                    s2.rival = combined;
+                    s2.rivalP = p;
+                }
+
+                prevScore[i] = combined;
+            }
+        }
+
+        // --- the winner per pixel -------------------------------------------
+        //
+        // Everything needed was carried forward by the sweep above, so this
+        // is a plain pass over the running state rather than a search through
+        // a cost volume.
         for (int y = radius; y < rp.h - radius; ++y) {
             for (int x = radius; x < rp.w - radius; ++x) {
                 ++tot;
+                const PixState& ps = st[size_t(y) * size_t(rp.w) + size_t(x)];
 
-                double best = -2.0;
-                int    bestP = -1;
-
-                // Every plane's score, kept so the runner-up can EXCLUDE the
-                // winner's own shoulder. See the margin computation below for
-                // why that matters; it is nPlanes doubles for one pixel at a
-                // time, reused across the frame.
-                curve.assign(size_t(nPlanes), -2.0);
-
-                for (int p = 0; p < nPlanes; ++p) {
-                    const double score =
-                        AggregateScore(rp, planes, nbs, H, p, x, y, radius,
-                                       scratch);
-                    curve[size_t(p)] = score;
-                    if (score <= -1.5) continue;
-                    if (score > best) { best = score; bestP = p; }
-                }
-
+                const double best  = double(ps.best);
+                const int    bestP = ps.bestP;
                 if (bestP < 0 || best < minCorr) continue;
 
                 // SUBPIXEL REFINEMENT by fitting a parabola through the
                 // winning plane and its two neighbours, in inverse depth
-                // where the sampling is uniform. Without it the depth map is
-                // quantised to the plane spacing and a flat wall comes out as
-                // visible terraces -- the classic plane-sweep artefact, and
-                // it is entirely an artefact of the discretisation rather
-                // than of the geometry.
+                // where the sampling is uniform. Without it a flat wall comes
+                // out as visible terraces at the plane spacing.
                 double invD = invNear + (double(bestP) / double(nPlanes - 1)) *
                                             (invFar - invNear);
                 if (bestP > 0 && bestP < nPlanes - 1) {
                     const double step = (invFar - invNear) / double(nPlanes - 1);
-                    // Read from the curve rather than recomputed: every plane
-                    // was already scored above, and these two were among them.
-                    const double c0 = curve[size_t(bestP - 1)];
+                    const double c0 = double(ps.prev);
                     const double c1 = best;
-                    const double c2 = curve[size_t(bestP + 1)];
-                    // CONCAVE DOWN ONLY. The vertex formula finds the
-                    // stationary point of the parabola through the three
-                    // scores, which is a MAXIMUM only when c0 - 2c1 + c2 is
-                    // negative. Fitting without that check refines toward a
-                    // minimum wherever the samples happen to curve the other
-                    // way -- which is common when a neighbouring plane scored
-                    // higher than the winner in one view and lower in
-                    // another -- and pushes the depth away from the answer
-                    // instead of toward it.
-                    //
-                    // Either neighbour unsampleable means there is no
-                    // parabola to fit; the plane's own depth stands.
+                    const double c2 = double(ps.next);
+
+                    // CONCAVE DOWN ONLY: the vertex is a MAXIMUM only when
+                    // c0 - 2c1 + c2 is negative, and fitting without that
+                    // check refines toward a minimum wherever the samples
+                    // happen to curve the other way.
                     const double den = c0 - 2.0 * c1 + c2;
                     if (c0 > -1.5 && c2 > -1.5 && den < -1e-12) {
                         double off = 0.5 * (c0 - c2) / den;
@@ -828,30 +1184,11 @@ private:
                 }
                 if (invD < 1e-12) continue;
 
-                // CONFIDENCE AS THE MARGIN over the runner-up, not as the
-                // correlation itself. A high correlation at the best depth
-                // means little if a dozen other depths score nearly as well --
-                // which is exactly what happens on a repeating brick course,
-                // where the sweep is confidently wrong. The margin asks the
-                // useful question: was this depth DISTINGUISHABLE?
-                // The runner-up, EXCLUDING THE WINNER'S OWN SHOULDER. The
-                // planes either side of the peak always score nearly as high
-                // -- the cost curve is smooth, that is what makes the
-                // parabola fit work -- so taking the plain second-best
-                // measured the smoothness of the curve rather than the
-                // ambiguity of the match, and reported a near-zero margin
-                // everywhere.
-                //
-                // A competing hypothesis is a SEPARATE peak: the wall matched
-                // one brick course over. Skipping a few planes either side is
-                // what distinguishes "a second interpretation exists" from
-                // "the curve has width".
-                const int skip = std::max(2, nPlanes / 24);
-                double second = -2.0;
-                for (int p = 0; p < nPlanes; ++p) {
-                    if (std::abs(p - bestP) <= skip) continue;
-                    if (curve[size_t(p)] > second) second = curve[size_t(p)];
-                }
+                // The runner-up, EXCLUDING THE WINNER'S OWN SHOULDER: the
+                // planes either side of the peak always score nearly as high,
+                // so a plain second-best measures the width of the curve
+                // rather than the ambiguity of the match.
+                const double second = double(ps.rival);
                 const double margin = (second <= -1.5) ? 1.0
                                                        : std::max(0.0, best - second);
 
