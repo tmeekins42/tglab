@@ -262,6 +262,14 @@ public:
         ImageView out = ctx.Out(0);
         if (!in.data || !out.data) return;
 
+        // LOCAL, NOT A MEMBER, for the same reason m_log and m_base below are.
+        // One algorithm instance is mapped across every frame of a group, so
+        // an unpacked input kept on the instance is shared between the threads
+        // running those frames -- and the symptom is not a crash but frames
+        // holding each other's pixels. Caught by TestNoSharedScratch, which
+        // reported this INTERMITTENTLY: a race only sometimes manifests, so it
+        // passed four runs in a row and then failed.
+        PixelBuffer m_in;
         m_in.Unpack(in);
         if (!m_in.Valid()) return;
 
@@ -296,7 +304,7 @@ public:
         if (!lv.valid) {   // degenerate input: pass it through rather than guess
             PixelBuffer dst;
             dst.Unpack(out);
-            CopyThrough(dst, 1.0f);
+            CopyThrough(m_in, dst, 1.0f);
             dst.PackInto(out);
             return;
         }
@@ -529,11 +537,13 @@ private:
     // negatives a merge legitimately produces.
     static constexpr float kFloor = 1e-6f;
 
-    void CopyThrough(PixelBuffer& dst, float gain) {
-        const std::vector<float>& sp = m_in.Data();
+    // `src` is passed rather than read from a member: see RunCPU for why the
+    // unpacked input cannot live on the instance.
+    void CopyThrough(const PixelBuffer& src, PixelBuffer& dst, float gain) {
+        const std::vector<float>& sp = src.Data();
         std::vector<float>& dp = dst.Data();
-        const int ch = m_in.Channels(), dch = dst.Channels();
-        const size_t n = size_t(m_in.Width()) * size_t(m_in.Height());
+        const int ch = src.Channels(), dch = dst.Channels();
+        const size_t n = size_t(src.Width()) * size_t(src.Height());
         for (size_t i = 0; i < n; ++i)
             for (int c = 0; c < dch; ++c) {
                 if (c == 3 && dch == 4) { dp[i * size_t(dch) + 3] = 1.0f; continue; }
@@ -659,7 +669,6 @@ private:
                  "on middle grey by default; this moves it.",
          .step = 0.05, .softMin = -2.0, .softMax = 2.0}};
 
-    PixelBuffer        m_in;
 
     float m_compression = 1.0f;
     float m_spanBefore  = 0.0f;

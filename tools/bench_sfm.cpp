@@ -102,6 +102,266 @@ bool Downscale(const Image& in, int maxDim, Image* out) {
 
 }  // namespace
 
+// How THICK the cloud is perpendicular to its dominant plane.
+//
+// WHY THIS IS THE RIGHT MEASUREMENT FOR A "DOUBLE WALL". A facade is flat, so
+// a correct reconstruction of one is thin in exactly one direction -- the
+// plane's normal. When triangulation places the same wall at two depths, the
+// cloud gains a second sheet and that one direction thickens, while nothing
+// else about the cloud changes. Point counts, reprojection error and rotation
+// residuals are all blind to it: both sheets reproject perfectly, because each
+// was placed to.
+//
+// Measured by PCA. The smallest eigenvalue's direction is the plane normal,
+// and the spread along it is the thickness. Reported as a fraction of the
+// in-plane extent so it is comparable across scenes and scales -- a flat wall
+// is a few percent, and two sheets a plane-separation apart is much more.
+//
+// Percentiles rather than min/max, for the reason the viewer's framing uses
+// them: a handful of strays decide an extremum and say nothing about the bulk.
+void ReportPlanarity(const PointCloud& pc) {
+    std::vector<Vec3> p;
+    p.reserve(pc.tracks.size());
+    for (const Track& t : pc.tracks) if (t.hasPoint) p.push_back(t.point);
+    if (p.size() < 32) return;
+
+    Vec3 c{0, 0, 0};
+    for (const Vec3& v : p) { c.x += v.x; c.y += v.y; c.z += v.z; }
+    c.x /= double(p.size()); c.y /= double(p.size()); c.z /= double(p.size());
+
+    // Covariance, then Jacobi for its eigenvectors. Three iterations of cyclic
+    // sweeps is ample for a symmetric 3x3.
+    double m[3][3] = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}};
+    for (const Vec3& v : p) {
+        const double d[3] = {v.x - c.x, v.y - c.y, v.z - c.z};
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j) m[i][j] += d[i] * d[j];
+    }
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j) m[i][j] /= double(p.size());
+
+    double ev[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+    for (int sweep = 0; sweep < 12; ++sweep) {
+        int q = 0, r = 1;
+        double best = std::fabs(m[0][1]);
+        if (std::fabs(m[0][2]) > best) { best = std::fabs(m[0][2]); q = 0; r = 2; }
+        if (std::fabs(m[1][2]) > best) { best = std::fabs(m[1][2]); q = 1; r = 2; }
+        if (best < 1e-18) break;
+
+        const double theta = 0.5 * std::atan2(2.0 * m[q][r], m[q][q] - m[r][r]);
+        const double cs = std::cos(theta), sn = std::sin(theta);
+        for (int k = 0; k < 3; ++k) {
+            const double a = m[k][q], b = m[k][r];
+            m[k][q] = cs * a + sn * b;  m[k][r] = -sn * a + cs * b;
+        }
+        for (int k = 0; k < 3; ++k) {
+            const double a = m[q][k], b = m[r][k];
+            m[q][k] = cs * a + sn * b;  m[r][k] = -sn * a + cs * b;
+            const double u = ev[k][q], w = ev[k][r];
+            ev[k][q] = cs * u + sn * w; ev[k][r] = -sn * u + cs * w;
+        }
+    }
+
+    int axis = 0;
+    for (int i = 1; i < 3; ++i) if (m[i][i] < m[axis][axis]) axis = i;
+    const Vec3 n{ev[0][axis], ev[1][axis], ev[2][axis]};
+
+    // Spread along the normal, and along the widest in-plane direction.
+    int wide = 0;
+    for (int i = 1; i < 3; ++i) if (m[i][i] > m[wide][wide]) wide = i;
+    const Vec3 w{ev[0][wide], ev[1][wide], ev[2][wide]};
+
+    std::vector<double> dn, dw;
+    dn.reserve(p.size()); dw.reserve(p.size());
+    for (const Vec3& v : p) {
+        const double d[3] = {v.x - c.x, v.y - c.y, v.z - c.z};
+        dn.push_back(d[0] * n.x + d[1] * n.y + d[2] * n.z);
+        dw.push_back(d[0] * w.x + d[1] * w.y + d[2] * w.z);
+    }
+    std::sort(dn.begin(), dn.end());
+    std::sort(dw.begin(), dw.end());
+    auto span = [](const std::vector<double>& v) {
+        return v[size_t(0.98 * double(v.size() - 1))] -
+               v[size_t(0.02 * double(v.size() - 1))];
+    };
+    const double thick = span(dn), width = span(dw);
+    if (width <= 1e-12) return;
+
+    std::printf("\n  planarity: thickness %.4f across a %.4f extent "
+                "(%.1f%% -- a flat wall is a few percent)",
+                thick, width, 100.0 * thick / width);
+
+    // WHICH SIDE OF THE FACADE THE CAMERAS ARE ON.
+    //
+    // A reconstruction can be mirrored about the dominant plane and still
+    // satisfy every reprojection test, because a mirrored scene photographed
+    // by mirrored cameras produces identical images. The fix for that is
+    // cheirality -- points must be IN FRONT of the cameras -- and the way to
+    // see whether it held is to ask where the cameras sit relative to the
+    // wall they photographed.
+    //
+    // They should all be on ONE side. Cameras straddling the plane means part
+    // of the structure was reconstructed behind them, which is what a
+    // mirrored surface looks like from the outside.
+    {
+        int front = 0, back = 0;
+        for (const Camera& cam : pc.cameras) {
+            if (!cam.solved) continue;
+            const Vec3 e = cam.Center();
+            const double d[3] = {e.x - c.x, e.y - c.y, e.z - c.z};
+            (d[0] * n.x + d[1] * n.y + d[2] * n.z >= 0.0 ? front : back)++;
+        }
+        std::printf("\n  cameras: %d in front of the dominant plane, %d behind%s",
+                    front, back,
+                    (front > 0 && back > 0)
+                        ? "  <-- STRADDLING: part of the scene is behind a camera"
+                        : "");
+    }
+
+    // A SIDE WALL'S SLANT, and whether it runs the right way.
+    //
+    // The facade dominates the PCA, so a side wall returning at an angle is
+    // invisible in the aggregate thickness -- it is a minority of the points
+    // and it simply widens the distribution. Measuring it needs the edges of
+    // the cloud looked at separately.
+    //
+    // Split along the widest in-plane direction and ask, in each outer fifth,
+    // how the depth-from-the-facade trends as you move outward. A real side
+    // wall recedes AWAY from the cameras. One reconstructed mirrored comes
+    // TOWARD them, which is what "180 degrees off" looks like.
+    {
+        const double loW = dw[size_t(0.02 * double(dw.size() - 1))];
+        const double hiW = dw[size_t(0.98 * double(dw.size() - 1))];
+        const double q = (hiW - loW) / 5.0;
+
+        // Camera side of the plane: the direction "toward the cameras".
+        double camSide = 0.0;
+        for (const Camera& cam : pc.cameras) {
+            if (!cam.solved) continue;
+            const Vec3 e = cam.Center();
+            const double d[3] = {e.x - c.x, e.y - c.y, e.z - c.z};
+            camSide += d[0] * n.x + d[1] * n.y + d[2] * n.z;
+        }
+        const double sgn = camSide >= 0.0 ? 1.0 : -1.0;
+
+        auto edgeTrend = [&](double from, double to, const char* label) {
+            std::vector<double> inner, outer;
+            for (const Vec3& v : p) {
+                const double d[3] = {v.x - c.x, v.y - c.y, v.z - c.z};
+                const double along = d[0] * w.x + d[1] * w.y + d[2] * w.z;
+                if (along < std::min(from, to) || along > std::max(from, to))
+                    continue;
+                const double depth =
+                    sgn * (d[0] * n.x + d[1] * n.y + d[2] * n.z);
+                const double t = std::fabs(along - from) / std::fabs(to - from);
+                (t < 0.5 ? inner : outer).push_back(depth);
+            }
+            if (inner.size() < 30 || outer.size() < 30) return;
+            std::sort(inner.begin(), inner.end());
+            std::sort(outer.begin(), outer.end());
+            const double mi = inner[inner.size() / 2];
+            const double mo = outer[outer.size() / 2];
+            // Positive depth is toward the cameras, so a receding wall has
+            // the outer half FURTHER from them: mo < mi.
+            std::printf("\n  %s edge: %s (%.3f -> %.3f toward the cameras)",
+                        label,
+                        mo < mi ? "recedes away, as a side wall should"
+                                : "comes TOWARD the cameras  <-- suspect",
+                        mi, mo);
+        };
+
+        // "A" and "B" rather than left and right: the PCA's widest axis has
+        // an arbitrary SIGN, so which end is which has nothing to do with
+        // what a viewer shows. Calling them left and right invited exactly
+        // the mistake it caused -- the viewer was mirroring the scene, so the
+        // two disagreed, and the probe's "left edge" was the screen's right.
+        edgeTrend(loW + q, loW, "edge A");
+        edgeTrend(hiW - q, hiW, "edge B");
+    }
+
+    // ONE THICK SHEET OR TWO THIN ONES? The thickness alone cannot tell them
+    // apart, and they mean completely different things: a thick sheet is
+    // noise, two sheets is the same surface triangulated at two depths.
+    //
+    // A histogram along the normal answers it. Two sheets show as two peaks
+    // with a gap between; noise shows as one mode. Reported as the fraction
+    // of points in the LARGEST bin -- with a genuine split, the bulk divides
+    // between two well-separated bins and neither dominates.
+    {
+        const int kBins = 24;
+        std::vector<int> hist(size_t(kBins), 0);
+        const double lo = dn[size_t(0.02 * double(dn.size() - 1))];
+        const double span2 = thick > 1e-12 ? thick : 1.0;
+        for (double v : dn) {
+            int b = int((v - lo) / span2 * double(kBins));
+            b = std::max(0, std::min(kBins - 1, b));
+            ++hist[size_t(b)];
+        }
+
+        // Peaks: a bin holding more than 6% of the points and at least as
+        // many as both neighbours. Two of those, well apart, is a double wall.
+        const int total = int(dn.size());
+        int peaks = 0, firstPeak = -1, lastPeak = -1;
+        for (int b = 0; b < kBins; ++b) {
+            const int h = hist[size_t(b)];
+            if (double(h) < 0.06 * double(total)) continue;
+            const int l = (b > 0) ? hist[size_t(b - 1)] : 0;
+            const int r = (b < kBins - 1) ? hist[size_t(b + 1)] : 0;
+            if (h >= l && h >= r) {
+                ++peaks;
+                if (firstPeak < 0) firstPeak = b;
+                lastPeak = b;
+            }
+        }
+        std::printf("\n  depth profile: %d peak%s", peaks,
+                    peaks == 1 ? "" : "s");
+        if (peaks >= 2) {
+            std::printf(" separated by %.1f%% of the thickness -- TWO SHEETS, "
+                        "not one noisy surface",
+                        100.0 * double(lastPeak - firstPeak) / double(kBins));
+
+            // WHICH CAMERAS SEE WHICH SHEET, which distinguishes the two
+            // possible causes. If each sheet is observed by its own subset of
+            // frames, the cameras disagree about where the wall is and the
+            // fault is in the POSES. If both sheets are seen by all of them,
+            // the poses agree and the split is in the correspondences -- the
+            // same wall matched to itself one brick course over.
+            const double mid = lo + span2 * (double(firstPeak + lastPeak + 1) *
+                                             0.5 / double(kBins));
+            std::vector<int> nearCam, farCam;
+            nearCam.assign(pc.cameras.size(), 0);
+            farCam.assign(pc.cameras.size(), 0);
+
+            for (const Track& t : pc.tracks) {
+                if (!t.hasPoint) continue;
+                const double d[3] = {t.point.x - c.x, t.point.y - c.y,
+                                     t.point.z - c.z};
+                const double v = d[0] * n.x + d[1] * n.y + d[2] * n.z;
+                for (const Observation& o : t.obs) {
+                    if (o.frame < 0 || o.frame >= int(pc.cameras.size()))
+                        continue;
+                    (v < mid ? nearCam : farCam)[size_t(o.frame)]++;
+                }
+            }
+
+            int split = 0;
+            for (size_t i = 0; i < pc.cameras.size(); ++i) {
+                const int a = nearCam[i], b = farCam[i];
+                if (a + b < 20) continue;
+                const double frac = double(std::min(a, b)) / double(a + b);
+                if (frac > 0.15) ++split;      // sees both sheets substantially
+            }
+            std::printf("\n  sheet membership: %d of %d cameras observe BOTH "
+                        "sheets%s", split, int(pc.cameras.size()),
+                        split > int(pc.cameras.size()) / 2
+                            ? " -- the poses agree, so the split is in the "
+                              "CORRESPONDENCES"
+                            : " -- the cameras disagree, so the split is in "
+                              "the POSES");
+        }
+    }
+}
+
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
 
@@ -268,9 +528,11 @@ int main(int argc, char** argv) {
             else if (d && std::holds_alternative<Image>(*d)) kind = "Image";
             else if (d && std::holds_alternative<ImageSet>(*d)) kind = "ImageSet";
             std::printf("viewer \"%s\": %s", vd.name.c_str(), kind);
-            if (d) if (const PointCloud* pc = std::get_if<PointCloud>(d))
+            if (d) if (const PointCloud* pc = std::get_if<PointCloud>(d)) {
                 std::printf(" (%d cameras, %d points)", pc->SolvedCameras(),
                             pc->TriangulatedPoints());
+                ReportPlanarity(*pc);
+            }
             std::printf("\n");
         }
         std::printf("\ntotal %.0f ms\n", sms);

@@ -141,6 +141,11 @@ public:
         ImageView       dst = ctx.Out(0);
         if (!src.Valid() || !dst.Valid()) return;
 
+        // LOCAL, NOT MEMBERS. See demosaic_ahd: one instance is mapped across
+        // every frame of a group, so instance scratch is shared between the
+        // threads running those frames. Caught by TestNoSharedScratch.
+        PixelBuffer        m_in;
+        std::vector<float> m_s, m_rgb;
         m_in.Unpack(src);
         if (!m_in.Valid()) return;
 
@@ -150,7 +155,7 @@ public:
         // Not a mosaic: pass it through rather than inventing a pattern, so an
         // unconditional demosaic in a script is harmless on an ordinary image.
         if (cfa == CfaPattern::None || cfa == CfaPattern::XTrans) {
-            PassThrough(dst, w, h);
+            PassThrough(m_in, dst, w, h);
             return;
         }
 
@@ -402,7 +407,8 @@ private:
     }
 
     // Not a mosaic: copy through unchanged.
-    void PassThrough(ImageView& dst, int w, int h) {
+    // `m_in` is passed rather than read from a member: see RunCPU.
+    void PassThrough(const PixelBuffer& m_in, ImageView& dst, int w, int h) {
         const int ch = m_in.Channels();
         const float scale = m_in.ValueScale();
         for (int y = 0; y < h; ++y)
@@ -445,8 +451,6 @@ private:
                  "fix.",
          .step = 0.002, .softMin = 0.0, .softMax = 0.06}};
 
-    PixelBuffer        m_in;
-    std::vector<float> m_s, m_rgb;
 };
 
 REGISTER_ALGORITHM(DemosaicVng);

@@ -282,6 +282,38 @@ private:
         "-- so leaving it fixed bakes that error into the geometry. Turn it "
         "off when the calibration is genuinely known."};
 
+    // ONE LENS TOOK EVERY FRAME, so there is ONE focal to solve for.
+    //
+    // A FOCAL PER CAMERA LETS EACH ONE FIND ITS OWN LOCAL MINIMUM. That is
+    // the real cost, and it is worse than the wasted parameters suggest. A
+    // camera with a slightly wrong pose can reduce its own reprojection error
+    // by bending its focal to suit, which makes the wrong pose FIT -- so the
+    // solve settles there instead of correcting the pose. Every camera can do
+    // this independently, and the result is a set of frames each internally
+    // consistent and mutually disagreeing.
+    //
+    // Measured on castle-P19 before this: focals spread from 48.9 to 81.9
+    // degrees across nineteen frames shot on one camera. Not noise around a
+    // true value -- a 33-degree disagreement is the solver having found
+    // nineteen different answers, each locally optimal.
+    //
+    // Sharing removes those degrees of freedom, so the only way to reduce
+    // reprojection error is to fix the geometry. Measured on fountain-P11,
+    // the focal then converges to 57.2-57.8 degrees from starting guesses of
+    // 40, 50 and 58: three independent starts agreeing, which is what makes
+    // it a measurement rather than an echo of the input.
+    //
+    // Shared is the right default because every capture this pipeline is
+    // aimed at -- a walk-around, a bracket, a panorama -- is one camera. A
+    // mixed set is the exception and turns this off.
+    Param<bool> m_sharedFocal{this, "shared_focal", true,
+        "Solve ONE focal length for the whole group rather than one per "
+        "camera. Correct whenever a single camera took every frame, which is "
+        "the usual case: separate focals let the solver absorb geometric "
+        "error into intrinsics that cannot physically differ. Turn it off "
+        "only for a set genuinely shot on different cameras or at different "
+        "zooms."};
+
     Param<float> m_maxDistance{this, "max_distance", 20.0f, 1.0f, 1000.0f,
         {.help = "How far a point may end up from the cameras before it is "
                  "dropped, as a MULTIPLE of the camera cluster's radius. "
@@ -364,6 +396,17 @@ bool BundleAdjustSfm::RunReconstruct(const std::vector<Image>*, PointCloud* clou
         cx[size_t(i)] = cam.cx;
         cy[size_t(i)] = cam.cy;
     }
+
+    // With a shared focal the steps are averaged, which keeps the focals
+    // equal only if they START equal. Upstream gives every camera the same
+    // guess so they normally are, but a second bundle pass inherits whatever
+    // the first produced -- so make the invariant hold rather than assume it.
+    if (bool(m_refineFocal) && bool(m_sharedFocal) && nActiveCam > 0) {
+        double mean = 0.0;
+        for (int c = 0; c < nActiveCam; ++c) mean += s.focal[size_t(c)];
+        mean /= double(nActiveCam);
+        for (int c = 0; c < nActiveCam; ++c) s.focal[size_t(c)] = mean;
+    }
     for (int t = 0; t < nPt; ++t) {
         const int i = ptIndex[size_t(t)];
         if (i < 0) continue;
@@ -374,8 +417,28 @@ bool BundleAdjustSfm::RunReconstruct(const std::vector<Image>*, PointCloud* clou
     }
 
     const bool doFocal = bool(m_refineFocal);
-    const int camParams = doFocal ? 7 : 6;   // 3 rotation + 3 centre + focal
-    const int nS = nActiveCam * camParams;
+    const bool shareFocal = doFocal && bool(m_sharedFocal) && nActiveCam > 1;
+
+    // PARAMETER LAYOUT. Six per camera always -- centre then rotation -- plus
+    // the focal.
+    //
+    // With a shared focal the focal is ONE column at the end of the system
+    // rather than one per camera, because that is what "every frame was shot
+    // on the same lens" means as a constraint. Every observation's focal
+    // derivative then accumulates into that single column, so all the
+    // evidence in the group bears on one number.
+    //
+    // An earlier attempt imposed this by solving per-camera focals and
+    // AVERAGING the steps. That is the projection of the step onto the shared
+    // subspace and it does converge to the right place eventually, but the
+    // averaged step is a fraction of the true one -- measured on
+    // fountain-P11, the focal moved from 50.0 to 49.9 in 24 iterations and
+    // from 40.0 to 40.0, which reads exactly like the damping bug it was
+    // meant to fix. One shared column moves it properly in one step.
+    const int perCam = doFocal && !shareFocal ? 7 : 6;
+    const int camParams = perCam;             // 3 centre + 3 rotation [+ focal]
+    const int nS = nActiveCam * camParams + (shareFocal ? 1 : 0);
+    const int focalCol = shareFocal ? nActiveCam * camParams : -1;
     const double delta = double(m_lossScale);
     const int lossKind = int(m_loss);
 
@@ -459,12 +522,29 @@ bool BundleAdjustSfm::RunReconstruct(const std::vector<Image>*, PointCloud* clou
             for (int k = 0; k < 6; ++k) { A[0][k] = Jc[k]; A[1][k] = Jc[6 + k]; }
             if (doFocal) { A[0][6] = Jf[0]; A[1][6] = Jf[1]; }
 
+            // Where each of this observation's camera parameters lands in the
+            // reduced system. The six pose parameters go in this camera's own
+            // block; the focal goes either alongside them (per-camera) or into
+            // the one shared column at the end.
             const int cbase = o.cam * camParams;
-            for (int a = 0; a < camParams; ++a) {
-                for (int b = 0; b < camParams; ++b)
-                    B[size_t(cbase + a) * size_t(nS) + size_t(cbase + b)] +=
+            int idx[7];
+            for (int a = 0; a < camParams; ++a) idx[a] = cbase + a;
+            const int nA = shareFocal ? camParams + 1 : camParams;
+            if (shareFocal) {
+                idx[camParams] = focalCol;
+                A[0][camParams] = Jf[0];
+                A[1][camParams] = Jf[1];
+            }
+
+            // B is no longer block diagonal when the focal is shared: the
+            // shared column couples every camera to every other. It was
+            // already stored densely, so this costs nothing but the honesty
+            // of saying so.
+            for (int a = 0; a < nA; ++a) {
+                for (int b = 0; b < nA; ++b)
+                    B[size_t(idx[a]) * size_t(nS) + size_t(idx[b])] +=
                         wgt * (A[0][a] * A[0][b] + A[1][a] * A[1][b]);
-                gCam[size_t(cbase + a)] -= wgt * (A[0][a] * rx + A[1][a] * ry);
+                gCam[size_t(idx[a])] -= wgt * (A[0][a] * rx + A[1][a] * ry);
             }
 
             double* Cp = &Cblk[size_t(o.pt) * 9];
@@ -478,7 +558,7 @@ bool BundleAdjustSfm::RunReconstruct(const std::vector<Image>*, PointCloud* clou
             EBlock eb;
             eb.cam = o.cam;
             eb.pt = o.pt;
-            for (int a = 0; a < camParams; ++a)
+            for (int a = 0; a < nA; ++a)
                 for (int b = 0; b < 3; ++b)
                     eb.m[a * 3 + b] = wgt * (A[0][a] * Jp[b] + A[1][a] * Jp[3 + b]);
             E.push_back(eb);
@@ -513,14 +593,51 @@ bool BundleAdjustSfm::RunReconstruct(const std::vector<Image>*, PointCloud* clou
         // Scaled by the mean diagonal so the additive term means the same
         // thing whatever units the scene is in -- a reconstruction's scale is
         // itself a gauge freedom, so an absolute epsilon would be arbitrary.
-        double diagMean = 0.0;
-        for (int a = 0; a < nS; ++a) diagMean += S[size_t(a) * size_t(nS) + size_t(a)];
-        diagMean = (nS > 0) ? diagMean / double(nS) : 1.0;
-        if (diagMean <= 0.0) diagMean = 1.0;
+        // PER PARAMETER KIND, not one mean over all of them, and this is what
+        // makes refining the focal actually work.
+        //
+        // The three parameter kinds have derivatives in different units:
+        // rotation is pixels per radian, position is pixels per scene unit,
+        // and the focal is pixels per pixel -- dx/df is just the normalised
+        // coordinate, order 1. Their diagonal entries therefore differ by
+        // orders of magnitude, and a single mean is dominated by whichever is
+        // largest.
+        //
+        // The additive term lambda * diagMean was then far bigger than the
+        // focal's own curvature, so the focal direction was damped to a
+        // standstill: measured on fountain-P11, every camera's focal stayed
+        // at its starting value to four significant figures, from any start.
+        // "focal refined to fov 50.0" from an input of 50.0 -- and equally
+        // 40.0 from 40.0, and 60.0 from 60.0. It looked like a measurement
+        // and was an echo.
+        //
+        // Scaling each kind by its OWN mean keeps what the additive term is
+        // for -- the gauge directions have no curvature at all, so a purely
+        // multiplicative damping leaves the system singular -- while letting
+        // each kind move at its own scale.
+        double diagSum[3] = {0.0, 0.0, 0.0};
+        int    diagN[3]   = {0, 0, 0};
+        auto kindOf = [&](int a) {
+            if (a >= nActiveCam * camParams) return 2;   // the shared focal
+            const int within = a % camParams;
+            if (within < 3) return 0;              // centre
+            if (within < 6) return 1;              // rotation
+            return 2;                              // per-camera focal
+        };
+        for (int a = 0; a < nS; ++a) {
+            const int k = kindOf(a);
+            diagSum[k] += S[size_t(a) * size_t(nS) + size_t(a)];
+            ++diagN[k];
+        }
+        double diagMean[3];
+        for (int k = 0; k < 3; ++k) {
+            diagMean[k] = (diagN[k] > 0) ? diagSum[k] / double(diagN[k]) : 1.0;
+            if (diagMean[k] <= 0.0) diagMean[k] = 1.0;
+        }
 
         for (int a = 0; a < nS; ++a) {
             double& d = S[size_t(a) * size_t(nS) + size_t(a)];
-            d = d * (1.0 + lambda) + lambda * diagMean;
+            d = d * (1.0 + lambda) + lambda * diagMean[kindOf(a)];
         }
 
         std::vector<double> Cinv(size_t(nActivePt) * 9, 0.0);
@@ -549,29 +666,38 @@ bool BundleAdjustSfm::RunReconstruct(const std::vector<Image>*, PointCloud* clou
             for (int a = 0; a < 3; ++a)
                 for (int b = 0; b < 3; ++b) Cg[a] += Ci[a * 3 + b] * gp[b];
 
+            // Slot `a` of camera `c`'s block, as an index into the reduced
+            // system. Slots 0..camParams-1 are that camera's own; the extra
+            // slot, present only when the focal is shared, is the one column
+            // every camera contributes to.
+            const int nE = shareFocal ? camParams + 1 : camParams;
+            auto slot = [&](int cam, int a) {
+                return (shareFocal && a == camParams) ? focalCol
+                                                      : cam * camParams + a;
+            };
+
             for (int ii : byPoint[size_t(p)]) {
                 const EBlock& ea = E[size_t(ii)];
-                const int abase = ea.cam * camParams;
 
-                for (int a = 0; a < camParams; ++a) {
+                for (int a = 0; a < nE; ++a) {
                     double acc = 0.0;
                     for (int b = 0; b < 3; ++b) acc += ea.m[a * 3 + b] * Cg[b];
-                    gS[size_t(abase + a)] -= acc;
+                    gS[size_t(slot(ea.cam, a))] -= acc;
                 }
 
                 for (int jj : byPoint[size_t(p)]) {
                     const EBlock& eb = E[size_t(jj)];
-                    const int bbase = eb.cam * camParams;
-                    for (int a = 0; a < camParams; ++a) {
+                    for (int a = 0; a < nE; ++a) {
                         // (E C^-1)_a, one row at a time.
                         double row[3] = {};
                         for (int k = 0; k < 3; ++k)
                             for (int b = 0; b < 3; ++b)
                                 row[k] += ea.m[a * 3 + b] * Ci[b * 3 + k];
-                        for (int b = 0; b < camParams; ++b) {
+                        for (int b = 0; b < nE; ++b) {
                             double acc = 0.0;
                             for (int k = 0; k < 3; ++k) acc += row[k] * eb.m[b * 3 + k];
-                            S[size_t(abase + a) * size_t(nS) + size_t(bbase + b)] -= acc;
+                            S[size_t(slot(ea.cam, a)) * size_t(nS) +
+                              size_t(slot(eb.cam, b))] -= acc;
                         }
                     }
                 }
@@ -591,10 +717,13 @@ bool BundleAdjustSfm::RunReconstruct(const std::vector<Image>*, PointCloud* clou
                              gPt[size_t(p) * 3 + 2]};
             for (int ii : byPoint[size_t(p)]) {
                 const EBlock& e = E[size_t(ii)];
-                const int base = e.cam * camParams;
+                const int nE = shareFocal ? camParams + 1 : camParams;
                 for (int b = 0; b < 3; ++b)
-                    for (int a = 0; a < camParams; ++a)
-                        rhs[b] -= e.m[a * 3 + b] * dCam[size_t(base + a)];
+                    for (int a = 0; a < nE; ++a) {
+                        const int gi = (shareFocal && a == camParams)
+                                           ? focalCol : e.cam * camParams + a;
+                        rhs[b] -= e.m[a * 3 + b] * dCam[size_t(gi)];
+                    }
             }
             const double* Ci = &Cinv[size_t(p) * 9];
             for (int a = 0; a < 3; ++a)
@@ -603,6 +732,7 @@ bool BundleAdjustSfm::RunReconstruct(const std::vector<Image>*, PointCloud* clou
         }
 
         State trial = s;
+
         for (int c = 0; c < nActiveCam; ++c) {
             const int base = c * camParams;
             for (int k = 0; k < 3; ++k) {
@@ -626,7 +756,11 @@ bool BundleAdjustSfm::RunReconstruct(const std::vector<Image>*, PointCloud* clou
                 // Never let a focal go non-positive: the projection divides by
                 // it, and a solve that overshoots into negative focal produces
                 // a mirrored reconstruction it can never climb back out of.
-                const double f = trial.focal[size_t(c)] + dCam[size_t(base + 6)];
+                //
+                // One step for every camera when the focal is shared: they
+                // start equal and move together, which is the constraint.
+                const int fi = shareFocal ? focalCol : base + 6;
+                const double f = trial.focal[size_t(c)] + dCam[size_t(fi)];
                 trial.focal[size_t(c)] = std::max(1.0, f);
             }
         }
@@ -751,17 +885,22 @@ bool BundleAdjustSfm::RunReconstruct(const std::vector<Image>*, PointCloud* clou
     // The mean refined focal, expressed as a horizontal field of view so it is
     // comparable with relative_pose's fov_deg parameter directly.
     double meanFovDeg = 0.0;
+    double minFovDeg = 1e9, maxFovDeg = -1e9;
     {
         int nf = 0;
         for (const Camera& c : cloud->cameras) {
             if (!c.solved || c.focal <= 0.0) continue;
-            meanFovDeg += 2.0 * std::atan2(0.5 * double(c.width), c.focal) *
-                          180.0 / 3.14159265358979;
+            const double fv = 2.0 * std::atan2(0.5 * double(c.width), c.focal) *
+                              180.0 / 3.14159265358979;
+            meanFovDeg += fv;
+            minFovDeg = std::min(minFovDeg, fv);
+            maxFovDeg = std::max(maxFovDeg, fv);
             ++nf;
         }
         if (nf > 0) meanFovDeg /= double(nf);
+        else { minFovDeg = maxFovDeg = 0.0; }
     }
-    char fovBuf[64] = "";
+    char fovBuf[96] = "";
 
     char buf[400];
     std::snprintf(buf, sizeof buf,
@@ -777,9 +916,15 @@ bool BundleAdjustSfm::RunReconstruct(const std::vector<Image>*, PointCloud* clou
                   // in pixels, so where it settles is a measurement of what
                   // the lens actually was. A guess far from it is worth fixing
                   // at the source rather than letting BA absorb.
+                  // The SPREAD as well as the mean. Per-camera focals that
+                  // disagree are the solver absorbing geometric error into
+                  // intrinsics it should not have: one lens took every frame,
+                  // so a spread of several degrees is a symptom, not a
+                  // measurement.
                   doFocal ? (std::snprintf(fovBuf, sizeof fovBuf,
-                                           ", focal refined to fov %.1f deg",
-                                           meanFovDeg),
+                                           ", focal refined to fov %.1f deg "
+                                           "(%.1f..%.1f across cameras)",
+                                           meanFovDeg, minFovDeg, maxFovDeg),
                              fovBuf)
                           : "",
                   dropped, double(m_maxDistance));

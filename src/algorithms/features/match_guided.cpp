@@ -12,8 +12,9 @@
 // -- and it is a blunt one, because on repetitive texture there is always a
 // close second and the correct match is thrown away with the ambiguous ones.
 //
-// Measured on fountain-P11: the first pass keeps 16% of its candidate pairs,
-// and 10000 features per frame yield 3398 tracks. The features are there; they
+// Measured on fountain-P11: the first pass keeps 11% of its candidate pairs
+// (15544 of 139829), and ~7300 features per frame yield 2128 tracks after
+// 66385 observations are dropped as too short. The features are there; they
 // are not being paired.
 //
 // ONCE THE ESSENTIAL MATRIX IS KNOWN, the problem changes completely. A feature
@@ -33,6 +34,76 @@
 // it needs the output of relative_pose, which needs the output of the matcher:
 // the dependency genuinely runs in a circle and the only way to express it is
 // two passes.
+//
+// KNOWN DEFECT, AND IT IS SERIOUS: ON REPETITIVE TEXTURE THIS STAGE BUILDS A
+// PHANTOM SURFACE. Measured on fountain-P11, whose subject is a brick wall.
+//
+// The sparse cloud, viewed edge-on, should be one thin sheet. With this stage
+// in the chain it is TWO, separated by about a third of the cloud's thickness
+// -- the same wall reconstructed at two depths, one brick course apart. The
+// dense reconstruction then amplifies it into two solid walls, which is how
+// Tim found it.
+//
+//   chain                         depth profile   points
+//   without match_guided          1 peak            1928
+//   with,   max_hamming 25        2 peaks           1902
+//   with,   max_hamming 40        2 peaks           1937
+//   with,   radius 5              3 peaks           2027
+//   with,   defaults              2 peaks           2127
+//
+// TWO HUNDRED AND EIGHTY-SEVEN EXTRA MATCHES -- two percent -- IS ENOUGH.
+// Neither tightening the descriptor threshold nor shrinking the search radius
+// avoids it; they only change how many points join the phantom.
+//
+// Why so few matches do so much damage: they are MUTUALLY CONSISTENT. A patch
+// of wall matched one course over satisfies the epipolar constraint exactly
+// and agrees with every other patch shifted the same way, so RANSAC counts
+// them as inliers, they chain into tracks, and they triangulate to a coherent
+// surface. Nothing downstream can tell that surface from a real one: it
+// reprojects correctly in every view, because it was built to.
+//
+// It is invisible to every number this pipeline reports. Reprojection rms
+// IMPROVES through the bundle adjustment that separates the sheets (1.377 ->
+// 0.970 px); the rotation residual is unaffected; the point count goes UP.
+// Only a measurement made perpendicular to the surface shows it, which is why
+// bench_sfm now reports planarity and a depth profile.
+//
+// WHAT WOULD ACTUALLY FIX IT is a constraint this stage does not have: that a
+// new match agree with the SCENE, not merely with the epipolar line and the
+// local flow. Checking a candidate against a third view -- the match must be
+// consistent with a point that all three cameras see -- is the standard
+// answer, and it is the same multi-view agreement fuse_depth already applies
+// to depths. Until then this stage is off by default.
+//
+// THE EPIPOLAR LINE ALONE IS NOT ENOUGH, and finding that out is most of what
+// this file has to teach. The first version of this stage used nothing else,
+// and it was WORSE THAN NOT RUNNING AT ALL: 114% more matches, and the
+// reconstruction fell from 2039 points to 588. The arithmetic says why. A 3 px
+// corridor across a 1228 px frame is a quarter of one percent of the image,
+// which sounds decisive until it is applied to ten thousand features -- about
+// fifty candidates survive, and on a brick wall a good fraction of those fifty
+// are indistinguishable from the right one. Narrowing a search from 10000 to
+// 50 is not the same as making it unambiguous, and without a ratio test there
+// is nothing left to catch the mistake.
+//
+// Worse, the mistakes agree with each other. A patch of wall matched to the
+// wrong course of bricks satisfies the epipolar constraint exactly, so RANSAC
+// scores it as an inlier; the bad matches do not scatter, they conspire, and
+// they pull the pose with them.
+//
+// SO A SECOND CONSTRAINT IS NEEDED, and it comes from the matches already in
+// hand. Near a feature in A, the first pass has usually found several matches
+// already, and those say roughly where this part of the image went. Weighting
+// the nearest few by inverse distance predicts a position in B, and a
+// candidate must land within `radius` of it. The epipolar line says which
+// CURVE the partner lies on; the neighbours say WHERE ALONG IT. Together they
+// leave a handful of candidates instead of fifty, and the reconstruction rises
+// to 2250 points -- 10% above the baseline, where the line alone lost 71%.
+//
+// The assumption is local smoothness of the flow field, which holds on a
+// surface and fails at a depth discontinuity, where the prediction is wrong by
+// the parallax between the two surfaces. `radius` is exactly the budget for
+// how wrong it is permitted to be.
 //
 // WHAT THIS DOES NOT DO YET, stated so the gap is visible: it does not expand
 // along tracks (match A->B, then use the track to predict C), and it does not
@@ -168,6 +239,35 @@ public:
                     if (m.b >= 0 && m.b < int(usedB.size())) usedB[size_t(m.b)] = 1;
                 }
 
+                // THE ALREADY-MATCHED PAIRS, as a lookup for local prediction.
+                //
+                // This is the constraint the first version lacked, and the
+                // measurement said it was the one that mattered: an epipolar
+                // line across a 1228 px frame still admits about fifty of ten
+                // thousand features, and on repetitive architecture fifty is
+                // plenty to choose wrong from. The reconstruction went from
+                // 2039 points to 588.
+                //
+                // Neighbouring points move together between two views of a
+                // scene -- that is what a surface IS -- so the partners of a
+                // feature's matched neighbours predict where it should land.
+                // The line says which curve; the neighbours say where along it.
+                struct Anchor { float ax, ay, bx, by; };
+                std::vector<Anchor> anchors;
+                anchors.reserve(set->matches.size());
+                for (const Match& m : set->matches) {
+                    if (m.a < 0 || m.a >= int(fsA->keypoints.size())) continue;
+                    if (m.b < 0 || m.b >= int(fsB->keypoints.size())) continue;
+                    // INLIERS ONLY where a verdict exists. An unverified match
+                    // used as an anchor would propagate its own error into
+                    // every prediction it informs.
+                    anchors.push_back({fsA->keypoints[size_t(m.a)].x,
+                                       fsA->keypoints[size_t(m.a)].y,
+                                       fsB->keypoints[size_t(m.b)].x,
+                                       fsB->keypoints[size_t(m.b)].y});
+                }
+                if (int(anchors.size()) < int(m_minAnchors)) continue;
+
                 const ImageDesc& dA = (*images)[size_t(e.reference)].Desc();
                 const double focal =
                     0.5 * dA.width / std::tan(0.5 * double(m_fovDeg) *
@@ -194,11 +294,67 @@ public:
                     //
                     // What replaces it is a hard distance cap: a match must be
                     // on the line AND look alike. Both, not either.
+                    // WHERE THE NEIGHBOURS SAY IT SHOULD BE.
+                    //
+                    // The K nearest anchors in A, averaged by their observed
+                    // displacement into B. Weighted by inverse distance, so a
+                    // neighbour twenty pixels away has more say than one two
+                    // hundred away -- local smoothness is a local claim and
+                    // weighting is what keeps it honest as the support spreads.
+                    //
+                    // A plain translation rather than an affine fit: three
+                    // anchors on a repetitive wall can agree on a wrong affine
+                    // transform far more easily than on a wrong translation,
+                    // and the residual radius below already absorbs the shear
+                    // a translation cannot express.
+                    double sumW = 0.0, predX = 0.0, predY = 0.0;
+                    {
+                        // Nearest K by squared distance. A linear scan because
+                        // the anchor count is in the hundreds and building an
+                        // index per feature would cost more than it saves.
+                        const int K = std::max(1, int(m_anchors));
+                        std::vector<std::pair<double, size_t>> near;
+                        near.reserve(anchors.size());
+                        for (size_t k = 0; k < anchors.size(); ++k) {
+                            const double dx = double(anchors[k].ax) - double(ka.x);
+                            const double dy = double(anchors[k].ay) - double(ka.y);
+                            near.emplace_back(dx * dx + dy * dy, k);
+                        }
+                        const size_t take = std::min(size_t(K), near.size());
+                        std::nth_element(near.begin(), near.begin() + long(take),
+                                         near.end());
+                        for (size_t i = 0; i < take; ++i) {
+                            const Anchor& an = anchors[near[i].second];
+                            const double w = 1.0 / (std::sqrt(near[i].first) + 8.0);
+                            predX += w * (double(an.bx) - double(an.ax));
+                            predY += w * (double(an.by) - double(an.ay));
+                            sumW += w;
+                        }
+                    }
+                    if (sumW <= 0.0) continue;
+                    const double px = double(ka.x) + predX / sumW;
+                    const double py = double(ka.y) + predY / sumW;
+
                     int bestDist = maxHam + 1;
                     int bestIdx  = -1;
                     for (size_t ib = 0; ib < fsB->keypoints.size(); ++ib) {
                         if (usedB[ib]) continue;
                         const Keypoint& kb = fsB->keypoints[ib];
+
+                        // NEAR THE PREDICTION, which is what turns the line
+                        // into a point. Checked first: it is two subtractions
+                        // and rejects more candidates than anything else here.
+                        //
+                        // The radius is how far local smoothness may be wrong
+                        // -- which is to say, how much depth varies between a
+                        // feature and its neighbours. Too small and every
+                        // depth edge is lost; too large and this stops
+                        // constraining anything and the stage reverts to the
+                        // version that made the reconstruction worse.
+                        const double sx = double(kb.x) - px;
+                        const double sy = double(kb.y) - py;
+                        if (sx * sx + sy * sy > double(m_radius) * double(m_radius))
+                            continue;
 
                         // GEOMETRY FIRST, because it rejects most candidates
                         // for the cost of a dot product, where a descriptor
@@ -263,6 +419,65 @@ public:
     bool HasGPU() const override { return false; }
 
 private:
+    // HOW FAR FROM THE NEIGHBOURS' PREDICTION a candidate may sit, in pixels.
+    //
+    // This is the constraint that makes the stage work, and it encodes a
+    // physical claim: how much the scene's depth may change between a feature
+    // and its matched neighbours. On a flat wall the prediction is nearly
+    // exact; across a depth discontinuity it is wrong by the parallax between
+    // the two surfaces, and this bounds how much of that to tolerate.
+    //
+    // Too small loses every feature near a depth edge. Too large and the
+    // stage reverts to searching the whole epipolar line, which measured
+    // WORSE than not running at all -- 2039 points down to 588.
+    //
+    // MEASURED on fountain-P11, against a 2039-point baseline without this
+    // stage. The default is 10 because that is where the sweep peaked, and
+    // the shape of the sweep is the argument for the parameter existing:
+    //
+    //   radius   added   worst rotation residual   points
+    //        5      9%                   1.35 deg     2207
+    //       10     18%                   1.37 deg     2250
+    //       15     25%                   0.96 deg     2219
+    //       20     31%                   1.66 deg     2208
+    //       40     49%                   9.26 deg     2183
+    //       60     60%                  25.04 deg     2124
+    //     none    114%                        --       588
+    //
+    // Read the middle column, not the last one. The point count varies by 5%
+    // across the whole usable range, but the worst per-edge rotation residual
+    // rises by a factor of eighteen, and THAT is the number that says what is
+    // going wrong: the bad matches a loose radius admits are CONSISTENT with
+    // each other. A patch of wall matched to the wrong course of bricks
+    // satisfies the epipolar constraint exactly, so RANSAC counts it as an
+    // inlier and it corrupts the pose instead of being rejected. This is why
+    // the stage cannot be tuned by counting points, and why the 2183 points
+    // at radius 40 are worth less than the 2250 at radius 10.
+    Param<float> m_radius{this, "radius", 10.0f, 4.0f, 400.0f,
+        {.help = "How far, in pixels, a candidate may sit from where the "
+                 "already-matched neighbours predict it should be. The "
+                 "epipolar line says which curve the partner lies on; this "
+                 "says where along it. Raise it for a scene with abrupt depth "
+                 "changes, where neighbours are a poorer guide.",
+         .step = 5.0, .softMax = 120.0}};
+
+    // Measured at radius 10 on fountain-P11: 4 anchors gave 2236 points and a
+    // 1.66 deg worst residual, 8 gave 2250 and 1.37, 16 gave 2242 and 1.67.
+    // A shallow optimum, which is the expected shape -- too few anchors and a
+    // single bad first-pass match drags the prediction with it, too many and
+    // the average reaches across a depth edge the prediction cannot represent.
+    Param<int> m_anchors{this, "anchors", 8, 1, 64,
+        {.help = "How many already-matched neighbours inform the prediction, "
+                 "weighted by inverse distance. More is smoother and less "
+                 "local; fewer follows the surface more closely and is noisier."}};
+
+    Param<int> m_minAnchors{this, "min_anchors", 20, 3, 500,
+        {.help = "Fewest first-pass matches a pair needs before this stage "
+                 "will guide from them. A pair with a handful of matches has "
+                 "no local structure to predict from, and guessing from it "
+                 "would add exactly the wrong matches this stage exists to "
+                 "avoid."}};
+
     Param<float> m_maxDistance{this, "max_distance", 3.0f, 0.5f, 20.0f,
         {.help = "How far, in PIXELS, a candidate may sit from the epipolar "
                  "line its partner must lie on. This is the constraint doing "

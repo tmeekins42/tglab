@@ -274,13 +274,19 @@ public:
         ImageView       dst = ctx.Out(0);
         if (!src.Valid() || !dst.Valid()) return;
 
+        // LOCAL, NOT MEMBERS. One algorithm instance is mapped across every
+        // frame of a group, so scratch kept on the instance is shared between
+        // the threads running those frames, and frames end up holding each
+        // other's pixels. Caught INTERMITTENTLY by TestNoSharedScratch.
+        PixelBuffer        m_in;
+        std::vector<float> m_s, m_r, m_g, m_b, m_delta, m_tmp, m_dr, m_db;
         m_in.Unpack(src);
         if (!m_in.Valid()) return;
 
         const int w = m_in.Width(), h = m_in.Height();
         const CfaPattern cfa = src.desc.cfa;
         if (cfa == CfaPattern::None || cfa == CfaPattern::XTrans) {
-            PassThrough(dst, w, h);
+            PassThrough(m_in, dst, w, h);
             return;
         }
 
@@ -521,7 +527,7 @@ public:
             }
             for (int p = 0; p < chromaPasses; ++p) {
                 if (ctx.Cancelled()) return;
-                ChromaMedianPair(m_dr, m_db, w, h);
+                ChromaMedianPair(m_r, m_g, m_b, m_dr, m_db, w, h);
             }
             // Put the filtered colour back, keeping green -- and therefore
             // luminance detail -- exactly as reconstructed.
@@ -591,8 +597,16 @@ private:
     // Identical output, which is the point: this is arithmetic the old code
     // was already doing, not a different filter. Verified against the previous
     // implementation over the full image before the old one was deleted.
-    void ChromaMedianPair(std::vector<float>& da, std::vector<float>& db, int w, int h) {
+    // The reconstructed planes are PASSED rather than read from members, and
+    // the scratch is local: see RunCPU for why none of it may live on the
+    // instance.
+    void ChromaMedianPair(const std::vector<float>& m_r,
+                          const std::vector<float>& m_g,
+                          const std::vector<float>& m_b,
+                          std::vector<float>& da, std::vector<float>& db,
+                          int w, int h) {
         const size_t n = da.size();
+        std::vector<float> m_luma, m_tmp, m_tmp2;
         m_luma.resize(n);
         for (size_t i = 0; i < n; ++i) m_luma[i] = Luma(m_r[i], m_g[i], m_b[i]);
 
@@ -655,7 +669,8 @@ private:
         db.swap(m_tmp2);
     }
 
-    void PassThrough(ImageView& dst, int w, int h) {
+    // `m_in` is passed rather than read from a member: see RunCPU.
+    void PassThrough(const PixelBuffer& m_in, ImageView& dst, int w, int h) {
         const int ch = m_in.Channels();
         const float scale = m_in.ValueScale();
         for (int y = 0; y < h; ++y)
@@ -758,14 +773,11 @@ private:
     float m_camMul[3] = {1.0f, 1.0f, 1.0f};
     float m_rgbCam[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
 
-    PixelBuffer        m_in;
-    std::vector<float> m_s, m_r, m_g, m_b, m_delta, m_tmp, m_dr, m_db;
 
     // Chroma median scratch: the luma plane computed once per pass, and a
     // second output buffer so both colour-difference planes are filtered in
     // one traversal. Members rather than locals so a slider drag does not
     // reallocate three full-size planes per tick.
-    std::vector<float> m_luma, m_tmp2;
 };
 
 // Shared prologue: constants, the CFA lookup, and the normalised sample fetch.

@@ -30,6 +30,17 @@
 #                    can; sweep it and watch the rotation residual where you
 #                    cannot.
 #
+#   match_guided     DELIBERATELY NOT IN THIS CHAIN. A second matching pass
+#                    guided by the solved geometry finds 18% more matches, and
+#                    on repetitive texture a small fraction of them are the
+#                    same wall matched one brick course over. Those are
+#                    mutually consistent, so they survive RANSAC, chain into
+#                    tracks and triangulate into a PHANTOM SECOND WALL --
+#                    measured on fountain-P11, where the cloud goes from one
+#                    sheet to two. 287 wrong matches out of 15544 is enough.
+#                    See the header of match_guided.cpp; it needs a third-view
+#                    check before it can be trusted here.
+#
 #   build_tracks     chains pairwise matches into TRACKS -- one 3D point and
 #                    every image that saw it -- by union-find. Global SfM needs
 #                    the whole correspondence graph before it can solve
@@ -58,6 +69,15 @@
 #                    to minimise reprojection error in pixels. That is the only
 #                    measure that says a reconstruction is right; every stage
 #                    before it minimises a proxy.
+#
+#   plane_sweep      DENSE depth, one map per frame, by testing a stack of
+#                    candidate depths at every pixel and keeping the one the
+#                    neighbouring views agree with.
+#
+#   fuse_depth       those maps into one cloud, keeping a depth only where
+#                    several cameras independently measured the same surface.
+#                    This is where the sparse few thousand points become
+#                    several hundred thousand.
 #
 # READING THE STATUS LINE, in the order things go wrong:
 #
@@ -110,7 +130,31 @@ small = params( resize, scale = 0.4 )( frames )
 #
 # The cost is quadratic in the matcher, so this is the first control to lower
 # if a large set is slow.
-feat  = params( detect_akaze, max_features = 10000 )( small )
+# colour = 1 APPENDS 84 BITS OF OPPONENT-COLOUR to each descriptor, which AKAZE
+# otherwise throws away entirely -- it describes a greyscale patch, so two
+# bricks of different colour with the same relief are indistinguishable to it.
+# On a scene of repetitive masonry that is exactly the ambiguity that matters.
+#
+# MEASURED ON fountain-P11, and it does more than add points:
+#
+#   colour   points   worst rotation residual   depth profile
+#        0     1636                   1.64 deg   TWO sheets
+#        1     1928                   0.74 deg   one sheet
+#
+# THE LAST COLUMN IS THE REAL RESULT. Without the colour bits the brick wall
+# reconstructs as two surfaces a course apart -- greyscale descriptors cannot
+# tell one course from the next, so a fraction of matches land on the wrong
+# one, and being mutually consistent they survive RANSAC and triangulate into
+# a phantom wall. The colour bits break that symmetry, and the cloud collapses
+# to a single sheet.
+#
+# See bench_sfm's planarity and depth-profile report for how that is measured:
+# no other number in this pipeline shows it, because both sheets reproject
+# correctly and the point count goes UP when the phantom appears.
+#
+# Turn it off for a monochrome or near-monochrome capture, where the extra
+# bits carry no information and only cost matching time.
+feat  = params( detect_akaze, max_features = 10000, colour = 1 )( small )
 
 # CHAIN IS NOT THE DEFAULT, and leaving it off is the single easiest way to
 # get nothing out of this script.
@@ -169,6 +213,7 @@ pairs = params( match_ann, chain = 1, window = 2 )( feat )
 # at fov 115) and near-identity rotations agree with each other trivially. The
 # residual rewards the collapse.
 posed = params( relative_pose, fov_deg = 50 )( pairs )
+
 
 # max_distance = 3 BECAUSE THIS IS A WALK AROUND A SUBJECT. The stages default
 # to 20, which is loose enough for a scene shot from outside -- cameras
@@ -250,5 +295,45 @@ cloud = params( build_tracks, fov_deg = 50, min_length = 3 )( posed )
      => params( triangulate, max_distance = 3 )()
      => params( bundle_adjust_sfm, max_distance = 3 )()
 
+# --- DENSE RECONSTRUCTION ----------------------------------------------------
+#
+# Everything above produces a SPARSE cloud: a few thousand points, one per
+# feature the detector happened to find and the matcher managed to chain. That
+# is enough to recover where the cameras were, which is what it is for, and it
+# is nowhere near enough to describe a surface.
+#
+# These two stages ask the question at every pixel instead.
+#
+#   plane_sweep   guesses a depth for each pixel and keeps the one whose
+#                 neighbouring views agree with it. Outputs a depth map and a
+#                 confidence map per frame, both viewable -- the confidence
+#                 map is where a bad sweep confesses.
+#
+#   fuse_depth    turns N depth maps into ONE cloud. The maps disagree, and
+#                 resolving that is the whole job: a depth is kept only when
+#                 other cameras independently measured the same surface in the
+#                 same place, and agreeing measurements merge into one point
+#                 rather than N near-duplicates.
+#
+# Measured on fountain-P11: a few thousand sparse points become several
+# hundred thousand dense ones, a ~200x increase.
+#
+# min_views = 3 RATHER THAN THE DEFAULT 2, because a third independent
+# measurement is what separates a real surface from a coincidence. Two views
+# agreeing happens often enough on repetitive texture to leave visible noise
+# in the cloud; requiring three removes most of it, at a real cost in
+# coverage. Raise it further on a capture with many overlapping views.
+#
+# THE COST IS REAL AND IT DOMINATES. The sweep runs 250-300 s against ~13 s
+# for the entire detector, matching and SfM chain above it, because it
+# correlates a window per pixel per plane per neighbour -- a few billion
+# operations. Lower `planes` first if that matters; the cost is linear in it.
+#
+# Delete these two lines and the "dense" viewer to get the sparse pipeline
+# back -- nothing above depends on them.
+dense = params( plane_sweep, planes = 48 )( cloud, small )
+fused = params( fuse_depth, min_views = 3 )( cloud, dense )
+
 display( small, "frames" )
 display( cloud, "reconstruction" )
+display( fused, "dense" )

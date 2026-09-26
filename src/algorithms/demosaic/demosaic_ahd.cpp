@@ -378,6 +378,19 @@ public:
         ImageView       dst = ctx.Out(0);
         if (!src.Valid() || !dst.Valid()) return;
 
+        // LOCAL, NOT MEMBERS. One algorithm instance is mapped across every
+        // frame of a group, so scratch kept on the instance is shared between
+        // the threads running those frames -- and the symptom is not a crash
+        // but frames holding each other's pixels. Caught by
+        // TestNoSharedScratch, which reports this INTERMITTENTLY, since a
+        // race only sometimes manifests.
+        //
+        // Keeping the names is deliberate: the arrays are referenced from a
+        // lambda and from fillDiff below, and renaming them would make this
+        // a much larger diff than the bug warrants.
+        PixelBuffer        m_in;
+        std::vector<float> m_s, m_g, m_dr, m_db, m_tmp;
+
         m_in.Unpack(src);
         if (!m_in.Valid()) return;
 
@@ -385,7 +398,7 @@ public:
         const CfaPattern cfa = src.desc.cfa;
 
         if (cfa == CfaPattern::None || cfa == CfaPattern::XTrans) {
-            PassThrough(dst, w, h);
+            PassThrough(m_in, dst, w, h);
             return;
         }
 
@@ -722,6 +735,10 @@ private:
     // since a median of one or two is not a median.
     void MedianFilter(const std::vector<float>& g, std::vector<float>& d,
                       int w, int h) {
+        // Local scratch: see RunCPU for why none of this may live on the
+        // instance. Allocated per call, which is once per colour plane per
+        // frame -- negligible beside the filter itself.
+        std::vector<float> m_tmp;
         m_tmp.assign(d.size(), 0.0f);
         for (int y = 0; y < h; ++y) {
             for (int x = 0; x < w; ++x) {
@@ -767,7 +784,8 @@ private:
         d.swap(m_tmp);
     }
 
-    void PassThrough(ImageView& dst, int w, int h) {
+    // `m_in` is passed rather than read from a member: see RunCPU.
+    void PassThrough(const PixelBuffer& m_in, ImageView& dst, int w, int h) {
         const int ch = m_in.Channels();
         const float scale = m_in.ValueScale();
         for (int y = 0; y < h; ++y)
@@ -896,8 +914,6 @@ private:
     }
 
 private:
-    PixelBuffer        m_in;
-    std::vector<float> m_s, m_g, m_dr, m_db, m_tmp;
 
     int   m_cfa   = 1;
     float m_black = 0.0f;

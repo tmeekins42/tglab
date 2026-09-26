@@ -83,10 +83,16 @@ struct OrbitCamera {
     void Pan(double dx, double dy) {
         const Vec3 fwd = (target - Eye()).Normalized();
         const Vec3 worldUp = WorldUp();
-        const Vec3 right = fwd.Cross(worldUp).Normalized();
+        // MUST MATCH ViewProj's basis, or a drag moves the scene the wrong
+        // way. See the note there on why this is worldUp x fwd.
+        const Vec3 right = worldUp.Cross(fwd).Normalized();
         const Vec3 up = right.Cross(fwd).Normalized();
         const double s = distance * 0.002;
-        target = target + right * (-dx * s) + up * (dy * s);
+        // dy is NOT negated now that `up` points the correct way: with the
+        // basis left-handed both this and the projection's y term carried a
+        // compensating sign, and removing one without the other makes a drag
+        // fight the mouse.
+        target = target + right * (-dx * s) + up * (-dy * s);
     }
 
     // Frames a bounding box: centres on it and backs off far enough to see it.
@@ -142,7 +148,23 @@ struct OrbitCamera {
         const Vec3 eye = Eye();
         const Vec3 fwd = (target - eye).Normalized();
         const Vec3 worldUp = WorldUp();
-        Vec3 right = fwd.Cross(worldUp).Normalized();
+        // right = worldUp x fwd, NOT fwd x worldUp.
+        //
+        // This was backwards, and it mirrored every reconstruction
+        // left-to-right. `fwd x worldUp` is the LEFT-handed convention: with
+        // +Y up it produces a vector pointing to the viewer's left, so the
+        // whole scene rendered as its own mirror image.
+        //
+        // Nothing in the geometry could reveal it -- a mirrored point cloud
+        // is still a plausible point cloud, reprojects correctly, and every
+        // numeric check passes. Tim found it with camera tracking markers
+        // taped to the wall in fountain-P11: a blue square and a black/white
+        // checker whose left-to-right order in the photograph was reversed on
+        // screen. The orbit test watched it happen for weeks because it
+        // computed its own expectation with the same cross product, so both
+        // sides flipped together; see test_sfm.cpp for why that is now
+        // derived from the world instead.
+        Vec3 right = worldUp.Cross(fwd).Normalized();
         if (right.Norm() < 0.5) right = Vec3{1, 0, 0};   // degenerate; pick one
         const Vec3 up = right.Cross(fwd).Normalized();
 
@@ -171,9 +193,20 @@ struct OrbitCamera {
         const double f = 1.0 / std::tan(fovY * 0.5);
         const double aspect = 1.0;   // the caller scales x by width/height
         const double a = f / aspect;
-        // Only the y term is negated; x keeps its sign, or the image would be
-        // mirrored left-to-right as well.
-        const double fy = -f;
+        // NO LONGER NEGATED, because the basis now does it.
+        //
+        // While `right` was computed left-handed (fwd x worldUp), `up` came
+        // out negated too -- up is right x fwd, so flipping one flips the
+        // other. This term was added to cancel that and make the scene look
+        // upright, which it did, at the cost of leaving the left-to-right
+        // mirror in place: two wrongs that together produced a plausible
+        // picture, upright and reversed.
+        //
+        // With the basis right-handed, `up` already points the correct way
+        // for a +Y-down reconstruction and negating here would flip the
+        // image vertically again. Fixing the handedness is what removes the
+        // need for this.
+        const double fy = f;
         const double zn = nearZ, zf = farZ;
         const double q = zf / (zf - zn);
 

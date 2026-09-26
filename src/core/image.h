@@ -196,6 +196,42 @@ struct ImageDesc {
     int FullWidth()  const { return fullW > 0 ? fullW : width;  }
     int FullHeight() const { return fullH > 0 ? fullH : height; }
 
+    // --- depth --------------------------------------------------------------
+    //
+    // True when these floats are METRIC DEPTH along the camera's +Z axis,
+    // rather than image intensity.
+    //
+    // A DEPTH MAP IS NOT A NEW Data TYPE, for exactly the reason a Bayer
+    // mosaic is not one: it is a single-channel 2D array of samples, which
+    // R32F already describes. What it needs beyond that is metadata saying
+    // what the samples MEAN -- a property of the image, not a new kind of
+    // data. Keeping it an Image means PixelBuffer, the stage cache,
+    // FormatSpec, the GPU path, the viewer and the loupe all handle it
+    // unchanged.
+    //
+    // The flag is needed because R32F alone cannot distinguish "depth in
+    // scene units" from "a greyscale image". It participates in operator==
+    // and therefore the stage cache, which is correct: a depth map and a
+    // greyscale image of the same size are genuinely different, and a cached
+    // result for one must not be reused for the other.
+    bool isDepth = false;
+
+    // The range the depth values span, in the same units as the
+    // reconstruction's camera positions. Zero when unknown.
+    //
+    // CARRIED SO THE EXISTING VIEWER WORKS. The R32F display path already
+    // normalises by blackLevel/whiteLevel -- written so a raw mosaic's sensor
+    // counts do not clamp to white -- and a depth map over [near, far] is the
+    // same problem. A producer sets blackLevel/whiteLevel to match these and
+    // the map displays correctly with no new drawing code.
+    //
+    // Kept SEPARATE from blackLevel/whiteLevel rather than reusing them,
+    // because those two mean "sensor black and saturation" and a consumer
+    // that wants the depth range should not have to know it was smuggled
+    // through a sensor field. One is for display; these are the measurement.
+    float depthNear = 0.0f;
+    float depthFar  = 0.0f;
+
     bool operator==(const ImageDesc&) const = default;
     size_t SizeInBytes() const;
     bool   Valid() const { return width > 0 && height > 0 && format != Format::Unknown; }

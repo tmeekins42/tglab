@@ -276,6 +276,30 @@ public:
         return true;
     }
 
+    // The DENSE variant: reads a finished reconstruction and the source
+    // frames, and produces IMAGES -- one depth map per frame for a plane
+    // sweep, and the same path for PMVS later.
+    //
+    // Called instead of RunReconstruct when IsReconstruct() is true and the
+    // stage declares an ImageSet output. Which of the two runs is decided by
+    // the declared output port, so a stage says what it makes rather than the
+    // pipeline assuming every reconstruct stage makes a cloud.
+    //
+    // `cloud` is CONST here where RunReconstruct takes it by pointer: a dense
+    // stage consumes the geometry and must not quietly refine it. Anything
+    // that improves the cameras belongs in bundle adjustment, where it can be
+    // measured, not as a side effect of sweeping for depth.
+    //
+    // `out` arrives EMPTY apart from its shape. A depth map is R32F where the
+    // frames are RGBA8 and there may be two per frame, so there is nothing
+    // useful to pre-allocate and pre-cloning the inputs would only be work
+    // thrown away.
+    virtual bool RunDense(const std::vector<Image>* /*images*/,
+                          const PointCloud& /*cloud*/, ImageSet* /*out*/,
+                          std::string* /*err*/) {
+        return true;
+    }
+
     // True when this stage's settings would leave the image unchanged, so the
     // pipeline can skip it ENTIRELY -- no allocation, no dispatch, no copy.
     //
@@ -409,6 +433,25 @@ public:
     // The streaming accumulator. See core/reduction.h for why it is Begin /
     // Accept / Finish rather than "here are all N images".
     virtual Reducer* AsReducer() { return nullptr; }
+
+    // --- the device, for whole-group stages ---------------------------------
+    //
+    // RunAlign and RunReconstruct see the group rather than one image, so
+    // neither is handed a RunCtx -- and RunCtx is where ctx.Gpu() lives. A
+    // group stage that wants the device therefore had no way to reach it.
+    //
+    // That was fine while every such stage was pure CPU geometry. It stops
+    // being fine for dense reconstruction: a plane sweep is a few hundred
+    // dispatches over a cost volume and is not worth writing for the CPU.
+    //
+    // SET BY THE PIPELINE immediately before the call, for the same reason
+    // RunCtx carries it rather than the algorithm owning one: the device
+    // belongs to the run, not to the algorithm, and an algorithm that cached
+    // one would outlive it. Null is legitimate and common -- no device,
+    // ForceCPU, a GPU-less build -- so every user needs a CPU fallback, and
+    // GpuLock is null-tolerant so the call site needs no second check.
+    void SetGroupGpu(ComputeContext* gpu) { m_groupGpu = gpu; }
+    ComputeContext* GroupGpu() const { return m_groupGpu; }
 
     // --- GPU path (M3) ------------------------------------------------------
     // An algorithm opts in by returning true from HasGPU() and providing the
@@ -738,6 +781,10 @@ public:
     // Folds every parameter value into one hash for dirty detection.
     uint64_t ParamHash() const;
 
+private:
+    // The device for a whole-group stage. Borrowed from the run, never owned:
+    // see SetGroupGpu. Null whenever there is no device or the run is CPU-only.
+    ComputeContext* m_groupGpu = nullptr;
 };
 
 // ---------------------------------------------------------------------------

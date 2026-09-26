@@ -1689,10 +1689,73 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
                 // Carried forward, so each stage refines what the last
                 // produced rather than starting over.
                 cloud = *prev;
+
+                // A SECOND INPUT MAY CARRY THE FRAMES, which is what a DENSE
+                // stage needs: plane sweeping and PMVS both read pixels, and
+                // by this point in the chain the pipeline is passing a
+                // PointCloud and the images are long gone.
+                //
+                // Optional rather than required, because every existing
+                // reconstruct stage -- rotation averaging, positioning,
+                // triangulation, bundle adjustment -- refines geometry alone
+                // and would only be burdened by a port it never reads.
+                //
+                //     dense = plane_sweep(cloud, small)
+                //
+                // The frames are NOT required to be the ones the cameras were
+                // solved from, and deliberately so: a reconstruction solved on
+                // downscaled frames can be swept at full resolution. What must
+                // hold is that frame i here is frame i there, which is the
+                // same ordering contract the whole chain already relies on.
+                if (in.size() > 1 && in[1]) {
+                    if (const auto* aux = std::get_if<ImageSet>(in[1])) {
+                        frames = &aux->images;
+                    } else {
+                        *err = "line " + std::to_string(s.line) + ": '" +
+                               s.algoName + "' takes a group as its second "
+                               "input, not a reconstruction";
+                        return false;
+                    }
+                }
             } else {
                 *err = "line " + std::to_string(s.line) + ": '" + s.algoName +
                        "' needs a group or a reconstruction";
                 return false;
+            }
+
+            // The device, for a dense stage that dispatches its own kernels.
+            // ForceCPU is honoured here exactly as it is for RunCPU: the mode
+            // exists so a result can be compared against the CPU path, and a
+            // reconstruct stage reaching past it would defeat that.
+            s.algo->SetGroupGpu(mode == ExecMode::ForceCPU ? nullptr : gpu);
+
+            // A DENSE stage produces IMAGES rather than a cloud: a plane sweep
+            // outputs one depth map per frame, and PMVS will want the same
+            // path. Declared through the output port like everything else, so
+            // the stage says what it makes rather than the pipeline assuming.
+            //
+            // Handed to the algorithm EMPTY, unlike the aligner path which
+            // pre-clones its input. A depth map is R32F where the frames are
+            // RGBA8, there may be two outputs per frame rather than one, and
+            // cloning colour pixels only to overwrite them with depth would be
+            // wasted work on every frame.
+            const PortList outPorts = s.algo->Outputs();
+            const bool wantsImages =
+                !outPorts.empty() && outPorts[0].type == DataType::ImageSet;
+
+            ImageSet dense;
+            if (wantsImages) {
+                dense.shape = cloud.shape;
+                std::string derr;
+                if (!s.algo->RunDense(frames, cloud, &dense, &derr)) {
+                    *err = "line " + std::to_string(s.line) + ": " + derr;
+                    return false;
+                }
+                s.outputs.clear();
+                s.outputs.resize(1);
+                s.outputs[0] = Data{std::move(dense)};
+                s.valid = true;
+                continue;
             }
 
             std::string rerr;
@@ -1718,6 +1781,8 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
             out.shape = src->shape;
             out.images.reserve(src->images.size());
             for (const Image& im : src->images) out.images.push_back(im.Clone());
+
+            s.algo->SetGroupGpu(mode == ExecMode::ForceCPU ? nullptr : gpu);
 
             std::string aerr;
             if (!s.algo->RunAlign(&out.images, &aerr)) {
