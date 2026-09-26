@@ -81,9 +81,13 @@
 #include <string>
 #include <vector>
 
+#include <memory>
+
 #include "../../algo_util/view_graph.h"
 #include "../../core/algorithm.h"
 #include "../../core/parallel.h"
+#include "../features/gpu_pyramid.h"
+#include "gpu_sweep.h"
 
 namespace tglab {
 namespace {
@@ -415,12 +419,57 @@ public:
         std::vector<double> perNear(size_t(nFrames), 0.0);
         std::vector<double> perFar(size_t(nFrames), 0.0);
 
-        ParallelFor(nFrames, [&](int f) {
-            SweepFrame(f, cloud, images, planes, nPlanes, radius, maxNb, minCorr,
-                       zNear, zFar, out, &perMeasured[size_t(f)],
+        // TWO PASSES: THE GPU SERIALLY, THEN THE CPU IN PARALLEL FOR WHATEVER
+        // THE GPU DID NOT FINISH.
+        //
+        // The device is ONE resource. ComputeContext has a single command
+        // queue with no locking of its own, so every frame that wants it
+        // takes the same lock and holds it for its whole sweep. Running eight
+        // threads at that overlaps nothing -- seven sit blocked while the
+        // eighth runs -- and only adds eight simultaneous sets of device
+        // textures. That was one of the two things that locked the UI up
+        // (3.5 GB of VRAM and no free worker thread). So the GPU pass is a
+        // plain loop.
+        //
+        // AND IT MAY FAIL PART WAY. A device removal, a shader that will not
+        // compile, a hung fence: any of them leaves some frames unswept. The
+        // first version then fell through to the CPU inside the same serial
+        // loop, which made a GPU failure cost eight times the CPU sweep --
+        // "ran forever", from the user's chair. Now a frame the GPU did not
+        // finish is collected and swept afterwards on the parallel CPU path,
+        // exactly as it would have been with no device at all.
+        //
+        // The report says how many frames each path took, because a fallback
+        // that happens silently is the kind of thing that costs a day.
+        std::vector<char> done(size_t(nFrames), 0);
+        int gpuFrames = 0;
+        const bool gpuAvail = GroupGpu() && GpuSweepReady(GroupGpu()) &&
+                              maxNb <= 4;
+        if (gpuAvail) {
+            for (int f = 0; f < nFrames; ++f) {
+                if (SweepFrame(f, cloud, images, planes, nPlanes, radius,
+                               maxNb, minCorr, zNear, zFar, out,
+                               &perMeasured[size_t(f)], &perTotal[size_t(f)],
+                               &perNear[size_t(f)], &perFar[size_t(f)],
+                               /*gpuOnly=*/true)) {
+                    done[size_t(f)] = 1;
+                    ++gpuFrames;
+                }
+            }
+        }
+
+        std::vector<int> rest;
+        for (int f = 0; f < nFrames; ++f)
+            if (!done[size_t(f)]) rest.push_back(f);
+        ParallelFor(int(rest.size()), [&](int i) {
+            const int f = rest[size_t(i)];
+            SweepFrame(f, cloud, images, planes, nPlanes, radius, maxNb,
+                       minCorr, zNear, zFar, out, &perMeasured[size_t(f)],
                        &perTotal[size_t(f)], &perNear[size_t(f)],
-                       &perFar[size_t(f)]);
+                       &perFar[size_t(f)], /*gpuOnly=*/false);
         });
+        m_gpuFrames = gpuFrames;
+        m_gpuAvail  = gpuAvail;
 
         for (int f = 0; f < nFrames; ++f) {
             measured += perMeasured[size_t(f)];
@@ -469,16 +518,24 @@ public:
             if (a >= 0.0 && a > worstAgree) { worstAgree = a; worstFrame = f; }
         }
 
-        char buf[520];
+        // WHICH PATH RAN, stated every time. A GPU fallback that happens
+        // silently reads as "the GPU is slow" and costs a day; one that says
+        // "0 of 11 on the GPU" reads as what it is.
+        char gpuBuf[64] = "";
+        if (m_gpuAvail)
+            std::snprintf(gpuBuf, sizeof(gpuBuf), "; %d of %d frames on the GPU",
+                          m_gpuFrames, nFrames);
+
+        char buf[600];
         std::snprintf(buf, sizeof(buf),
                       "plane sweep: %d frames, %d planes, %d neighbours, "
                       "%dx%d window; per-frame depth span %.3f (whole cloud "
                       "%.3f..%.3f); %.1f%% of pixels measured, median %.1f%% "
-                      "from the sparse points (worst frame %d at %.1f%%)",
+                      "from the sparse points (worst frame %d at %.1f%%)%s",
                       nFrames, nPlanes, maxNb,
                       2 * radius + 1, 2 * radius + 1, meanSpan, zNear, zFar,
                       total > 0 ? 100.0 * double(measured) / double(total) : 0.0,
-                      agree * 100.0, worstFrame, worstAgree * 100.0);
+                      agree * 100.0, worstFrame, worstAgree * 100.0, gpuBuf);
         m_note = buf;
         return true;
     }
@@ -648,13 +705,16 @@ private:
         return outIdx;
     }
 
-    void SweepFrame(int f, const PointCloud& cloud,
+    // Returns false ONLY when `gpuOnly` is set and the device did not finish
+    // the frame; the caller then sweeps it on the CPU. With gpuOnly false it
+    // always completes, on the CPU.
+    bool SweepFrame(int f, const PointCloud& cloud,
                     const std::vector<Image>* srcFrames,
                     const std::vector<Plane>& planes, int nPlanes, int radius,
                     int maxNb, double minCorr, double zNear, double zFar,
                     ImageSet* out, long long* measured,
                     long long* total, double* usedNear,
-                    double* usedFar) const {
+                    double* usedFar, bool gpuOnly) const {
         const Camera& ref = cloud.cameras[size_t(f)];
         const Plane&  rp  = planes[size_t(f)];
 
@@ -740,7 +800,7 @@ private:
             out->images[size_t(f) * 3 + 0] = std::move(depthImg);
             out->images[size_t(f) * 3 + 1] = std::move(confImg);
             out->images[size_t(f) * 3 + 2] = std::move(colImg);
-            return;
+            return true;
         }
 
         // SWEPT IN INVERSE DEPTH, not in depth. Depth resolution from a fixed
@@ -944,7 +1004,78 @@ private:
         std::vector<float> perNb;
         perNb.assign(nPix * nbs.size(), -2.0f);
 
-        for (int p = 0; p < nPlanes; ++p) {
+        // --- the device, if there is one -------------------------------------
+        //
+        // Every (plane, neighbour) pair is independent and the work per pixel
+        // is a texture fetch and two separable passes, which is as close to
+        // an ideal compute shader as this pipeline has. The session uploads
+        // the reference, its window sums and every neighbour ONCE, then
+        // dispatches per pair.
+        //
+        // FALLS BACK SILENTLY. A GPU-less build, ForceCPU, a failed shader
+        // compile or a device removal all leave `session` null and the CPU
+        // path runs exactly as before. That matters more here than usual:
+        // the sweep is the stage most likely to be run on a machine without
+        // a usable device, and a hard failure would make the whole pipeline
+        // unusable rather than slow.
+        const int skipNowShared = std::max(2, nPlanes / 24);
+        bool onGpu = false;
+        if (gpuOnly) {
+            ComputeContext* dev = GroupGpu();
+            if (dev && GpuSweepReady(dev) && nbs.size() <= 4) {
+                SweepPlane sref{rp.v.data(), rp.w, rp.h};
+                std::vector<SweepPlane> snb;
+                snb.reserve(nbs.size());
+                for (int nbi : nbs) {
+                    const Plane& q = planes[size_t(nbi)];
+                    snb.push_back(SweepPlane{q.v.data(), q.w, q.h});
+                }
+
+                // The whole homography table, flattened for one upload. The
+                // session holds it on the device so a plane costs a dispatch
+                // and nothing else.
+                std::vector<double> Hflat(size_t(nPlanes) * nbs.size() * 9);
+                for (int p = 0; p < nPlanes; ++p)
+                    for (size_t k = 0; k < nbs.size(); ++k)
+                        for (int e = 0; e < 9; ++e)
+                            Hflat[(size_t(p) * nbs.size() + k) * 9 + size_t(e)] =
+                                H[size_t(p) * nbs.size() + k].m[e];
+
+                // ONE LOCK FOR THE WHOLE FRAME. ComputeContext has a single
+                // command queue with no locking of its own. Held across every
+                // dispatch rather than inside each, because upload, dispatch
+                // and readback are one logical operation.
+                GpuLock lock(dev);
+                GpuSweepSession s;
+                std::string gerr;
+                if (s.Begin(dev, sref, snb, radius, nPlanes, skipNowShared,
+                            Hflat.data(), &gerr)) {
+                    bool ok = true;
+                    for (int p = 0; p < nPlanes && ok; ++p)
+                        ok = s.Plane(p, &gerr);
+
+                    std::vector<float> gb, gp, gn, gr;
+                    std::vector<int>   gi;
+                    if (ok && s.Finish(&gb, &gp, &gn, &gr, &gi, &gerr)) {
+                        for (size_t i = 0; i < nPix; ++i) {
+                            PixState& q = st[i];
+                            q.best   = gb[i];
+                            q.prev   = gp[i];
+                            q.next   = gn[i];
+                            q.rival  = gr[i];
+                            q.bestP  = gi[i];
+                        }
+                        onGpu = true;
+                    }
+                }
+            }
+            // The device did not finish this frame. Hand it back untouched so
+            // the caller sweeps it on the parallel CPU path, rather than
+            // doing that work here, serially, one frame at a time.
+            if (!onGpu) return false;
+        }
+
+        for (int p = 0; !onGpu && p < nPlanes; ++p) {
             std::fill(perNb.begin(), perNb.end(), -2.0f);
 
             for (size_t k = 0; k < nbs.size(); ++k) {
@@ -1204,6 +1335,7 @@ private:
         out->images[size_t(f) * 3 + 0] = std::move(depthImg);
         out->images[size_t(f) * 3 + 1] = std::move(confImg);
         out->images[size_t(f) * 3 + 2] = std::move(colImg);
+        return true;
     }
 
     // Median relative disagreement between the sweep and triangulation, at
@@ -1423,6 +1555,11 @@ private:
          .step = 0.05}};
 
     std::string m_note;
+
+    // How the last run split its frames between the device and the CPU.
+    // Diagnostics for the report, set by RunDense; nothing reads them back.
+    int  m_gpuFrames = 0;
+    bool m_gpuAvail  = false;
 };
 
 REGISTER_ALGORITHM(PlaneSweep);

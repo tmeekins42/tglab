@@ -35,6 +35,20 @@
 #include "../src/core/pipeline.h"
 #include "../src/script/interp.h"
 #include "../src/script/parser.h"
+#include "../src/gpu/compute.h"
+#include "../src/algorithms/sfm/gpu_sweep.h"
+
+#include <d3d12.h>
+
+// d3d12.h drags in windows.h, which defines `near` and `far` as macros for
+// 16-bit segmented addressing. They have no business here and they collide
+// with ordinary variable names.
+#ifdef near
+#undef near
+#endif
+#ifdef far
+#undef far
+#endif
 
 using namespace tglab;
 
@@ -2737,6 +2751,159 @@ int main() {
                     Check(std::fabs(got - want) < 0.35 * std::fabs(want), m2);
                 }
             }
+        }
+    }
+
+    // --- the GPU sweep agrees with the CPU one ------------------------------
+    //
+    // THE ONLY CHECK THAT MATTERS FOR AN OFFLOAD. A GPU path that is merely
+    // plausible is worse than none: it runs by default, produces a slightly
+    // different answer, and every measurement taken afterwards is quietly
+    // against a different algorithm than the one that was tested.
+    //
+    // So this runs plane_sweep twice on the same synthetic scene -- once with
+    // the device and once with ForceCPU -- and compares the depth maps pixel
+    // by pixel. Skipped, loudly, where there is no device.
+    //
+    // The GPU path is one fused kernel per plane, submitted on its own -- see
+    // gpu_sweep.h for why that shape and not the three-pass one it replaced.
+    // The float summation order differs from the CPU's sliding box sums, so
+    // exact equality is not expected; a fraction of a percent is.
+    {
+        std::printf("\n--- gpu sweep vs cpu ---\n");
+
+        ID3D12Device* dev = nullptr;
+        if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0,
+                                     IID_PPV_ARGS(&dev)))) {
+            std::printf("       no D3D12 device; skipped\n");
+        } else {
+            ComputeContext gpu;
+            if (!gpu.Init(dev)) {
+                std::printf("       compute init failed; skipped\n");
+            } else if (!GpuSweepReady(&gpu)) {
+                std::printf("       sweep kernels did not compile; skipped\n");
+            } else {
+                // The same fronto-parallel fixture the CPU test uses, rebuilt
+                // here so the two tests cannot drift apart silently.
+                const int    W = 160, H = 120;
+                const double focal = 150.0, cx = W * 0.5, cy = H * 0.5;
+                const double trueDepth = 5.0, baseline = 0.6;
+
+                auto Texture = [](double wx, double wy) {
+                    const double v =
+                        std::sin(wx * 2.7 + 0.3) * std::cos(wy * 3.1 - 0.7) +
+                        0.5 * std::sin(wx * 7.3 - wy * 5.1 + 1.1) +
+                        0.25 * std::cos(wx * 13.7 + wy * 11.3);
+                    return 0.5 + 0.18 * v;
+                };
+
+                PointCloud pc;
+                for (int i = 0; i < 2; ++i) {
+                    Camera c;
+                    c.width = W; c.height = H;
+                    c.cx = cx;   c.cy = cy;
+                    c.focal = focal;
+                    c.R = Mat3::Identity();
+                    c.t = Vec3{-(i == 0 ? 0.0 : baseline), 0.0, 0.0};
+                    c.solved = true;
+                    pc.cameras.push_back(c);
+                }
+
+                std::vector<Image> frames;
+                for (int f = 0; f < 2; ++f) {
+                    const Camera& c = pc.cameras[size_t(f)];
+                    const Vec3 centre = c.Center();
+                    ImageDesc d{W, H, Format::RGBA8};
+                    Image im;
+                    im.Alloc(d);
+                    ImageView v = im.MapCpuWrite();
+                    for (int y = 0; y < H; ++y)
+                        for (int x = 0; x < W; ++x) {
+                            const double dx = (double(x) - c.cx) / c.focal;
+                            const double dy = (double(y) - c.cy) / c.focal;
+                            const uint8_t g = uint8_t(std::clamp(
+                                Texture(centre.x + dx * trueDepth,
+                                        centre.y + dy * trueDepth) * 255.0,
+                                0.0, 255.0));
+                            uint8_t* p = v.At<uint8_t>(x, y);
+                            p[0] = p[1] = p[2] = g;
+                            p[3] = 255;
+                        }
+                    frames.push_back(std::move(im));
+                }
+                for (int i = 0; i < 64; ++i) {
+                    Track t;
+                    t.hasPoint = true;
+                    const double u = double(i % 8) - 3.5, w2 = double(i / 8) - 3.5;
+                    t.point = Vec3{u * 0.2, w2 * 0.2, trueDepth};
+                    pc.tracks.push_back(t);
+                }
+
+                // The CPU reference, through the stage as a user would get it.
+                auto sweep = [&](ComputeContext* device, ImageSet* out) {
+                    auto algo = Registry::Get().Create("plane_sweep");
+                    if (!algo) return false;
+                    std::string e;
+                    if (ParamBase* p = algo->FindParam("planes"))
+                        p->SetFromScript(Value(32.0), &e);
+                    if (ParamBase* p = algo->FindParam("neighbours"))
+                        p->SetFromScript(Value(1.0), &e);
+                    algo->SetGroupGpu(device);
+                    return algo->RunDense(&frames, pc, out, &e);
+                };
+
+                ImageSet cpuOut, gpuOut;
+                const bool okC = sweep(nullptr, &cpuOut);
+                const bool okG = sweep(&gpu,    &gpuOut);
+                Check(okC && okG, "plane_sweep runs on both paths");
+
+
+                if (okC && okG && cpuOut.images.size() >= 1 &&
+                    gpuOut.images.size() >= 1) {
+                    ImageView a = cpuOut.images[0].MapCpuRead();
+                    ImageView b = gpuOut.images[0].MapCpuRead();
+
+                    int both = 0, onlyOne = 0;
+                    double worst = 0.0;
+                    if (a.Valid() && b.Valid()) {
+                        for (int y = 0; y < H; ++y)
+                            for (int x = 0; x < W; ++x) {
+                                const float za = *a.At<float>(x, y);
+                                const float zb = *b.At<float>(x, y);
+                                const bool ma = za > 0.0f, mb = zb > 0.0f;
+                                if (ma != mb) { ++onlyOne; continue; }
+                                if (!ma) continue;
+                                ++both;
+                                worst = std::max(worst,
+                                    std::fabs(double(za) - double(zb)) / double(za));
+                            }
+                    }
+
+                    Check(both > 1000,
+                          "the two paths measure the same region (" +
+                              std::to_string(both) + " shared pixels)");
+
+                    char m[220];
+                    std::snprintf(m, sizeof(m),
+                                  "the GPU depth matches the CPU (worst %.3f%%"
+                                  " over %d pixels, %d disagree on coverage)",
+                                  worst * 100.0, both, onlyOne);
+                    // Float arithmetic on the device against float on the
+                    // host, in a different summation order -- exact equality
+                    // is not on offer, but a fraction of a percent is.
+                    Check(worst < 0.01, m);
+
+                    // Coverage may differ slightly at the flat-window
+                    // threshold, where a correlation of exactly zero falls on
+                    // one side or the other. A few pixels is rounding; a
+                    // large fraction means the paths disagree about what is
+                    // measurable.
+                    Check(onlyOne < (W * H) / 50,
+                          "...and they agree on WHICH pixels are measurable (" +
+                              std::to_string(onlyOne) + " differ)");
+                }
+            }
+            dev->Release();
         }
     }
 

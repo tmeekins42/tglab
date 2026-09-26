@@ -109,16 +109,19 @@ frames = image("group")
 # sees while leaving the image alone. That fixed the cause, and the warning
 # with it. Measured on fountain-P11:
 #
-#   resize   sparse points   dense points   sweep time
-#     0.4             2032         508582         15 s
-#     off             2894        2507256         47 s
+#   resize   sparse points   dense points   sweep, GPU   sweep, CPU
+#     0.4             2032         508582          2 s         15 s
+#     off             2894        2507256         18 s         33 s
+#
+# (Dense counts from bench_sfm at the script's settings; the app has produced
+# around six million at full resolution with looser fuse_depth settings.)
 #
 # FULL RESOLUTION IS NOW BETTER, not worse: 40% more sparse points and five
 # times the dense cloud, because the sweep correlates real pixels rather than
 # a quarter of them.
 #
 # So this is a speed control. The dense stages cost roughly the pixel count,
-# and 2.5 million points is more than most uses need -- 0.4 is a reasonable
+# and millions of points is more than most uses need -- 0.4 is a reasonable
 # default for working quickly and turning it off is the right move for a
 # final reconstruction. Both are correct; they differ in how long you wait.
 small = params( resize, scale = 0.4 )( frames )
@@ -336,11 +339,12 @@ cloud = params( build_tracks, fov_deg = 50, min_length = 3 )( posed )
 # in the cloud; requiring three removes most of it, at a real cost in
 # coverage. Raise it further on a capture with many overlapping views.
 #
-# THE SWEEP IS THE EXPENSIVE STAGE, though far less so than it was: ~6 s
-# against ~13 s for the detector, matching and SfM chain above it. It
-# correlates a window per pixel per plane per neighbour, which was 110 s
-# before the warp-once-per-plane rewrite. Lower `planes` if it matters;
-# the cost is linear in it.
+# THE SWEEP IS NO LONGER THE EXPENSIVE STAGE. It correlates a window per
+# pixel per plane per neighbour, which cost 110 s on the CPU originally, 15 s
+# after the warp-once-per-plane rewrite, and 2 s on the GPU -- against ~13 s
+# for the detector, matching and SfM chain above it. Without a usable device
+# it falls back to the CPU and the report line says so. Lower `planes` if it
+# matters; the cost is linear in it.
 #
 # Delete these two lines and the "dense" viewer to get the sparse pipeline
 # back -- nothing above depends on them.
