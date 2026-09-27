@@ -79,6 +79,17 @@ struct PointCloud {
     };
     std::vector<ViewEdge> edges;
 
+    // Gaussian splats, when a stage has made them. Empty otherwise.
+    //
+    // HERE RATHER THAN AS A NEW Data TYPE. A splat set is a reconstruction:
+    // it needs the cameras to be trained against and to be viewed from, and
+    // it flows through the same stages and the same viewer. A separate type
+    // would copy the cameras across, add a variant branch to every site that
+    // switches on Data, and still end up wanting both halves together.
+    // The tracks stay alongside, so the viewer can still frame on them and
+    // show either representation.
+    std::vector<Splat> splats;
+
     // The group this was reconstructed from, for reporting and for viewers
     // that want to show a camera's image.
     Shape shape;

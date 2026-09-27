@@ -385,6 +385,7 @@ int main(int argc, char** argv) {
     int detMaxDim = -1;          // negative: leave the detector's own default
     int detColour = -1;          // negative: leave the detector's default
     std::string script;
+    std::string dumpDir;   // --dump: save every image-set viewer as PNGs
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -408,6 +409,7 @@ int main(int argc, char** argv) {
         else if (a == "--det-max-dim" && i + 1 < argc) detMaxDim = std::atoi(argv[++i]);
         else if (a == "--colour" && i + 1 < argc) detColour = std::atoi(argv[++i]);
         else if (a == "--script" && i + 1 < argc)   script = argv[++i];
+        else if (a == "--dump" && i + 1 < argc)     dumpDir = argv[++i];
         else files.push_back(a);
     }
 
@@ -523,6 +525,22 @@ int main(int argc, char** argv) {
         // makes when it chooses a panel kind.
         for (const ViewerDecl& vd : sp.Viewers()) {
             const Data* d = sp.Resolve(vd.source, &s);
+
+            // --dump: what a viewer would show, as files. The bench has no
+            // window, and some things -- a render beside its photograph --
+            // cannot be judged from numbers alone.
+            if (!dumpDir.empty() && d) {
+                if (const ImageSet* set = std::get_if<ImageSet>(d)) {
+                    std::filesystem::create_directories(dumpDir);
+                    for (size_t i = 0; i < set->images.size(); ++i) {
+                        Image copy = set->images[i].Clone();
+                        char name[64];
+                        std::snprintf(name, sizeof(name), "_%02d.png", int(i));
+                        std::string e;
+                        SavePng(dumpDir + "/" + vd.name + name, copy, &e);
+                    }
+                }
+            }
             const char* kind = "nothing";
             if (d && std::holds_alternative<PointCloud>(*d)) kind = "PointCloud";
             else if (d && std::holds_alternative<Image>(*d)) kind = "Image";

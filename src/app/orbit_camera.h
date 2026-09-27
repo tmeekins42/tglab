@@ -80,13 +80,24 @@ struct OrbitCamera {
 
     // Pan across the view plane, in units scaled by distance so a drag moves
     // the same fraction of the screen however far out the camera is.
+    // The camera's basis: right, up and the viewing direction, in world space.
+    //
+    // ONE DEFINITION for everything that needs it. ViewProj builds its matrix
+    // from this, Pan moves along it, and the splat renderer projects each
+    // Gaussian's covariance into it. Three copies of the same cross products
+    // would be three chances to get the handedness wrong independently, and
+    // the handedness has already been wrong once -- see ViewProj.
+    void Basis(Vec3* right, Vec3* up, Vec3* fwd) const {
+        *fwd = (target - Eye()).Normalized();
+        // right = worldUp x fwd, NOT fwd x worldUp: see ViewProj.
+        *right = WorldUp().Cross(*fwd).Normalized();
+        if (right->Norm() < 0.5) *right = Vec3{1, 0, 0};   // degenerate
+        *up = right->Cross(*fwd).Normalized();
+    }
+
     void Pan(double dx, double dy) {
-        const Vec3 fwd = (target - Eye()).Normalized();
-        const Vec3 worldUp = WorldUp();
-        // MUST MATCH ViewProj's basis, or a drag moves the scene the wrong
-        // way. See the note there on why this is worldUp x fwd.
-        const Vec3 right = worldUp.Cross(fwd).Normalized();
-        const Vec3 up = right.Cross(fwd).Normalized();
+        Vec3 right, up, fwd;
+        Basis(&right, &up, &fwd);
         const double s = distance * 0.002;
         // dy is NOT negated now that `up` points the correct way: with the
         // basis left-handed both this and the projection's y term carried a
@@ -146,8 +157,8 @@ struct OrbitCamera {
     // z-fighting.
     void ViewProj(float out[16]) const {
         const Vec3 eye = Eye();
-        const Vec3 fwd = (target - eye).Normalized();
-        const Vec3 worldUp = WorldUp();
+        Vec3 right, up, fwd;
+        Basis(&right, &up, &fwd);
         // right = worldUp x fwd, NOT fwd x worldUp.
         //
         // This was backwards, and it mirrored every reconstruction
@@ -163,10 +174,7 @@ struct OrbitCamera {
         // screen. The orbit test watched it happen for weeks because it
         // computed its own expectation with the same cross product, so both
         // sides flipped together; see test_sfm.cpp for why that is now
-        // derived from the world instead.
-        Vec3 right = worldUp.Cross(fwd).Normalized();
-        if (right.Norm() < 0.5) right = Vec3{1, 0, 0};   // degenerate; pick one
-        const Vec3 up = right.Cross(fwd).Normalized();
+        // derived from the world instead. The cross products live in Basis().
 
         // View: rotate into the camera basis, then translate.
         const double vx = -right.Dot(eye), vy = -up.Dot(eye), vz = fwd.Dot(eye);

@@ -284,4 +284,56 @@ struct Track {
     int Length() const { return int(obs.size()); }
 };
 
+// One 3D Gaussian: the primitive of Gaussian splatting (Kerbl et al. 2023).
+//
+// A point says only WHERE a surface is. A Gaussian also says how big the
+// surface element is, which way it faces, and how opaque it is -- enough that a
+// few hundred thousand of them, blended in depth order, render as a continuous
+// surface rather than a scatter of dots. That is the whole reason to prefer
+// them over the dense cloud they are initialised from.
+//
+// PARAMETERISED AS THE PAPER DOES, and deliberately so: scale and rotation
+// rather than a covariance matrix. Any scale and any unit quaternion give a
+// valid covariance R S S^T R^T, so an optimiser can move them freely; moving
+// a covariance directly can leave it non-positive-definite, which is not a
+// Gaussian at all. Training will need exactly these parameters, so the type
+// has them from the start.
+//
+// Colour is a single RGB for now -- the paper's zeroth spherical-harmonic
+// band. The higher bands, which let colour vary with viewing direction, only
+// mean anything once training can fit them.
+struct Splat {
+    Vec3   mean;
+    Vec3   scale;                         // standard deviations, world units
+    double rot[4] = {1.0, 0.0, 0.0, 0.0}; // unit quaternion, w x y z
+    double opacity = 1.0;                 // 0..1
+    Vec3   color;                         // linear-ish 0..1, as Track::color
+
+    // The rotation as a matrix: columns are the Gaussian's local axes in world
+    // space, so column 2 is the normal of a flattened splat.
+    Mat3 Rotation() const {
+        const double w = rot[0], x = rot[1], y = rot[2], z = rot[3];
+        Mat3 R;
+        R.m[0] = 1 - 2 * (y * y + z * z); R.m[1] = 2 * (x * y - w * z);     R.m[2] = 2 * (x * z + w * y);
+        R.m[3] = 2 * (x * y + w * z);     R.m[4] = 1 - 2 * (x * x + z * z); R.m[5] = 2 * (y * z - w * x);
+        R.m[6] = 2 * (x * z - w * y);     R.m[7] = 2 * (y * z + w * x);     R.m[8] = 1 - 2 * (x * x + y * y);
+        return R;
+    }
+
+    // Sigma = R S S^T R^T, as the six unique entries xx xy xz yy yz zz.
+    void Covariance(double c[6]) const {
+        const Mat3 R = Rotation();
+        const double s2[3] = {scale.x * scale.x, scale.y * scale.y,
+                              scale.z * scale.z};
+        auto e = [&](int i, int j) {
+            double v = 0.0;
+            for (int k = 0; k < 3; ++k)
+                v += R.m[i * 3 + k] * s2[k] * R.m[j * 3 + k];
+            return v;
+        };
+        c[0] = e(0, 0); c[1] = e(0, 1); c[2] = e(0, 2);
+        c[3] = e(1, 1); c[4] = e(1, 2); c[5] = e(2, 2);
+    }
+};
+
 }  // namespace tglab

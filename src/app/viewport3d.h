@@ -57,8 +57,17 @@ public:
 
 private:
     bool EnsurePipeline(Device& dev);
+    bool EnsureSplatPipeline(Device& dev);
     bool UploadGeometry(Device& dev);
+    bool UploadSplats(Device& dev);
+    bool SortSplats(Device& dev, const OrbitCamera& cam);
     void ReleaseGpu(Device& dev);
+
+    // Whether this frame draws Gaussians rather than dots: the cloud has
+    // splats and the toolbar asks for them.
+    bool DrawingSplats() const {
+        return m_showSplats && m_cloud && !m_cloud->splats.empty();
+    }
 
     std::string m_name;
     uint64_t    m_version = 0;
@@ -94,6 +103,33 @@ private:
     bool m_visible = false;
     bool m_showCameras = true;
     float m_pointSize = 3.0f;
+
+    // --- Gaussian splats -----------------------------------------------------
+    //
+    // A second pipeline beside the point one. Splats are blended, not depth
+    // tested -- a Gaussian is translucent at its edges, and the only correct
+    // way to composite translucent things is in depth order, back to front.
+    // So the pipeline has depth testing OFF and the draw order is kept sorted
+    // on the CPU, re-sorted whenever the camera moves.
+    ID3D12RootSignature* m_splatRoot = nullptr;
+    ID3D12PipelineState* m_splatPso  = nullptr;
+    ID3D12Resource*      m_splatBuf  = nullptr;   // one GpuSplat each
+    ID3D12Resource*      m_orderBuf  = nullptr;   // draw order, back to front
+    int                  m_splatCount = 0;
+    uint64_t             m_splatVersion = ~0ull;
+
+    // Means kept on the CPU for sorting, and the camera the current order was
+    // sorted for. An unchanged camera costs nothing; a moved one costs a sort.
+    std::vector<float>    m_splatMeans;           // x y z per splat
+    std::vector<uint32_t> m_order, m_orderTmp;
+    std::vector<uint32_t> m_keys, m_keysTmp;
+    Vec3                  m_sortedEye{1e30, 1e30, 1e30};
+    Vec3                  m_sortedTarget{1e30, 1e30, 1e30};
+    double                m_sortMs = 0.0;
+
+    bool m_showSplats = true;
+    bool m_uploadedSplatMode = false;   // part of the point buffer's cache key
+    float m_splatScale = 1.0f;
 };
 
 }  // namespace tglab

@@ -37,6 +37,7 @@
 #include "../src/script/parser.h"
 #include "../src/gpu/compute.h"
 #include "../src/algorithms/sfm/gpu_sweep.h"
+#include "../src/algo_util/splat_raster.h"
 
 #include <d3d12.h>
 
@@ -2904,6 +2905,394 @@ int main() {
                 }
             }
             dev->Release();
+        }
+    }
+
+    // --- init_splats: discs lying in a known surface ------------------------
+    //
+    // Points scattered on a TILTED plane with a known normal. Every Gaussian
+    // init_splats makes must be a flat disc whose thin axis is that normal --
+    // the whole point of fitting the surface rather than starting from
+    // spheres, as the paper does. Tilted rather than axis-aligned so a
+    // rotation that silently came out as the identity cannot pass.
+    {
+        std::printf("\n--- init_splats ---\n");
+
+        const Vec3 nTrue = Vec3{0.3, -0.5, 0.81}.Normalized();
+        // Two in-plane directions.
+        const Vec3 u = nTrue.Cross(Vec3{1, 0, 0}).Normalized();
+        const Vec3 v = nTrue.Cross(u).Normalized();
+
+        PointCloud pc;
+        uint32_t seed = 12345u;
+        auto rnd = [&]() {
+            seed = seed * 1664525u + 1013904223u;
+            return double(seed >> 8) / double(1u << 24);
+        };
+        const int n = 4000;
+        for (int i = 0; i < n; ++i) {
+            Track t;
+            t.hasPoint = true;
+            const double a = rnd() * 4.0 - 2.0, b = rnd() * 4.0 - 2.0;
+            t.point = Vec3{1.0, 2.0, 5.0} + u * a + v * b;
+            t.color = Vec3{0.2 + 0.5 * rnd(), 0.4, 0.6};
+            pc.tracks.push_back(t);
+        }
+
+        auto algo = Registry::Get().Create("init_splats");
+        Check(algo != nullptr, "init_splats is registered");
+        if (algo) {
+            std::string err;
+            const bool ok = algo->RunReconstruct(nullptr, &pc, &err);
+            Check(ok, "init_splats runs" + (ok ? std::string() : ": " + err));
+            Check(ok && int(pc.splats.size()) == n,
+                  "one Gaussian per point (" + std::to_string(pc.splats.size()) +
+                      ")");
+
+            if (ok && !pc.splats.empty()) {
+                // The thin axis is column 2 of the rotation, by construction.
+                // Compared up to sign: a disc facing either way is the same.
+                double worstDeg = 0.0, worstFlat = 0.0, worstQ = 0.0;
+                bool colourKept = true;
+                // Expected spacing: 4000 points on a 4x4 square.
+                const double spacing = 4.0 / std::sqrt(double(n));
+                double meanWidth = 0.0;
+                for (size_t i = 0; i < pc.splats.size(); ++i) {
+                    const Splat& s = pc.splats[i];
+                    const Mat3 R = s.Rotation();
+                    const Vec3 axis{R.m[2], R.m[5], R.m[8]};
+                    const double cosA = std::min(1.0, std::fabs(axis.Dot(nTrue)));
+                    worstDeg = std::max(worstDeg,
+                                        std::acos(cosA) * 180.0 / 3.14159265358979);
+                    worstFlat = std::max(worstFlat, s.scale.z / s.scale.x);
+                    const double qn = s.rot[0] * s.rot[0] + s.rot[1] * s.rot[1] +
+                                      s.rot[2] * s.rot[2] + s.rot[3] * s.rot[3];
+                    worstQ = std::max(worstQ, std::fabs(qn - 1.0));
+                    if (std::fabs(s.color.x - pc.tracks[i].color.x) > 1e-12)
+                        colourKept = false;
+                    meanWidth += s.scale.x;
+                }
+                meanWidth /= double(pc.splats.size());
+
+                char m1[200];
+                std::snprintf(m1, sizeof(m1),
+                              "every disc lies in the surface (worst normal "
+                              "error %.2f deg)", worstDeg);
+                // Random points give a noisy local plane; a few degrees is
+                // the fit, tens of degrees is a wrong axis.
+                Check(worstDeg < 15.0, m1);
+
+                Check(worstFlat < 0.11,
+                      "...and is flat through it (thickness/width " +
+                          std::to_string(worstFlat) + ")");
+                Check(worstQ < 1e-9, "...with a unit quaternion");
+                Check(colourKept, "...and the colour of its point");
+
+                // Width tracks the spacing: `size` 0.6 of the neighbour
+                // distance, which for k=8 is a little over the grid spacing.
+                char m2[200];
+                std::snprintf(m2, sizeof(m2),
+                              "discs are sized to the point spacing (mean "
+                              "width %.4f, spacing %.4f)", meanWidth, spacing);
+                Check(meanWidth > 0.3 * spacing && meanWidth < 2.0 * spacing, m2);
+            }
+        }
+
+        // Splat::Covariance must agree with the scale and rotation it is
+        // built from: along the thin axis the variance is scale.z squared.
+        {
+            Splat s;
+            s.scale = Vec3{2.0, 1.0, 0.25};
+            const double h = 0.5 * 0.7;   // 40 degrees about z, as a quaternion
+            s.rot[0] = std::cos(h); s.rot[1] = 0; s.rot[2] = 0; s.rot[3] = std::sin(h);
+            double c[6];
+            s.Covariance(c);
+            const Mat3 R = s.Rotation();
+            const Vec3 ax0{R.m[0], R.m[3], R.m[6]};
+            // v^T Sigma v along the first axis should be scale.x squared.
+            const double sxx =
+                ax0.x * (c[0] * ax0.x + c[1] * ax0.y + c[2] * ax0.z) +
+                ax0.y * (c[1] * ax0.x + c[3] * ax0.y + c[4] * ax0.z) +
+                ax0.z * (c[2] * ax0.x + c[4] * ax0.y + c[5] * ax0.z);
+            Check(std::fabs(sxx - 4.0) < 1e-9 && std::fabs(c[5] - 0.0625) < 1e-9,
+                  "Splat::Covariance matches its scale and rotation (" +
+                      std::to_string(sxx) + ", " + std::to_string(c[5]) + ")");
+        }
+    }
+
+    // --- the splat rasteriser's gradients, against finite differences -------
+    //
+    // THE TEST THE WHOLE TRAINER RESTS ON. A backward pass that is wrong does
+    // not crash and does not stop training from reducing the loss a little;
+    // it just optimises something other than the image. The only honest check
+    // is to perturb every parameter of every Gaussian and compare the change
+    // in loss with what the gradient predicted.
+    //
+    // Set up to be SMOOTH, because finite differences are meaningless across a
+    // discontinuity: minAlpha near zero so nothing is skipped at a threshold,
+    // tStop zero so compositing never stops early, and opacities well under
+    // maxAlpha so nothing clamps. Four Gaussians, overlapping, rotated and
+    // anisotropic, so every term of the chain -- ordering, transmittance,
+    // the conic, the Jacobian, the quaternion -- is exercised.
+    {
+        std::printf("\n--- splat rasteriser gradients ---\n");
+
+        SplatCam cam;
+        cam.R = Mat3::Identity();
+        cam.t = Vec3{0.1, -0.05, 0.0};
+        cam.fx = 40.0; cam.fy = 42.0; cam.cx = 15.5; cam.cy = 16.5;
+        cam.w = 32; cam.h = 32;
+
+        RasterOptions opt;
+        opt.minAlpha = 1e-12;
+        opt.tStop = 0.0;
+        opt.background = Vec3{0.1, 0.2, 0.3};
+
+        std::vector<SplatParam> sp(4);
+        const double means[4][3] = {{0.0, 0.0, 3.0}, {0.3, -0.2, 3.5},
+                                    {-0.25, 0.3, 4.0}, {0.1, 0.25, 2.6}};
+        for (int i = 0; i < 4; ++i) {
+            SplatParam& p = sp[size_t(i)];
+            for (int k = 0; k < 3; ++k) p.mean[k] = means[i][k];
+            p.logScale[0] = std::log(0.25 + 0.05 * i);
+            p.logScale[1] = std::log(0.15 + 0.03 * i);
+            p.logScale[2] = std::log(0.08 + 0.02 * i);
+            // Deliberately NOT unit: the forward pass normalises, and the
+            // gradient has to go back through that normalisation.
+            p.quat[0] = 0.9 + 0.1 * i; p.quat[1] = 0.2 * i - 0.3;
+            p.quat[2] = 0.15 * i;      p.quat[3] = 0.4 - 0.1 * i;
+            p.opacity = -0.8 + 0.4 * i;   // sigmoid: 0.31 .. 0.60
+            p.color[0] = 0.2 + 0.2 * i; p.color[1] = 0.8 - 0.15 * i;
+            p.color[2] = 0.5;
+        }
+
+        // A fixed pseudo-random target.
+        std::vector<double> target(size_t(cam.w * cam.h * 3));
+        uint32_t seed = 777u;
+        for (double& t : target) {
+            seed = seed * 1664525u + 1013904223u;
+            t = double(seed >> 8) / double(1u << 24);
+        }
+
+        auto loss = [&](const std::vector<SplatParam>& s) {
+            SplatRaster r;
+            std::vector<double> img;
+            r.Forward(s, cam, opt, &img);
+            double L = 0.0;
+            for (size_t i = 0; i < img.size(); ++i) {
+                const double d = img[i] - target[i];
+                L += 0.5 * d * d;
+            }
+            return L;
+        };
+
+        SplatRaster r;
+        std::vector<double> img;
+        r.Forward(sp, cam, opt, &img);
+        Check(r.Visible() == 4, "all four Gaussians are in view (" +
+                                    std::to_string(r.Visible()) + ")");
+        std::vector<double> dImg(img.size());
+        for (size_t i = 0; i < img.size(); ++i) dImg[i] = img[i] - target[i];
+        std::vector<SplatParam> grad(sp.size(), SplatParam::Zero());
+        r.Backward(sp, cam, opt, dImg, &grad);
+
+        // Worst relative error per parameter group, over every Gaussian.
+        const char* names[5] = {"mean", "log-scale", "quaternion", "opacity",
+                                "colour"};
+        const int groupOf[14] = {0, 0, 0, 1, 1, 1, 2, 2, 2, 2, 3, 4, 4, 4};
+        double worst[5] = {0, 0, 0, 0, 0};
+        double biggest[5] = {0, 0, 0, 0, 0};
+        const double eps = 1e-6;
+        for (size_t i = 0; i < sp.size(); ++i)
+            for (int k = 0; k < SplatParam::kCount; ++k) {
+                std::vector<SplatParam> a = sp, b = sp;
+                a[i].Data()[k] += eps;
+                b[i].Data()[k] -= eps;
+                const double fd = (loss(a) - loss(b)) / (2.0 * eps);
+                const double an = grad[i].Data()[k];
+                const double rel = std::fabs(an - fd) /
+                                   std::max(1e-4, std::fabs(an) + std::fabs(fd));
+                worst[groupOf[k]] = std::max(worst[groupOf[k]], rel);
+                biggest[groupOf[k]] = std::max(biggest[groupOf[k]], std::fabs(fd));
+            }
+        for (int g = 0; g < 5; ++g) {
+            char m[200];
+            std::snprintf(m, sizeof(m),
+                          "%s gradients match finite differences (worst "
+                          "relative error %.1e, largest gradient %.2e)",
+                          names[g], worst[g], biggest[g]);
+            // A gradient that is identically zero would "match" a zero finite
+            // difference, so require that each group actually has something
+            // to match.
+            Check(worst[g] < 1e-4 && biggest[g] > 1e-6, m);
+        }
+    }
+
+    // --- train_splats recovers a known scene -------------------------------
+    //
+    // Gradients that match finite differences say the derivative is right;
+    // they do not say the loop around it -- loss, Adam, learning rates, the
+    // camera cycling -- actually fits anything. So: photograph a known splat
+    // scene from three cameras (rendered by the rasteriser itself, so the
+    // target is exactly representable), spoil a copy of the splats, and train
+    // the copy back. The fit must improve by a wide margin.
+    {
+        std::printf("\n--- train_splats ---\n");
+
+        const int W = 64, H = 48;
+        PointCloud truth;
+        for (int i = 0; i < 3; ++i) {
+            Camera c;
+            c.width = W; c.height = H;
+            c.focal = 60.0; c.cx = W * 0.5 - 0.5; c.cy = H * 0.5 - 0.5;
+            // Turned a little about Y and spaced along X.
+            const double a = (double(i) - 1.0) * 0.12;
+            c.R = Mat3::Identity();
+            c.R.m[0] = std::cos(a); c.R.m[2] = -std::sin(a);
+            c.R.m[6] = std::sin(a); c.R.m[8] = std::cos(a);
+            const Vec3 centre{(double(i) - 1.0) * 0.4, 0.0, 0.0};
+            c.t = c.R * centre * -1.0;
+            c.solved = true;
+            truth.cameras.push_back(c);
+        }
+        uint32_t seed = 4242u;
+        auto rnd = [&]() {
+            seed = seed * 1664525u + 1013904223u;
+            return double(seed >> 8) / double(1u << 24);
+        };
+        for (int i = 0; i < 60; ++i) {
+            Splat s;
+            s.mean = Vec3{rnd() * 2.4 - 1.2, rnd() * 1.6 - 0.8, 3.0 + rnd() * 1.5};
+            s.scale = Vec3{0.08 + 0.1 * rnd(), 0.08 + 0.1 * rnd(), 0.05};
+            const double h = rnd() * 3.0;
+            s.rot[0] = std::cos(h); s.rot[1] = 0.3 * std::sin(h);
+            s.rot[2] = 0.0;         s.rot[3] = std::sin(h);
+            const double qn = std::sqrt(s.rot[0] * s.rot[0] + s.rot[1] * s.rot[1] +
+                                        s.rot[3] * s.rot[3]);
+            for (double& q : s.rot) q /= qn;
+            s.opacity = 0.5 + 0.4 * rnd();
+            s.color = Vec3{rnd(), rnd(), rnd()};
+            truth.splats.push_back(s);
+        }
+
+        // The photographs: the true splats, rendered.
+        std::vector<Image> frames;
+        {
+            std::vector<SplatParam> tp;
+            for (const Splat& s : truth.splats) tp.push_back(ToParam(s));
+            RasterOptions opt;
+            for (const Camera& c : truth.cameras) {
+                SplatRaster r;
+                std::vector<double> rgb;
+                r.Forward(tp, SplatCamFrom(c, W, H), opt, &rgb);
+                Image im;
+                im.Alloc(ImageDesc{W, H, Format::RGBA32F});
+                ImageView v = im.MapCpuWrite();
+                for (int y = 0; y < H; ++y)
+                    for (int x = 0; x < W; ++x) {
+                        float* p = v.At<float>(x, y);
+                        for (int ch = 0; ch < 3; ++ch)
+                            p[ch] = float(rgb[(size_t(y) * W + size_t(x)) * 3 + ch]);
+                        p[3] = 1.0f;
+                    }
+                frames.push_back(std::move(im));
+            }
+        }
+
+        // The spoiled start: grey, half as opaque, and nudged.
+        PointCloud start = truth;
+        for (Splat& s : start.splats) {
+            s.color = Vec3{0.5, 0.5, 0.5};
+            s.opacity *= 0.5;
+            s.mean = s.mean + Vec3{rnd() * 0.06 - 0.03, rnd() * 0.06 - 0.03, 0.0};
+        }
+
+        auto algo = Registry::Get().Create("train_splats");
+        Check(algo != nullptr, "train_splats is registered");
+        if (algo) {
+            std::string e;
+            if (ParamBase* p = algo->FindParam("iterations"))
+                p->SetFromScript(Value(300.0), &e);
+            if (ParamBase* p = algo->FindParam("downscale"))
+                p->SetFromScript(Value(1.0), &e);
+            // OFF HERE, because this tests the optimiser, and the scene is
+            // exactly representable by the Gaussians it starts with -- the
+            // case densification exists NOT to touch. Left on, it split 60
+            // Gaussians into 470 and the fit came out 5 dB worse (40.8 against
+            // 35.4): every gradient is large early on, while the colours are
+            // still grey, so everything looked like it needed dividing.
+            if (ParamBase* p = algo->FindParam("densify"))
+                p->SetFromScript(Value(0.0), &e);
+            PointCloud trained = start;
+            std::string err;
+            const bool ok = algo->RunReconstruct(&frames, &trained, &err);
+            Check(ok, "train_splats runs" + (ok ? std::string() : ": " + err));
+            if (ok) {
+                const std::string note = algo->RunReport();
+                std::printf("       %s\n", note.c_str());
+                double before = 0, after = 0;
+                const size_t at = note.find("PSNR ");
+                if (at != std::string::npos)
+                    std::sscanf(note.c_str() + at, "PSNR %lf -> %lf", &before, &after);
+                char m[200];
+                std::snprintf(m, sizeof(m),
+                              "training fits the photographs far better "
+                              "(PSNR %.2f -> %.2f dB)", before, after);
+                Check(after > before + 8.0, m);
+            }
+        }
+
+        // --- densification, where it is supposed to help ---------------------
+        //
+        // The case it exists for: too FEW Gaussians, too LARGE for the detail
+        // in the photographs. Twelve big grey blobs where the scene has sixty
+        // small coloured ones. Without densification training can only
+        // reshape the twelve; with it, the set should grow and fit better.
+        PointCloud coarse = truth;
+        coarse.splats.clear();
+        for (int i = 0; i < 12; ++i) {
+            Splat s;
+            s.mean = Vec3{rnd() * 2.4 - 1.2, rnd() * 1.6 - 0.8, 3.0 + rnd() * 1.5};
+            s.scale = Vec3{0.35, 0.35, 0.35};
+            s.opacity = 0.6;
+            s.color = Vec3{0.5, 0.5, 0.5};
+            coarse.splats.push_back(s);
+        }
+        auto run = [&](bool dens, PointCloud* outCloud, double* psnr) {
+            auto a = Registry::Get().Create("train_splats");
+            std::string e;
+            a->FindParam("iterations")->SetFromScript(Value(600.0), &e);
+            a->FindParam("downscale")->SetFromScript(Value(1.0), &e);
+            a->FindParam("densify")->SetFromScript(Value(dens ? 1.0 : 0.0), &e);
+            // The world-size limit is 10% of the CAMERA spread, which here is
+            // 0.8 -- smaller than the true Gaussians. A known weakness of the
+            // paper's heuristic for close-set cameras; see train_splats.cpp.
+            a->FindParam("max_world_size")->SetFromScript(Value(0.0), &e);
+            *outCloud = coarse;
+            std::string err;
+            if (!a->RunReconstruct(&frames, outCloud, &err)) return false;
+            const std::string note = a->RunReport();
+            std::printf("       densify %s: %s\n", dens ? "on " : "off", note.c_str());
+            double before = 0;
+            const size_t at = note.find("PSNR ");
+            if (at == std::string::npos) return false;
+            std::sscanf(note.c_str() + at, "PSNR %lf -> %lf", &before, psnr);
+            return true;
+        };
+        PointCloud withD, withoutD;
+        double pOn = 0, pOff = 0;
+        const bool okOn = run(true, &withD, &pOn);
+        const bool okOff = run(false, &withoutD, &pOff);
+        Check(okOn && okOff, "train_splats runs with and without densification");
+        if (okOn && okOff) {
+            Check(withD.splats.size() > coarse.splats.size() * 2,
+                  "densification grows a too-coarse set (12 -> " +
+                      std::to_string(withD.splats.size()) + ")");
+            char m[200];
+            std::snprintf(m, sizeof(m),
+                          "...and the grown set fits better (%.2f dB against "
+                          "%.2f without)", pOn, pOff);
+            Check(pOn > pOff + 2.0, m);
         }
     }
 
