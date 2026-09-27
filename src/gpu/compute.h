@@ -120,11 +120,18 @@ public:
 
     // Records and submits one dispatch, then waits. `constants` are the b0
     // root constants beyond the automatic width/height pair.
+    //
+    // `groupsX` / `groupsY`, when non-zero, set the thread-group grid
+    // directly instead of deriving it from the first output's size. For a
+    // kernel whose groups are not 8x8 pixels of that output -- the splat
+    // rasteriser runs one 16x16 group per screen tile, so that a tile's
+    // threads can reduce their gradients together in group-shared memory.
     bool Dispatch(const ComputeKernel& k,
                   const std::vector<const GpuImage*>& inputs,
                   const std::vector<GpuImage*>& outputs,
                   const std::vector<uint32_t>& constants,
-                  std::string* err);
+                  std::string* err, uint32_t groupsX = 0,
+                  uint32_t groupsY = 0);
 
     ShaderCompiler& Compiler() { return m_compiler; }
 

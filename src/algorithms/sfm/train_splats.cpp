@@ -203,7 +203,7 @@ public:
 
         // --- how well it fits before -----------------------------------------
         double l1Before = 0.0, psnrBefore = 0.0;
-        Evaluate(params, views, opt, &l1Before, &psnrBefore);
+        Evaluate(params, views, opt, GroupGpu(), &l1Before, &psnrBefore);
 
         // --- the scene's scale, for the position learning rate ------------------
         // A step size for positions has to be in scene units, and a
@@ -241,6 +241,9 @@ public:
         std::vector<SplatParam> grad(n, SplatParam::Zero());
         std::vector<double> img, dImg;
         SplatRaster raster;
+        // The per-pixel passes on the device when the run has one; the
+        // rasteriser falls back to the CPU on its own if the device fails.
+        raster.SetGpu(GroupGpu());
 
         // --- densification bookkeeping ------------------------------------------
         // The screen-position gradient, summed per Gaussian over the
@@ -283,6 +286,12 @@ public:
             return std::sqrt(-2.0 * std::log(u1)) * std::cos(6.283185307179586 * u2);
         };
 
+        // Where each iteration goes, beside the rasteriser's own phases.
+        using Clock = std::chrono::steady_clock;
+        auto msSince = [](Clock::time_point t) {
+            return std::chrono::duration<double, std::milli>(Clock::now() - t).count();
+        };
+        double msAdam = 0.0, msDensify = 0.0;
         long long visibleSum = 0;
         for (int it = 0; it < iters; ++it) {
             if (order.empty()) {
@@ -328,6 +337,7 @@ public:
             const double c1 = 1.0 - std::pow(b1, double(it + 1));
             const double c2 = 1.0 - std::pow(b2, double(it + 1));
 
+            auto tAdam = Clock::now();
             ParallelFor(n, [&](size_t i) {
                 double* p = params[i].Data();
                 const double* g = grad[i].Data();
@@ -341,6 +351,8 @@ public:
                 }
             });
 
+            msAdam += msSince(tAdam);
+            auto tDens = Clock::now();
             // --- densify and prune ----------------------------------------------
             if (densify && (it + 1) % every == 0 && it + 1 <= until) {
                 std::vector<SplatParam> np;
@@ -467,6 +479,7 @@ public:
                 ++densifySteps;
             }
 
+            msDensify += msSince(tDens);
             // --- opacity reset ---------------------------------------------------
             // Every Gaussian's opacity is capped at 0.01, and its optimiser
             // state for opacity cleared. The ones the photographs need climb
@@ -489,7 +502,7 @@ public:
 
         // --- how well it fits after ------------------------------------------
         double l1After = l1Before, psnrAfter = psnrBefore;
-        if (iters > 0) Evaluate(params, views, opt, &l1After, &psnrAfter);
+        if (iters > 0) Evaluate(params, views, opt, GroupGpu(), &l1After, &psnrAfter);
 
         const size_t startCount = cloud->splats.size();
         cloud->splats.resize(n);
@@ -506,14 +519,32 @@ public:
                           densifySteps, cloned, split, pruned, prunedFaint,
                           prunedBig, resets, resets == 1 ? "" : "s",
                           int(startCount), int(n));
-        char buf[600];
+        // Per iteration, so it reads the same at any iteration count.
+        char timing[300] = "";
+        if (iters > 0) {
+            const SplatRaster::Timings& tm = raster.Time();
+            const double k = 1.0 / double(iters);
+            // Which path ran, stated every time: a GPU fallback that happens
+            // silently reads as "the GPU is slow".
+            std::snprintf(timing, sizeof(timing),
+                          "; pixels on the %s; per iteration: project %.0f, "
+                          "bin %.0f, composite "
+                          "%.0f, back-pixel %.0f, back-sum %.0f, back-Gaussian "
+                          "%.0f, Adam %.0f, densify %.0f ms",
+                          raster.UsedGpu() ? "GPU" : "CPU",
+                          tm.project * k, tm.bin * k, tm.composite * k,
+                          tm.backPixel * k, tm.backSum * k, tm.backGaussian * k,
+                          msAdam * k, msDensify * k);
+        }
+        char buf[900];
         std::snprintf(buf, sizeof(buf),
                       "train_splats: %d iterations over %d views at %dx%d, %d "
                       "Gaussians (%.0f in view on average); L1 %.4f -> %.4f, "
-                      "PSNR %.2f -> %.2f dB; %.1f s%s",
+                      "PSNR %.2f -> %.2f dB; %.1f s%s%s",
                       iters, int(views.size()), views[0].cam.w, views[0].cam.h,
                       int(n), double(visibleSum) / double(std::max(1, iters)),
-                      l1Before, l1After, psnrBefore, psnrAfter, secs, dens);
+                      l1Before, l1After, psnrBefore, psnrAfter, secs, dens,
+                      timing);
         m_note = buf;
         return true;
     }
@@ -526,8 +557,10 @@ private:
     // it happened to step on.
     static void Evaluate(const std::vector<SplatParam>& params,
                          const std::vector<View>& views,
-                         const RasterOptions& opt, double* l1, double* psnr) {
+                         const RasterOptions& opt, ComputeContext* gpu,
+                         double* l1, double* psnr) {
         SplatRaster r;
+        r.SetGpu(gpu);
         std::vector<double> img;
         double sl = 0.0, sp = 0.0;
         for (const View& v : views) {

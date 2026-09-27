@@ -47,6 +47,7 @@ add_library(tglab_core STATIC
     src/algo_util/histogram.cpp
     src/algo_util/pixel_buffer.cpp
     src/algo_util/splat_raster.cpp
+    src/algo_util/splat_raster_gpu.cpp
     src/algo_util/white_balance.cpp
     src/core/exif.cpp
     src/core/image_stats.cpp
@@ -462,6 +463,11 @@ endif()
 # stage dominates is a question about size rather than about the code.
 add_executable(bench_sfm tools/bench_sfm.cpp $<TARGET_OBJECTS:tglab_algorithms>)
 target_link_libraries(bench_sfm PRIVATE tglab_core imgui d3d12 dxgi)
+# --gpu includes d3d12.h and so windows.h, whose min and max macros would
+# otherwise break every std::min and std::max in the tool.
+if(MSVC)
+    target_compile_definitions(bench_sfm PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
 
 add_executable(bench_dehaze tools/bench_dehaze.cpp $<TARGET_OBJECTS:tglab_algorithms>)
 target_link_libraries(bench_dehaze PRIVATE tglab_core)

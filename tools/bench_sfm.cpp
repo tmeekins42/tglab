@@ -50,6 +50,20 @@
 #include "../src/script/interp.h"
 #include "../src/script/parser.h"
 #include "../src/script/value.h"
+#include "../src/gpu/compute.h"
+
+#include <d3d12.h>
+// windows.h, via d3d12.h, defines near, far and small as macros -- the
+// last as `char`, which collides with this file's own variable of that name.
+#ifdef small
+#undef small
+#endif
+#ifdef near
+#undef near
+#endif
+#ifdef far
+#undef far
+#endif
 
 using namespace tglab;
 
@@ -386,6 +400,7 @@ int main(int argc, char** argv) {
     int detColour = -1;          // negative: leave the detector's default
     std::string script;
     std::string dumpDir;   // --dump: save every image-set viewer as PNGs
+    bool useGpu = false;   // --gpu: give the pipeline a D3D12 device
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -410,6 +425,7 @@ int main(int argc, char** argv) {
         else if (a == "--colour" && i + 1 < argc) detColour = std::atoi(argv[++i]);
         else if (a == "--script" && i + 1 < argc)   script = argv[++i];
         else if (a == "--dump" && i + 1 < argc)     dumpDir = argv[++i];
+        else if (a == "--gpu")                         useGpu = true;
         else files.push_back(a);
     }
 
@@ -506,9 +522,26 @@ int main(int argc, char** argv) {
         std::printf("running %s (%d stages, %d viewers)\n\n", script.c_str(),
                     int(sp.Stages().size()), int(sp.Viewers().size()));
 
+        // --gpu: a real device, so GPU paths run and can be TIMED here rather
+        // than only in the app. Without it every GPU stage falls back to the
+        // CPU and the bench measures that instead.
+        ID3D12Device* dev = nullptr;
+        ComputeContext gpu;
+        ComputeContext* gpuPtr = nullptr;
+        if (useGpu) {
+            if (SUCCEEDED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0,
+                                            IID_PPV_ARGS(&dev))) &&
+                gpu.Init(dev)) {
+                gpuPtr = &gpu;
+                std::printf("GPU: on\n");
+            } else {
+                std::printf("GPU: requested but not available; running on the CPU\n");
+            }
+        }
+
         const auto ts = std::chrono::steady_clock::now();
         std::string serr;
-        const bool sok = sp.Execute(&s, nullptr, &serr);
+        const bool sok = sp.Execute(&s, nullptr, &serr, gpuPtr);
         const double sms = Ms(ts, std::chrono::steady_clock::now());
 
         for (const Stage& st : sp.Stages()) {

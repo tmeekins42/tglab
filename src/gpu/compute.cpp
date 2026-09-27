@@ -430,7 +430,8 @@ bool ComputeContext::Dispatch(const ComputeKernel& k,
                               const std::vector<const GpuImage*>& inputs,
                               const std::vector<GpuImage*>& outputs,
                               const std::vector<uint32_t>& constants,
-                              std::string* err) {
+                              std::string* err, uint32_t groupsX,
+                              uint32_t groupsY) {
     if (!k.Valid())          { *err = "kernel is not valid"; return false; }
     if (outputs.empty())     { *err = "dispatch needs at least one output"; return false; }
     if (inputs.size() > kMaxSrv || outputs.size() > kMaxUav) {
@@ -546,9 +547,10 @@ bool ComputeContext::Dispatch(const ComputeKernel& k,
     m_list->SetComputeRoot32BitConstants(0, kNumConstants, roots, 0);
     m_list->SetComputeRootDescriptorTable(1, gpu);
 
-    // 8x8 threads per group, matching the [numthreads(8,8,1)] convention.
-    const UINT gx = UINT((od.width  + 7) / 8);
-    const UINT gy = UINT((od.height + 7) / 8);
+    // 8x8 threads per group, matching the [numthreads(8,8,1)] convention --
+    // unless the caller gave the grid explicitly.
+    const UINT gx = groupsX ? UINT(groupsX) : UINT((od.width  + 7) / 8);
+    const UINT gy = groupsY ? UINT(groupsY) : UINT((od.height + 7) / 8);
     m_list->Dispatch(gx, gy, 1);
 
     // Chained dispatches on the same resource need a UAV barrier, not a fence.

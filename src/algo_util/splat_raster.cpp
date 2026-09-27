@@ -1,12 +1,18 @@
 #include "splat_raster.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 
 #include "../core/parallel.h"
 
 namespace tglab {
 namespace {
+
+using Clock = std::chrono::steady_clock;
+inline double MsSince(Clock::time_point t) {
+    return std::chrono::duration<double, std::milli>(Clock::now() - t).count();
+}
 
 inline double Sigmoid(double x) { return 1.0 / (1.0 + std::exp(-x)); }
 
@@ -191,8 +197,22 @@ void SplatRaster::BinTiles(const SplatCam&) {
 void SplatRaster::Forward(const std::vector<SplatParam>& splats,
                           const SplatCam& cam, const RasterOptions& opt,
                           std::vector<double>* rgb) {
+    auto clk = Clock::now();
     Project(splats, cam, opt);
+    m_time.project += MsSince(clk);
+    clk = Clock::now();
     BinTiles(cam);
+    m_time.bin += MsSince(clk);
+    clk = Clock::now();
+
+    // On the device when there is one; the CPU loop below otherwise, or if
+    // the device fails -- in which case nothing it wrote is used.
+    m_usedGpu = false;
+    if (m_gpu && CompositeGpu(splats, cam, opt, rgb)) {
+        m_usedGpu = true;
+        m_time.composite += MsSince(clk);
+        return;
+    }
 
     const size_t np = size_t(cam.w) * size_t(cam.h);
     rgb->assign(np * 3, 0.0);
@@ -235,6 +255,7 @@ void SplatRaster::Forward(const std::vector<SplatParam>& splats,
                 m_lastIdx[pi] = last;
             }
     });
+    m_time.composite += MsSince(clk);
 }
 
 // --- backward --------------------------------------------------------------------
@@ -243,6 +264,7 @@ void SplatRaster::Backward(const std::vector<SplatParam>& splats,
                            const SplatCam& cam, const RasterOptions& opt,
                            const std::vector<double>& dRgb,
                            std::vector<SplatParam>* grad) {
+    auto clk = Clock::now();
     // PER-PIXEL PASS, one slot per tile-list entry. Each tile is handled by
     // one thread and writes only its own entries, so there is no contention
     // and no atomics; the entries are summed per Gaussian afterwards. Cheaper
@@ -253,7 +275,13 @@ void SplatRaster::Backward(const std::vector<SplatParam>& splats,
         offset[t + 1] = offset[t] + m_tiles[t].size();
     std::vector<Grad2> entry(offset.back());
 
-    ParallelFor(m_tiles.size(), [&](size_t t) {
+    // The device's version produces the same per-entry gradients. Only tried
+    // if the forward pass also ran there: its transmittance and last-used
+    // index live on the device.
+    const bool onGpu = m_gpu && m_usedGpu &&
+                       BackPixelGpu(cam, opt, dRgb, offset, &entry);
+
+    if (!onGpu) ParallelFor(m_tiles.size(), [&](size_t t) {
         const std::vector<int>& list = m_tiles[t];
         Grad2* eg = entry.data() + offset[t];
         const int tx = int(t % size_t(m_tilesX)), ty = int(t / size_t(m_tilesX));
@@ -317,6 +345,8 @@ void SplatRaster::Backward(const std::vector<SplatParam>& splats,
             }
     });
 
+    m_time.backPixel += MsSince(clk);
+    clk = Clock::now();
     // Sum the entries per Gaussian.
     std::vector<Grad2> g2(m_proj.size());
     for (size_t t = 0; t < m_tiles.size(); ++t)
@@ -327,6 +357,8 @@ void SplatRaster::Backward(const std::vector<SplatParam>& splats,
     for (size_t i = 0; i < m_proj.size(); ++i)
         if (m_proj[i].ok) m_screenGrad[i] = std::hypot(g2[i].u, g2[i].v);
 
+    m_time.backSum += MsSince(clk);
+    clk = Clock::now();
     // PER-GAUSSIAN PASS: from the 2D quantities back to the parameters.
     const double* W = cam.R.m;
     ParallelFor(m_proj.size(), [&](size_t i) {
@@ -444,6 +476,7 @@ void SplatRaster::Backward(const std::vector<SplatParam>& splats,
             out.mean[a] += W[0 * 3 + a] * gt[0] + W[1 * 3 + a] * gt[1] +
                            W[2 * 3 + a] * gt[2];
     });
+    m_time.backGaussian += MsSince(clk);
 }
 
 }  // namespace tglab

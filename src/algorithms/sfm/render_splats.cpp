@@ -65,6 +65,7 @@ public:
 
             if (c.solved && v.Valid()) {
                 SplatRaster r;
+                r.SetGpu(GroupGpu());
                 std::vector<double> rgb;
                 r.Forward(params, SplatCamFrom(c, w, h), opt, &rgb);
                 for (int y = 0; y < h; ++y)

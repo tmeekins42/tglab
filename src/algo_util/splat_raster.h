@@ -37,11 +37,15 @@
 // (0,1). ToParams/FromParams convert.
 #pragma once
 
+#include <memory>
+#include <string>
 #include <vector>
 
 #include "../core/geometry.h"
 
 namespace tglab {
+
+class ComputeContext;
 
 // A pinhole camera in the rasteriser's pixel frame: OpenCV conventions, as
 // the rest of the pipeline -- +X right, +Y DOWN, looking along +Z.
@@ -123,6 +127,30 @@ struct RasterOptions {
 
 class SplatRaster {
 public:
+    SplatRaster();
+    ~SplatRaster();
+    SplatRaster(const SplatRaster&)            = delete;
+    SplatRaster& operator=(const SplatRaster&) = delete;
+
+    // THE PER-PIXEL PASSES ON THE GPU, when given a device.
+    //
+    // Measured on fountain-P11 (490k Gaussians in view, 320x213), an
+    // iteration was 206 ms compositing and 223 ms in the per-pixel backward
+    // pass, against 264 ms for everything per-Gaussian combined: at training
+    // resolution half a million Gaussians overlap heavily, and each pixel
+    // walks a hundred or more of them. That walk is what a GPU is for.
+    //
+    // Only the per-pixel work moves. Projection, sorting, the per-Gaussian
+    // chain rule and the optimiser stay here, so the GPU path produces
+    // exactly the intermediate the CPU one does -- a gradient per tile-list
+    // entry -- and everything after it is shared.
+    //
+    // FALLS BACK TO THE CPU on any device failure, per call, and says so in
+    // GpuNote(). Null turns the GPU off.
+    void SetGpu(ComputeContext* gpu);
+    bool UsedGpu() const { return m_usedGpu; }
+    const std::string& GpuNote() const { return m_gpuNote; }
+
     // Renders `splats` from `cam` into `rgb` (w*h*3, row-major). Keeps what
     // Backward needs, so Backward must follow with the same splats and camera.
     void Forward(const std::vector<SplatParam>& splats, const SplatCam& cam,
@@ -137,6 +165,16 @@ public:
 
     // How many Gaussians the last Forward found in view.
     int Visible() const { return m_visible; }
+
+    // Milliseconds spent in each phase, accumulated over every call since
+    // the raster was made. Kept permanently rather than added when needed:
+    // the question "where does an iteration go" decides what is worth
+    // moving to the GPU, and guessing at it has been wrong before.
+    struct Timings {
+        double project = 0, bin = 0, composite = 0;          // forward
+        double backPixel = 0, backSum = 0, backGaussian = 0; // backward
+    };
+    const Timings& Time() const { return m_time; }
 
     // Per Gaussian, from the last Backward: the magnitude of the loss
     // gradient with respect to its SCREEN position, in pixels -- or -1 where
@@ -193,6 +231,19 @@ private:
                  const RasterOptions& opt);
     void BinTiles(const SplatCam& cam);
 
+    // The GPU halves of Forward and Backward. Each returns false, having
+    // changed nothing the CPU path depends on, if the device fails.
+    struct Gpu;
+    bool CompositeGpu(const std::vector<SplatParam>& splats, const SplatCam& cam,
+                      const RasterOptions& opt, std::vector<double>* rgb);
+    bool BackPixelGpu(const SplatCam& cam, const RasterOptions& opt,
+                      const std::vector<double>& dRgb,
+                      const std::vector<size_t>& offset,
+                      std::vector<Grad2>* entry);
+    std::unique_ptr<Gpu> m_gpu;
+    bool        m_usedGpu = false;
+    std::string m_gpuNote;
+
     static constexpr int kTile = 16;
 
     std::vector<Proj>              m_proj;
@@ -202,6 +253,7 @@ private:
     std::vector<int>               m_lastIdx;    // per pixel: list entries used
     std::vector<double>            m_screenGrad; // per Gaussian, see ScreenGrad
     std::vector<double>            m_screenRadius;   // see ScreenRadius
+    Timings                        m_time;
     int                            m_visible = 0;
 };
 

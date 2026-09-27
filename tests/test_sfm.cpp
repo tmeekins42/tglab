@@ -3128,6 +3128,115 @@ int main() {
         }
     }
 
+    // --- the GPU rasteriser agrees with the CPU one ------------------------
+    //
+    // The CPU rasteriser is the reference -- its gradients are checked
+    // against finite differences above -- so the GPU one is checked against
+    // IT: same scene, same camera, and every pixel of the render and every
+    // gradient compared.
+    //
+    // Compared in AGGREGATE per parameter group, not element by element. The
+    // GPU works in float and the CPU in double, so a Gaussian sitting on a
+    // threshold -- alpha at exactly 1/255, transmittance at the stopping
+    // point -- can fall on different sides of it, and one pixel's worth of
+    // difference is not a bug. A wrong formula moves the aggregate by far
+    // more than rounding does.
+    {
+        std::printf("\n--- splat rasteriser, GPU against CPU ---\n");
+        ID3D12Device* dev = nullptr;
+        if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0,
+                                     IID_PPV_ARGS(&dev)))) {
+            std::printf("       no D3D12 device; skipped\n");
+        } else {
+            ComputeContext gpu;
+            if (!gpu.Init(dev)) {
+                std::printf("       compute init failed; skipped\n");
+            } else {
+                SplatCam cam;
+                cam.R = Mat3::Identity();
+                cam.fx = cam.fy = 90.0;
+                cam.cx = 47.5; cam.cy = 39.5;
+                cam.w = 96; cam.h = 80;   // six by five tiles
+
+                RasterOptions opt;
+                opt.background = Vec3{0.2, 0.1, 0.3};
+
+                std::vector<SplatParam> sp;
+                uint32_t seed = 99u;
+                auto rnd = [&]() {
+                    seed = seed * 1664525u + 1013904223u;
+                    return double(seed >> 8) / double(1u << 24);
+                };
+                for (int i = 0; i < 400; ++i) {
+                    Splat s;
+                    s.mean = Vec3{rnd() * 2.2 - 1.1, rnd() * 1.8 - 0.9, 2.5 + rnd() * 2.0};
+                    s.scale = Vec3{0.02 + 0.08 * rnd(), 0.02 + 0.08 * rnd(),
+                                   0.01 + 0.03 * rnd()};
+                    s.rot[0] = rnd() + 0.2; s.rot[1] = rnd() - 0.5;
+                    s.rot[2] = rnd() - 0.5; s.rot[3] = rnd() - 0.5;
+                    s.opacity = 0.2 + 0.7 * rnd();
+                    s.color = Vec3{rnd(), rnd(), rnd()};
+                    sp.push_back(ToParam(s));
+                }
+                std::vector<double> target(size_t(cam.w * cam.h * 3));
+                for (double& t : target) t = rnd();
+
+                auto run = [&](ComputeContext* device, std::vector<double>* img,
+                               std::vector<SplatParam>* grad, bool* usedGpu) {
+                    SplatRaster r;
+                    r.SetGpu(device);
+                    r.Forward(sp, cam, opt, img);
+                    *usedGpu = r.UsedGpu();
+                    std::vector<double> d(img->size());
+                    for (size_t i = 0; i < img->size(); ++i) d[i] = (*img)[i] - target[i];
+                    grad->assign(sp.size(), SplatParam::Zero());
+                    r.Backward(sp, cam, opt, d, grad);
+                    if (device && !r.UsedGpu())
+                        std::printf("       GPU note: %s\n", r.GpuNote().c_str());
+                };
+
+                std::vector<double> imgC, imgG;
+                std::vector<SplatParam> gradC, gradG;
+                bool usedC = false, usedG = false;
+                run(nullptr, &imgC, &gradC, &usedC);
+                run(&gpu, &imgG, &gradG, &usedG);
+                Check(usedG, "the GPU path actually ran");
+
+                if (usedG) {
+                    double worst = 0.0;
+                    for (size_t i = 0; i < imgC.size(); ++i)
+                        worst = std::max(worst, std::fabs(imgC[i] - imgG[i]));
+                    char m[200];
+                    std::snprintf(m, sizeof(m),
+                                  "the GPU render matches the CPU (worst pixel "
+                                  "difference %.1e)", worst);
+                    Check(worst < 1e-3, m);
+
+                    const char* names[5] = {"mean", "log-scale", "quaternion",
+                                            "opacity", "colour"};
+                    const int groupOf[14] = {0, 0, 0, 1, 1, 1, 2, 2, 2, 2, 3, 4, 4, 4};
+                    double diff[5] = {0, 0, 0, 0, 0}, mag[5] = {0, 0, 0, 0, 0};
+                    for (size_t i = 0; i < sp.size(); ++i)
+                        for (int q = 0; q < 14; ++q) {
+                            const double a = gradC[i].Data()[q], b = gradG[i].Data()[q];
+                            diff[groupOf[q]] += std::fabs(a - b);
+                            mag[groupOf[q]] += std::fabs(a);
+                        }
+                    for (int gi = 0; gi < 5; ++gi) {
+                        const double rel = diff[gi] / std::max(1e-12, mag[gi]);
+                        char m2[200];
+                        std::snprintf(m2, sizeof(m2),
+                                      "%s gradients match the CPU (aggregate "
+                                      "relative difference %.1e)",
+                                      names[gi], rel);
+                        Check(rel < 1e-3 && mag[gi] > 0.0, m2);
+                    }
+                }
+            }
+            dev->Release();
+        }
+    }
+
     // --- train_splats recovers a known scene -------------------------------
     //
     // Gradients that match finite differences say the derivative is right;
