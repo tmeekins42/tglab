@@ -14,6 +14,9 @@
 #include <set>
 
 #include "parallel.h"
+#include "ply_io.h"
+
+#include <filesystem>
 
 #include "../gpu/compute.h"
 #include "../gpu/gpu_image.h"
@@ -118,6 +121,37 @@ bool Pipeline::RunSaves(std::vector<Data>* sources, std::string* err,
         if (!d) {
             if (allOk) *err = "save('" + s.path + "'): nothing to save";
             allOk = false;
+            continue;
+        }
+
+        // A RECONSTRUCTION goes to .ply: its Gaussians when it has them,
+        // otherwise its points. One file, whatever the cloud holds.
+        if (const auto* pc = std::get_if<PointCloud>(d)) {
+            if (s.format != SaveFormat::Ply) {
+                if (allOk) *err = "save('" + s.path + "'): a reconstruction is "
+                                  "saved as .ply";
+                allOk = false;
+                continue;
+            }
+            std::string path = s.path;
+            if (s.existing == SaveDecl::Existing::Increment) path = NextFreePath(path);
+            else if (s.existing == SaveDecl::Existing::Skip &&
+                     GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES)
+                continue;
+            {
+                const auto slash = path.find_last_of("/\\");
+                if (slash != std::string::npos && slash > 0) {
+                    std::error_code ec;
+                    std::filesystem::create_directories(path.substr(0, slash), ec);
+                }
+            }
+            std::string werr;
+            if (SavePly(path, *pc, &werr)) {
+                if (written) written->push_back(path);
+            } else {
+                if (allOk) *err = werr;
+                allOk = false;
+            }
             continue;
         }
 
@@ -1682,7 +1716,11 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
             PointCloud cloud;
             const std::vector<Image>* frames = nullptr;
 
-            if (const auto* set = std::get_if<ImageSet>(in[0])) {
+            if (in.empty()) {
+                // A SOURCE: a stage with no inputs that makes a
+                // reconstruction from nothing the pipeline holds -- load_ply
+                // reading a file. It starts from an empty cloud.
+            } else if (const auto* set = std::get_if<ImageSet>(in[0])) {
                 frames = &set->images;
                 cloud.shape = set->shape;
             } else if (const auto* prev = std::get_if<PointCloud>(in[0])) {

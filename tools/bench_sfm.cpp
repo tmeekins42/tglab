@@ -615,6 +615,19 @@ int main(int argc, char** argv) {
         const bool sok = sp.Execute(&s, nullptr, &serr, gpuPtr);
         const double sms = Ms(ts, std::chrono::steady_clock::now());
 
+        // The script's save() lines, which the app runs on request; here
+        // every run, so a bench script can export what it made.
+        if (sok && !sp.Saves().empty()) {
+            const auto tw = std::chrono::steady_clock::now();
+            std::vector<std::string> wrote;
+            std::string werr;
+            if (!sp.RunSaves(&s, &werr, &wrote))
+                std::printf("save failed: %s\n", werr.c_str());
+            for (const std::string& w : wrote)
+                std::printf("saved %s (%.0f ms)\n", w.c_str(),
+                            Ms(tw, std::chrono::steady_clock::now()));
+        }
+
         for (const Stage& st : sp.Stages()) {
             if (!st.algo) continue;
             const std::string rep = st.Report();

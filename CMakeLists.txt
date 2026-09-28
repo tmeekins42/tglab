@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(tglab VERSION 0.15.0 LANGUAGES CXX)
+project(tglab VERSION 0.16.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -36,6 +36,7 @@ add_library(tglab_core STATIC
     src/core/image_group.cpp
     src/core/image.cpp
     src/core/image_io.cpp
+    src/core/ply_io.cpp
     src/core/param.cpp
     src/core/lut.cpp
     src/core/algorithm.cpp

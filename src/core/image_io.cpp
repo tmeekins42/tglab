@@ -92,6 +92,7 @@ SaveFormat SaveFormatFromPath(const std::string& path) {
     if (ext == "bmp")                  return SaveFormat::Bmp;
     if (ext == "tga")                  return SaveFormat::Tga;
     if (ext == "hdr")                  return SaveFormat::Hdr;
+    if (ext == "ply")                  return SaveFormat::Ply;
     return SaveFormat::Png;
 }
 
@@ -117,6 +118,10 @@ std::string NextFreePath(const std::string& path) {
 bool SaveImage(const std::string& path, Image& img, SaveFormat fmt,
                int quality, std::string* err) {
     if (!img.Valid()) { *err = "nothing to save"; return false; }
+    if (fmt == SaveFormat::Ply) {
+        *err = "'" + path + "': .ply is for point clouds and splats, not images";
+        return false;
+    }
 
     // Create the directory rather than failing on it. A script saying
     // save(img, "export/out.png") plainly means to put a file in export/, and
@@ -211,6 +216,7 @@ bool SaveImage(const std::string& path, Image& img, SaveFormat fmt,
         case SaveFormat::Bmp: ok = stbi_write_bmp(path.c_str(), w, h, 4, out.data()); break;
         case SaveFormat::Tga: ok = stbi_write_tga(path.c_str(), w, h, 4, out.data()); break;
         case SaveFormat::Hdr: break;   // handled above
+        case SaveFormat::Ply: break;   // rejected above
         case SaveFormat::Png:
         default:
             ok = stbi_write_png(path.c_str(), w, h, 4, out.data(), stride);

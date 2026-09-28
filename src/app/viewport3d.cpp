@@ -740,7 +740,9 @@ void Viewport3D::Draw(Device& dev, Image*) {
 
     OrbitCamera& cam = m_shared ? *m_shared : m_own;
 
-    if (!m_cloud || m_cloud->tracks.empty()) {
+    // Nothing yet. A cloud with Gaussians but no points -- one imported from
+    // a .ply -- is ready, not computing.
+    if (!m_cloud || (m_cloud->tracks.empty() && m_cloud->splats.empty())) {
         ImGui::TextDisabled("computing...");
         ImGui::End();
         return;
@@ -795,6 +797,13 @@ void Viewport3D::Draw(Device& dev, Image*) {
             ys.push_back(t.point.y);
             zs.push_back(t.point.z);
         }
+        // No points -- an imported .ply of Gaussians -- so frame on those.
+        if (xs.empty())
+            for (const Splat& s : m_cloud->splats) {
+                xs.push_back(s.mean.x);
+                ys.push_back(s.mean.y);
+                zs.push_back(s.mean.z);
+            }
         if (!xs.empty()) {
             auto pct = [](std::vector<double>& v, double p) {
                 const size_t i = size_t(p * double(v.size() - 1));

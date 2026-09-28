@@ -429,3 +429,10 @@ display( cloud, "reconstruction" )
 display( fused, "dense" )
 display( carved, "splats" )
 display( rendered, "render" )
+
+# EXPORT, for viewing elsewhere: the carved splats in the standard 3DGS .ply
+# layout that SuperSplat and other splat viewers read (see view_ply.tgl to
+# bring one back in). Written when the app is asked to save, not on every
+# run. `fused` or `cloud` save as plain coloured points.
+#
+#   save( carved, "fountain_splats.ply" )

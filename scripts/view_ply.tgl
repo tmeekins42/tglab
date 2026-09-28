@@ -1,0 +1,24 @@
+# view_ply.tgl -- look at a .ply made somewhere else.
+#
+# Point `file` at any Gaussian-splat .ply in the standard 3DGS layout -- the
+# kind SuperSplat, Polycam, Luma, Nerfstudio and the INRIA reference code
+# write -- or at a plain point cloud. The 3D viewer draws it like one made
+# here: drag to orbit, the "splats" checkbox, the scale slider.
+#
+# What comes through: position, shape, rotation, opacity and base colour.
+# What does not: view-dependent colour (the file's f_rest spherical-harmonic
+# terms), which tglab's splats do not have -- so reflections and sheen are
+# averaged away. The load report says when a file had them.
+#
+# Up is whatever the file says it is. Most splat tools use the COLMAP camera
+# convention, as tglab does, but a file oriented otherwise will simply look
+# rotated; orbit to it.
+
+imported = load_ply( file = "D:/lrwork/TEST/Big Flower pot MK/scene.ply" )
+
+display( imported, "imported" )
+
+# To write it back out -- after trimming or carving, say -- save() takes any
+# reconstruction to .ply. The app writes saves when asked, not on every run.
+#
+#   save( imported, "D:/splats/scene_copy.ply" )

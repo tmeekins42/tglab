@@ -398,8 +398,9 @@ and `pipe.tgl` are good starting points; `panorama.tgl`, `features.tgl`,
 `bloom.tgl` is glow and halation, `vignette.tgl` corner falloff,
 `film_grain.tgl` grain with a real grain size, `orton.tgl` the darkroom
 sandwich, `lut.tgl` film emulation through a .cube LUT, and
-`demosaic_stages.tgl` opens up a
-demosaic one step at a time.
+`demosaic_stages.tgl` opens up a demosaic one step at a time. `sfm.tgl` is
+the whole 3D chain — frames to cameras, dense depth, Gaussian splats — and
+`view_ply.tgl` opens a splat or point cloud made elsewhere.
 Each carries its reasoning in comments, including the measurements behind the
 defaults.
 
@@ -407,14 +408,14 @@ defaults.
 
 ## Algorithms
 
-60 registered. `choose("x", "category")` offers every algorithm in a category,
+76 registered. `choose("x", "category")` offers every algorithm in a category,
 so these names are the ones that matter in a script.
 
 | Category | Algorithms |
 |---|---|
 | **adjust** | `basic_adjust` (exposure, contrast, highlights, shadows, whites, blacks, vibrance, saturation, white balance), `brightness`, `crop` (trim and straighten, with a preview), `vignette`, `film_grain`, `dehaze` (dark channel prior), `resize` (area-average on minify, bilinear on magnify) |
 | **tonemap** | `tonemap` (global), `tonemap_local` (illumination/detail split) |
-| **features** | `detect_sift`, `detect_surf`, `detect_akaze`, `detect_orb`, `detect_brisk`, `draw_features`, `draw_matches` |
+| **features** | `detect_sift`, `detect_surf`, `detect_akaze`, `detect_orb`, `detect_brisk`, `draw_features`, `draw_matches`, `match_guided` (a second pass along epipolar lines) |
 | **match** | `match_brute` (exact), `match_ann` (k-d forest / LSH) |
 | **merge** | `merge_hdr`, `merge_mean`, `align`, `align_features`, `bundle_adjust`, `stitch_panorama`, `reshape` |
 | **demosaic** | `demosaic_ahd` (default), `demosaic_consistent`, `demosaic_malvar`, `demosaic_ppg`, `demosaic_vng`, `demosaic_bilinear`, `demosaic_passthrough`, `demosaic_stages` (every intermediate as its own image, for debugging), `hot_pixel_repair` |
@@ -423,6 +424,7 @@ so these names are the ones that matter in a script.
 | **edge** | `sobel`, `canny`, `non_max_suppression`, `hysteresis` |
 | **threshold** | `threshold`, `threshold_otsu`, `threshold_isodata`, `threshold_triangle`, `threshold_adaptive_mean`, `threshold_adaptive_gaussian`, `threshold_niblack`, `threshold_sauvola`, `threshold_bernsen` |
 | **color** | `grayscale`, `apply_lut` (3D .cube LUTs) |
+| **sfm** | `relative_pose`, `build_tracks`, `rotation_average`, `global_position`, `triangulate`, `bundle_adjust_sfm`; dense: `plane_sweep` (depth maps), `fuse_depth`; splats: `init_splats`, `train_splats`, `carve_splats`, `render_splats`, `load_ply` |
 
 Most have a GPU kernel and fall back to the CPU if it fails — **always saying
 so** in Status rather than merely running slower. `demosaic_vng` is CPU-only.
@@ -659,6 +661,74 @@ and near-identity rotations agree with each other trivially. The residual
 rewards the collapse. A closed walk-around also gives a free ground truth with
 no ground-truth file: the relative rotations should sum to about 360°.
 
+### Dense depth and Gaussian splatting
+
+`scripts/sfm.tgl` carries on past the sparse reconstruction, to a depth map per
+frame, a dense point cloud, and a trained set of 3D Gaussians (Kerbl et al.,
+SIGGRAPH 2023) that renders like the photographs:
+
+```
+dense   = params( plane_sweep, planes = 48 )( cloud, small )    # depth per frame
+fused   = params( fuse_depth, min_views = 3 )( cloud, dense )   # dense cloud
+splats  = params( init_splats )( fused )                        # a flat Gaussian per point
+trained = params( train_splats, iterations = 1000 )( splats, small, dense )
+carved  = params( carve_splats )( trained, dense )              # floaters removed
+display( carved, "splats" )
+```
+
+**`plane_sweep`** sweeps inverse-depth planes through each frame's neighbours
+and scores them by NCC; it emits a depth, confidence and colour map per frame,
+which the ordinary image viewers show. On the GPU it is one fused kernel per
+plane: 2 s for fountain-P11's eleven frames at script resolution, 18 s at full
+resolution. **`fuse_depth`** keeps a depth only where other cameras measured
+the same surface (`min_views`), which is the filter that matters — a wrong
+depth is wrong in one view's own way.
+
+**`train_splats`** is the paper's optimiser: a differentiable rasteriser with a
+hand-derived backward pass (checked against finite differences, and the GPU
+against the CPU), Adam at the paper's rates, and densification. The whole
+state lives on the GPU: an iteration on half a million Gaussians is about
+50 ms, so the default 1000 iterations take under a minute. The CPU fallback is
+about 1 s per iteration.
+
+**Eleven photographs is few, and the defaults are tuned for it.** Training
+scores on the photographs it fits, which rewards memorising them; `holdout = 5`
+leaves cameras out and scores them separately. Measured on fountain-P11 with
+cameras 2 and 7 held out:
+
+| iterations | depth | training | held out |
+|---|---|---|---|
+| 300 | no | 18.1 dB | 17.2 dB |
+| 1000 | no | 25.3 dB | 24.2 dB |
+| 1000 | **yes** | 24.9 dB | **24.8 dB** |
+| 3000 | no | 30.9 dB | 23.9 dB |
+| 3000 | **yes** | 30.6 dB | **25.0 dB** |
+
+Past about 1000 iterations the training score keeps rising while the held-out
+one falls — false colour and smears between the viewpoints. What pushes back:
+
+- **Depth supervision** — the sweep's maps as the third input. Rendered depth
+  is pulled toward them (`depth_weight`, 0.3), pinning Gaussians to the
+  surfaces the cameras measured. Compared against the target scaled by each
+  pixel's coverage: comparing with the raw target made partly transparent
+  pixels read as too near, and the loss pushed Gaussians *behind* the walls.
+- **`carve_splats`** removes Gaussians that other cameras see straight through
+  (free-space carving against the depth maps), and large ones too few cameras
+  have in view. The first is what clears the floating paint over the blank
+  wall at the right of the fountain.
+- **Pruning outlives growth.** Oversized Gaussians are still removed after
+  densification stops; the paper stops both together, and with eleven views a
+  Gaussian edge-on to every camera grew into a sheet across the whole scene.
+- **Colour is clamped to 0..1.** Unclamped, the optimiser cancelled
+  over-bright Gaussians against darker ones in front — right from the training
+  views, bright red patches from anywhere else.
+
+**`.ply` in and out.** `save( carved, "scene.ply" )` writes the Gaussians in the
+standard 3DGS layout that SuperSplat and other splat viewers read; a cloud
+without them saves as coloured points for MeshLab, CloudCompare or Blender.
+`load_ply( file = "scene.ply" )` reads either back in — including splats from
+other tools, which `scripts/view_ply.tgl` opens in the 3D viewer.
+
 ### Notes on a few
 
 - **`dehaze`** inverts the atmospheric scattering model, `I = J·t + A·(1−t)`,
@@ -805,6 +875,7 @@ no ground-truth file: the relative rotations should sum to about 360°.
 ./build/Release/tglab_tone_tests.exe     # tone curve
 ./build/Release/tglab_autodev_tests.exe  # auto-exposure measurement
 ./build/Release/tglab_runtime_tests.exe  # worker thread, shaders, GPU
+./build/Release/tglab_sfm_tests.exe      # SfM, depth, splat gradients, GPU == CPU
 ./build/Release/tglab_pyramid_tests.exe  # detector GPU paths == CPU, same keypoints
 ```
 
@@ -820,6 +891,7 @@ leave the judgement to you:
 | `bench_pyramid <w> <h>` | The SIFT blur pyramid alone, CPU vs GPU. |
 | `bench_dehaze <image>` | Dehaze on a real image. `BENCH_ALGO=brightness` times a trivial algorithm instead, which gives the framework's own unpack/pack floor — worth knowing before optimising anything. |
 | `bench_stitch <raw>...` | The whole panorama chain headlessly, printing every stage's report. `--gain`, `--wta`. |
+| `bench_sfm <dir> --script s.tgl` | A 3D script headlessly, printing every stage's report. `--gpu` gives it a device; `--dump DIR` saves every image viewer as PNG and renders splats from orbit viewpoints beside the middle camera — where floaters show. |
 | `frame_exposure <raw>...` | What actually differs across a sweep: EXIF settings, measured brightness, centre vs surround. Says whether seams want a per-frame gain or something spatial. |
 | `vignette_profile <raw>...` | Lens falloff measured by averaging frames in sensor coordinates. **Reads its own verdict**: it refuses to call a result a lens profile when the variation is not radial. |
 
@@ -908,6 +980,14 @@ src/
   ~0.16² ≈ 2.6% and are measured at 2.7%. Disabling cross-check tripled the
   chaining rate and still did not move it, because the extra merges were wrong
   (1156 physically impossible tracks, ray residual doubled).
+- **A Gaussian has one colour.** There is no view-dependent colour (the
+  spherical-harmonic bands of the paper), so reflections and sheen cannot be
+  learned, and a `.ply` from another tool loses them on import — `load_ply`
+  says so when it drops them.
+- **Splats only know what the cameras measured.** A textureless surface gets
+  no depth from the sweep, so neither depth supervision nor carving can pin
+  it, and colour alone places the Gaussians painting it. Views well outside
+  the capture — beyond the first or last camera — extrapolate and look it.
 
 ---
 

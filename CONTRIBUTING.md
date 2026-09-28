@@ -221,6 +221,21 @@ the last stage that needs them, and everything after it reads and writes the
 rather than storing only a keypoint index: after the first reconstruction
 stage there are no frames left to look it up in.
 
+A reconstruct stage can take more than the cloud:
+
+- **A second input, a group of frames**, arrives as `images` — how
+  `plane_sweep(cloud, small)` reads pixels long after `build_tracks`. A stage
+  that declares an `ImageSet` *output* gets `RunDense` instead, and makes
+  images (a depth map per frame) rather than refining the cloud.
+- **A third input, another group**, is read through `ReconstructExtra()` —
+  how `train_splats(splats, frames, depth)` gets the sweep's depth maps
+  beside the frames. Null when the script left it out.
+- **Trailing inputs can be optional.** A `Port` with `optional = true` may be
+  omitted by the script, so a new input need not break every existing call:
+  `train_splats(splats, frames)` still works.
+- **No inputs at all** makes a source. `load_ply(file = "x.ply")` declares
+  none, and `RunReconstruct` starts from an empty cloud.
+
 `PointCloud` is the third member of the `Data` variant, alongside `Image` and
 `ImageSet`, which is what lets `display()` route a reconstruction to a 3D
 viewport rather than an image panel — the decision is made from the declared
@@ -277,6 +292,17 @@ being algorithms themselves. Currently:
   Note that pinning: a stored rotation-induced homography does **not** have
   determinant 1, because `From3x3` normalises by h22. Do not use the
   determinant as a health check.
+- `splat_raster.h` — the differentiable Gaussian rasteriser: `Forward` renders
+  colour (and optionally expected depth), `Backward` returns every
+  parameter's gradient, on the GPU when given a device. `DepthLossGrad` is the
+  depth loss every training path shares. `splat_train_gpu.h` keeps a whole
+  training run's state on the device; `splat_kernels.h` holds the HLSL both
+  use, so there is one copy of each kernel.
+- `depth_views.h` — plane_sweep's per-camera maps read back as raw planes,
+  and `CountSeenThrough`, the free-space test `fuse_depth` and `carve_splats`
+  share.
+- `ply_io.h` (in `src/core/`) — point clouds and splats to and from `.ply`, in
+  the 3DGS layout other splat tools read.
 - `PixelBuffer` — unpacks an image to flat floats and packs it back, so a
   spatial filter gets branch-free neighbour access and correct handling of every
   format without repeating the format switch. `AtClamped()` gives the

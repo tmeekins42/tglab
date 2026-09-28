@@ -26,6 +26,7 @@
 #include "../src/core/image_loader.h"
 #include "../src/core/image_io.h"
 #include "../src/core/image_stats.h"
+#include "../src/core/ply_io.h"
 #include "../src/core/raw_io.h"
 #include "../src/core/cancel.h"
 #include "../src/core/pipeline.h"
@@ -133,6 +134,185 @@ static bool WriteExifFixture(const std::string& path) {
     std::fwrite(jpg.data(), 1, jpg.size(), f);
     std::fclose(f);
     return true;
+}
+
+// The .ply tests, in a function of their own: main's frame is already near
+// the 1 MB stack, since MSVC reserves every block's locals at entry.
+static void TestPly() {
+    // --- .ply: Gaussians and points, out and back in --------------------------
+    //
+    // Written by SavePly, read by LoadPly, compared field by field. The stored
+    // forms differ from the held ones -- log scale, logit opacity, colour as
+    // a spherical-harmonic coefficient -- so a sign or constant wrong on
+    // either side shows here as a value that does not come back.
+    std::printf("\n--- .ply import and export ---\n");
+    {
+        PointCloud pc;
+        for (int i = 0; i < 5; ++i) {
+            Splat s;
+            s.mean = Vec3{0.1 * i, -0.2 * i, 3.0 + i};
+            s.scale = Vec3{0.01 * (i + 1), 0.02, 0.003 * (i + 1)};
+            const double q[4] = {0.9, 0.1 * i, -0.2, 0.3};
+            const double n = std::sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+            for (int k = 0; k < 4; ++k) s.rot[k] = q[k] / n;
+            s.opacity = 0.1 + 0.2 * i;
+            s.color = Vec3{0.1 + 0.2 * i, 0.5, 0.9 - 0.2 * i};
+            pc.splats.push_back(s);
+        }
+        std::string err, note;
+        const bool wok = SavePly("ply_splats.ply", pc, &err);
+        Check(wok, "Gaussians save as .ply" + (wok ? "" : ": " + err));
+        PointCloud back;
+        const bool rok = LoadPly("ply_splats.ply", &back, &note, &err);
+        Check(rok && back.splats.size() == pc.splats.size(),
+              "...and load back, all of them (" + note + ")");
+        if (rok && back.splats.size() == pc.splats.size()) {
+            double worst = 0.0;
+            for (size_t i = 0; i < pc.splats.size(); ++i) {
+                const Splat& a = pc.splats[i];
+                const Splat& b = back.splats[i];
+                const double d[] = {
+                    a.mean.x - b.mean.x, a.mean.y - b.mean.y, a.mean.z - b.mean.z,
+                    (a.scale.x - b.scale.x) / a.scale.x, (a.scale.y - b.scale.y) / a.scale.y,
+                    (a.scale.z - b.scale.z) / a.scale.z,
+                    a.rot[0] - b.rot[0], a.rot[1] - b.rot[1], a.rot[2] - b.rot[2],
+                    a.rot[3] - b.rot[3], a.opacity - b.opacity,
+                    a.color.x - b.color.x, a.color.y - b.color.y, a.color.z - b.color.z};
+                for (double x : d) worst = std::max(worst, std::fabs(x));
+            }
+            char m[160];
+            std::snprintf(m, sizeof(m),
+                          "...unchanged to float precision (worst difference %.1e)",
+                          worst);
+            Check(worst < 1e-5, m);
+        }
+
+        // The header, read as text: the property names are the contract
+        // with every other splat tool, so they are checked by name.
+        std::ifstream hf("ply_splats.ply", std::ios::binary);
+        std::string header, line;
+        while (std::getline(hf, line) && line != "end_header") header += line + "\n";
+        hf.close();
+        bool named = true;
+        for (const char* p : {"property float f_dc_0", "property float opacity",
+                              "property float scale_0", "property float rot_0",
+                              "format binary_little_endian 1.0", "element vertex 5"})
+            named &= header.find(p) != std::string::npos;
+        Check(named, "...in the 3DGS layout other tools read");
+
+        // A plain point cloud: no Gaussians, so points with 8-bit colour.
+        PointCloud pts;
+        for (int i = 0; i < 3; ++i) {
+            Track t;
+            t.hasPoint = true;
+            t.point = Vec3{double(i), 2.0 * i, -1.0};
+            t.color = Vec3{1.0, 0.5, 0.0};
+            pts.tracks.push_back(t);
+        }
+        Track noPoint;                     // untriangulated: not written
+        pts.tracks.push_back(noPoint);
+        PointCloud pback;
+        const bool pok = SavePly("ply_points.ply", pts, &err) &&
+                         LoadPly("ply_points.ply", &pback, &note, &err);
+        Check(pok && pback.tracks.size() == 3 && pback.splats.empty() &&
+                  std::fabs(pback.tracks[2].point.y - 4.0) < 1e-6 &&
+                  std::fabs(pback.tracks[0].color.y - 128.0 / 255.0) < 1e-6,
+              "a point cloud round-trips as coloured points (" + note + ")");
+
+        // An ASCII file, as other tools write, with a property this reader
+        // does not know -- which must be skipped, not misread.
+        {
+            std::ofstream af("ply_ascii.ply");
+            af << "ply\nformat ascii 1.0\nelement vertex 2\n"
+               << "property float x\nproperty float y\nproperty float z\n"
+               << "property float confidence\n"
+               << "property uchar red\nproperty uchar green\nproperty uchar blue\n"
+               << "element face 0\nproperty list uchar int vertex_indices\n"
+               << "end_header\n"
+               << "1 2 3 0.5 255 0 0\n4 5 6 0.9 0 255 0\n";
+        }
+        PointCloud aback;
+        const bool aok = LoadPly("ply_ascii.ply", &aback, &note, &err);
+        Check(aok && aback.tracks.size() == 2 &&
+                  std::fabs(aback.tracks[1].point.z - 6.0) < 1e-9 &&
+                  std::fabs(aback.tracks[1].color.y - 1.0) < 1e-9,
+              "an ASCII .ply with an unknown property and faces reads" +
+                  (aok ? "" : ": " + err));
+
+        // A FILE AS THE 3DGS REFERENCE WRITES IT, which is what a download
+        // is: normals, then f_dc, then 45 f_rest values, then opacity, scale
+        // and rotation -- properties this writer never emits, in an order it
+        // does not use. The f_rest values must be skipped and reported.
+        {
+            std::ofstream rf("ply_inria.ply", std::ios::binary);
+            rf << "ply\nformat binary_little_endian 1.0\nelement vertex 2\n"
+               << "property float x\nproperty float y\nproperty float z\n"
+               << "property float nx\nproperty float ny\nproperty float nz\n"
+               << "property float f_dc_0\nproperty float f_dc_1\nproperty float f_dc_2\n";
+            for (int k = 0; k < 45; ++k) rf << "property float f_rest_" << k << "\n";
+            rf << "property float opacity\n"
+               << "property float scale_0\nproperty float scale_1\nproperty float scale_2\n"
+               << "property float rot_0\nproperty float rot_1\nproperty float rot_2\n"
+               << "property float rot_3\nend_header\n";
+            for (int i = 0; i < 2; ++i) {
+                std::vector<float> r;
+                r.insert(r.end(), {float(i), 1.0f, 2.0f, 0.0f, 0.0f, 0.0f});
+                // f_dc of 0 is colour 0.5; of 1/C0 is colour 1.5, clamped to 1.
+                r.insert(r.end(), {0.0f, float(1.0 / 0.28209479177387814), -1.0f});
+                for (int k = 0; k < 45; ++k) r.push_back(9.0f);   // must be ignored
+                r.push_back(0.0f);                                 // logit 0: 0.5
+                r.insert(r.end(), {std::log(0.1f), std::log(0.2f), std::log(0.3f)});
+                r.insert(r.end(), {2.0f, 0.0f, 0.0f, 0.0f});       // not unit
+                rf.write(reinterpret_cast<const char*>(r.data()),
+                         std::streamsize(r.size() * sizeof(float)));
+            }
+        }
+        PointCloud ib;
+        const bool iok = LoadPly("ply_inria.ply", &ib, &note, &err);
+        const bool right =
+            iok && ib.splats.size() == 2 && std::fabs(ib.splats[1].mean.x - 1.0) < 1e-6 &&
+            std::fabs(ib.splats[0].color.x - 0.5) < 1e-6 &&
+            std::fabs(ib.splats[0].color.y - 1.0) < 1e-6 &&
+            std::fabs(ib.splats[0].color.z - (0.5 - 0.28209479177387814)) < 1e-6 &&
+            std::fabs(ib.splats[0].opacity - 0.5) < 1e-6 &&
+            std::fabs(ib.splats[0].scale.z - 0.3) < 1e-6 &&
+            std::fabs(ib.splats[0].rot[0] - 1.0) < 1e-9;
+        Check(right, "a 3DGS reference file with f_rest decodes (" +
+                         (iok ? note : err) + ")");
+        Check(iok && note.find("dropped") != std::string::npos,
+              "...and says its view-dependent colour was dropped");
+
+        // THROUGH A SCRIPT: load_ply takes no inputs, and save() writes a
+        // reconstruction as .ply.
+        {
+            UiState ui; Pipeline p; std::vector<Data> src; std::string serr;
+            const bool sok = RunScript(
+                "s = load_ply( file = \"ply_splats.ply\" )\n"
+                "display( s, \"imported\" )\n"
+                "save( s, \"ply_resaved.ply\", existing = \"overwrite\" )\n",
+                &ui, &p, &serr, &src);
+            Check(sok, "a script loads a .ply with load_ply()" + (sok ? "" : ": " + serr));
+            std::vector<std::string> wrote;
+            const bool saved = sok && p.RunSaves(&src, &serr, &wrote);
+            PointCloud rs;
+            const bool reread = saved && LoadPly("ply_resaved.ply", &rs, &note, &serr);
+            Check(reread && rs.splats.size() == 5,
+                  "...and save() writes it back out as .ply" +
+                      (reread ? "" : ": " + serr));
+
+            // An image cannot be saved as .ply, and says so.
+            UiState ui2; Pipeline p2; std::vector<Data> src2; std::string e2;
+            RunScript("src = image(\"test\")\nsave(src, \"ply_img.ply\")\n",
+                      &ui2, &p2, &e2, &src2);
+            std::vector<std::string> w2;
+            const bool imgOk = p2.RunSaves(&src2, &e2, &w2);
+            Check(!imgOk && e2.find(".ply") != std::string::npos,
+                  "saving an image as .ply is refused (" + e2 + ")");
+        }
+        for (const char* f : {"ply_splats.ply", "ply_points.ply", "ply_ascii.ply", "ply_inria.ply",
+                              "ply_resaved.ply", "ply_img.ply"})
+            std::remove(f);
+    }
 }
 
 int main() {
@@ -4072,6 +4252,8 @@ int main() {
               "overwrite keeps writing the same path");
         std::remove("save_over.png");
     }
+
+    TestPly();
 
     // A GROUP writes one file per frame, numbered -- a single path cannot name
     // N images, and a reduction consumes them in order so the numbering has to

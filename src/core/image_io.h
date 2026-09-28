@@ -13,7 +13,9 @@ bool LoadImageFile(const std::string& path, Image* out, std::string* err);
 bool SavePng(const std::string& path, Image& img, std::string* err);
 
 // What to write. Chosen from the extension unless a script names one.
-enum class SaveFormat { Png, Jpg, Bmp, Tga, Hdr };
+// Ply is for point clouds and Gaussian splats (see ply_io.h); an image
+// cannot be written as one.
+enum class SaveFormat { Png, Jpg, Bmp, Tga, Hdr, Ply };
 
 // Picks a format from a path's extension. Png when there is nothing to go on,
 // since it is the lossless one that every viewer opens.
