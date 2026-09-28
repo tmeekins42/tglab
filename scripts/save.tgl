@@ -23,6 +23,9 @@
 # two.
 #
 # A GROUP writes one numbered file per frame: out_001.png, out_002.png, ...
+#
+# A RECONSTRUCTION -- a point cloud or Gaussian splats, from sfm.tgl or
+# load_ply -- saves as .ply; see sfm.tgl and view_ply.tgl.
 
 src = image("test")
 

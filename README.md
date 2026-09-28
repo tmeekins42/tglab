@@ -245,8 +245,27 @@ gx, gy, mag = sobel(src => gaussian_blur(sigma = 2))
 | `params(algo, "name")` | The same, as an independent instance, so one algorithm can appear twice. |
 | `shape(group, axis=n, ...)` | Gives a group named axes (see *Groups*). |
 | `display(data)` / `display(data, "name")` | Opens a viewer panel; returns its input. |
+| `save(data, "path"[, format=, quality=, existing=])` | Declares an export; returns its input, so it sits in a pipe. |
 
 `include "name.tgl"` is a statement rather than a builtin — see below.
+
+**`save()` writes nothing while you tune.** A save that fired on every slider
+tick would fill a directory, so saves are written when you ask — **File → Run
+script saves**. For a one-off, right-click an image viewer and choose *Save
+image...* instead.
+
+- **Format** comes from the extension, or `format = "jpg"`. PNG and BMP are
+  lossless 8-bit, JPEG takes `quality = 1..100`, and `.hdr` keeps linear values
+  — the one for a merged bracket. An 8-bit save goes through the viewer's
+  display curve, so the file matches the screen.
+- **A reconstruction** saves as `.ply`: Gaussian splats in the standard 3DGS
+  layout, or coloured points (see *Dense depth and Gaussian splatting*).
+- **Existing files** are kept: `existing = "increment"` (the default) writes
+  `out_1.png` beside `out.png`; `"overwrite"` and `"skip"` are the others.
+- **A group** writes one numbered file per frame: `out_001.png`,
+  `out_002.png`, ...
+
+`scripts/save.tgl` shows each of these.
 
 ### Sharing a chain between scripts
 
