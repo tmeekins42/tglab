@@ -37,6 +37,12 @@ struct Port {
     // so every algorithm written before shape existed declares the right thing
     // by saying nothing. See shape.h for why the default matters.
     ShapeSpec   shape  = ShapeSpec::Scalar;
+
+    // A trailing input the script may leave out. The call then passes fewer
+    // arguments and the stage sees no data on this port. Only meaningful at
+    // the END of the list: an optional port cannot precede a required one,
+    // since arguments bind positionally.
+    bool        optional = false;
 };
 
 using PortList = std::vector<Port>;
@@ -453,6 +459,15 @@ public:
     void SetGroupGpu(ComputeContext* gpu) { m_groupGpu = gpu; }
     ComputeContext* GroupGpu() const { return m_groupGpu; }
 
+    // A reconstruct stage's THIRD input, when it declares one and the script
+    // supplied it: a second group of images beside the frames on input 1 --
+    // train_splats(splats, frames, depth) reads plane_sweep's maps here.
+    // Set by the pipeline immediately before RunReconstruct, like
+    // SetGroupGpu, and null when the port was left out. Valid only during
+    // that call.
+    void SetReconstructExtra(const std::vector<Image>* extra) { m_reconExtra = extra; }
+    const std::vector<Image>* ReconstructExtra() const { return m_reconExtra; }
+
     // --- GPU path (M3) ------------------------------------------------------
     // An algorithm opts in by returning true from HasGPU() and providing the
     // HLSL for a compute kernel. The framework handles residency, descriptor
@@ -785,6 +800,8 @@ private:
     // The device for a whole-group stage. Borrowed from the run, never owned:
     // see SetGroupGpu. Null whenever there is no device or the run is CPU-only.
     ComputeContext* m_groupGpu = nullptr;
+    // See SetReconstructExtra.
+    const std::vector<Image>* m_reconExtra = nullptr;
 };
 
 // ---------------------------------------------------------------------------

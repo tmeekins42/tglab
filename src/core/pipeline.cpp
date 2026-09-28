@@ -1729,6 +1729,21 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
             // reconstruct stage reaching past it would defeat that.
             s.algo->SetGroupGpu(mode == ExecMode::ForceCPU ? nullptr : gpu);
 
+            // A THIRD INPUT, a second group beside the frames, for a stage
+            // that declares one: train_splats(splats, frames, depth). Null
+            // when the script left the (optional) port out.
+            const std::vector<Image>* extra = nullptr;
+            if (in.size() > 2 && in[2]) {
+                if (const auto* aux = std::get_if<ImageSet>(in[2])) {
+                    extra = &aux->images;
+                } else {
+                    *err = "line " + std::to_string(s.line) + ": '" +
+                           s.algoName + "' takes a group as its third input";
+                    return false;
+                }
+            }
+            s.algo->SetReconstructExtra(extra);
+
             // A DENSE stage produces IMAGES rather than a cloud: a plane sweep
             // outputs one depth map per frame, and PMVS will want the same
             // path. Declared through the output port like everything else, so

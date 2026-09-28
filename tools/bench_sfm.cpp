@@ -41,6 +41,7 @@
 #include <vector>
 
 #include "../src/algo_util/features.h"
+#include "../src/algo_util/splat_raster.h"
 #include "../src/algo_util/view_graph.h"
 #include "../src/core/algorithm.h"
 #include "../src/core/image.h"
@@ -376,6 +377,76 @@ void ReportPlanarity(const PointCloud& pc) {
     }
 }
 
+// --dump for a cloud with Gaussians: renders it from NOVEL viewpoints, the
+// middle camera swung around the scene centre, and saves each as a PNG.
+// Training views can hide floaters by construction -- the optimiser put them
+// exactly where those views wanted them -- so seeing them needs somewhere
+// else to look from, which is what the viewer's orbit does interactively.
+static void DumpOrbit(const PointCloud& pc, const std::string& prefix) {
+    const Camera& mid = pc.cameras[pc.cameras.size() / 2];
+    if (!mid.solved) return;
+
+    // Centre: the component-wise median of the Gaussians, robust to strays.
+    std::vector<double> xs, ys, zs;
+    for (const Splat& s : pc.splats) {
+        xs.push_back(s.mean.x);
+        ys.push_back(s.mean.y);
+        zs.push_back(s.mean.z);
+    }
+    auto median = [](std::vector<double>& v) {
+        std::nth_element(v.begin(), v.begin() + long(v.size() / 2), v.end());
+        return v[v.size() / 2];
+    };
+    const Vec3 centre{median(xs), median(ys), median(zs)};
+
+    // Swing about the middle camera's own vertical axis (row 1 of R).
+    const Vec3 up{mid.R.m[3], mid.R.m[4], mid.R.m[5]};
+    const Vec3 p0 = mid.Center() - centre;
+
+    std::vector<SplatParam> params;
+    params.reserve(pc.splats.size());
+    for (const Splat& s : pc.splats) params.push_back(ToParam(s));
+
+    const int w = 768, h = int(std::lround(768.0 * mid.height / std::max(1, mid.width)));
+    for (int deg : {-60, -30, 0, 30, 60}) {
+        const double a = deg * 3.14159265358979 / 180.0;
+        const Vec3 p = p0 * std::cos(a) + up.Cross(p0) * std::sin(a) +
+                       up * (up.Dot(p0) * (1.0 - std::cos(a)));
+        const Vec3 pos = centre + p;
+        const Vec3 z = (centre - pos).Normalized();
+        const Vec3 x = up.Cross(z).Normalized();
+        const Vec3 y = z.Cross(x);
+
+        Camera c = mid;
+        c.R.m[0] = x.x; c.R.m[1] = x.y; c.R.m[2] = x.z;
+        c.R.m[3] = y.x; c.R.m[4] = y.y; c.R.m[5] = y.z;
+        c.R.m[6] = z.x; c.R.m[7] = z.y; c.R.m[8] = z.z;
+        c.t = (c.R * pos) * -1.0;
+
+        SplatRaster r;
+        RasterOptions opt;
+        std::vector<double> rgb;
+        r.Forward(params, SplatCamFrom(c, w, h), opt, &rgb);
+
+        Image im;
+        im.Alloc(ImageDesc{w, h, Format::RGBA8});
+        ImageView v = im.MapCpuWrite();
+        for (int yy = 0; yy < h; ++yy)
+            for (int xx = 0; xx < w; ++xx) {
+                uint8_t* q = v.At<uint8_t>(xx, yy);
+                const double* s = &rgb[(size_t(yy) * size_t(w) + size_t(xx)) * 3];
+                for (int ch = 0; ch < 3; ++ch)
+                    q[ch] = uint8_t(std::clamp(s[ch], 0.0, 1.0) * 255.0 + 0.5);
+                q[3] = 255;
+            }
+        v = ImageView{};
+        char name[64];
+        std::snprintf(name, sizeof(name), "_orbit%+03d.png", deg);
+        std::string e;
+        SavePng(prefix + name, im, &e);
+    }
+}
+
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
 
@@ -572,6 +643,11 @@ int main(int argc, char** argv) {
                         std::string e;
                         SavePng(dumpDir + "/" + vd.name + name, copy, &e);
                     }
+                }
+                if (const PointCloud* pc = std::get_if<PointCloud>(d);
+                    pc && !pc->splats.empty() && !pc->cameras.empty()) {
+                    std::filesystem::create_directories(dumpDir);
+                    DumpOrbit(*pc, dumpDir + "/" + vd.name);
                 }
             }
             const char* kind = "nothing";

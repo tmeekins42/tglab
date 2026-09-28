@@ -962,10 +962,17 @@ private:
         const PortList inPorts  = algo->Inputs();
         const PortList outPorts = algo->Outputs();
 
-        // Positional arguments bind to input ports, in order.
-        if (a.pos.size() != inPorts.size()) {
-            return Fail(e.line, "'" + name + "' takes " + std::to_string(inPorts.size()) +
-                                    " input" + (inPorts.size() == 1 ? "" : "s") + ", " +
+        // Positional arguments bind to input ports, in order. Trailing ports
+        // marked optional may be left out.
+        size_t required = inPorts.size();
+        while (required > 0 && inPorts[required - 1].optional) --required;
+        if (a.pos.size() < required || a.pos.size() > inPorts.size()) {
+            const std::string want =
+                (required == inPorts.size())
+                    ? std::to_string(inPorts.size())
+                    : std::to_string(required) + " to " + std::to_string(inPorts.size());
+            return Fail(e.line, "'" + name + "' takes " + want + " input" +
+                                    (inPorts.size() == 1 ? "" : "s") + ", " +
                                     std::to_string(a.pos.size()) + " given");
         }
 

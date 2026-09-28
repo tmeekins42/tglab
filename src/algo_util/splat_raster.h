@@ -37,6 +37,8 @@
 // (0,1). ToParams/FromParams convert.
 #pragma once
 
+#include <algorithm>
+#include <cmath>
 #include <memory>
 #include <string>
 #include <vector>
@@ -110,6 +112,49 @@ inline SplatCam SplatCamFrom(const Camera& c, int w, int h) {
     return o;
 }
 
+// THE DEPTH LOSS, shared by every training path so they cannot drift apart.
+//
+// Per pixel with a target t (t > 0; 0 means "no measurement here"):
+//
+//     weight * | D - A t | / t,        A = 1 - T, the pixel's coverage
+//
+// normalised per pixel as the colour L1 is. RELATIVE because a
+// reconstruction's units are arbitrary and depth uncertainty grows with
+// distance, the same reasoning fuse_depth's tolerance uses.
+//
+// AGAINST A t, NOT t. The rendered D is sum(w_i z_i) over a background of
+// depth 0, so a partly transparent pixel renders NEARER than its surface. The
+// first version compared D with t directly, and to close that gap the loss
+// pushed Gaussians BEHIND the surface and up in opacity -- smearing brick
+// across the walls from every novel view (fountain-P11, 3000 iterations,
+// weight 1). Against A t the loss is zero whenever every Gaussian sits at the
+// measured depth, however much of the pixel they cover: coverage is colour's
+// business, depth only says where.
+//
+// In the backward pass that is one extra channel whose value for Gaussian i
+// is (z_i - t) -- A is the same blend with value 1 -- so the kernels take the
+// target as a per-pixel SHIFT beside dLoss/dD. See SplatRaster::Backward.
+//
+// Writes dLoss/dD into `dD` (sized like `rendered`); adds the summed relative
+// residual |D - A t| / t and the pixels it covered to `errSum`/`count`.
+template <typename R, typename T2, typename G>
+void DepthLossGrad(const std::vector<R>& rendered, const std::vector<T2>& finalT,
+                   const std::vector<float>& target, double weight,
+                   std::vector<G>* dD, double* errSum, long long* count) {
+    const size_t np = rendered.size();
+    dD->assign(np, G(0));
+    const double k = weight / double(std::max<size_t>(1, np));
+    for (size_t i = 0; i < np && i < target.size(); ++i) {
+        const double t = double(target[i]);
+        if (t <= 0.0) continue;
+        const double cover = 1.0 - double(finalT[i]);
+        const double diff = double(rendered[i]) - cover * t;
+        *errSum += std::fabs(diff) / t;
+        ++*count;
+        (*dD)[i] = G(diff > 0.0 ? k / t : (diff < 0.0 ? -k / t : 0.0));
+    }
+}
+
 struct RasterOptions {
     // An alpha below this is skipped. It also sets how far out a Gaussian is
     // evaluated: to where opacity * G falls below it, which for a fully
@@ -153,15 +198,34 @@ public:
 
     // Renders `splats` from `cam` into `rgb` (w*h*3, row-major). Keeps what
     // Backward needs, so Backward must follow with the same splats and camera.
+    //
+    // `depth`, when given, receives each pixel's EXPECTED depth: the
+    // camera-space depth of every Gaussian's centre, blended with the same
+    // weights as its colour -- alpha times the transmittance reaching it --
+    // over a background of depth 0. Depth is composited exactly as a fourth
+    // colour channel would be, which is what makes its gradient the same
+    // machinery as colour's plus one term: moving a Gaussian toward or away
+    // from the camera changes the depth it contributes.
     void Forward(const std::vector<SplatParam>& splats, const SplatCam& cam,
-                 const RasterOptions& opt, std::vector<double>* rgb);
+                 const RasterOptions& opt, std::vector<double>* rgb,
+                 std::vector<double>* depth = nullptr);
 
     // Given dLoss/dRGB for the image Forward produced, ADDS dLoss/dparam into
     // `grad` (same size as the splats, filled with SplatParam::Zero() by the
-    // caller -- not default-constructed; see Zero()).
+    // caller -- not default-constructed; see Zero()). `dDepth`, when given,
+    // is dLoss/d(expected depth) per pixel (w*h), and `depthShift` the
+    // per-pixel value subtracted from every Gaussian's depth in that
+    // channel -- the depth TARGET, for DepthLossGrad's loss; see there.
+    // Null shift is zero.
     void Backward(const std::vector<SplatParam>& splats, const SplatCam& cam,
                   const RasterOptions& opt, const std::vector<double>& dRgb,
-                  std::vector<SplatParam>* grad);
+                  std::vector<SplatParam>* grad,
+                  const std::vector<double>* dDepth = nullptr,
+                  const std::vector<float>* depthShift = nullptr);
+
+    // Per pixel, from the last Forward: the transmittance left after every
+    // Gaussian -- 1 minus the pixel's coverage.
+    const std::vector<double>& FinalT() const { return m_finalT; }
 
     // How many Gaussians the last Forward found in view.
     int Visible() const { return m_visible; }
@@ -220,10 +284,12 @@ private:
         double conic[3] = {0, 0, 0};
         double color[3] = {0, 0, 0};
         double opacity = 0;   // w.r.t. the logit
+        double depth = 0;     // w.r.t. the centre's camera-space depth
         void Add(const Grad2& o) {
             u += o.u; v += o.v;
             for (int i = 0; i < 3; ++i) { conic[i] += o.conic[i]; color[i] += o.color[i]; }
             opacity += o.opacity;
+            depth += o.depth;
         }
     };
 
@@ -235,9 +301,12 @@ private:
     // changed nothing the CPU path depends on, if the device fails.
     struct Gpu;
     bool CompositeGpu(const std::vector<SplatParam>& splats, const SplatCam& cam,
-                      const RasterOptions& opt, std::vector<double>* rgb);
+                      const RasterOptions& opt, std::vector<double>* rgb,
+                      std::vector<double>* depth);
     bool BackPixelGpu(const SplatCam& cam, const RasterOptions& opt,
                       const std::vector<double>& dRgb,
+                      const std::vector<double>* dDepth,
+                      const std::vector<float>* depthShift,
                       const std::vector<size_t>& offset,
                       std::vector<Grad2>* entry);
     std::unique_ptr<Gpu> m_gpu;

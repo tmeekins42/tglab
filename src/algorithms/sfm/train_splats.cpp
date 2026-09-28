@@ -60,7 +60,9 @@
 #include <string>
 #include <vector>
 
+#include "../../algo_util/depth_views.h"
 #include "../../algo_util/splat_raster.h"
+#include "../../algo_util/splat_train_gpu.h"
 #include "../../core/algorithm.h"
 #include "../../core/parallel.h"
 
@@ -71,7 +73,32 @@ namespace {
 struct View {
     SplatCam            cam;
     std::vector<double> rgb;   // w*h*3, 0..1
+    // The plane sweep's depth at training resolution, w*h, 0 where there is
+    // no confident measurement. Empty without a depth input.
+    std::vector<float>  depth;
 };
+
+// A camera's sweep depth resampled to the training view's w x h, nearest
+// pixel by pixel centre, keeping only depths at or above `minConf`. The
+// sweep ran on the same frames at their own resolution, so the two cover
+// the same field of view and relative coordinates line up.
+//
+// Nearest rather than averaged: averaging depths across an edge invents a
+// surface halfway between the two that neither camera saw.
+std::vector<float> DepthTarget(const DepthView& dv, int w, int h, double minConf) {
+    std::vector<float> out(size_t(w) * size_t(h), 0.0f);
+    if (!dv.ok) return out;
+    for (int y = 0; y < h; ++y) {
+        const int sy = std::min(dv.h - 1, int((double(y) + 0.5) * dv.h / h));
+        for (int x = 0; x < w; ++x) {
+            const int sx = std::min(dv.w - 1, int((double(x) + 0.5) * dv.w / w));
+            const float d = dv.At(sx, sy);
+            if (d > 0.0f && dv.Conf(sx, sy) >= float(minConf))
+                out[size_t(y) * size_t(w) + size_t(x)] = d;
+        }
+    }
+    return out;
+}
 
 // Reads a frame as RGB and box-downsamples it by an integer factor.
 //
@@ -150,8 +177,12 @@ public:
     const char* Category() const override { return "sfm"; }
 
     PortList Inputs() const override {
+        // `depth`, optional: plane_sweep's maps, to supervise geometry as
+        // well as colour. See depth_weight.
         return {{"src",    DataType::PointCloud, FormatSpec::Any, ShapeSpec::Any},
-                {"frames", DataType::ImageSet,   FormatSpec::Any, ShapeSpec::Any}};
+                {"frames", DataType::ImageSet,   FormatSpec::Any, ShapeSpec::Any},
+                {"depth",  DataType::ImageSet,   FormatSpec::Any, ShapeSpec::Any,
+                 true}};
     }
     PortList Outputs() const override {
         return {{"out", DataType::PointCloud, FormatSpec::Any, ShapeSpec::Any}};
@@ -175,9 +206,25 @@ public:
             return false;
         }
 
-        // --- training views ----------------------------------------------------
+        // --- training views, and any held out ----------------------------------
+        // HELD-OUT VIEWS are the honest score. PSNR on the photographs being
+        // trained on rewards a fit that is perfect from those viewpoints and
+        // wrong between them -- which is exactly what a few-view capture
+        // produces. A camera left out of training says how the splats look
+        // from somewhere they were not fitted to.
         const int k = std::clamp(int(m_downscale), 1, 16);
-        std::vector<View> views;
+        const int holdEvery = std::max(0, int(m_holdout));
+
+        // DEPTH, when the third input carries plane_sweep's maps.
+        std::vector<DepthView> depthViews;
+        std::vector<ImageView> depthHolds;   // keep the mappings alive
+        const double depthWeight = double(m_depthWeight);
+        const bool useDepth = ReconstructExtra() && depthWeight > 0.0;
+        if (useDepth &&
+            !ReadDepthViews(*ReconstructExtra(), int(cloud->cameras.size()),
+                            "train_splats", &depthViews, &depthHolds, err))
+            return false;
+        std::vector<View> views, heldOut;
         for (size_t i = 0; i < cloud->cameras.size(); ++i) {
             const Camera& c = cloud->cameras[i];
             if (!c.solved) continue;
@@ -185,7 +232,14 @@ public:
             int w = 0, h = 0;
             if (!LoadView((*images)[i], k, &vw.rgb, &w, &h)) continue;
             vw.cam = SplatCamFrom(c, w, h);
-            views.push_back(std::move(vw));
+            if (useDepth)
+                vw.depth = DepthTarget(depthViews[i], w, h, double(m_depthConfidence));
+            // Every Nth camera from the middle of each run of N, so the held-
+            // out ones sit BETWEEN training cameras: interpolation, which is
+            // the question. Holding out an end camera would ask about
+            // extrapolation instead, which no amount of fitting fixes.
+            const bool hold = holdEvery >= 2 && int(i) % holdEvery == holdEvery / 2;
+            (hold ? heldOut : views).push_back(std::move(vw));
         }
         if (views.empty()) {
             *err = "train_splats: no solved camera has a usable frame";
@@ -203,7 +257,12 @@ public:
 
         // --- how well it fits before -----------------------------------------
         double l1Before = 0.0, psnrBefore = 0.0;
-        Evaluate(params, views, opt, GroupGpu(), &l1Before, &psnrBefore);
+        double depthBefore = -1.0, depthAfter = -1.0;
+        Evaluate(params, views, opt, GroupGpu(), &l1Before, &psnrBefore,
+                 useDepth ? &depthBefore : nullptr);
+        double heldBefore = 0.0, heldAfter = 0.0, heldL1 = 0.0;
+        if (!heldOut.empty())
+            Evaluate(params, heldOut, opt, GroupGpu(), &heldL1, &heldBefore);
 
         // --- the scene's scale, for the position learning rate ------------------
         // A step size for positions has to be in scene units, and a
@@ -240,6 +299,9 @@ public:
         std::vector<double> m1(n * 14, 0.0), m2(n * 14, 0.0);
         std::vector<SplatParam> grad(n, SplatParam::Zero());
         std::vector<double> img, dImg;
+        std::vector<double> rDepth, dDepth;          // the CPU path's depth term
+        double    cpuDepthErr = 0.0;
+        long long cpuDepthCount = 0;
         SplatRaster raster;
         // The per-pixel passes on the device when the run has one; the
         // rasteriser falls back to the CPU on its own if the device fails.
@@ -265,8 +327,10 @@ public:
         const double threshold = double(m_gradThreshold);
         const size_t maxCount = size_t(std::max(1, int(m_maxGaussians)));
         const double pruneOpacity = double(m_pruneOpacity);
+        const bool   clampColour  = bool(m_clampColour);
         long long cloned = 0, split = 0, pruned = 0;
         int densifySteps = 0;
+        int pruneSteps   = 0;   // after densify_until: prune, never grow
 
         // Cameras in a shuffled order each pass, as the paper does, so no
         // camera is always followed by the same one. A fixed seed keeps runs
@@ -293,6 +357,22 @@ public:
         };
         double msAdam = 0.0, msDensify = 0.0;
         long long visibleSum = 0;
+
+        // --- the whole state on the device, when there is one -----------------
+        //
+        // See SplatTrainerGpu. The CPU loop below stays as the reference and
+        // the fallback: if the device fails part way, the state is read back
+        // from the last good step and training carries on here.
+        std::unique_ptr<SplatTrainerGpu> gpuTrainer;
+        std::string gpuNote;
+        if (ComputeContext* dev = GroupGpu()) {
+            auto t = std::make_unique<SplatTrainerGpu>(dev);
+            t->SetClampColour(clampColour);
+            if (t->Upload(params, m1, m2, gradAccum, gradCount, maxScreen, &gpuNote))
+                gpuTrainer = std::move(t);
+        }
+        int gpuIters = 0;
+
         for (int it = 0; it < iters; ++it) {
             if (order.empty()) {
                 order.resize(views.size());
@@ -303,7 +383,38 @@ public:
             const View& vw = views[size_t(order.back())];
             order.pop_back();
 
-            raster.Forward(params, vw.cam, opt, &img);
+            const double frac = (iters > 1) ? double(it) / double(iters - 1) : 1.0;
+            const double lrMean = lrMean0 * std::pow(lrMean1 / lrMean0, frac);
+            const double c1 = 1.0 - std::pow(b1, double(it + 1));
+            const double c2 = 1.0 - std::pow(b2, double(it + 1));
+
+            // One step on the device; if it fails, bring the state home and
+            // take this step, and every later one, on the CPU.
+            bool stepped = false;
+            if (gpuTrainer) {
+                if (gpuTrainer->Step(vw.cam, opt, vw.rgb, lrMean, c1, c2, &gpuNote,
+                                     vw.depth.empty() ? nullptr : &vw.depth,
+                                     depthWeight)) {
+                    visibleSum += gpuTrainer->Visible();
+                    ++gpuIters;
+                    stepped = true;
+                } else {
+                    std::string derr;
+                    if (!gpuTrainer->Download(&params, &m1, &m2, &gradAccum,
+                                              &gradCount, &maxScreen, &derr)) {
+                        *err = "train_splats: the GPU failed (" + gpuNote +
+                               ") and its state could not be recovered (" + derr + ")";
+                        return false;
+                    }
+                    n = params.size();
+                    grad.assign(n, SplatParam::Zero());
+                    gpuTrainer.reset();
+                }
+            }
+
+            if (!stepped) {
+            raster.Forward(params, vw.cam, opt, &img,
+                           vw.depth.empty() ? nullptr : &rDepth);
             visibleSum += raster.Visible();
 
             // L1: the gradient is the sign of each difference, over the mean.
@@ -315,7 +426,12 @@ public:
             }
 
             std::fill(grad.begin(), grad.end(), SplatParam::Zero());
-            raster.Backward(params, vw.cam, opt, dImg, &grad);
+            if (!vw.depth.empty())
+                DepthLossGrad(rDepth, raster.FinalT(), vw.depth, depthWeight, &dDepth,
+                              &cpuDepthErr, &cpuDepthCount);
+            raster.Backward(params, vw.cam, opt, dImg, &grad,
+                            vw.depth.empty() ? nullptr : &dDepth,
+                            vw.depth.empty() ? nullptr : &vw.depth);
 
             // Accumulate the screen-position gradient for densification, in
             // the paper's units. The paper measures it against NDC, which
@@ -332,11 +448,6 @@ public:
                 }
             }
 
-            const double frac = (iters > 1) ? double(it) / double(iters - 1) : 1.0;
-            const double lrMean = lrMean0 * std::pow(lrMean1 / lrMean0, frac);
-            const double c1 = 1.0 - std::pow(b1, double(it + 1));
-            const double c2 = 1.0 - std::pow(b2, double(it + 1));
-
             auto tAdam = Clock::now();
             ParallelFor(n, [&](size_t i) {
                 double* p = params[i].Data();
@@ -349,12 +460,63 @@ public:
                     const double lr = (groupOf[q] == 0) ? lrMean : lrGroup[groupOf[q]];
                     p[q] -= lr * (a[q] / c1) / (std::sqrt(b[q] / c2) + adamEps);
                 }
+                if (clampColour)
+                    for (int q = 11; q < 14; ++q) p[q] = std::clamp(p[q], 0.0, 1.0);
             });
 
             msAdam += msSince(tAdam);
+            }   // the CPU step
+
             auto tDens = Clock::now();
+
+            // Densification and the opacity reset work on the CPU copy, so on
+            // the GPU path the state comes down before either and goes back
+            // up after. Every `densify_every` iterations, not every one.
+            // Growth stops at densify_until; PRUNING DOES NOT, see below.
+            const bool growing   = it + 1 <= until;
+            const bool doDensify = densify && (it + 1) % every == 0;
+            const bool doReset = densify && resetEvery > 0 &&
+                                 (it + 1) % resetEvery == 0 && it + 1 < until;
+            if (gpuTrainer && (doDensify || doReset)) {
+                std::string derr;
+                if (!gpuTrainer->Download(&params, &m1, &m2, &gradAccum,
+                                          &gradCount, &maxScreen, &derr)) {
+                    *err = "train_splats: could not read the GPU state back to "
+                           "densify: " + derr;
+                    return false;
+                }
+                n = params.size();
+            }
+
             // --- densify and prune ----------------------------------------------
-            if (densify && (it + 1) % every == 0 && it + 1 <= until) {
+            // PRUNING OUTLIVES GROWTH. After densify_until nothing is cloned
+            // or split, but the faint and the oversized are still removed
+            // every `densify_every` iterations, to the end.
+            //
+            // The paper stops both together, and with a hundred-plus views it
+            // can: every Gaussian is seen from enough angles that none can
+            // grow unnoticed. With eleven it cannot. A flat Gaussian seen
+            // edge-on from every training camera is a thin line in every
+            // photograph, so nothing in the loss stops its other two axes
+            // growing -- log-scale moves up to ~0.005 an iteration, a factor
+            // of 400 over 1200 unchecked iterations. At 3000 iterations
+            // on fountain-P11 that made sheets spanning the whole scene,
+            // invisible from the cameras and a wall of smear from anywhere
+            // else. At 300 there were only 120 iterations after the cutoff,
+            // too few for it to show.
+            //
+            // Only the WORLD-size limit applies once growth has stopped; the
+            // screen-size one does not. The sheets are small on screen by
+            // construction, so the world limit is the one that catches them,
+            // while the screen limit then removes big-on-screen Gaussians
+            // that nothing can replace any more. Measured on fountain-P11:
+            //
+            //   late pruning          300 iterations   3000 iterations
+            //   none (the paper's)        17.59 dB      sheets across the scene
+            //                                           (seen at full resolution)
+            //   world and screen          16.63 dB        28.37 dB
+            //   world only                17.59 dB        30.92 dB
+            if (doDensify) {
                 std::vector<SplatParam> np;
                 std::vector<double> nm1, nm2;
                 np.reserve(n + n / 4);
@@ -386,7 +548,7 @@ public:
                     if (avg >= threshold) grow.emplace_back(avg, i);
                 }
                 std::sort(grow.begin(), grow.end(), std::greater<>());
-                const size_t room = (maxCount > n) ? maxCount - n : 0;
+                const size_t room = (growing && maxCount > n) ? maxCount - n : 0;
                 std::vector<char> grows(n, 0);
                 for (size_t k = 0; k < grow.size() && k < room; ++k)
                     grows[grow[k].second] = 1;
@@ -433,7 +595,8 @@ public:
                                                               p.logScale[1],
                                                               p.logScale[2]}));
                         if ((worldLimit > 0.0 && big > worldLimit) ||
-                            (screenLimit > 0.0 && maxScreen[i] > screenLimit)) {
+                            (growing && screenLimit > 0.0 &&
+                             maxScreen[i] > screenLimit)) {
                             ++pruned;
                             ++prunedBig;
                             continue;
@@ -476,7 +639,7 @@ public:
                 gradAccum.assign(n, 0.0);
                 gradCount.assign(n, 0);
                 maxScreen.assign(n, 0.0);
-                ++densifySteps;
+                if (growing) ++densifySteps; else ++pruneSteps;
             }
 
             msDensify += msSince(tDens);
@@ -498,11 +661,39 @@ public:
                 }
                 ++resets;
             }
+
+            if (gpuTrainer && (doDensify || doReset)) {
+                if (!gpuTrainer->Upload(params, m1, m2, gradAccum, gradCount,
+                                        maxScreen, &gpuNote)) {
+                    // Nothing lost: the CPU copy is current, so the run simply
+                    // continues there.
+                    gpuTrainer.reset();
+                    grad.assign(n, SplatParam::Zero());
+                }
+            }
+        }
+
+        // The final state, home from the device.
+        if (gpuTrainer) {
+            std::string derr;
+            if (!gpuTrainer->Download(&params, &m1, &m2, &gradAccum, &gradCount,
+                                      &maxScreen, &derr)) {
+                *err = "train_splats: could not read the trained splats back from "
+                       "the GPU: " + derr;
+                return false;
+            }
+            n = params.size();
         }
 
         // --- how well it fits after ------------------------------------------
         double l1After = l1Before, psnrAfter = psnrBefore;
-        if (iters > 0) Evaluate(params, views, opt, GroupGpu(), &l1After, &psnrAfter);
+        depthAfter = depthBefore;
+        if (iters > 0)
+            Evaluate(params, views, opt, GroupGpu(), &l1After, &psnrAfter,
+                     useDepth ? &depthAfter : nullptr);
+        heldAfter = heldBefore;
+        if (iters > 0 && !heldOut.empty())
+            Evaluate(params, heldOut, opt, GroupGpu(), &heldL1, &heldAfter);
 
         const size_t startCount = cloud->splats.size();
         cloud->splats.resize(n);
@@ -510,28 +701,43 @@ public:
 
         const double secs = std::chrono::duration<double>(
                                 std::chrono::steady_clock::now() - t0).count();
-        char dens[200] = "";
+        char dens[260] = "";
         if (densify)
             std::snprintf(dens, sizeof(dens),
-                          "; %d densify steps: %lld cloned, %lld split, %lld "
+                          "; %d densify steps and %d prune-only: %lld cloned, "
+                          "%lld split, %lld "
                           "pruned (%lld faint, %lld too large), %d opacity "
                           "reset%s, %d -> %d Gaussians",
-                          densifySteps, cloned, split, pruned, prunedFaint,
+                          densifySteps, pruneSteps, cloned, split, pruned, prunedFaint,
                           prunedBig, resets, resets == 1 ? "" : "s",
                           int(startCount), int(n));
         // Per iteration, so it reads the same at any iteration count.
-        char timing[300] = "";
-        if (iters > 0) {
+        char timing[400] = "";
+        if (gpuIters > 0 && gpuTrainer) {
+            // Stated every time, with the count: a fallback part way through
+            // reads as "the GPU is slow" unless the report says it happened.
+            const SplatTrainerGpu::Timings& tm = gpuTrainer->Time();
+            const double k = 1.0 / double(gpuIters);
+            std::snprintf(timing, sizeof(timing),
+                          "; %d of %d iterations on the GPU; per iteration: "
+                          "project %.0f, bin %.0f, composite %.0f, loss %.0f, "
+                          "backward %.0f, update %.0f, densify %.0f ms",
+                          gpuIters, iters, tm.project * k, tm.bin * k,
+                          tm.composite * k, tm.loss * k, tm.backward * k,
+                          tm.update * k, msDensify / double(iters));
+        } else if (iters > 0) {
             const SplatRaster::Timings& tm = raster.Time();
             const double k = 1.0 / double(iters);
             // Which path ran, stated every time: a GPU fallback that happens
             // silently reads as "the GPU is slow".
             std::snprintf(timing, sizeof(timing),
-                          "; pixels on the %s; per iteration: project %.0f, "
+                          "; %s; per iteration: project %.0f, "
                           "bin %.0f, composite "
                           "%.0f, back-pixel %.0f, back-sum %.0f, back-Gaussian "
                           "%.0f, Adam %.0f, densify %.0f ms",
-                          raster.UsedGpu() ? "GPU" : "CPU",
+                          raster.UsedGpu() ? "pixels on the GPU"
+                                           : (gpuNote.empty() ? "on the CPU"
+                                                              : ("on the CPU -- GPU failed: " + gpuNote).c_str()),
                           tm.project * k, tm.bin * k, tm.composite * k,
                           tm.backPixel * k, tm.backSum * k, tm.backGaussian * k,
                           msAdam * k, msDensify * k);
@@ -546,6 +752,23 @@ public:
                       l1Before, l1After, psnrBefore, psnrAfter, secs, dens,
                       timing);
         m_note = buf;
+        if (useDepth) {
+            char db[200];
+            std::snprintf(db, sizeof(db),
+                          "; DEPTH (weight %.3g): mean error against the sweep "
+                          "%.2f%% -> %.2f%%",
+                          depthWeight, depthBefore * 100.0, depthAfter * 100.0);
+            m_note += db;
+        }
+        if (!heldOut.empty()) {
+            char hb[200];
+            std::snprintf(hb, sizeof(hb),
+                          "; HELD OUT (%d view%s, not trained on): PSNR %.2f -> "
+                          "%.2f dB",
+                          int(heldOut.size()), heldOut.size() == 1 ? "" : "s",
+                          heldBefore, heldAfter);
+            m_note += hb;
+        }
         return true;
     }
 
@@ -554,24 +777,31 @@ public:
 private:
     // Mean L1 and PSNR over every view: the number that says whether
     // training helped, measured on all the cameras rather than the last few
-    // it happened to step on.
+    // it happened to step on. `depthErr`, when given, receives the mean
+    // RELATIVE depth error against the views' sweep depth, over the pixels
+    // that have one -- or -1 if none do.
     static void Evaluate(const std::vector<SplatParam>& params,
                          const std::vector<View>& views,
                          const RasterOptions& opt, ComputeContext* gpu,
-                         double* l1, double* psnr) {
+                         double* l1, double* psnr, double* depthErr = nullptr) {
         SplatRaster r;
         r.SetGpu(gpu);
-        std::vector<double> img;
-        double sl = 0.0, sp = 0.0;
+        std::vector<double> img, dep, unused;
+        double sl = 0.0, sp = 0.0, de = 0.0;
+        long long dn = 0;
         for (const View& v : views) {
-            r.Forward(params, v.cam, opt, &img);
+            const bool withDepth = depthErr && !v.depth.empty();
+            r.Forward(params, v.cam, opt, &img, withDepth ? &dep : nullptr);
             double a = 0.0, b = 0.0;
             Score(img, v.rgb, &a, &b);
             sl += a;
             sp += b;
+            if (withDepth)
+                DepthLossGrad(dep, r.FinalT(), v.depth, 1.0, &unused, &de, &dn);
         }
         *l1 = sl / double(views.size());
         *psnr = sp / double(views.size());
+        if (depthErr) *depthErr = dn > 0 ? de / double(dn) : -1.0;
     }
 
     Param<int> m_iterations{this, "iterations", 300, 0, 100000,
@@ -580,6 +810,55 @@ private:
                  "few hundred already shows the fit improving. 0 trains "
                  "nothing and only reports how well the splats fit.",
          .softMax = 3000.0}};
+
+    // DEPTH SUPERVISION, when the optional third input carries plane_sweep's
+    // maps: train_splats(splats, frames, dense).
+    //
+    // With few photographs, colour alone under-determines geometry: a
+    // Gaussian can sit in front of or behind the surface and still paint the
+    // right colour into the views that see it, and from anywhere else it is
+    // in the wrong place. Rendering each pixel's expected depth and pulling
+    // it toward the sweep's pins Gaussians to the surface the cameras
+    // measured. Where the sweep measured nothing -- a blank wall -- there is
+    // no depth term, and colour alone decides as before.
+    //
+    // MEASURED on fountain-P11 with cameras 2 and 7 held out (holdout = 5),
+    // PSNR on the training views / the held-out ones:
+    //
+    //   iterations   depth_weight   training   held out
+    //         1000              0    25.27      24.18
+    //         1000            0.1    25.42      24.38
+    //         1000            0.3    24.93      24.78
+    //         1000            0.5    24.01      24.27
+    //         3000              0    30.86      23.93
+    //         3000            0.3    30.60      25.04
+    //         3000            1.0    27.42      22.87
+    //
+    // 0.3 is best at both lengths, and at 1000 iterations it all but closes
+    // the gap between the photographs trained on and the ones held out --
+    // the gap that IS overfitting. Stronger, and the sweep's own errors
+    // start to win over the photographs.
+    Param<float> m_depthWeight{this, "depth_weight", 0.3f, 0.0f, 10.0f,
+        {.help = "How strongly rendered depth is pulled toward the plane "
+                 "sweep's, relative to the colour loss. The error is "
+                 "relative (a fraction of the distance), so the weight means "
+                 "the same at any scene scale. Used only when the depth maps "
+                 "are passed as the third input; 0 disables.",
+         .step = 0.05, .softMax = 2.0}};
+
+    Param<float> m_depthConfidence{this, "depth_confidence", 0.0f, 0.0f, 1.0f,
+        {.help = "Lowest sweep confidence a depth may have to be used as a "
+                 "target. Raise it if a wrong sweep depth -- repetitive "
+                 "texture matched to the wrong place -- is pulling the "
+                 "splats with it.",
+         .step = 0.05}};
+
+    Param<int> m_holdout{this, "holdout", 0, 0, 16,
+        {.help = "Leave every Nth camera out of training and report PSNR on "
+                 "those separately: how the splats look from viewpoints they "
+                 "were not fitted to. The honest score for a few-view capture, "
+                 "where training-view PSNR rewards overfitting. 0 trains on "
+                 "every camera."}};
 
     Param<int> m_downscale{this, "downscale", 2, 1, 16,
         {.help = "Train on the frames shrunk by this factor. The cost is "
@@ -682,6 +961,23 @@ private:
         {.help = "Gaussians whose opacity has fallen below this are removed at "
                  "each densification step.",
          .step = 0.005, .softMax = 0.1}};
+
+    // COLOUR IS KEPT BETWEEN 0 AND 1, clamped after every step.
+    //
+    // Unclamped, the optimiser learns to CANCEL: a Gaussian four times too
+    // red behind a darker one in front blends to the right colour from the
+    // training views. From any other view the pair no longer lines up and
+    // the excess shows -- saturated red on a corner of the fountain, as seen
+    // after 3000 iterations. Measured there before clamping: 43333 of 540229
+    // Gaussians had a channel above 1.05 (up to 4.24), 3309 below -0.05
+    // (down to -0.80). The paper allows this -- it clamps only at 0 -- but it
+    // has a hundred-plus views and view-dependent colour to absorb it; with
+    // eleven views and one colour per Gaussian, the cancellation is the fit.
+    Param<bool> m_clampColour{this, "clamp_colour", true,
+        "Keep every Gaussian's colour within 0..1. Off lets the optimiser use "
+        "over-bright colours that cancel against others -- a slightly better "
+        "fit to the photographs, and discoloured patches from any other "
+        "viewpoint."};
 
     std::string m_note;
 };

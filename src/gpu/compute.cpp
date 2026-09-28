@@ -99,6 +99,8 @@ void ComputeContext::Shutdown() {
     }
     for (ID3D12Resource* r : m_staging) if (r) r->Release();
     m_staging.clear();
+    for (const PooledStaging& p : m_stagingPool) p.res->Release();
+    m_stagingPool.clear();
 
     // Histogram scratch. The kernels hold PSOs created by this context, so they
     // go before the device reference is dropped.
@@ -273,6 +275,72 @@ bool ComputeContext::BeginRecording() {
     return true;
 }
 
+// A staging buffer of at least `size` bytes on an upload or readback heap:
+// the smallest pooled one that fits, else a new one.
+//
+// Pooled because creating one is not free -- a committed resource of a few
+// megabytes costs about a millisecond, mostly the OS zeroing fresh pages --
+// and callers that move data every iteration (splat training uploads four
+// lists and reads one back per step) paid that each time.
+ID3D12Resource* ComputeContext::TakeStaging(D3D12_HEAP_TYPE type, UINT64 size) {
+    size_t best = m_stagingPool.size();
+    for (size_t k = 0; k < m_stagingPool.size(); ++k) {
+        const PooledStaging& p = m_stagingPool[k];
+        if (p.type == type && p.size >= size &&
+            (best == m_stagingPool.size() || p.size < m_stagingPool[best].size))
+            best = k;
+    }
+    if (best < m_stagingPool.size()) {
+        ID3D12Resource* r = m_stagingPool[best].res;
+        m_stagingPool.erase(m_stagingPool.begin() + long(best));
+        return r;
+    }
+
+    D3D12_HEAP_PROPERTIES hp = {};
+    hp.Type = type;
+
+    D3D12_RESOURCE_DESC bd = {};
+    bd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width            = size;
+    bd.Height           = 1;
+    bd.DepthOrArraySize = 1;
+    bd.MipLevels        = 1;
+    bd.Format           = DXGI_FORMAT_UNKNOWN;
+    bd.SampleDesc.Count = 1;
+    bd.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    // Each heap type has one state its buffers must stay in.
+    const D3D12_RESOURCE_STATES state = (type == D3D12_HEAP_TYPE_UPLOAD)
+                                            ? D3D12_RESOURCE_STATE_GENERIC_READ
+                                            : D3D12_RESOURCE_STATE_COPY_DEST;
+    ID3D12Resource* staging = nullptr;
+    if (FAILED(m_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, state,
+                                                 nullptr, IID_PPV_ARGS(&staging))))
+        return nullptr;
+    return staging;
+}
+
+// Returns a staging buffer the GPU has finished with. The pool is bounded, in
+// count and in bytes, so one huge transfer does not pin its buffer forever:
+// past either limit the buffer is simply released.
+void ComputeContext::RecycleStaging(ID3D12Resource* r) {
+    constexpr size_t kMaxBuffers = 8;
+    constexpr UINT64 kMaxBytes   = UINT64(256) << 20;
+
+    const D3D12_RESOURCE_DESC d = r->GetDesc();
+    D3D12_HEAP_PROPERTIES hp = {};
+    D3D12_HEAP_FLAGS      hf = {};
+    if (FAILED(r->GetHeapProperties(&hp, &hf))) { r->Release(); return; }
+
+    UINT64 bytes = d.Width;
+    for (const PooledStaging& p : m_stagingPool) bytes += p.size;
+    if (m_stagingPool.size() >= kMaxBuffers || bytes > kMaxBytes) {
+        r->Release();
+        return;
+    }
+    m_stagingPool.push_back({r, d.Width, hp.Type});
+}
+
 bool ComputeContext::Upload(const ImageView& src, GpuImage* dst) {
     if (!src.Valid() || !dst->Valid()) return false;
 
@@ -281,24 +349,8 @@ bool ComputeContext::Upload(const ImageView& src, GpuImage* dst) {
                           ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
     const UINT64 total  = UINT64(aligned) * UINT64(src.desc.height);
 
-    D3D12_HEAP_PROPERTIES hp = {};
-    hp.Type = D3D12_HEAP_TYPE_UPLOAD;
-
-    D3D12_RESOURCE_DESC bd = {};
-    bd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
-    bd.Width            = total;
-    bd.Height           = 1;
-    bd.DepthOrArraySize = 1;
-    bd.MipLevels        = 1;
-    bd.Format           = DXGI_FORMAT_UNKNOWN;
-    bd.SampleDesc.Count = 1;
-    bd.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-
-    ID3D12Resource* staging = nullptr;
-    if (FAILED(m_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd,
-                                                 D3D12_RESOURCE_STATE_GENERIC_READ,
-                                                 nullptr, IID_PPV_ARGS(&staging))))
-        return false;
+    ID3D12Resource* staging = TakeStaging(D3D12_HEAP_TYPE_UPLOAD, total);
+    if (!staging) return false;
 
     void* mapped = nullptr;
     D3D12_RANGE noRead = {0, 0};
@@ -357,24 +409,8 @@ bool ComputeContext::Readback(const GpuImage& src, ImageView* dst) {
                           ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
     const UINT64 total  = UINT64(aligned) * UINT64(src.desc.height);
 
-    D3D12_HEAP_PROPERTIES hp = {};
-    hp.Type = D3D12_HEAP_TYPE_READBACK;
-
-    D3D12_RESOURCE_DESC bd = {};
-    bd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
-    bd.Width            = total;
-    bd.Height           = 1;
-    bd.DepthOrArraySize = 1;
-    bd.MipLevels        = 1;
-    bd.Format           = DXGI_FORMAT_UNKNOWN;
-    bd.SampleDesc.Count = 1;
-    bd.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-
-    ID3D12Resource* staging = nullptr;
-    if (FAILED(m_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd,
-                                                 D3D12_RESOURCE_STATE_COPY_DEST,
-                                                 nullptr, IID_PPV_ARGS(&staging))))
-        return false;
+    ID3D12Resource* staging = TakeStaging(D3D12_HEAP_TYPE_READBACK, total);
+    if (!staging) return false;
 
     if (!BeginRecording()) return false;
 
@@ -422,7 +458,7 @@ bool ComputeContext::Readback(const GpuImage& src, ImageView* dst) {
         std::memcpy(dst->data + size_t(y) * rowPitch,
                     static_cast<const uint8_t*>(mapped) + size_t(y) * aligned, rowPitch);
     staging->Unmap(0, nullptr);
-    staging->Release();
+    RecycleStaging(staging);
     return true;
 }
 
@@ -674,8 +710,8 @@ bool ComputeContext::Flush(std::string* err) {
         return false;
     }
 
-    // Staging buffers are only safe to free once the GPU is done with them.
-    for (ID3D12Resource* r : m_staging) if (r) r->Release();
+    // Staging buffers are only safe to reuse once the GPU is done with them.
+    for (ID3D12Resource* r : m_staging) if (r) RecycleStaging(r);
     m_staging.clear();
 
     m_gpuMs += std::chrono::duration<double, std::milli>(

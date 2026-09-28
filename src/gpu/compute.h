@@ -252,7 +252,17 @@ private:
     // gives every dispatch in a batch the last one's bindings.
     UINT                  m_heapCursor = 0;
 
-    std::vector<ID3D12Resource*> m_staging;   // upload/readback buffers, freed on flush
+    std::vector<ID3D12Resource*> m_staging;   // upload buffers in flight, pooled on flush
+
+    // Idle staging buffers for reuse; see TakeStaging().
+    struct PooledStaging {
+        ID3D12Resource*  res;
+        UINT64           size;
+        D3D12_HEAP_TYPE  type;
+    };
+    std::vector<PooledStaging> m_stagingPool;
+    ID3D12Resource* TakeStaging(D3D12_HEAP_TYPE type, UINT64 size);
+    void            RecycleStaging(ID3D12Resource* r);
     ShaderCompiler               m_compiler;
     bool                         m_deviceLost = false;
     std::mutex           m_submitMtx;   // see SubmitMutex()

@@ -196,7 +196,7 @@ void SplatRaster::BinTiles(const SplatCam&) {
 
 void SplatRaster::Forward(const std::vector<SplatParam>& splats,
                           const SplatCam& cam, const RasterOptions& opt,
-                          std::vector<double>* rgb) {
+                          std::vector<double>* rgb, std::vector<double>* depth) {
     auto clk = Clock::now();
     Project(splats, cam, opt);
     m_time.project += MsSince(clk);
@@ -208,7 +208,7 @@ void SplatRaster::Forward(const std::vector<SplatParam>& splats,
     // On the device when there is one; the CPU loop below otherwise, or if
     // the device fails -- in which case nothing it wrote is used.
     m_usedGpu = false;
-    if (m_gpu && CompositeGpu(splats, cam, opt, rgb)) {
+    if (m_gpu && CompositeGpu(splats, cam, opt, rgb, depth)) {
         m_usedGpu = true;
         m_time.composite += MsSince(clk);
         return;
@@ -216,6 +216,7 @@ void SplatRaster::Forward(const std::vector<SplatParam>& splats,
 
     const size_t np = size_t(cam.w) * size_t(cam.h);
     rgb->assign(np * 3, 0.0);
+    if (depth) depth->assign(np, 0.0);
     m_finalT.assign(np, 1.0);
     m_lastIdx.assign(np, 0);
 
@@ -224,7 +225,7 @@ void SplatRaster::Forward(const std::vector<SplatParam>& splats,
         const int tx = int(t % size_t(m_tilesX)), ty = int(t / size_t(m_tilesX));
         for (int py = ty * kTile; py < std::min(cam.h, (ty + 1) * kTile); ++py)
             for (int px = tx * kTile; px < std::min(cam.w, (tx + 1) * kTile); ++px) {
-                double T = 1.0, c0 = 0, c1 = 0, c2 = 0;
+                double T = 1.0, c0 = 0, c1 = 0, c2 = 0, cd = 0;
                 int last = 0;
                 for (int k = 0; k < int(list.size()); ++k) {
                     const Proj& P = m_proj[size_t(list[size_t(k)])];
@@ -244,6 +245,7 @@ void SplatRaster::Forward(const std::vector<SplatParam>& splats,
                     c0 += col[0] * alpha * T;
                     c1 += col[1] * alpha * T;
                     c2 += col[2] * alpha * T;
+                    cd += P.depth * alpha * T;
                     T = nextT;
                     last = k + 1;
                 }
@@ -253,6 +255,7 @@ void SplatRaster::Forward(const std::vector<SplatParam>& splats,
                 (*rgb)[pi * 3 + 2] = c2 + T * opt.background.z;
                 m_finalT[pi] = T;
                 m_lastIdx[pi] = last;
+                if (depth) (*depth)[pi] = cd;   // background depth is 0
             }
     });
     m_time.composite += MsSince(clk);
@@ -263,7 +266,9 @@ void SplatRaster::Forward(const std::vector<SplatParam>& splats,
 void SplatRaster::Backward(const std::vector<SplatParam>& splats,
                            const SplatCam& cam, const RasterOptions& opt,
                            const std::vector<double>& dRgb,
-                           std::vector<SplatParam>* grad) {
+                           std::vector<SplatParam>* grad,
+                           const std::vector<double>* dDepth,
+                           const std::vector<float>* depthShift) {
     auto clk = Clock::now();
     // PER-PIXEL PASS, one slot per tile-list entry. Each tile is handled by
     // one thread and writes only its own entries, so there is no contention
@@ -279,7 +284,7 @@ void SplatRaster::Backward(const std::vector<SplatParam>& splats,
     // if the forward pass also ran there: its transmittance and last-used
     // index live on the device.
     const bool onGpu = m_gpu && m_usedGpu &&
-                       BackPixelGpu(cam, opt, dRgb, offset, &entry);
+                       BackPixelGpu(cam, opt, dRgb, dDepth, depthShift, offset, &entry);
 
     if (!onGpu) ParallelFor(m_tiles.size(), [&](size_t t) {
         const std::vector<int>& list = m_tiles[t];
@@ -302,6 +307,13 @@ void SplatRaster::Backward(const std::vector<SplatParam>& splats,
                 double T = m_finalT[pi];
                 double acc[3] = {opt.background.x, opt.background.y,
                                  opt.background.z};
+                // Depth is a fourth channel: each Gaussian's "colour" in it
+                // is its own depth less the per-pixel shift, and the
+                // background's is 0. The gradient of its depth itself is
+                // unshifted: d(value)/dz is 1 either way.
+                const double dD = dDepth ? (*dDepth)[pi] : 0.0;
+                const double shift = depthShift ? double((*depthShift)[pi]) : 0.0;
+                double accD = 0.0;
                 for (int k = m_lastIdx[pi] - 1; k >= 0; --k) {
                     const int j = list[size_t(k)];
                     const Proj& P = m_proj[size_t(j)];
@@ -325,6 +337,13 @@ void SplatRaster::Backward(const std::vector<SplatParam>& splats,
                         g.color[ch] += alpha * Ti * dC[ch];
                         dAlpha += Ti * (col[ch] - acc[ch]) * dC[ch];
                         acc[ch] = alpha * col[ch] + (1.0 - alpha) * acc[ch];
+                    }
+                    if (dD != 0.0) {
+                        g.depth += alpha * Ti * dD;
+                        // Value (z - shift), background 0: see DepthLossGrad.
+                        const double zs = P.depth - shift;
+                        dAlpha += Ti * (zs - accD) * dD;
+                        accD = alpha * zs + (1.0 - alpha) * accD;
                     }
                     T = Ti;
 
@@ -462,6 +481,8 @@ void SplatRaster::Backward(const std::vector<SplatParam>& splats,
         const double tx = P.tc[0], ty = P.tc[1], tz = P.tc[2];
         const double iz = 1.0 / tz, iz2 = iz * iz, iz3 = iz2 * iz;
         double gt[3] = {0, 0, 0};
+        // The depth a Gaussian contributes IS its camera-space z.
+        gt[2] += g.depth;
         gt[0] += g.u * cam.fx * iz;
         gt[2] += g.u * (-cam.fx * tx * iz2);
         gt[1] += g.v * cam.fy * iz;

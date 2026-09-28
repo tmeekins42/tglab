@@ -371,30 +371,61 @@ splats = params( init_splats )( fused )
 # Gaussian's position, shape, rotation, opacity and colour toward a better
 # match. The report gives L1 and PSNR over all the cameras before and after.
 #
-# SLOW, and this is the knob. It runs on the CPU at about 0.7 s per iteration
-# for half a million Gaussians at `downscale` 2, so 100 iterations is over a
-# minute. The paper runs 30000 on a GPU; a few hundred here already shows the
-# fit improving. 0 trains nothing and just measures the untrained fit.
+# `iterations` IS THE KNOB. On the GPU an iteration is about 50 ms for half a
+# million Gaussians at `downscale` 2; without a device it falls back to the
+# CPU at about 0.8 s, and the report says which ran. The paper runs 30000; a
+# few hundred here already fits well. 0 trains nothing and just measures the
+# untrained fit.
 #
 # DENSIFICATION IS ON: every 50 iterations Gaussians that cannot follow the
 # detail under them are split or cloned, and near-transparent ones removed.
-# Measured on fountain-P11: 100 iterations take PSNR from 12.8 to 13.7 dB,
-# 300 to 17.7 dB (about four minutes) and fill most of the gaps.
+# Measured on fountain-P11:
 #
-# Soft blobs appear on the right where the photographs show a white wall the
-# dense cloud never covered. They are mostly not floaters but the optimiser
-# painting that missing surface with the few Gaussians nearby, so the floater
-# pruning (max_screen_size, max_world_size, opacity_reset_every) leaves them
-# alone at the paper's settings. Lowering max_screen_size to 8 removes a
-# genuine floater in front of the basin, at a cost of 0.7 dB.
-trained = params( train_splats, iterations = 100 )( splats, small )
+#   iterations   PSNR after   GPU     CPU
+#          100     13.7 dB     7 s    85 s
+#          300     17.6 dB    15 s   308 s
+#         3000     30.9 dB   143 s
+#
+# Those are scores on the photographs being trained on, which rewards fitting
+# them exactly. Setting `holdout = 5` leaves cameras 2 and 7 out and scores
+# them separately -- how it looks from somewhere it was not fitted to:
+#
+#   iterations   depth   training   held out
+#          300      no    18.1 dB    17.2 dB
+#         1000      no    25.3       24.2
+#         1000     yes    24.9       24.8
+#         3000      no    30.9       23.9     <- memorising the photographs
+#         3000     yes    30.6       25.0
+#
+# 1000 is the default because that is where the held-out score peaks; past
+# it, training fits the eleven photographs ever more closely and the views
+# between them get worse -- false colour, smears.
+#
+# DEPTH SUPERVISION is the third input: the sweep's depth maps. Rendered depth
+# is pulled toward them (depth_weight, 0.3), which pins Gaussians to the
+# surfaces the cameras measured instead of wherever paints the right colour.
+# Leave `dense` out to train on colour alone. Where the sweep measured nothing
+# -- the blank wall on the right -- colour decides as before.
+trained = params( train_splats, iterations = 1000 )( splats, small, dense )
+
+# FLOATERS, removed by free-space carving against the sweep's depth maps. A
+# Gaussian is dropped when more than `max_seen_through` cameras measured a
+# surface clearly BEHIND it -- they looked straight through where it claims
+# to be. These are Gaussians training used to paint the pale, textureless
+# wall on the right, which only a few left-hand views see: correct from
+# those views, floating in front of the fountain from everywhere else.
+# 1 removes most of them; 0 is stricter but punches holes in the basin,
+# because then one camera's depth noise is enough to condemn a Gaussian.
+# It also removes LARGE Gaussians that fewer than `large_min_views` cameras
+# have in view: at the edges of the capture nothing stops one smearing.
+carved = params( carve_splats )( trained, dense )
 
 # The trained splats rendered from each camera, through the same rasteriser
 # training scored against -- for comparing frame N with render N directly.
-rendered = params( render_splats )( trained )
+rendered = params( render_splats )( carved )
 
 display( small, "frames" )
 display( cloud, "reconstruction" )
 display( fused, "dense" )
-display( trained, "splats" )
+display( carved, "splats" )
 display( rendered, "render" )

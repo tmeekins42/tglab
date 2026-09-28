@@ -37,11 +37,13 @@
 // contradicting it -- an occluded pixel simply fails to find support and is
 // dropped, which is conservative but loses real geometry at depth edges.
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <string>
 #include <vector>
 
+#include "../../algo_util/depth_views.h"
 #include "../../algo_util/view_graph.h"
 #include "../../core/algorithm.h"
 #include "../../core/parallel.h"
@@ -49,37 +51,8 @@
 namespace tglab {
 namespace {
 
-// A depth map and its confidence, read back out of the ImageSet plane_sweep
-// produced. Held as raw planes for the same reason the sweep did it: the inner
-// loop runs per pixel per camera and a format switch there would dominate.
-struct DepthView {
-    const float* depth = nullptr;
-    const float* conf  = nullptr;
-    // The reference frame's own pixels, RGBA32F, carried through by the sweep
-    // so a dense point takes the colour of the pixel it was measured from.
-    const float* rgb   = nullptr;
-    int w = 0, h = 0;
-    bool ok = false;
-
-    Vec3 Colour(int x, int y) const {
-        if (!rgb || x < 0 || y < 0 || x >= w || y >= h)
-            return Vec3{0.72, 0.72, 0.74};
-        const float* p = &rgb[(size_t(y) * size_t(w) + size_t(x)) * 4];
-        return Vec3{double(p[0]), double(p[1]), double(p[2])};
-    }
-
-    // Depth at an integer pixel, or 0 where nothing was measured. The sweep
-    // writes exactly 0.0 for an unmeasured pixel, which is distinguishable
-    // from a real depth because a real one is strictly positive.
-    float At(int x, int y) const {
-        if (x < 0 || y < 0 || x >= w || y >= h) return 0.0f;
-        return depth[size_t(y) * size_t(w) + size_t(x)];
-    }
-    float Conf(int x, int y) const {
-        if (!conf || x < 0 || y < 0 || x >= w || y >= h) return 0.0f;
-        return conf[size_t(y) * size_t(w) + size_t(x)];
-    }
-};
+// Buckets in the seen-through histogram: 0, 1, 2, 3, 4 and "5 or more".
+constexpr int kHist = 6;
 
 class FuseDepth : public AlgorithmBase {
 public:
@@ -116,51 +89,10 @@ public:
             return false;
         }
 
-        // plane_sweep emits depth and confidence INTERLEAVED, two images per
-        // frame. Checked rather than assumed: handing this the colour frames
-        // by mistake is an easy error and produces nonsense silently.
-        if (int(images->size()) != nCam * 3) {
-            *err = "fuse_depth: expected " + std::to_string(nCam * 3) +
-                   " images (a depth, confidence and colour map per camera), "
-                   "got " + std::to_string(images->size()) + " -- the second "
-                   "input should be plane_sweep's output";
-            return false;
-        }
-
         std::vector<DepthView> views;
-        views.resize(size_t(nCam));
         std::vector<ImageView> holds;      // keep the mappings alive
-        holds.reserve(size_t(nCam) * 2);
-
-        for (int c = 0; c < nCam; ++c) {
-            ImageView dv =
-                const_cast<Image&>((*images)[size_t(c) * 3 + 0]).MapCpuRead();
-            ImageView cv =
-                const_cast<Image&>((*images)[size_t(c) * 3 + 1]).MapCpuRead();
-            ImageView rv =
-                const_cast<Image&>((*images)[size_t(c) * 3 + 2]).MapCpuRead();
-            holds.push_back(dv);
-            holds.push_back(cv);
-            holds.push_back(rv);
-
-            if (!dv.Valid() || dv.desc.format != Format::R32F) continue;
-            if (!dv.desc.isDepth) {
-                *err = "fuse_depth: input 1 image " +
-                       std::to_string(c * 3) + " is not a depth map -- the "
-                       "second input should be plane_sweep's output";
-                return false;
-            }
-
-            DepthView& v = views[size_t(c)];
-            v.depth = dv.At<float>(0, 0);
-            v.w = dv.desc.width;
-            v.h = dv.desc.height;
-            v.conf = (cv.Valid() && cv.desc.format == Format::R32F)
-                         ? cv.At<float>(0, 0) : nullptr;
-            v.rgb = (rv.Valid() && rv.desc.format == Format::RGBA32F)
-                        ? rv.At<float>(0, 0) : nullptr;
-            v.ok = true;
-        }
+        if (!ReadDepthViews(*images, nCam, "fuse_depth", &views, &holds, err))
+            return false;
 
         // COLOUR COMES FROM THE SWEEP'S THIRD MAP, one RGBA plane per frame
         // carrying that frame's own pixels. A dense point therefore takes the
@@ -188,8 +120,17 @@ public:
         std::vector<long long> perTested(size_t(nCam), 0);
         std::vector<long long> perKept(size_t(nCam), 0);
 
+        // Per camera, how many agreeing points each number of other cameras
+        // saw through; the last bucket collects the rest.
+        std::vector<std::array<long long, kHist>> perHist;
+        perHist.resize(size_t(nCam));
+        for (auto& h : perHist) h.fill(0);
+        const int    maxSeen = int(m_maxSeenThrough);
+        const double seeTol  = double(m_seeTolerance);
+
         ParallelFor(nCam, [&](int c) {
             FuseCamera(c, *cloud, views, minViews, relTol, step, minConf,
+                       maxSeen, seeTol, perHist[size_t(c)].data(),
                        &perCam[size_t(c)], &perTested[size_t(c)],
                        &perKept[size_t(c)]);
         });
@@ -229,6 +170,22 @@ public:
                           ? double(cloud->tracks.size()) / double(sparseBefore)
                           : 0.0);
         m_note = buf;
+
+        std::array<long long, kHist> hist{};
+        for (const auto& h : perHist)
+            for (int k = 0; k < kHist; ++k) hist[size_t(k)] += h[size_t(k)];
+        std::snprintf(buf, sizeof(buf),
+                      "; cameras seeing through each agreeing point: "
+                      "0: %lld, 1: %lld, 2: %lld, 3: %lld, 4: %lld, 5+: %lld",
+                      hist[0], hist[1], hist[2], hist[3], hist[4], hist[5]);
+        m_note += buf;
+        if (maxSeen < 16) {
+            long long dropped = 0;
+            for (int k = maxSeen + 1; k < kHist; ++k) dropped += hist[size_t(k)];
+            std::snprintf(buf, sizeof(buf), " (more than %d dropped: %lld)",
+                          maxSeen, dropped);
+            m_note += buf;
+        }
         return true;
     }
 
@@ -238,7 +195,8 @@ public:
 private:
     void FuseCamera(int ci, const PointCloud& cloud,
                     const std::vector<DepthView>& views, int minViews,
-                    double relTol, int step, double minConf,
+                    double relTol, int step, double minConf, int maxSeen,
+                    double seeTol, long long* hist,
                     std::vector<Track>* out, long long* tested,
                     long long* kept) const {
         const Camera& ref = cloud.cameras[size_t(ci)];
@@ -301,6 +259,17 @@ private:
                 }
 
                 if (agree < minViews) continue;
+
+                // HOW MANY CAMERAS SEE THROUGH IT. Agreement asks whether
+                // others measured a surface HERE; this asks the opposite
+                // question -- whether another camera measured a surface
+                // clearly BEHIND this point along its own ray. If so, that
+                // camera looked straight through the place this point claims
+                // is solid: free space, and the point is a floater.
+                const int seenThrough =
+                    CountSeenThrough(cloud, views, world, ci, minConf, seeTol);
+                ++hist[std::min(seenThrough, kHist - 1)];
+                if (seenThrough > maxSeen) continue;
 
                 // Re-unproject at the averaged depth.
                 const double fused = sumD / double(sumN);
@@ -398,6 +367,25 @@ private:
                  "sweep picking a competing peak on repetitive texture, and "
                  "such a pixel has a small margin by construction.",
          .step = 0.05}};
+
+    // FREE-SPACE CARVING. Agreement alone lets a mistake through when a few
+    // cameras make the SAME mistake -- typically a textureless wall seen at a
+    // grazing angle from one side, where neighbouring views all lock onto the
+    // same wrong, too-near depth. Every camera looking at the scene from
+    // elsewhere then sees a real surface BEHIND that point, straight through
+    // the place it claims is solid.
+    Param<int> m_maxSeenThrough{this, "max_seen_through", 16, 0, 16,
+        {.help = "Drop a point when more than this many other cameras "
+                 "measured a surface clearly BEHIND it along their own line "
+                 "of sight -- they looked through where the point claims to "
+                 "be, so it is floating in free space. 16 disables the test."}};
+
+    Param<float> m_seeTolerance{this, "see_tolerance", 0.05f, 0.005f, 0.5f,
+        {.help = "How far behind the point another camera's surface must be, "
+                 "as a fraction of the distance, before that camera counts "
+                 "as seeing through it. Looser than `tolerance` on purpose: "
+                 "this removes points, so only a clear gap should count.",
+         .step = 0.01}};
 
     std::string m_note;
 };

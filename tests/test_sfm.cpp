@@ -2449,6 +2449,86 @@ int main() {
                 // the camera-to-world transform -- a transpose the wrong way
                 // round, a translation not subtracted -- shows here and is
                 // invisible in a depth map, which never leaves camera space.
+                // --- carve_splats, on the same known scene -----------------
+                //
+                // Three Gaussians on the central ray of camera 0: one ON the
+                // plane, one floating halfway to it, one behind it. Both
+                // cameras measured the plane, so both look straight through
+                // the floater -- it must go. The one on the plane agrees with
+                // them and must stay. The one BEHIND is occluded, not seen
+                // through: nothing measured says it is empty, so it stays too.
+                // A carve that removed it would be treating "hidden" as
+                // "absent", which would eat every back surface in a scene.
+                std::printf("\n--- carve_splats ---\n");
+                if (auto carver = Registry::Get().Create("carve_splats")) {
+                    const Camera& c0 = pc.cameras[0];
+                    const double u = c0.cx, v = c0.cy;
+                    PointCloud sp = pc;
+                    auto add = [&](double depth, double red) {
+                        Splat s;
+                        s.mean = UnprojectForTest(c0, u, v, depth);
+                        s.scale = Vec3{0.01, 0.01, 0.01};
+                        s.color = Vec3{red, 0.5, 0.5};
+                        sp.splats.push_back(s);
+                    };
+                    add(trueDepth, 0.1);          // on the surface
+                    add(trueDepth * 0.5, 0.2);    // floating in front
+                    add(trueDepth * 1.5, 0.3);    // hidden behind
+
+                    // The fixture has two cameras, so every Gaussian is in
+                    // view of fewer than large_min_views' default: off here,
+                    // so this checks the see-through rule alone.
+                    PointCloud sizeCase = sp;     // before any carving
+                    if (ParamBase* p = carver->FindParam("large_min_views"))
+                        { std::string e; p->SetFromScript(Value(0.0), &e); }
+
+                    std::string cerr2;
+                    const bool cok = carver->RunReconstruct(&out.images, &sp, &cerr2);
+                    Check(cok, "carve_splats runs on the swept maps" +
+                                   (cok ? std::string() : ": " + cerr2));
+                    bool onPlane = false, floater = false, behind = false;
+                    for (const Splat& s : sp.splats) {
+                        onPlane |= s.color.x == 0.1;
+                        floater |= s.color.x == 0.2;
+                        behind  |= s.color.x == 0.3;
+                    }
+                    Check(cok && !floater,
+                          "the Gaussian both cameras see through is carved away");
+                    Check(cok && onPlane, "...the one on the surface is kept");
+                    Check(cok && behind,
+                          "...and the one hidden behind it is kept: occluded is "
+                          "not empty");
+
+                    // LARGE AND BARELY SEEN. Same surface Gaussian twice, once
+                    // small and once huge, with three views required: the
+                    // fixture's two cameras are too few to vouch for the big
+                    // one, and size is the only thing that condemns it.
+                    {
+                        PointCloud lc = sizeCase;
+                        lc.splats.resize(1);                 // the surface one
+                        lc.splats[0].scale = Vec3{1e-6, 1e-6, 1e-6};   // tiny at any extent
+                        Splat big = lc.splats[0];
+                        big.scale = Vec3{10.0, 10.0, 10.0};
+                        big.color.x = 0.4;
+                        lc.splats.push_back(big);
+                        if (ParamBase* p = carver->FindParam("large_min_views"))
+                            { std::string e; p->SetFromScript(Value(3.0), &e); }
+                        std::string lerr;
+                        const bool lok = carver->RunReconstruct(&out.images, &lc, &lerr);
+                        bool keptSmall = false, keptLarge = false;
+                        for (const Splat& s : lc.splats) {
+                            keptSmall |= s.color.x == 0.1;
+                            keptLarge |= s.color.x == 0.4;
+                        }
+                        Check(lok && !keptLarge,
+                              "a LARGE Gaussian too few cameras see is removed");
+                        Check(lok && keptSmall,
+                              "...while a small one in the same place is kept");
+                    }
+                } else {
+                    Check(false, "carve_splats is registered");
+                }
+
                 std::printf("\n--- fuse_depth ---\n");
 
                 auto fuser = Registry::Get().Create("fuse_depth");
@@ -3126,6 +3206,68 @@ int main() {
             // to match.
             Check(worst[g] < 1e-4 && biggest[g] > 1e-6, m);
         }
+
+        // THE DEPTH TERM, alone. A loss on the rendered EXPECTED depth only,
+        // so every gradient here comes through depth: through each
+        // Gaussian's own depth (its mean) and through the blending weights
+        // (everything that shapes alpha). Colour must get none -- depth does
+        // not depend on it -- which is checked rather than assumed.
+        {
+            std::vector<double> dTarget(size_t(cam.w * cam.h));
+            std::vector<float> shiftF;   // the target, as Backward takes it
+            uint32_t ds = 4242u;
+            for (double& t : dTarget) {
+                ds = ds * 1664525u + 1013904223u;
+                t = 2.5 + 1.5 * double(ds >> 8) / double(1u << 24);
+            }
+            auto dloss = [&](const std::vector<SplatParam>& s) {
+                SplatRaster rr;
+                std::vector<double> im, dep;
+                rr.Forward(s, cam, opt, &im, &dep);
+                double L = 0.0;
+                for (size_t i = 0; i < dep.size(); ++i) {
+                    // DepthLossGrad's form, squared: D against coverage x t.
+                    const double d = dep[i] - (1.0 - rr.FinalT()[i]) * dTarget[i];
+                    L += 0.5 * d * d;
+                }
+                return L;
+            };
+            SplatRaster rd;
+            std::vector<double> im, dep;
+            rd.Forward(sp, cam, opt, &im, &dep);
+            std::vector<double> dDep(dep.size()), zeroRgb(im.size(), 0.0);
+            for (size_t i = 0; i < dep.size(); ++i)
+                dDep[i] = dep[i] - (1.0 - rd.FinalT()[i]) * dTarget[i];
+            shiftF.assign(dTarget.begin(), dTarget.end());
+            std::vector<SplatParam> dg(sp.size(), SplatParam::Zero());
+            rd.Backward(sp, cam, opt, zeroRgb, &dg, &dDep, &shiftF);
+
+            double dworst[5] = {0, 0, 0, 0, 0}, dbig[5] = {0, 0, 0, 0, 0};
+            double colourMax = 0.0;
+            for (size_t i = 0; i < sp.size(); ++i)
+                for (int k = 0; k < SplatParam::kCount; ++k) {
+                    std::vector<SplatParam> a = sp, b = sp;
+                    a[i].Data()[k] += eps;
+                    b[i].Data()[k] -= eps;
+                    const double fd = (dloss(a) - dloss(b)) / (2.0 * eps);
+                    const double an = dg[i].Data()[k];
+                    const double rel = std::fabs(an - fd) /
+                                       std::max(1e-4, std::fabs(an) + std::fabs(fd));
+                    dworst[groupOf[k]] = std::max(dworst[groupOf[k]], rel);
+                    dbig[groupOf[k]] = std::max(dbig[groupOf[k]], std::fabs(fd));
+                    if (groupOf[k] == 4) colourMax = std::max(colourMax, std::fabs(an));
+                }
+            for (int g = 0; g < 4; ++g) {
+                char m[220];
+                std::snprintf(m, sizeof(m),
+                              "DEPTH loss: %s gradients match finite differences "
+                              "(worst relative error %.1e, largest %.2e)",
+                              names[g], dworst[g], dbig[g]);
+                Check(dworst[g] < 1e-4 && dbig[g] > 1e-6, m);
+            }
+            Check(colourMax == 0.0,
+                  "DEPTH loss: colour gets no gradient from depth");
+        }
     }
 
     // --- the GPU rasteriser agrees with the CPU one ------------------------
@@ -3181,16 +3323,27 @@ int main() {
                 std::vector<double> target(size_t(cam.w * cam.h * 3));
                 for (double& t : target) t = rnd();
 
+                // The loss has a DEPTH term as well as colour, so the device's
+                // depth render and depth gradients are checked by the same
+                // comparisons as everything else.
+                std::vector<double> dTarget(size_t(cam.w * cam.h));
+                for (double& t : dTarget) t = 2.5 + 2.0 * rnd();
+                std::vector<double> depC, depG;
                 auto run = [&](ComputeContext* device, std::vector<double>* img,
-                               std::vector<SplatParam>* grad, bool* usedGpu) {
+                               std::vector<SplatParam>* grad, bool* usedGpu,
+                               std::vector<double>* dep) {
                     SplatRaster r;
                     r.SetGpu(device);
-                    r.Forward(sp, cam, opt, img);
+                    r.Forward(sp, cam, opt, img, dep);
                     *usedGpu = r.UsedGpu();
                     std::vector<double> d(img->size());
                     for (size_t i = 0; i < img->size(); ++i) d[i] = (*img)[i] - target[i];
+                    std::vector<double> dd(dep->size());
+                    for (size_t i = 0; i < dep->size(); ++i)
+                        dd[i] = 0.1 * ((*dep)[i] - (1.0 - r.FinalT()[i]) * dTarget[i]);
+                    std::vector<float> shiftF(dTarget.begin(), dTarget.end());
                     grad->assign(sp.size(), SplatParam::Zero());
-                    r.Backward(sp, cam, opt, d, grad);
+                    r.Backward(sp, cam, opt, d, grad, &dd, &shiftF);
                     if (device && !r.UsedGpu())
                         std::printf("       GPU note: %s\n", r.GpuNote().c_str());
                 };
@@ -3198,9 +3351,19 @@ int main() {
                 std::vector<double> imgC, imgG;
                 std::vector<SplatParam> gradC, gradG;
                 bool usedC = false, usedG = false;
-                run(nullptr, &imgC, &gradC, &usedC);
-                run(&gpu, &imgG, &gradG, &usedG);
+                run(nullptr, &imgC, &gradC, &usedC, &depC);
+                run(&gpu, &imgG, &gradG, &usedG, &depG);
                 Check(usedG, "the GPU path actually ran");
+                if (usedG) {
+                    double worstD = 0.0;
+                    for (size_t i = 0; i < depC.size(); ++i)
+                        worstD = std::max(worstD, std::fabs(depC[i] - depG[i]));
+                    char m[200];
+                    std::snprintf(m, sizeof(m),
+                                  "the GPU depth render matches the CPU (worst "
+                                  "pixel difference %.1e)", worstD);
+                    Check(worstD < 1e-3, m);
+                }
 
                 if (usedG) {
                     double worst = 0.0;
@@ -3402,6 +3565,178 @@ int main() {
                           "...and the grown set fits better (%.2f dB against "
                           "%.2f without)", pOn, pOff);
             Check(pOn > pOff + 2.0, m);
+        }
+
+        // --- training on the GPU matches training on the CPU -----------------
+        //
+        // The GPU trainer keeps the whole state on the device and runs its
+        // own projection, chain rule and Adam step, in float. Checked two
+        // ways against the CPU loop, which is itself checked against finite
+        // differences:
+        //
+        //   * ONE step, comparing every parameter's update. Adam's first step
+        //     moves each parameter by about the learning rate in the
+        //     direction of its gradient, so this isolates the chain rule: a
+        //     wrong term sends parameters the wrong way.
+        //   * THREE HUNDRED steps, comparing the fit, which says the loop as
+        //     a whole converges the same way.
+        ID3D12Device* dev = nullptr;
+        if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0,
+                                     IID_PPV_ARGS(&dev)))) {
+            std::printf("       no D3D12 device; GPU training not checked\n");
+        } else {
+            ComputeContext gpu;
+            if (!gpu.Init(dev)) {
+                std::printf("       compute init failed; GPU training not checked\n");
+            } else {
+                auto train = [&](ComputeContext* device, int its, PointCloud* out,
+                                 std::string* note) {
+                    auto a = Registry::Get().Create("train_splats");
+                    std::string e;
+                    a->FindParam("iterations")->SetFromScript(Value(double(its)), &e);
+                    a->FindParam("downscale")->SetFromScript(Value(1.0), &e);
+                    a->FindParam("densify")->SetFromScript(Value(0.0), &e);
+                    a->SetGroupGpu(device);
+                    *out = start;
+                    std::string err;
+                    const bool ok = a->RunReconstruct(&frames, out, &err);
+                    *note = ok ? a->RunReport() : err;
+                    return ok;
+                };
+
+                PointCloud c1, g1;
+                std::string n1c, n1g;
+                const bool ok1 = train(nullptr, 1, &c1, &n1c) && train(&gpu, 1, &g1, &n1g);
+                Check(ok1, "one training step runs on both paths");
+                Check(ok1 && n1g.find("1 of 1 iterations on the GPU") != std::string::npos,
+                      "...and the GPU one really ran there (" +
+                          n1g.substr(n1g.find(';') == std::string::npos ? 0 : n1g.rfind(';')) + ")");
+                if (ok1) {
+                    // Aggregate: how far the two updates differ, against how
+                    // far the parameters moved at all.
+                    double diff = 0.0, moved = 0.0;
+                    for (size_t i = 0; i < start.splats.size(); ++i) {
+                        const SplatParam s0 = ToParam(start.splats[i]);
+                        const SplatParam sc = ToParam(c1.splats[i]);
+                        const SplatParam sg = ToParam(g1.splats[i]);
+                        for (int q = 0; q < SplatParam::kCount; ++q) {
+                            const double dc = sc.Data()[q] - s0.Data()[q];
+                            const double dg = sg.Data()[q] - s0.Data()[q];
+                            diff += std::fabs(dc - dg);
+                            moved += std::fabs(dc);
+                        }
+                    }
+                    char m1[200];
+                    std::snprintf(m1, sizeof(m1),
+                                  "one GPU step moves the parameters as the CPU "
+                                  "step does (aggregate difference %.1e of the "
+                                  "movement)", diff / std::max(1e-30, moved));
+                    // Adam's first step is sign-like, so a gradient that is
+                    // essentially zero can round to either sign in float and
+                    // move a parameter the full step the other way. A few
+                    // percent is that; a wrong chain rule is most of it.
+                    Check(moved > 0.0 && diff / moved < 0.05, m1);
+                }
+
+                // THE SAME, WITH DEPTH SUPERVISION. Depth maps shaped as
+                // plane_sweep emits them -- depth, confidence, colour per
+                // camera -- passed as the third input. The values only need
+                // to pull: each camera's is 10% beyond the Gaussians' mean
+                // depth in it, so every depth gradient is non-zero.
+                {
+                    std::vector<Image> depthSet;
+                    for (size_t c = 0; c < start.cameras.size(); ++c) {
+                        const Camera& cam = start.cameras[c];
+                        double zs = 0.0;
+                        for (const Splat& s : start.splats) zs += (cam.R * s.mean + cam.t).z;
+                        const float z = float(1.1 * zs / double(start.splats.size()));
+                        const ImageDesc fd = frames[c].Desc();
+                        ImageDesc dd{fd.width, fd.height, Format::R32F};
+                        dd.isDepth = true;
+                        dd.depthNear = z * 0.5f;
+                        dd.depthFar = z * 2.0f;
+                        Image dimg, cimg, rimg;
+                        dimg.Alloc(dd);
+                        cimg.Alloc(ImageDesc{fd.width, fd.height, Format::R32F});
+                        rimg.Alloc(ImageDesc{fd.width, fd.height, Format::RGBA32F});
+                        ImageView dv = dimg.MapCpuWrite(), cv = cimg.MapCpuWrite();
+                        for (int y = 0; y < fd.height; ++y)
+                            for (int x = 0; x < fd.width; ++x) {
+                                *dv.At<float>(x, y) = z;
+                                *cv.At<float>(x, y) = 1.0f;
+                            }
+                        dv = ImageView{};
+                        cv = ImageView{};
+                        depthSet.push_back(std::move(dimg));
+                        depthSet.push_back(std::move(cimg));
+                        depthSet.push_back(std::move(rimg));
+                    }
+                    auto trainD = [&](ComputeContext* device, PointCloud* out,
+                                      std::string* note) {
+                        auto a = Registry::Get().Create("train_splats");
+                        std::string e;
+                        a->FindParam("iterations")->SetFromScript(Value(1.0), &e);
+                        a->FindParam("downscale")->SetFromScript(Value(1.0), &e);
+                        a->FindParam("densify")->SetFromScript(Value(0.0), &e);
+                        a->FindParam("depth_weight")->SetFromScript(Value(1.0), &e);
+                        a->SetGroupGpu(device);
+                        a->SetReconstructExtra(&depthSet);
+                        *out = start;
+                        std::string err;
+                        const bool ok = a->RunReconstruct(&frames, out, &err);
+                        *note = ok ? a->RunReport() : err;
+                        return ok;
+                    };
+                    PointCloud cd, gd;
+                    std::string ncd, ngd;
+                    const bool okd = trainD(nullptr, &cd, &ncd) && trainD(&gpu, &gd, &ngd);
+                    Check(okd && ncd.find("DEPTH") != std::string::npos,
+                          "a depth-supervised step runs on both paths" +
+                              (okd ? std::string() : ": " + ncd + " / " + ngd));
+                    if (okd) {
+                        double diff = 0.0, moved = 0.0, meanShift = 0.0;
+                        for (size_t i = 0; i < start.splats.size(); ++i) {
+                            const SplatParam s0 = ToParam(start.splats[i]);
+                            const SplatParam sc = ToParam(cd.splats[i]);
+                            const SplatParam sg = ToParam(gd.splats[i]);
+                            const SplatParam sn = ToParam(c1.splats[i]);   // no depth
+                            for (int q = 0; q < SplatParam::kCount; ++q) {
+                                const double dc = sc.Data()[q] - s0.Data()[q];
+                                const double dg = sg.Data()[q] - s0.Data()[q];
+                                diff += std::fabs(dc - dg);
+                                moved += std::fabs(dc);
+                                if (q < 3) meanShift += std::fabs(sc.Data()[q] - sn.Data()[q]);
+                            }
+                        }
+                        char m2[200];
+                        std::snprintf(m2, sizeof(m2),
+                                      "...and the GPU step matches the CPU one "
+                                      "(aggregate difference %.1e of the movement)",
+                                      diff / std::max(1e-30, moved));
+                        Check(moved > 0.0 && diff / moved < 0.05, m2);
+                        // Depth must actually change the step -- a term that
+                        // was silently dropped would pass the comparison.
+                        Check(meanShift > 0.0,
+                              "...and depth changes where the Gaussians move");
+                    }
+                }
+
+                PointCloud cN, gN;
+                std::string nNc, nNg;
+                const bool okN = train(nullptr, 300, &cN, &nNc) && train(&gpu, 300, &gN, &nNg);
+                if (okN) {
+                    double bc = 0, ac = 0, bg = 0, ag = 0;
+                    std::sscanf(nNc.c_str() + nNc.find("PSNR "), "PSNR %lf -> %lf", &bc, &ac);
+                    std::sscanf(nNg.c_str() + nNg.find("PSNR "), "PSNR %lf -> %lf", &bg, &ag);
+                    std::printf("       CPU: %s\n       GPU: %s\n", nNc.c_str(), nNg.c_str());
+                    char m2[200];
+                    std::snprintf(m2, sizeof(m2),
+                                  "300 GPU steps fit as well as 300 CPU steps "
+                                  "(%.2f dB against %.2f)", ag, ac);
+                    Check(ag > bg + 8.0 && std::fabs(ag - ac) < 1.0, m2);
+                }
+            }
+            dev->Release();
         }
     }
 
