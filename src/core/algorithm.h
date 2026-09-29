@@ -789,6 +789,7 @@ public:
     // directly, so an algorithm overriding IsNoOp never has to remember the
     // switch.
     bool ShouldBypass() const { return !bool(m_enabled) || IsNoOp(); }
+    bool Enabled() const { return bool(m_enabled); }
 
     std::span<ParamBase* const> Params() const { return m_params; }
     ParamBase* FindParam(std::string_view name) const;

@@ -90,6 +90,7 @@ public:
             return false;
 
         const int    maxSeen = int(m_maxSeenThrough);
+        const double seenFrac = double(m_maxSeenFraction);
         const double tol     = double(m_tolerance);
         const double minConf = double(m_minConfidence);
 
@@ -111,13 +112,13 @@ public:
         const int    minViews   = int(m_largeMinViews);
 
         const size_t n = cloud->splats.size();
-        std::vector<int> seen(n, 0), inView(n, 0);
+        std::vector<int> seen(n, 0), inView(n, 0), measured(n, 0);
         const size_t chunk = 4096;
         ParallelFor((n + chunk - 1) / chunk, [&](size_t c) {
             const size_t end = std::min(n, (c + 1) * chunk);
             for (size_t i = c * chunk; i < end; ++i) {
                 const Vec3& m = cloud->splats[i].mean;
-                seen[i] = CountSeenThrough(*cloud, views, m, -1, minConf, tol);
+                seen[i] = CountSeenThrough(*cloud, views, m, -1, minConf, tol, &measured[i]);
                 int v = 0;
                 for (const Camera& cam : cloud->cameras) {
                     if (!cam.solved) continue;
@@ -131,10 +132,13 @@ public:
         });
 
         std::array<long long, kHist> hist{};
-        size_t kept = 0, thinLarge = 0;
+        size_t kept = 0, thinLarge = 0, seenDropped = 0;
         for (size_t i = 0; i < n; ++i) {
             ++hist[size_t(std::min(seen[i], kHist - 1))];
-            if (seen[i] > maxSeen) continue;
+            if (seen[i] > maxSeen && double(seen[i]) >= seenFrac * double(measured[i])) {
+                ++seenDropped;
+                continue;
+            }
             const Splat& s = cloud->splats[i];
             if (minViews > 0 && inView[i] < minViews &&
                 std::max({s.scale.x, s.scale.y, s.scale.z}) > largeLimit) {
@@ -148,11 +152,12 @@ public:
         char buf[420];
         std::snprintf(buf, sizeof(buf),
                       "carve_splats: removed %zu of %zu Gaussians -- %zu seen "
-                      "through by more than %d camera%s, %zu large and in view "
+                      "through by more than %d camera%s and %.0f%% of those that "
+                      "measured there, %zu large and in view "
                       "of fewer than %d; cameras seeing through each: 0: %lld, "
                       "1: %lld, 2: %lld, 3: %lld, 4: %lld, 5+: %lld",
-                      n - kept, n, n - kept - thinLarge, maxSeen,
-                      maxSeen == 1 ? "" : "s", thinLarge, minViews, hist[0],
+                      n - kept, n, seenDropped, maxSeen,
+                      maxSeen == 1 ? "" : "s", seenFrac * 100.0, thinLarge, minViews, hist[0],
                       hist[1], hist[2], hist[3], hist[4], hist[5]);
         m_note = buf;
         return true;
@@ -161,6 +166,22 @@ public:
     std::string RunReport() const override { return m_note; }
 
 private:
+    // AND A FRACTION, because a count alone means different things at
+    // different camera counts. With eleven cameras, two seeing through a
+    // point is a real signal; with a hundred, a point measured by fifty of
+    // them collects two such votes from depth noise alone -- on a 100-frame
+    // video it removed two thirds of the Gaussians, holes and all. Requiring
+    // the dissenters to be a fifth of the cameras that measured there too
+    // leaves an eleven-camera capture judged as before and makes a hundred-
+    // camera one need about ten.
+    Param<float> m_maxSeenFraction{this, "max_seen_fraction", 0.2f, 0.0f, 1.0f,
+        {.help = "A Gaussian is removed only when the cameras seeing through "
+                 "it are ALSO at least this fraction of the cameras that "
+                 "measured a depth there. Keeps a capture with many cameras "
+                 "from losing real surface to depth noise. 0 uses the count "
+                 "alone.",
+         .step = 0.05}};
+
     Param<int> m_maxSeenThrough{this, "max_seen_through", 1, 0, 16,
         {.help = "Remove a Gaussian when more than this many cameras measured "
                  "a surface clearly BEHIND it along their own line of sight: "

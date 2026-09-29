@@ -48,6 +48,7 @@
 #include "../src/core/image_io.h"
 #include "../src/core/pipeline.h"
 #include "../src/core/shape.h"
+#include "../src/core/video_io.h"
 #include "../src/script/interp.h"
 #include "../src/script/parser.h"
 #include "../src/script/value.h"
@@ -382,17 +383,62 @@ void ReportPlanarity(const PointCloud& pc) {
 // Training views can hide floaters by construction -- the optimiser put them
 // exactly where those views wanted them -- so seeing them needs somewhere
 // else to look from, which is what the viewer's orbit does interactively.
+// --cameras: the camera path, one line per camera -- centre relative to the
+// centroid in units of the ring radius, heading turned since camera 0, and the
+// step from the previous camera. A walk around a subject should read as one
+// smooth ring with the heading advancing steadily; a solve that has broken
+// into pieces shows as jumps in the step or the heading.
+static void PrintCameras(const PointCloud& pc) {
+    Vec3 cm{0, 0, 0};
+    int n = 0;
+    for (const Camera& c : pc.cameras)
+        if (c.solved) { cm = cm + c.Center(); ++n; }
+    if (n == 0) return;
+    cm = cm * (1.0 / double(n));
+    double rad = 0.0;
+    for (const Camera& c : pc.cameras)
+        if (c.solved) rad += (c.Center() - cm).Norm();
+    rad = rad > 1e-12 ? rad / double(n) : 1.0;
+    std::printf("\ncamera path (centroid-relative, in mean radii):\n");
+    const Camera* prev = nullptr;
+    const Camera* first = nullptr;
+    for (size_t i = 0; i < pc.cameras.size(); ++i) {
+        const Camera& c = pc.cameras[i];
+        if (!c.solved) { std::printf("  %3zu: ---\n", i); continue; }
+        if (!first) first = &c;
+        const Vec3 d = (c.Center() - cm) * (1.0 / rad);
+        const Mat3 rel = c.R * first->R.Transpose();
+        const double turned = Mat3::Identity().AngleTo(rel) * 57.2958;
+        const double step = prev ? (c.Center() - prev->Center()).Norm() / rad : 0.0;
+        std::printf("  %3zu: %6.2f %6.2f %6.2f   turned %6.1f   step %.3f\n", i, d.x, d.y,
+                    d.z, turned, step);
+        prev = &c;
+    }
+}
+
 static void DumpOrbit(const PointCloud& pc, const std::string& prefix) {
     const Camera& mid = pc.cameras[pc.cameras.size() / 2];
     if (!mid.solved) return;
 
-    // Centre: the component-wise median of the Gaussians, robust to strays.
+    // Gaussians when there are any, otherwise the plain points -- drawn as
+    // z-buffered dots, so a dense cloud's floaters show from the side.
+    const bool asPoints = pc.splats.empty();
+    std::vector<Vec3> pts, cols;
+    if (asPoints)
+        for (const Track& t : pc.tracks)
+            if (t.hasPoint) { pts.push_back(t.point); cols.push_back(t.color); }
+    if (asPoints && pts.empty()) return;
+
+    // Centre: the component-wise median, robust to strays.
     std::vector<double> xs, ys, zs;
-    for (const Splat& s : pc.splats) {
-        xs.push_back(s.mean.x);
-        ys.push_back(s.mean.y);
-        zs.push_back(s.mean.z);
-    }
+    if (asPoints)
+        for (const Vec3& p : pts) { xs.push_back(p.x); ys.push_back(p.y); zs.push_back(p.z); }
+    else
+        for (const Splat& s : pc.splats) {
+            xs.push_back(s.mean.x);
+            ys.push_back(s.mean.y);
+            zs.push_back(s.mean.z);
+        }
     auto median = [](std::vector<double>& v) {
         std::nth_element(v.begin(), v.begin() + long(v.size() / 2), v.end());
         return v[v.size() / 2];
@@ -423,10 +469,32 @@ static void DumpOrbit(const PointCloud& pc, const std::string& prefix) {
         c.R.m[6] = z.x; c.R.m[7] = z.y; c.R.m[8] = z.z;
         c.t = (c.R * pos) * -1.0;
 
-        SplatRaster r;
-        RasterOptions opt;
         std::vector<double> rgb;
-        r.Forward(params, SplatCamFrom(c, w, h), opt, &rgb);
+        if (asPoints) {
+            // The orbit camera keeps the middle frame's focal, rescaled to w.
+            const double f = c.focal * double(w) / std::max(1, c.width);
+            rgb.assign(size_t(w) * size_t(h) * 3, 0.08);
+            std::vector<float> zb(size_t(w) * size_t(h), 1e30f);
+            for (size_t i = 0; i < pts.size(); ++i) {
+                const Vec3 q = c.R * pts[i] + c.t;
+                if (q.z <= 1e-6) continue;
+                const int u = int(f * q.x / q.z + 0.5 * w), v = int(f * q.y / q.z + 0.5 * h);
+                for (int dy = 0; dy < 2; ++dy)
+                    for (int dx = 0; dx < 2; ++dx) {
+                        const int uu = u + dx, vv = v + dy;
+                        if (uu < 0 || vv < 0 || uu >= w || vv >= h) continue;
+                        float& zz = zb[size_t(vv) * size_t(w) + size_t(uu)];
+                        if (float(q.z) >= zz) continue;
+                        zz = float(q.z);
+                        double* s = &rgb[(size_t(vv) * size_t(w) + size_t(uu)) * 3];
+                        s[0] = cols[i].x; s[1] = cols[i].y; s[2] = cols[i].z;
+                    }
+            }
+        } else {
+            SplatRaster r;
+            RasterOptions opt;
+            r.Forward(params, SplatCamFrom(c, w, h), opt, &rgb);
+        }
 
         Image im;
         im.Alloc(ImageDesc{w, h, Format::RGBA8});
@@ -453,6 +521,8 @@ int main(int argc, char** argv) {
     std::vector<std::string> files;
     std::string detector = "detect_akaze";
     int window = 3, maxDim = 1600, rotMethod = 1, posMethod = 0;
+    int videoFrames = 100;   // --video-frames: time slots for a video input
+    bool printCameras = false;   // --cameras: the camera path, per camera
     double fov = 50.0;
     std::string matcher = "match_ann";
     double ratio = 0.8;
@@ -497,6 +567,8 @@ int main(int argc, char** argv) {
         else if (a == "--script" && i + 1 < argc)   script = argv[++i];
         else if (a == "--dump" && i + 1 < argc)     dumpDir = argv[++i];
         else if (a == "--gpu")                         useGpu = true;
+        else if (a == "--cameras")                     printCameras = true;
+        else if (a == "--video-frames" && i + 1 < argc) videoFrames = std::atoi(argv[++i]);
         else files.push_back(a);
     }
 
@@ -516,8 +588,28 @@ int main(int argc, char** argv) {
         std::sort(files.begin(), files.end());
     }
 
+    // A VIDEO: its sharpest frame per time slot, as the app's palette gets
+    // them, standing in for a folder of photographs.
+    std::vector<Image> videoSet;
+    if (files.size() == 1 && IsVideoPath(files[0])) {
+        VideoOptions vo;
+        vo.frames = videoFrames;
+        VideoInfo vi;
+        std::string verr;
+        const auto tv = std::chrono::steady_clock::now();
+        if (!LoadVideoFrames(files[0], vo, &videoSet, &vi, &verr)) {
+            std::printf("%s\n", verr.c_str());
+            return 1;
+        }
+        std::printf("video: %d frames kept of %d (%.1f s at %.1f fps, %dx%d, "
+                    "rotation %d) in %.0f ms\n",
+                    int(videoSet.size()), vi.decoded, vi.seconds, vi.fps, vi.width,
+                    vi.height, vi.rotation, Ms(tv, std::chrono::steady_clock::now()));
+        files.assign(videoSet.size(), files[0]);
+    }
+
     if (files.size() < 3) {
-        std::printf("usage: bench_sfm <dir-or-image> [image...] "
+        std::printf("usage: bench_sfm <dir-or-image-or-video> [image...] "
                     "[--detector NAME] [--window N] [--max-dim N] "
                     "[--rotation 0|1] [--position 0|1]\n");
         return 2;
@@ -532,10 +624,13 @@ int main(int argc, char** argv) {
     // --- load ---------------------------------------------------------------
     const auto tLoad = std::chrono::steady_clock::now();
     ImageSet set;
-    for (const std::string& f : files) {
+    for (size_t fi = 0; fi < files.size(); ++fi) {
+        const std::string& f = files[fi];
         Image full;
         std::string err;
-        if (!LoadImageFile(f, &full, &err)) {
+        if (!videoSet.empty()) {
+            full = std::move(videoSet[fi]);
+        } else if (!LoadImageFile(f, &full, &err)) {
             std::printf("  %s: %s\n", f.c_str(), err.c_str());
             return 1;
         }
@@ -651,14 +746,41 @@ int main(int argc, char** argv) {
                     std::filesystem::create_directories(dumpDir);
                     for (size_t i = 0; i < set->images.size(); ++i) {
                         Image copy = set->images[i].Clone();
+                        // A depth or confidence map is R32F, which SavePng
+                        // does not take: stretched to grey over its measured
+                        // range, unmeasured pixels (0) left black.
+                        if (copy.Desc().format == Format::R32F) {
+                            const ImageDesc& cd = copy.Desc();
+                            ImageView cv = copy.MapCpuRead();
+                            float lo = 1e30f, hi = -1e30f;
+                            for (int y = 0; y < cd.height; ++y)
+                                for (int x = 0; x < cd.width; ++x) {
+                                    const float v = *cv.At<float>(x, y);
+                                    if (v > 0.0f && std::isfinite(v)) { lo = std::min(lo, v); hi = std::max(hi, v); }
+                                }
+                            Image g;
+                            g.Alloc(ImageDesc{cd.width, cd.height, Format::RGBA8});
+                            ImageView gv = g.MapCpuWrite();
+                            for (int y = 0; y < cd.height; ++y)
+                                for (int x = 0; x < cd.width; ++x) {
+                                    const float v = *cv.At<float>(x, y);
+                                    uint8_t b = 0;
+                                    if (v > 0.0f && hi > lo) b = uint8_t(40 + 215.0f * (v - lo) / (hi - lo));
+                                    uint8_t* px = gv.At<uint8_t>(x, y);
+                                    px[0] = px[1] = px[2] = b;
+                                    px[3] = 255;
+                                }
+                            copy = std::move(g);
+                        }
                         char name[64];
                         std::snprintf(name, sizeof(name), "_%02d.png", int(i));
                         std::string e;
-                        SavePng(dumpDir + "/" + vd.name + name, copy, &e);
+                        if (!SavePng(dumpDir + "/" + vd.name + name, copy, &e))
+                            std::printf("dump %s: %s\n", name, e.c_str());
                     }
                 }
                 if (const PointCloud* pc = std::get_if<PointCloud>(d);
-                    pc && !pc->splats.empty() && !pc->cameras.empty()) {
+                    pc && !pc->cameras.empty()) {
                     std::filesystem::create_directories(dumpDir);
                     DumpOrbit(*pc, dumpDir + "/" + vd.name);
                 }
@@ -672,9 +794,15 @@ int main(int argc, char** argv) {
                 std::printf(" (%d cameras, %d points)", pc->SolvedCameras(),
                             pc->TriangulatedPoints());
                 ReportPlanarity(*pc);
+                if (printCameras) PrintCameras(*pc);
             }
             std::printf("\n");
         }
+        std::printf("\nstage timings\n");
+        for (const Stage& st : sp.Stages())
+            if (st.algo && st.lastMs > 0.0)
+                std::printf("  %-22s %9.0f ms  %5.1f%%\n", st.algoName.c_str(), st.lastMs,
+                            100.0 * st.lastMs / std::max(1.0, sms));
         std::printf("\ntotal %.0f ms\n", sms);
         return 0;
     }

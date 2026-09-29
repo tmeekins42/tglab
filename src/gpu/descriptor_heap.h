@@ -16,7 +16,10 @@ public:
     bool Init(ID3D12Device* device, uint32_t capacity);
     void Shutdown();
 
-    void Alloc(D3D12_CPU_DESCRIPTOR_HANDLE* outCpu, D3D12_GPU_DESCRIPTOR_HANDLE* outGpu);
+    // False when the heap is full, leaving the handles zero. A full heap was
+    // an assert, so a release build popped an empty free list and crashed --
+    // expanding a 100-frame video group was enough to get there.
+    bool Alloc(D3D12_CPU_DESCRIPTOR_HANDLE* outCpu, D3D12_GPU_DESCRIPTOR_HANDLE* outGpu);
     void Free(D3D12_CPU_DESCRIPTOR_HANDLE cpu, D3D12_GPU_DESCRIPTOR_HANDLE gpu);
 
     // Reserves `count` CONTIGUOUS descriptors and returns the base handles.

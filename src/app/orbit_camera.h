@@ -10,9 +10,10 @@
 // IsItemHovered() plus a drag and the wheel; this reads the same gestures and
 // means the analogous thing:
 //
-//     drag            rotate      (pan, in 2D)
-//     shift + drag    pan
-//     wheel           dolly       (zoom, in 2D)
+//     drag                         rotate      (pan, in 2D)
+//     right / middle / shift+drag  pan         the scene follows the mouse
+//     wheel                        dolly       toward the point under the cursor
+//     double-click                 re-centre   orbit about the point clicked
 //
 // ORBIT RATHER THAN FREE-FLY. A reconstruction is an object to be inspected,
 // not a space to be walked through: the useful motion is "turn it over and look
@@ -75,7 +76,75 @@ struct OrbitCamera {
     // the remaining distance every notch, which is what feels linear.
     void Dolly(double notches) {
         distance *= std::pow(1.12, -notches);
-        distance = std::clamp(distance, 1e-3, 1e6);
+        distance = std::clamp(distance, 1e-6, 1e6);
+        FitClip();
+    }
+
+    // Dolly TOWARD THE CURSOR: the point under (sx, sy) on the target's plane
+    // stays where it is on screen while everything else closes in on it, so
+    // the wheel zooms into whatever is being pointed at rather than the
+    // middle. Pixels from the viewport's top-left.
+    void DollyAt(double notches, double sx, double sy, double viewW, double viewH) {
+        const Vec3 p = OnTargetPlane(sx, sy, viewW, viewH);
+        const double before = distance;
+        Dolly(notches);
+        const double f = distance / before;
+        target = p + (target - p) * f;
+    }
+
+    // The point under a pixel, on the plane through the target facing the
+    // camera. `up` renders toward the TOP of the screen, so a pixel below
+    // the centre is toward -up. (Measured against ViewProj in test_sfm.)
+    Vec3 OnTargetPlane(double sx, double sy, double viewW, double viewH) const {
+        Vec3 right, up, fwd;
+        Basis(&right, &up, &fwd);
+        const double halfH = distance * std::tan(fovY * 0.5);
+        const double halfW = halfH * viewW / std::max(1.0, viewH);
+        const double nx = 2.0 * sx / std::max(1.0, viewW) - 1.0;
+        const double ny = 2.0 * sy / std::max(1.0, viewH) - 1.0;
+        return target + right * (nx * halfW) - up * (ny * halfH);
+    }
+
+    // Where a world point lands on screen, in pixels from the top-left, and
+    // its depth along the view; false when it is behind the near plane.
+    bool ToScreen(const Vec3& p, double viewW, double viewH, double* sx, double* sy,
+                  double* depth) const {
+        Vec3 right, up, fwd;
+        Basis(&right, &up, &fwd);
+        const Vec3 q = p - Eye();
+        const double z = q.Dot(fwd);
+        if (z <= nearZ) return false;
+        const double t = std::tan(fovY * 0.5);
+        const double aspect = viewW / std::max(1.0, viewH);
+        *sx = (q.Dot(right) / (z * t * aspect) + 1.0) * 0.5 * viewW;
+        *sy = (1.0 - q.Dot(up) / (z * t)) * 0.5 * viewH;
+        *depth = z;
+        return true;
+    }
+
+    // Re-centre the orbit on a point without moving the eye's distance to
+    // it: the view turns to put it in the middle, and orbiting then turns
+    // about it.
+    void FocusOn(const Vec3& p) {
+        const double d = (Eye() - p).Norm();
+        target = p;
+        distance = std::clamp(d, 1e-6, 1e6);
+        FitClip();
+    }
+
+    // The scene's radius, from the last Frame(): the far plane must still
+    // reach across it however close the camera has moved to the target.
+    double sceneRadius = 1.0;
+
+    // Near and far planes that follow the distance. Fixed at Frame() time,
+    // zooming in to a tenth of that distance put the near plane BEHIND the
+    // target and sliced away what was being looked at. The near plane stays
+    // a small fraction of the distance; the far one reaches past the scene;
+    // the ratio between them is capped, since that is what depth precision
+    // depends on (see Frame).
+    void FitClip() {
+        farZ  = distance * 3.0 + sceneRadius * 2.0;
+        nearZ = std::max({1e-9, distance * 0.1, farZ / 20000.0});
     }
 
     // Pan across the view plane, in units scaled by distance so a drag moves
@@ -95,15 +164,20 @@ struct OrbitCamera {
         *up = right->Cross(*fwd).Normalized();
     }
 
-    void Pan(double dx, double dy) {
+    // Pan by a mouse delta in pixels, over a viewport `viewH` pixels tall: the
+    // scale is the height of the view at the target's distance over the
+    // pixels showing it, so what was under the cursor at the target's depth
+    // stays under it -- the drag grabs the scene rather than sliding it.
+    void Pan(double dx, double dy, double viewH) {
         Vec3 right, up, fwd;
         Basis(&right, &up, &fwd);
-        const double s = distance * 0.002;
-        // dy is NOT negated now that `up` points the correct way: with the
-        // basis left-handed both this and the projection's y term carried a
-        // compensating sign, and removing one without the other makes a drag
-        // fight the mouse.
-        target = target + right * (-dx * s) + up * (-dy * s);
+        const double s = 2.0 * distance * std::tan(fovY * 0.5) / std::max(1.0, viewH);
+        // A mouse moving DOWN must carry the scene down, so the target moves
+        // toward +up: `up` renders toward the top of the screen. This had the
+        // opposite sign, and a shift-drag moved the scene against the mouse
+        // vertically; the orbit tests in test_sfm now check it against the
+        // rendered projection, pixel for pixel.
+        target = target + right * (-dx * s) + up * (dy * s);
     }
 
     // Frames a bounding box: centres on it and backs off far enough to see it.
@@ -136,6 +210,7 @@ struct OrbitCamera {
         // outside it.
         nearZ = std::max(1e-6, distance * 0.1);
         farZ  = distance * 3.0 + radius * 2.0;
+        sceneRadius = radius;
     }
 
     // The view-projection matrix, for a constant buffer.

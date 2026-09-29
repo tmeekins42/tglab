@@ -710,12 +710,13 @@ private:
     // always completes, on the CPU.
     bool SweepFrame(int f, const PointCloud& cloud,
                     const std::vector<Image>* srcFrames,
-                    const std::vector<Plane>& planes, int nPlanes, int radius,
+                    const std::vector<Plane>& planes, int nPlanesIn, int radius,
                     int maxNb, double minCorr, double zNear, double zFar,
                     ImageSet* out, long long* measured,
                     long long* total, double* usedNear,
                     double* usedFar, bool gpuOnly) const {
         const Camera& ref = cloud.cameras[size_t(f)];
+        const double minBracket = double(m_minBracket);
         const Plane&  rp  = planes[size_t(f)];
 
         // This frame's OWN depth range. Falls back to the whole-cloud range
@@ -809,9 +810,24 @@ private:
         // small parallax -- so planes spaced evenly in depth are wastefully
         // dense up close and uselessly sparse far away. Even steps in 1/d put
         // them where the geometry can actually distinguish them.
+        //
+        // THREE GUARD PLANES PAST EACH END, at the same spacing. The winner
+        // must stand clear of the scores at the ends of what was swept (see
+        // min_bracket), and without guards a real surface right at the edge
+        // of the sparse points' range could never do that. The guards give
+        // it room to fall away, without spreading the requested planes any
+        // thinner -- which is what measured worse when range_pad grew. On
+        // the far side they stop short of infinity.
+        const double invNear0 = 1.0 / zNear, invFar0 = 1.0 / zFar;
+        const double spacing = (invNear0 - invFar0) / double(std::max(1, nPlanesIn - 1));
+        const int guardNear = 3;
+        const int guardFar = spacing > 0.0
+            ? std::clamp(int(0.9 * invFar0 / spacing), 0, 3) : 0;
+        const int nPlanes = nPlanesIn + guardNear + guardFar;
+        const double invNear = invNear0 + guardNear * spacing;
+        const double invFar  = invFar0 - guardFar * spacing;
         std::vector<double> depths;
         depths.resize(size_t(nPlanes));
-        const double invNear = 1.0 / zNear, invFar = 1.0 / zFar;
         for (int i = 0; i < nPlanes; ++i) {
             const double s = double(i) / double(nPlanes - 1);
             depths[size_t(i)] = 1.0 / (invNear + s * (invFar - invNear));
@@ -991,6 +1007,7 @@ private:
             float rival = -2.0f;     // best score outside the winner's shoulder
             int   bestP = -1;
             int   rivalP = -1;
+            float edge = -2.0f;      // higher of the first and last planes' scores
         };
         std::vector<PixState> st;
         st.assign(nPix, PixState{});
@@ -1054,9 +1071,9 @@ private:
                     for (int p = 0; p < nPlanes && ok; ++p)
                         ok = s.Plane(p, &gerr);
 
-                    std::vector<float> gb, gp, gn, gr;
+                    std::vector<float> gb, gp, gn, gr, ge;
                     std::vector<int>   gi;
-                    if (ok && s.Finish(&gb, &gp, &gn, &gr, &gi, &gerr)) {
+                    if (ok && s.Finish(&gb, &gp, &gn, &gr, &gi, &ge, &gerr)) {
                         for (size_t i = 0; i < nPix; ++i) {
                             PixState& q = st[i];
                             q.best   = gb[i];
@@ -1064,6 +1081,7 @@ private:
                             q.next   = gn[i];
                             q.rival  = gr[i];
                             q.bestP  = gi[i];
+                            q.edge   = ge[i];
                         }
                         onGpu = true;
                     }
@@ -1273,6 +1291,7 @@ private:
                 }
 
                 prevScore[i] = combined;
+                if (p == 0 || p == nPlanes - 1) s2.edge = std::max(s2.edge, combined);
             }
         }
 
@@ -1289,6 +1308,18 @@ private:
                 const double best  = double(ps.best);
                 const int    bestP = ps.bestP;
                 if (bestP < 0 || best < minCorr) continue;
+
+                // THE PEAK MUST BE BRACKETED: the score has to fall clearly
+                // away at BOTH ends of the range. When the first or last plane
+                // scores nearly as well as the winner, the surface may be
+                // beyond the range -- a wall behind a face, sky behind a
+                // building -- and the winner is just where the rising score
+                // ran out of planes. Those pixels land at the range's edge in
+                // every view, AGREE there, and survived fusion on a selfie
+                // video as a shell of wall around the head. A plain wall that
+                // correlates equally everywhere fails the same test.
+                if (bestP == 0 || bestP == nPlanes - 1) continue;
+                if (double(ps.edge) > best - minBracket) continue;
 
                 // SUBPIXEL REFINEMENT by fitting a parabola through the
                 // winning plane and its two neighbours, in inverse depth
@@ -1552,6 +1583,29 @@ private:
                  "fountain-P11, agreement with the sparse points is unchanged "
                  "from 0.30 to 0.65 while coverage moves 99% to 75% -- so "
                  "lower this to fill holes, not to improve accuracy.",
+         .step = 0.05}};
+
+    // HOW CLEARLY THE WINNING DEPTH MUST STAND ABOVE THE ENDS OF THE RANGE.
+    // MEASURED, against boundary-only rejection (0):
+    //
+    //                  measured   dense points   worst frame vs sparse
+    //   fountain  0     94.0%        501392          0.5%
+    //             0.15  85.3%        460761          0.5%
+    //   castle    0     82.8%        471889          2.3%
+    //             0.15  67.8%        409634          1.0%
+    //   selfie    0     83.7%       1772512       (a shell of wall around the head)
+    //             0.15  34.9%       1412946       (the head, and nothing around it)
+    //
+    // The selfie's lost coverage was the background, measured wrongly; the
+    // photo sets lose a tenth of their points and their accuracy holds or
+    // improves. 0.1 left a visible sprinkle of wall on the selfie.
+    Param<float> m_minBracket{this, "min_bracket", 0.15f, 0.0f, 1.0f,
+        {.help = "How far the best correlation must stand above the scores at "
+                 "the near and far ends of the swept range. A surface beyond "
+                 "the range -- a background behind the subject -- scores "
+                 "highest at the end it lies past, and without this lands "
+                 "there in every view as a false shell. 0 rejects only a "
+                 "winner ON the end plane.",
          .step = 0.05}};
 
     std::string m_note;

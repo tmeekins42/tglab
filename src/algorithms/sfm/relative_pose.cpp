@@ -45,6 +45,7 @@
 #include "../../algo_util/features.h"
 #include "../../algo_util/view_graph.h"
 #include "../../core/algorithm.h"
+#include "../../core/parallel.h"
 
 namespace tglab {
 namespace {
@@ -597,39 +598,89 @@ void BuildMatrixAtZ(const double rows[10][kNMono], double z, double M[100]) {
     }
 }
 
-// Determinant of a 10x10 by LU with partial pivoting.
+// The SIGN of det M(z), which is all the root scan and the bisection read.
 //
-// Scaled by the row norms first, because the monomial columns span several
-// orders of magnitude at large |z| -- x^3 against 1 -- and an unscaled
-// determinant underflows to zero and manufactures roots everywhere.
-double DetAtZ(const double rows[10][kNMono], double z) {
-    double M[100];
-    BuildMatrixAtZ(rows, z, M);
+// Built once per solve and then evaluated a few thousand times, so the work
+// that does not depend on z is done here, once. M's first four columns (the
+// cubic x,y monomials) carry no z at all, so the first four steps of
+// elimination with partial pivoting pick the same pivots and apply the same
+// row operations at EVERY z. They are applied to the rows' polynomial
+// coefficients up front, leaving a 6x6 whose entries are cubics in z; each
+// evaluation is then that 6x6's LU instead of the full 10x10's. It used to be
+// the full LU through ten logs and an exp, per evaluation -- and the focal
+// estimate makes some hundred thousand solves of two thousand evaluations.
+class DetSign {
+public:
+    explicit DetSign(const double rows[10][kNMono]) {
+        // Which of the twenty monomials carries each (x,y) monomial at each
+        // power of z; the same table as BuildMatrixAtZ.
+        static const int kMap[10][4] = {
+            { 0, -1, -1, -1}, { 1, -1, -1, -1}, { 2, -1, -1, -1}, { 3, -1, -1, -1},
+            { 5,  4, -1, -1}, { 7,  6, -1, -1}, { 9,  8, -1, -1},
+            {12, 11, 10, -1}, {15, 14, 13, -1}, {19, 18, 17, 16},
+        };
+        double C[10][10][4];
+        for (int r = 0; r < 10; ++r)
+            for (int m = 0; m < 10; ++m)
+                for (int p = 0; p < 4; ++p)
+                    C[r][m][p] = kMap[m][p] >= 0 ? rows[r][kMap[m][p]] : 0.0;
 
-    double sign = 1.0;
-    double logAbs = 0.0;
-    for (int col = 0; col < 10; ++col) {
-        int piv = col;
-        for (int r = col + 1; r < 10; ++r)
-            if (std::fabs(M[r * 10 + col]) > std::fabs(M[piv * 10 + col])) piv = r;
-        const double pv = M[piv * 10 + col];
-        if (std::fabs(pv) < 1e-300) return 0.0;
-        if (piv != col) {
-            for (int c = 0; c < 10; ++c) std::swap(M[col * 10 + c], M[piv * 10 + c]);
-            sign = -sign;
+        for (int col = 0; col < 4; ++col) {
+            int piv = col;
+            for (int r = col + 1; r < 10; ++r)
+                if (std::fabs(C[r][col][0]) > std::fabs(C[piv][col][0])) piv = r;
+            if (std::fabs(C[piv][col][0]) < 1e-300) { m_zero = true; return; }
+            if (piv != col) {
+                for (int m = 0; m < 10; ++m)
+                    for (int p = 0; p < 4; ++p) std::swap(C[col][m][p], C[piv][m][p]);
+                m_sign = -m_sign;
+            }
+            if (C[col][col][0] < 0.0) m_sign = -m_sign;
+            for (int r = col + 1; r < 10; ++r) {
+                const double f = C[r][col][0] / C[col][col][0];
+                if (f == 0.0) continue;
+                for (int m = col; m < 10; ++m)
+                    for (int p = 0; p < 4; ++p) C[r][m][p] -= f * C[col][m][p];
+            }
         }
-        if (M[col * 10 + col] < 0.0) sign = -sign;
-        logAbs += std::log(std::fabs(M[col * 10 + col]));
-        for (int r = col + 1; r < 10; ++r) {
-            const double f = M[r * 10 + col] / M[col * 10 + col];
-            if (f == 0.0) continue;
-            for (int c = col; c < 10; ++c) M[r * 10 + c] -= f * M[col * 10 + c];
-        }
+        for (int r = 0; r < 6; ++r)
+            for (int c = 0; c < 6; ++c)
+                for (int p = 0; p < 4; ++p) m_s[r][c][p] = C[r + 4][c + 4][p];
     }
-    // Returned as a scaled value rather than the true determinant: only its
-    // SIGN and its zeros matter here, and the magnitude would overflow.
-    return sign * std::exp(std::min(logAbs, 700.0) / 10.0);
-}
+
+    double operator()(double z) const {
+        if (m_zero) return 0.0;
+        double M[36];
+        for (int r = 0; r < 6; ++r)
+            for (int c = 0; c < 6; ++c) {
+                const double* k = m_s[r][c];
+                M[r * 6 + c] = ((k[3] * z + k[2]) * z + k[1]) * z + k[0];
+            }
+        double sign = m_sign;
+        for (int col = 0; col < 6; ++col) {
+            int piv = col;
+            for (int r = col + 1; r < 6; ++r)
+                if (std::fabs(M[r * 6 + col]) > std::fabs(M[piv * 6 + col])) piv = r;
+            if (std::fabs(M[piv * 6 + col]) < 1e-300) return 0.0;
+            if (piv != col) {
+                for (int c = col; c < 6; ++c) std::swap(M[col * 6 + c], M[piv * 6 + c]);
+                sign = -sign;
+            }
+            if (M[col * 6 + col] < 0.0) sign = -sign;
+            for (int r = col + 1; r < 6; ++r) {
+                const double f = M[r * 6 + col] / M[col * 6 + col];
+                if (f == 0.0) continue;
+                for (int c = col; c < 6; ++c) M[r * 6 + c] -= f * M[col * 6 + c];
+            }
+        }
+        return sign;
+    }
+
+private:
+    double m_s[6][6][4] = {};
+    double m_sign = 1.0;
+    bool   m_zero = false;
+};
 
 // Given a z where the determinant vanishes, recovers x and y.
 //
@@ -711,7 +762,8 @@ int FivePointSolve(const std::vector<Corr>& pts, const std::vector<int>& idx,
     // Reported once, because a failure here means every candidate downstream
     // is describing the wrong polynomial and the estimator's poor showing
     // would otherwise look like an inherent property of the method.
-    if (std::getenv("TGLAB_SFM_DEBUG")) {
+    static const bool kDebug = std::getenv("TGLAB_SFM_DEBUG") != nullptr;
+    if (kDebug) {
         static bool reported = false;
         if (!reported) {
             reported = true;
@@ -742,11 +794,12 @@ int FivePointSolve(const std::vector<Corr>& pts, const std::vector<int>& idx,
     const double step = (kHi - kLo) / double(kSteps);
 
     double prevZ = kLo;
-    double prevD = DetAtZ(rows, prevZ);
+    const DetSign detAt(rows);
+    double prevD = detAt(prevZ);
 
     for (int i = 1; i <= kSteps && found < 10; ++i) {
         const double z = kLo + step * double(i);
-        const double d = DetAtZ(rows, z);
+        const double d = detAt(z);
 
         const bool crosses = (prevD != 0.0) && ((prevD < 0.0) != (d < 0.0));
         if (crosses) {
@@ -755,7 +808,8 @@ int FivePointSolve(const std::vector<Corr>& pts, const std::vector<int>& idx,
             double a = prevZ, b = z, fa = prevD;
             for (int it = 0; it < 80; ++it) {
                 const double mid = 0.5 * (a + b);
-                const double fm = DetAtZ(rows, mid);
+                if (mid <= a || mid >= b) break;   // adjacent doubles: done
+                const double fm = detAt(mid);
                 if ((fa < 0.0) != (fm < 0.0)) b = mid;
                 else                          { a = mid; fa = fm; }
             }
@@ -1065,6 +1119,178 @@ bool DecomposeEssential(const Mat3& E, const std::vector<Corr>& pts,
     return true;
 }
 
+// RANSAC for the essential matrix over normalised correspondences: the
+// consensus set in `best`, and the model that found it in `bestE`. Five-point
+// when `five`, eight-point otherwise; the THRESHOLD is a squared Sampson
+// distance in normalised units. Deterministic for a given seed.
+//
+// `confidence` > 0 stops early, the textbook way: once the best inlier rate w
+// says an all-inlier sample would have turned up with that probability by now
+// -- log(1 - confidence) / log(1 - w^s) draws -- more draws are unlikely to
+// find a larger consensus. At 85% inliers and 0.999 that is 13 five-point
+// draws, not 200. Never before 20 draws, so an early lucky sample on a
+// low-inlier pair cannot end the search.
+void RansacEssential(const std::vector<Corr>& pts, bool five, double threshSq,
+                     int iterations, uint32_t seed, std::vector<int>* best, Mat3* bestE,
+                     double confidence = 0.0) {
+    best->clear();
+    if (pts.size() < 8) return;
+    const int sampleSize = five ? 5 : 8;
+    std::mt19937 rng(seed);
+    std::uniform_int_distribution<size_t> pick(0, pts.size() - 1);
+    // Braces, not parentheses: `std::vector<int> sample(size_t(n))`
+    // declares a FUNCTION taking a size_t, and the errors land on the
+    // uses rather than here.
+    std::vector<int> sample(static_cast<size_t>(sampleSize), 0);
+    for (int it = 0; it < iterations; ++it) {
+        for (int s = 0; s < sampleSize; ++s) {
+            bool dup; int tries = 0;
+            do {
+                sample[size_t(s)] = int(pick(rng));
+                dup = false;
+                for (int q = 0; q < s; ++q)
+                    if (sample[size_t(q)] == sample[size_t(s)]) dup = true;
+            } while (dup && ++tries < 16);
+        }
+        // Five-point returns SEVERAL candidates -- the constraints are cubic
+        // and admit up to ten essential matrices per sample -- so each is
+        // scored and the best kept. Eight-point's linear solve returns one.
+        Mat3 cands[10];
+        int nCand = 0;
+        if (five) nCand = FivePointSolve(pts, sample, cands);
+        else if (EssentialEightPoint(pts, sample, &cands[0])) nCand = 1;
+        for (int c = 0; c < nCand; ++c) {
+            const Mat3& E = cands[c];
+            std::vector<int> in;
+            in.reserve(pts.size());
+            for (size_t i = 0; i < pts.size(); ++i)
+                if (SampsonDistance(E, pts[i]) <= threshSq) in.push_back(int(i));
+            if (in.size() > best->size()) {
+                best->swap(in);
+                *bestE = E;
+            }
+        }
+        if (best->size() > pts.size() * 9 / 10) break;
+        if (confidence > 0.0 && it + 1 >= 20 && !best->empty()) {
+            const double w = double(best->size()) / double(pts.size());
+            const double allIn = std::pow(w, double(sampleSize));
+            if (allIn > 0.0 && allIn < 1.0 &&
+                double(it + 1) >= std::log(1.0 - confidence) / std::log(1.0 - allIn))
+                break;
+        }
+    }
+}
+
+// THE FIELD OF VIEW, ESTIMATED FROM THE MATCHES when nobody supplied one.
+//
+// An essential matrix is only an essential matrix in CALIBRATED coordinates:
+// with the right focal, the correspondences of a rigid scene fit one -- two
+// equal singular values and all -- and with the wrong one they fit it less
+// well, so fewer of them pass a tight threshold. The five-point solver builds
+// the essential constraints in (eight-point does not, and scores every focal
+// the same -- measured: identical inlier counts from 40 to 76 degrees), so
+// scoring a candidate focal by five-point inliers at 1 px measures how well
+// that focal explains the data.
+//
+// Measured, mean inliers per pair against the field of view:
+//
+//   fountain-P11  40:600  48:607  54:612  58:614  62:612  68:608  76:589
+//   castle-P19    40:413  48:421  54:429  58:430  62:425  68:403  76:368
+//   cat video     30:510  33:509  36:509  39:503  42:496  48:481
+//
+// The two photo sets peak at 58 against a calibrated 58.2. The walk-around
+// video is broad -- cameras all aimed at one subject are the known weak case
+// for self-calibration -- and peaks at 30-36 against the ~34 its closed loop
+// settles on. A starting point, then, that solve_cameras refines by letting
+// bundle adjustment measure the focal and solving again.
+//
+// Up to 40 pairs, spread through the sequence, so a long video costs what a
+// short set does. A coarse grid, then two-degree steps around its best, then
+// a parabola through the peak.
+double EstimateFov(const std::vector<Image>& images) {
+    struct PairPts { std::vector<double> ax, ay, bx, by; double wa = 1, wb = 1; };
+    std::vector<PairPts> all;
+    const int n = int(images.size());
+    for (int f = 0; f < n; ++f) {
+        const MatchSidecar* ms = MatchesOf(images[size_t(f)]);
+        const FeatureSidecar* fsB = FeaturesOf(images[size_t(f)]);
+        if (!ms || !fsB) continue;
+        for (const MatchSet& set : ms->sets) {
+            if (set.reference < 0 || set.reference >= n) continue;
+            const FeatureSidecar* fsA = FeaturesOf(images[size_t(set.reference)]);
+            if (!fsA || set.matches.size() < 30) continue;
+            const ImageDesc& dA = images[size_t(set.reference)].Desc();
+            const ImageDesc& dB = images[size_t(f)].Desc();
+            PairPts p;
+            p.wa = dA.width;
+            p.wb = dB.width;
+            // At most 400 matches, evenly spread: the score is a count, and a
+            // subset ranks focals the same while costing a third as much.
+            const size_t step = std::max<size_t>(1, set.matches.size() / 400);
+            for (size_t mi = 0; mi < set.matches.size(); mi += step) {
+                const Match& m = set.matches[mi];
+                if (m.a < 0 || m.a >= int(fsA->keypoints.size())) continue;
+                if (m.b < 0 || m.b >= int(fsB->keypoints.size())) continue;
+                const Keypoint& ka = fsA->keypoints[size_t(m.a)];
+                const Keypoint& kb = fsB->keypoints[size_t(m.b)];
+                p.ax.push_back(ka.x - 0.5 * dA.width);
+                p.ay.push_back(ka.y - 0.5 * dA.height);
+                p.bx.push_back(kb.x - 0.5 * dB.width);
+                p.by.push_back(kb.y - 0.5 * dB.height);
+            }
+            all.push_back(std::move(p));
+        }
+    }
+    if (all.empty()) return 50.0;
+    std::vector<const PairPts*> use;
+    const size_t want = std::min<size_t>(40, all.size());
+    for (size_t k = 0; k < want; ++k) use.push_back(&all[k * all.size() / want]);
+
+    auto score = [&](double fovDeg) {
+        const double t = std::tan(0.5 * fovDeg * 3.14159265358979 / 180.0);
+        std::vector<int> counts(use.size(), 0);
+        ParallelFor(use.size(), [&](size_t i) {
+            const PairPts& p = *use[i];
+            const double fa = 0.5 * p.wa / t, fb = 0.5 * p.wb / t;
+            std::vector<Corr> pts;
+            pts.reserve(p.ax.size());
+            for (size_t k = 0; k < p.ax.size(); ++k)
+                pts.push_back(Corr{p.ax[k] / fa, p.ay[k] / fa, p.bx[k] / fb, p.by[k] / fb});
+            const double tn = 1.0 / fb;   // 1 px
+            std::vector<int> best;
+            Mat3 E;
+            RansacEssential(pts, true, tn * tn, 200, 777u + uint32_t(i), &best, &E, 0.999);
+            counts[i] = int(best.size());
+        });
+        double s = 0.0;
+        for (int c : counts) s += c;
+        return s;
+    };
+
+    double bestFov = 50.0, bestScore = -1.0;
+    // 11 coarse and 7 fine evaluations rather than 16 and 11: this is a
+    // starting point that solve_cameras refines, and each evaluation is 40
+    // RANSAC runs.
+    for (double fov = 25.0; fov <= 100.0 + 1e-9; fov += 7.5) {
+        const double s = score(fov);
+        if (s > bestScore) { bestScore = s; bestFov = fov; }
+    }
+    const double lo = std::max(20.0, bestFov - 6.0), hi = std::min(110.0, bestFov + 6.0);
+    std::vector<std::pair<double, double>> fine;
+    for (double fov = lo; fov <= hi + 1e-9; fov += 2.0) fine.emplace_back(fov, score(fov));
+    size_t k = 0;
+    for (size_t i = 1; i < fine.size(); ++i)
+        if (fine[i].second > fine[k].second) k = i;
+    double est = fine[k].first;
+    if (k > 0 && k + 1 < fine.size()) {
+        // The vertex of the parabola through the peak and its neighbours.
+        const double y0 = fine[k - 1].second, y1 = fine[k].second, y2 = fine[k + 1].second;
+        const double den = y0 - 2.0 * y1 + y2;
+        if (den < 0.0) est += 0.5 * (y0 - y2) / den;
+    }
+    return est;
+}
+
 class RelativePose : public AlgorithmBase {
 public:
     const char* Name()     const override { return "relative_pose"; }
@@ -1126,19 +1352,16 @@ private:
                  "puts a badly determined relative rotation into the average, "
                  "where it pulls every camera connected through it."}};
 
-    Param<float> m_fovDeg{this, "fov_deg", 50.0f, 5.0f, 150.0f,
+    Param<float> m_fovDeg{this, "fov_deg", 0.0f, 0.0f, 150.0f,
         {.help = "Horizontal field of view, used to turn pixels into "
                  "normalised camera coordinates. THE most consequential "
                  "setting here: the essential matrix is only an essential "
                  "matrix in calibrated coordinates, so a wrong focal biases "
                  "every recovered rotation and the error compounds through "
                  "averaging.\n\n"
-                 "Measured on castle-P19 at 1600 px: the 50-degree default "
-                 "implies a focal of 1716 px where the true one is about "
-                 "1438 (58 degrees), and that 19% error alone took the mean "
-                 "rotation residual from under a degree to fourteen. Read it "
-                 "off the EXIF where there is any, or sweep it and watch the "
-                 "residual."}};
+                 "0 (the default) ESTIMATES it from the matches -- see "
+                 "EstimateFov. Set a value only when it is known, from a "
+                 "calibration or a lens."}};
 
     std::string m_note;
 };
@@ -1146,18 +1369,43 @@ private:
 bool RelativePose::RunAlign(std::vector<Image>* images, std::string* err) {
     const int n = int(images->size());
     if (n < 2) { *err = "relative_pose needs at least two frames"; return false; }
+    // Given, or estimated from the matches themselves.
+    double fovEstimated = 0.0;
+    const double fovDeg = double(m_fovDeg) > 0.0
+                              ? double(m_fovDeg)
+                              : (fovEstimated = EstimateFov(*images));
 
-    int solved = 0, attempted = 0, rejected = 0;
-    double inlierSum = 0.0;
-    double rotSum = 0.0;
-    double planarSum = 0.0;
-    int planarPairs = 0;
+    std::vector<std::shared_ptr<RelativePoseSidecar>> outs;
+    std::vector<std::shared_ptr<MatchSidecar>> reviseds;
+    outs.resize(size_t(n));
+    reviseds.resize(size_t(n));
 
-    for (int f = 0; f < n; ++f) {
+    // FRAMES IN PARALLEL. Each frame's pairs read only the shared features
+    // and write only that frame's slot, and RANSAC's seed is fixed per call,
+    // so the result is identical to the serial loop -- which spent 14 s a
+    // round on a 100-frame video, most of solve_cameras' time.
+    struct Tally {
+        int solved = 0, attempted = 0, rejected = 0, planarPairs = 0;
+        double inlierSum = 0.0, rotSum = 0.0, planarSum = 0.0;
+    };
+    std::vector<Tally> tallies;
+    tallies.resize(size_t(n));
+
+    ParallelFor(size_t(n), [&](size_t fi) {
+        const int f = int(fi);
+        Tally& tl = tallies[fi];
+        int& solved = tl.solved;
+        int& attempted = tl.attempted;
+        int& rejected = tl.rejected;
+        int& planarPairs = tl.planarPairs;
+        double& inlierSum = tl.inlierSum;
+        double& rotSum = tl.rotSum;
+        double& planarSum = tl.planarSum;
+
         const MatchSidecar* ms = MatchesOf((*images)[size_t(f)]);
-        if (!ms) continue;
+        if (!ms) return;
         const FeatureSidecar* fsB = FeaturesOf((*images)[size_t(f)]);
-        if (!fsB) continue;
+        if (!fsB) return;
 
         // REPLACED WITH OUR OWN INLIERS at the end of this frame's loop.
         //
@@ -1170,6 +1418,7 @@ bool RelativePose::RunAlign(std::vector<Image>* images, std::string* err) {
         auto revised = std::make_shared<MatchSidecar>(*ms);
 
         auto out = std::make_shared<RelativePoseSidecar>();
+        out->fovDeg = fovDeg;
 
         for (size_t setIdx = 0; setIdx < ms->sets.size(); ++setIdx) {
             const MatchSet& set = ms->sets[setIdx];
@@ -1183,7 +1432,7 @@ bool RelativePose::RunAlign(std::vector<Image>* images, std::string* err) {
             // nothing has calibrated anything yet.
             const ImageDesc& dA = (*images)[size_t(set.reference)].Desc();
             const ImageDesc& dB = (*images)[size_t(f)].Desc();
-            const double halfFov = 0.5 * double(m_fovDeg) * 3.14159265358979 / 180.0;
+            const double halfFov = 0.5 * fovDeg * 3.14159265358979 / 180.0;
             const double fA = 0.5 * dA.width / std::tan(halfFov);
             const double fB = 0.5 * dB.width / std::tan(halfFov);
 
@@ -1234,55 +1483,10 @@ bool RelativePose::RunAlign(std::vector<Image>* images, std::string* err) {
             // power. On this project's worst pairs -- 30% inliers -- that is
             // 0.007% against 0.24%.
             const bool useFive = int(m_method) == 1;
-            const int sampleSize = useFive ? 5 : 8;
-
-            std::mt19937 rng(20260921u);
-            std::uniform_int_distribution<size_t> pick(0, pts.size() - 1);
-            // Braces, not parentheses: `std::vector<int> sample(size_t(n))`
-            // declares a FUNCTION taking a size_t, and the errors land on the
-            // uses rather than here.
-            std::vector<int> sample(static_cast<size_t>(sampleSize), 0);
             std::vector<int> best;
             Mat3 bestE;
-
-            for (int it = 0; it < int(m_iterations); ++it) {
-                for (int s = 0; s < sampleSize; ++s) {
-                    bool dup; int tries = 0;
-                    do {
-                        sample[size_t(s)] = int(pick(rng));
-                        dup = false;
-                        for (int q = 0; q < s; ++q)
-                            if (sample[size_t(q)] == sample[size_t(s)]) dup = true;
-                    } while (dup && ++tries < 16);
-                }
-
-                // Five-point returns SEVERAL candidates -- the constraints are
-                // cubic and admit up to ten essential matrices per sample --
-                // so each is scored and the best kept. Eight-point's linear
-                // solve returns exactly one.
-                Mat3 cands[10];
-                int nCand = 0;
-                if (useFive) {
-                    nCand = FivePointSolve(pts, sample, cands);
-                } else {
-                    if (EssentialEightPoint(pts, sample, &cands[0])) nCand = 1;
-                }
-
-                for (int c = 0; c < nCand; ++c) {
-                    const Mat3& E = cands[c];
-                    std::vector<int> in;
-                    in.reserve(pts.size());
-                    for (size_t i = 0; i < pts.size(); ++i)
-                        if (SampsonDistance(E, pts[i]) <= threshSq)
-                            in.push_back(int(i));
-
-                    if (in.size() > best.size()) {
-                        best.swap(in);
-                        bestE = E;
-                    }
-                }
-                if (best.size() > pts.size() * 9 / 10) break;
-            }
+            RansacEssential(pts, useFive, threshSq, int(m_iterations), 20260921u,
+                            &best, &bestE);
 
             if (int(best.size()) < int(m_minInliers)) { ++rejected; continue; }
 
@@ -1375,6 +1579,7 @@ bool RelativePose::RunAlign(std::vector<Image>* images, std::string* err) {
             // were exactly right.
             edge.direction = (R.Transpose() * t).Normalized();
             edge.inliers = int(best.size());
+            edge.revisit = set.revisit;
             out->edges.push_back(edge);
             ++solved;
             inlierSum += double(best.size());
@@ -1388,13 +1593,132 @@ bool RelativePose::RunAlign(std::vector<Image>* images, std::string* err) {
             rotSum += Mat3{}.AngleTo(R);
         }
 
-        if (!out->edges.empty()) {
-            (*images)[size_t(f)].Sidecars().Set(kRelativePoseSidecar, std::move(out));
-            // Only when at least one pair solved: a frame whose every pair was
-            // rejected keeps the upstream flags rather than having them
-            // replaced with all-zero, which would silently delete its matches.
-            (*images)[size_t(f)].Sidecars().Set(kMatchSidecar, std::move(revised));
+        // Held until every pair is solved: revisits are checked against the
+        // whole neighbour chain before anything is written.
+        outs[size_t(f)] = std::move(out);
+        reviseds[size_t(f)] = std::move(revised);
+    });
+
+    int solved = 0, attempted = 0, rejected = 0, planarPairs = 0;
+    double inlierSum = 0.0, rotSum = 0.0, planarSum = 0.0;
+    for (const Tally& tl : tallies) {
+        solved += tl.solved;
+        attempted += tl.attempted;
+        rejected += tl.rejected;
+        planarPairs += tl.planarPairs;
+        inlierSum += tl.inlierSum;
+        rotSum += tl.rotSum;
+        planarSum += tl.planarSum;
+    }
+
+    // --- REVISITS, checked against the neighbour chain ------------------------
+    //
+    // A revisit pair was matched because two frames far apart LOOK alike, and
+    // a scene with repeating structure has frames that look alike without
+    // being the same view: on castle-P19 the window bays gave revisits that
+    // passed RANSAC with a hundred-plus inliers and still dragged the solve
+    // from a 0.8 degree ray residual to 4.3. RANSAC cannot tell -- the matches
+    // really are consistent with SOME essential matrix.
+    //
+    // What can tell is the chain. Composing the neighbour pairs' rotations
+    // from one frame of the revisit to the other predicts how far the camera
+    // turned between them; a real revisit agrees with that and a look-alike
+    // does not. The tolerance grows with how far the chain turned in between,
+    // since every link adds a little error -- 5 degrees plus 10% of the turn,
+    // which also admits a focal a few percent off. A rejected revisit loses
+    // its edge AND its matches, so build_tracks never unions them.
+    int revisitsKept = 0, revisitsDropped = 0;
+    {
+        // Absolute rotations from neighbour edges only, by breadth-first
+        // search from frame 0 over the strongest links.
+        std::vector<Mat3> Rabs;
+        Rabs.resize(size_t(n));
+        std::vector<double> turned(size_t(n), 0.0);   // accumulated turn from the root
+        std::vector<char> known(size_t(n), 0);
+        struct Link { int a, b; Mat3 R; int inl; };
+        std::vector<Link> links;
+        for (int f = 0; f < n; ++f)
+            if (outs[size_t(f)])
+                for (const RelativePoseSidecar::Edge& e : outs[size_t(f)]->edges)
+                    if (!e.revisit) links.push_back({e.reference, f, e.R, e.inliers});
+        std::sort(links.begin(), links.end(),
+                  [](const Link& x, const Link& y) { return x.inl > y.inl; });
+        bool grew = true;
+        for (int root = 0; root < n && !known[size_t(root)]; ++root) {
+            known[size_t(root)] = 1;
+            Rabs[size_t(root)] = Mat3::Identity();
+            break;
         }
+        while (grew) {
+            grew = false;
+            for (const Link& l : links) {
+                // x_b = R x_a, so R_b = R R_a and R_a = R^T R_b.
+                if (known[size_t(l.a)] && !known[size_t(l.b)]) {
+                    Rabs[size_t(l.b)] = l.R * Rabs[size_t(l.a)];
+                    turned[size_t(l.b)] = turned[size_t(l.a)] + Mat3::Identity().AngleTo(l.R);
+                    known[size_t(l.b)] = 1;
+                    grew = true;
+                } else if (known[size_t(l.b)] && !known[size_t(l.a)]) {
+                    Rabs[size_t(l.a)] = l.R.Transpose() * Rabs[size_t(l.b)];
+                    turned[size_t(l.a)] = turned[size_t(l.b)] + Mat3::Identity().AngleTo(l.R);
+                    known[size_t(l.a)] = 1;
+                    grew = true;
+                }
+            }
+        }
+        const double deg = 3.14159265358979 / 180.0;
+        for (int f = 0; f < n; ++f) {
+            if (!reviseds[size_t(f)]) continue;
+            auto& sets = reviseds[size_t(f)]->sets;
+            if (!outs[size_t(f)]) {
+                // Nothing solved here, revisits included: none may be used.
+                for (MatchSet& s : sets)
+                    if (s.revisit) s.inlier.assign(s.matches.size(), 0);
+                continue;
+            }
+            auto& edges = outs[size_t(f)]->edges;
+            std::vector<RelativePoseSidecar::Edge> keep;
+            for (size_t k = 0; k < edges.size(); ++k) {
+                const RelativePoseSidecar::Edge& e = edges[k];
+                if (!e.revisit) { keep.push_back(e); continue; }
+                const int a = e.reference;
+                bool ok = a >= 0 && a < n && known[size_t(a)] && known[size_t(f)];
+                if (ok) {
+                    const Mat3 predicted = Rabs[size_t(f)] * Rabs[size_t(a)].Transpose();
+                    const double between = std::fabs(turned[size_t(f)] - turned[size_t(a)]);
+                    ok = predicted.AngleTo(e.R) <= 5.0 * deg + 0.10 * between;
+                }
+                if (ok) { keep.push_back(e); ++revisitsKept; continue; }
+                ++revisitsDropped;
+            }
+            edges.swap(keep);
+            // Every revisit set without a kept edge -- rejected here, or never
+            // solved -- loses its matches, so no track is built through it.
+            // (An EMPTY inlier list means "use them all", so an unsolved set
+            // left alone would be the worst case, not the safe one.)
+            for (MatchSet& s : sets) {
+                if (!s.revisit) continue;
+                bool kept = false;
+                for (const RelativePoseSidecar::Edge& e : edges)
+                    if (e.revisit && e.reference == s.reference) kept = true;
+                if (!kept) s.inlier.assign(s.matches.size(), 0);
+            }
+        }
+    }
+
+    for (int f = 0; f < n; ++f) {
+        const bool solvedHere = outs[size_t(f)] && !outs[size_t(f)]->edges.empty();
+        bool hasRevisit = false;
+        if (reviseds[size_t(f)])
+            for (const MatchSet& s : reviseds[size_t(f)]->sets) hasRevisit |= s.revisit;
+        if (solvedHere)
+            (*images)[size_t(f)].Sidecars().Set(kRelativePoseSidecar, std::move(outs[size_t(f)]));
+        // Only when at least one pair solved: a frame whose every pair was
+        // rejected keeps the upstream flags rather than having them
+        // replaced with all-zero, which would silently delete its matches.
+        // Revisit sets are the exception, cleared above either way.
+        if ((solvedHere || hasRevisit) && reviseds[size_t(f)])
+            (*images)[size_t(f)].Sidecars().Set(kMatchSidecar, std::move(reviseds[size_t(f)]));
     }
 
     char buf[256];
@@ -1408,6 +1732,21 @@ bool RelativePose::RunAlign(std::vector<Image>* images, std::string* err) {
                          : 0.0,
                   solved ? planarSum / double(solved) : 0.0, planarPairs);
     m_note = buf;
+    {
+        char fb[96];
+        if (fovEstimated > 0.0)
+            std::snprintf(fb, sizeof fb, "; fov %.1f deg, ESTIMATED from the matches",
+                          fovEstimated);
+        else
+            std::snprintf(fb, sizeof fb, "; fov %.1f deg as given", fovDeg);
+        m_note += fb;
+        if (revisitsKept + revisitsDropped > 0) {
+            std::snprintf(fb, sizeof fb,
+                          "; revisits: %d agree with the chain, %d dropped",
+                          revisitsKept, revisitsDropped);
+            m_note += fb;
+        }
+    }
 
     if (solved == 0) {
         *err = "relative_pose: no pair yielded a usable essential matrix -- " + m_note;

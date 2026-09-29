@@ -61,6 +61,11 @@ private:
     bool UploadGeometry(Device& dev);
     bool UploadSplats(Device& dev);
     bool SortSplats(Device& dev, const OrbitCamera& cam);
+
+    // The frontmost point drawn within a few pixels of (sx, sy), for
+    // double-click to orbit about; false when nothing is near the cursor.
+    bool PickPoint(const OrbitCamera& cam, double sx, double sy, double w, double h,
+                   Vec3* out) const;
     void ReleaseGpu(Device& dev);
 
     // Whether this frame draws Gaussians rather than dots: the cloud has

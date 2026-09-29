@@ -27,12 +27,26 @@
 // between cameras. Three collinear cameras looking at a point off the line have
 // three distinct rays, and the spacing is determined again.
 //
-// The error is a NORMALISED DIRECTION DIFFERENCE, bounded to [0, 1]: the angle
-// between where a camera says a point is and where the current estimate puts
-// it, expressed so that a wildly wrong observation contributes no more than a
-// merely bad one. That bound is what lets the solve start from uniform random
-// positions -- which it does, in the paper and here -- with no initialisation
-// from anything.
+// HOW IT IS SOLVED HERE, in two parts -- and the second is what makes it work.
+//
+//   1. A START, from uniform random positions: alternating least squares,
+//      each point placed where its rays pass closest, then each camera where
+//      its rays best reach its points. Cheap and globally convergent enough to
+//      find the right basin.
+//   2. THE ANSWER: Levenberg-Marquardt on the ANGLE between each ray and the
+//      direction to its point -- the paper's normalised direction error, the
+//      chord between two unit vectors, bounded -- with points eliminated per
+//      track as bundle adjustment does. See RefineAngular.
+//
+// Part 1 used to be all of it, and it was the reason reconstructions failed.
+// Perpendicular distance is not the paper's error: it rewards shrinking the
+// scene, and alternating passes converge one link of the chain at a time.
+// Measured on castle-P19: mean ray residual 4.97 degrees, 424 of 2803 tracks
+// triangulated at a 32 px median -- a walk-around that did not reconstruct,
+// which this README had put down to the imagery. With part 2: 0.81 degrees,
+// 2166 tracks at 0.9 px, and the focal refined to 58.4 degrees against the
+// dataset's calibrated 58.2. fountain-P11, which had always "worked", had been
+// biased too -- its focal came back as 50 degrees; it now refines to 57.4.
 //
 // SCALE IS NOT RECOVERABLE. The whole reconstruction can be scaled freely and
 // every measurement stays satisfied, exactly as the whole thing can be rotated
@@ -57,6 +71,261 @@ struct Ray {
     Vec3 dir;       // unit, world space: which way the camera saw the point
     double weight = 1.0;
 };
+
+// THE REFINEMENT: Levenberg-Marquardt on the ANGLE each ray makes with the
+// direction to its point, cameras and points together.
+//
+// Why it exists. The alternating solve above minimises each point's
+// PERPENDICULAR DISTANCE from its rays. That objective has a trivial
+// optimum -- shrink everything toward one spot and every distance goes to
+// zero -- and alternating passes creep toward it while moving information
+// only one link along the chain per pass. Measured on castle-P19: after the
+// default 150 passes even the best-constrained cameras sat at a 1 degree
+// median ray residual, and 2000 passes brought cameras 0-3 to 0.16 --
+// nowhere near converged, and the answer depended on the pass count. What
+// the formulation this stage follows actually bounds is the ANGLE, which is
+// scale-free: no collapse to reward.
+//
+// The residual is the chord r = u - v between the observed unit ray v and
+// the unit direction u = (X - c)/|X - c| to the point: |r| = 2 sin(theta/2),
+// bounded by 2, smooth, and large for a point BEHIND the camera -- so
+// cheirality needs no special case. Huber-weighted, so a mismatched track
+// cannot drag a camera.
+//
+// Solved as bundle adjustment is: each point's 3x3 block eliminated (the
+// Schur complement), leaving a dense 3C x 3C system in the camera positions
+// -- 300 x 300 for a hundred cameras, trivial. NO camera is held fixed:
+// translation and scale are left free and the damping keeps steps along them
+// small. Holding the first camera fixed was tried and failed exactly when it
+// mattered -- a start that placed that camera badly left it stranded, its
+// rays written off as outliers by the robust loss while the rest solved
+// around it (frame 0 of a video walk-around, 1.5 radii from frame 1).
+double RefineAngular(const std::vector<Ray>& rays, const std::vector<bool>& solved,
+                   int iterations, double huber, std::vector<Vec3>* camPos,
+                   std::vector<Vec3>* pts) {
+    const int nCam = int(camPos->size()), nTrk = int(pts->size());
+    std::vector<int> var(size_t(nCam), -1);
+    int nv = 0;
+    for (int c = 0; c < nCam; ++c) {
+        if (!solved[size_t(c)]) continue;
+        var[size_t(c)] = nv++;
+    }
+    if (nv == 0) return 0.0;
+    const int n3 = nv * 3;
+
+    // Rays grouped by track, for the per-point elimination.
+    std::vector<std::vector<int>> byTrack;
+    byTrack.resize(size_t(nTrk));
+    for (size_t r = 0; r < rays.size(); ++r)
+        if (solved[size_t(rays[r].camera)]) byTrack[size_t(rays[r].track)].push_back(int(r));
+
+    auto cost = [&](const std::vector<Vec3>& cp, const std::vector<Vec3>& pp) {
+        double s = 0.0;
+        for (const Ray& r : rays) {
+            if (!solved[size_t(r.camera)]) continue;
+            const Vec3 d = pp[size_t(r.track)] - cp[size_t(r.camera)];
+            const double L = d.Norm();
+            if (L < 1e-12) continue;
+            const double e = (d * (1.0 / L) - r.dir).Norm();
+            s += e <= huber ? 0.5 * e * e : huber * (e - 0.5 * huber);
+        }
+        return s;
+    };
+
+    double lambda = 1e-3;
+    double cur = cost(*camPos, *pts);
+    std::vector<double> S, rhs;
+    S.resize(size_t(n3) * size_t(n3));
+    rhs.resize(size_t(n3));
+    for (int it = 0; it < iterations; ++it) {
+        std::fill(S.begin(), S.end(), 0.0);
+        std::fill(rhs.begin(), rhs.end(), 0.0);
+        // Per point: its block, its gradient, and each ray's camera coupling.
+        struct PointSys { double H[9]; Vec3 g; };
+        std::vector<PointSys> psys;
+        psys.resize(size_t(nTrk));
+        std::vector<double> rayA(rays.size() * 9, 0.0);   // w A A per ray
+        std::vector<Vec3>   rayG(rays.size());            // w A r per ray
+
+        for (int t = 0; t < nTrk; ++t) {
+            PointSys& P = psys[size_t(t)];
+            std::fill(P.H, P.H + 9, 0.0);
+            P.g = Vec3{0, 0, 0};
+            for (int ri : byTrack[size_t(t)]) {
+                const Ray& r = rays[size_t(ri)];
+                const Vec3 d = (*pts)[size_t(t)] - (*camPos)[size_t(r.camera)];
+                const double L = d.Norm();
+                if (L < 1e-12) continue;
+                const Vec3 u = d * (1.0 / L);
+                const Vec3 res = u - r.dir;
+                const double e = res.Norm();
+                const double w = e <= huber ? 1.0 : huber / e;
+                // du/dX = A = (I - u u^T) / L, symmetric; du/dc = -A.
+                double A[9];
+                const double uu[3] = {u.x, u.y, u.z};
+                for (int a = 0; a < 3; ++a)
+                    for (int b = 0; b < 3; ++b)
+                        A[a * 3 + b] = ((a == b ? 1.0 : 0.0) - uu[a] * uu[b]) / L;
+                double* AA = &rayA[size_t(ri) * 9];
+                for (int a = 0; a < 3; ++a)
+                    for (int b = 0; b < 3; ++b) {
+                        double v = 0.0;
+                        for (int k = 0; k < 3; ++k) v += A[a * 3 + k] * A[k * 3 + b];
+                        AA[a * 3 + b] = w * v;
+                        P.H[a * 3 + b] += w * v;
+                    }
+                const double rr[3] = {res.x, res.y, res.z};
+                double Ar[3];
+                for (int a = 0; a < 3; ++a)
+                    Ar[a] = w * (A[a * 3 + 0] * rr[0] + A[a * 3 + 1] * rr[1] + A[a * 3 + 2] * rr[2]);
+                rayG[size_t(ri)] = Vec3{Ar[0], Ar[1], Ar[2]};
+                P.g = P.g + Vec3{Ar[0], Ar[1], Ar[2]};
+                // Camera diagonal block and gradient (d/dc = -A).
+                const int vc = var[size_t(r.camera)];
+                if (vc >= 0) {
+                    for (int a = 0; a < 3; ++a)
+                        for (int b = 0; b < 3; ++b)
+                            S[size_t(vc * 3 + a) * size_t(n3) + size_t(vc * 3 + b)] +=
+                                AA[a * 3 + b];
+                    rhs[size_t(vc * 3 + 0)] += Ar[0];   // -g_c = +A r
+                    rhs[size_t(vc * 3 + 1)] += Ar[1];
+                    rhs[size_t(vc * 3 + 2)] += Ar[2];
+                }
+            }
+        }
+
+        // Damped point blocks, inverted; Schur-eliminated into S and rhs.
+        std::vector<double> Hinv(size_t(nTrk) * 9, 0.0);
+        auto inv3 = [](const double M[9], double* out) {
+            const double det = M[0] * (M[4] * M[8] - M[5] * M[7]) -
+                               M[1] * (M[3] * M[8] - M[5] * M[6]) +
+                               M[2] * (M[3] * M[7] - M[4] * M[6]);
+            if (std::fabs(det) < 1e-300) return false;
+            out[0] = (M[4] * M[8] - M[5] * M[7]) / det; out[1] = (M[2] * M[7] - M[1] * M[8]) / det;
+            out[2] = (M[1] * M[5] - M[2] * M[4]) / det; out[3] = (M[5] * M[6] - M[3] * M[8]) / det;
+            out[4] = (M[0] * M[8] - M[2] * M[6]) / det; out[5] = (M[2] * M[3] - M[0] * M[5]) / det;
+            out[6] = (M[3] * M[7] - M[4] * M[6]) / det; out[7] = (M[1] * M[6] - M[0] * M[7]) / det;
+            out[8] = (M[0] * M[4] - M[1] * M[3]) / det;
+            return true;
+        };
+        for (int a = 0; a < n3; ++a)
+            S[size_t(a) * size_t(n3) + size_t(a)] *= (1.0 + lambda);
+        for (int a = 0; a < n3; ++a) S[size_t(a) * size_t(n3) + size_t(a)] += 1e-12;
+        for (int t = 0; t < nTrk; ++t) {
+            PointSys& P = psys[size_t(t)];
+            double Hd[9];
+            std::copy(P.H, P.H + 9, Hd);
+            for (int a = 0; a < 3; ++a) Hd[a * 4] = Hd[a * 4] * (1.0 + lambda) + 1e-12;
+            double* Hi = &Hinv[size_t(t) * 9];
+            if (!inv3(Hd, Hi)) { std::fill(Hi, Hi + 9, 0.0); continue; }
+            // H_ct = -AA per ray (d/dc = -A, d/dX = A). With -g_X = -P.g:
+            // S -= H_ct Hi H_tc = AA_i Hi AA_j; rhs -= H_ct Hi (-g_X) = AA_i Hi (-P.g)... signs below.
+            const std::vector<int>& rs = byTrack[size_t(t)];
+            // Hi * (-g_X)
+            const double gx[3] = {-P.g.x, -P.g.y, -P.g.z};
+            double hg[3];
+            for (int a = 0; a < 3; ++a)
+                hg[a] = Hi[a * 3 + 0] * gx[0] + Hi[a * 3 + 1] * gx[1] + Hi[a * 3 + 2] * gx[2];
+            for (int ri : rs) {
+                const int vi = var[size_t(rays[size_t(ri)].camera)];
+                if (vi < 0) continue;
+                const double* Ai = &rayA[size_t(ri) * 9];   // H_{c_i t} = -Ai
+                // rhs_i -= H_ct Hi (-g_X) = -(-Ai) hg = +Ai hg
+                for (int a = 0; a < 3; ++a)
+                    rhs[size_t(vi * 3 + a)] +=
+                        Ai[a * 3 + 0] * hg[0] + Ai[a * 3 + 1] * hg[1] + Ai[a * 3 + 2] * hg[2];
+                // (Ai Hi) once, then times each Aj: S_ij -= (-Ai) Hi (-Aj) = Ai Hi Aj
+                double AiHi[9];
+                for (int a = 0; a < 3; ++a)
+                    for (int b = 0; b < 3; ++b) {
+                        double v = 0.0;
+                        for (int k = 0; k < 3; ++k) v += Ai[a * 3 + k] * Hi[k * 3 + b];
+                        AiHi[a * 3 + b] = v;
+                    }
+                for (int rj : rs) {
+                    const int vj = var[size_t(rays[size_t(rj)].camera)];
+                    if (vj < 0) continue;
+                    const double* Aj = &rayA[size_t(rj) * 9];
+                    for (int a = 0; a < 3; ++a)
+                        for (int b = 0; b < 3; ++b) {
+                            double v = 0.0;
+                            for (int k = 0; k < 3; ++k) v += AiHi[a * 3 + k] * Aj[k * 3 + b];
+                            S[size_t(vi * 3 + a) * size_t(n3) + size_t(vj * 3 + b)] -= v;
+                        }
+                }
+            }
+        }
+
+        // Dense Cholesky, in place in a copy.
+        std::vector<double> Lm = S;
+        bool ok = true;
+        for (int j = 0; j < n3 && ok; ++j) {
+            double s = Lm[size_t(j) * size_t(n3) + size_t(j)];
+            for (int k = 0; k < j; ++k) s -= Lm[size_t(j) * size_t(n3) + size_t(k)] *
+                                             Lm[size_t(j) * size_t(n3) + size_t(k)];
+            if (s <= 0.0) { ok = false; break; }
+            const double d = std::sqrt(s);
+            Lm[size_t(j) * size_t(n3) + size_t(j)] = d;
+            for (int i = j + 1; i < n3; ++i) {
+                double v = Lm[size_t(i) * size_t(n3) + size_t(j)];
+                for (int k = 0; k < j; ++k) v -= Lm[size_t(i) * size_t(n3) + size_t(k)] *
+                                                 Lm[size_t(j) * size_t(n3) + size_t(k)];
+                Lm[size_t(i) * size_t(n3) + size_t(j)] = v / d;
+            }
+        }
+        if (!ok) { lambda *= 10.0; continue; }
+        std::vector<double> y, dc;
+        y.resize(size_t(n3));
+        dc.resize(size_t(n3));
+        for (int i = 0; i < n3; ++i) {
+            double v = rhs[size_t(i)];
+            for (int k = 0; k < i; ++k) v -= Lm[size_t(i) * size_t(n3) + size_t(k)] * y[size_t(k)];
+            y[size_t(i)] = v / Lm[size_t(i) * size_t(n3) + size_t(i)];
+        }
+        for (int i = n3 - 1; i >= 0; --i) {
+            double v = y[size_t(i)];
+            for (int k = i + 1; k < n3; ++k) v -= Lm[size_t(k) * size_t(n3) + size_t(i)] * dc[size_t(k)];
+            dc[size_t(i)] = v / Lm[size_t(i) * size_t(n3) + size_t(i)];
+        }
+
+        // Candidate: cameras moved, then each point from its own block:
+        // dX = Hi (-g_X - H_tc dc) = Hi (-g_X + sum Ai dc_i).
+        std::vector<Vec3> nc = *camPos, np = *pts;
+        for (int c = 0; c < nCam; ++c) {
+            const int v = var[size_t(c)];
+            if (v >= 0) nc[size_t(c)] = nc[size_t(c)] + Vec3{dc[size_t(v * 3)], dc[size_t(v * 3 + 1)],
+                                                            dc[size_t(v * 3 + 2)]};
+        }
+        for (int t = 0; t < nTrk; ++t) {
+            const double* Hi = &Hinv[size_t(t) * 9];
+            double q[3] = {-psys[size_t(t)].g.x, -psys[size_t(t)].g.y, -psys[size_t(t)].g.z};
+            for (int ri : byTrack[size_t(t)]) {
+                const int v = var[size_t(rays[size_t(ri)].camera)];
+                if (v < 0) continue;
+                const double* Ai = &rayA[size_t(ri) * 9];
+                for (int a = 0; a < 3; ++a)
+                    q[a] += Ai[a * 3 + 0] * dc[size_t(v * 3)] + Ai[a * 3 + 1] * dc[size_t(v * 3 + 1)] +
+                            Ai[a * 3 + 2] * dc[size_t(v * 3 + 2)];
+            }
+            np[size_t(t)] = np[size_t(t)] + Vec3{Hi[0] * q[0] + Hi[1] * q[1] + Hi[2] * q[2],
+                                                Hi[3] * q[0] + Hi[4] * q[1] + Hi[5] * q[2],
+                                                Hi[6] * q[0] + Hi[7] * q[1] + Hi[8] * q[2]};
+        }
+        const double next = cost(nc, np);
+        if (next < cur) {
+            *camPos = std::move(nc);
+            *pts = std::move(np);
+            const bool tiny = cur - next < 1e-9 * cur;
+            cur = next;
+            lambda = std::max(1e-6, lambda / 3.0);
+            if (tiny) break;
+        } else {
+            lambda *= 5.0;
+            if (lambda > 1e8) break;
+        }
+    }
+    return cur;
+}
 
 class GlobalPosition : public AlgorithmBase {
 public:
@@ -103,6 +372,13 @@ private:
                  "each; convergence is fast at first and then slow, which is "
                  "normal for an alternating scheme."}};
 
+    Param<int> m_refine{this, "refine", 100, 0, 1000,
+        {.help = "Levenberg-Marquardt steps on the angle between each ray and "
+                 "its point, after the alternating passes. The passes only "
+                 "reach a starting point: they minimise distance, which rewards "
+                 "shrinking the scene, and converge one link of the chain at a "
+                 "time. 0 skips it, for comparison."}};
+
     Param<int> m_seed{this, "seed", 1, 0, 100000,
         {.help = "Random seed for the initial positions. The joint method "
                  "starts from uniform random -- the GLOMAP formulation is "
@@ -111,6 +387,7 @@ private:
                  "merely asserted."}};
 
     std::string m_note;
+    std::string m_start;   // which starting point the refinement kept
 };
 
 // --- the joint method --------------------------------------------------------
@@ -136,6 +413,7 @@ private:
 bool GlobalPosition::SolveJoint(PointCloud* cloud, std::string* err) {
     const int nCam = int(cloud->cameras.size());
     const int nTrk = int(cloud->tracks.size());
+    m_start.clear();
     if (nTrk == 0) {
         *err = "global_position: no tracks -- run build_tracks first";
         return false;
@@ -170,6 +448,12 @@ bool GlobalPosition::SolveJoint(PointCloud* cloud, std::string* err) {
     // roughly how much evidence there is, and the STANDARD ERROR of an
     // estimate from n samples falls as sqrt(n). Using n itself would let one
     // rich pair dominate the entire reconstruction.
+    //
+    // These weights apply to the alternating START only. RefineAngular, which
+    // produces the answer, relies on its robust loss instead -- and the "two
+    // clusters" measured above were mostly that start failing to converge,
+    // not the weak link alone: with the refinement, castle-P19 is one
+    // connected reconstruction at a 0.8 degree mean ray residual.
     std::vector<double> camSupport(size_t(nCam), 0.0);
     for (const PointCloud::ViewEdge& e : cloud->edges) {
         if (e.i < 0 || e.i >= nCam || e.j < 0 || e.j >= nCam) continue;
@@ -338,6 +622,109 @@ bool GlobalPosition::SolveJoint(PointCloud* cloud, std::string* err) {
         }
     }
 
+    // --- refinement: the angle, not the distance -------------------------------
+    // The alternating passes above are only the starting point; see
+    // RefineAngular for why they cannot be the answer.
+    if (int(m_refine) > 0) {
+        std::vector<bool> isSolved(size_t(nCam), false);
+        for (int c = 0; c < nCam; ++c) isSolved[size_t(c)] = cloud->cameras[size_t(c)].solved;
+
+        // A SECOND START, from the pairs' own translation DIRECTIONS chained
+        // along the sequence at equal steps -- and the refinement run from
+        // both, keeping whichever explains the rays better.
+        //
+        // Why: the angle cannot see scale, so a stretch of cameras tied to
+        // the rest by few tracks can sit at almost any scale for almost no
+        // cost -- and the alternating start above, which minimises DISTANCE,
+        // hands it a shrunken one. Measured on a 100-frame video: frames 18
+        // to 71 crushed into a clump, with a jump of 2.26 radii either side,
+        // at a 0.47 degree residual that looked healthy. A chain of equal
+        // steps has no such bias: for video, where frames are evenly spaced
+        // in time, it is close to the truth, and for photographs it is at
+        // least a start with one scale throughout.
+        std::vector<Vec3> chainCam = camPos, chainPt = pt;
+        bool chainOk = false;
+        {
+            struct E { int a, b, gap, inl; Vec3 dirW; };
+            std::vector<E> es;
+            for (const PointCloud::ViewEdge& e : cloud->edges) {
+                if (e.i < 0 || e.i >= nCam || e.j < 0 || e.j >= nCam) continue;
+                if (!isSolved[size_t(e.i)] || !isSolved[size_t(e.j)]) continue;
+                // direction is i-to-j in camera i's frame; into the world:
+                es.push_back({e.i, e.j, std::abs(e.j - e.i), e.inliers,
+                              cloud->cameras[size_t(e.i)].R.Transpose() * e.direction});
+            }
+            // Nearest neighbours first, then the best supported: a chain
+            // along the sequence, not a leap across it.
+            std::sort(es.begin(), es.end(), [](const E& x, const E& y) {
+                return x.gap != y.gap ? x.gap < y.gap : x.inl > y.inl;
+            });
+            std::vector<char> known(size_t(nCam), 0);
+            int root = -1;
+            for (int c = 0; c < nCam && root < 0; ++c) if (isSolved[size_t(c)]) root = c;
+            if (root >= 0) {
+                known[size_t(root)] = 1;
+                chainCam[size_t(root)] = Vec3{0, 0, 0};
+                int reached = 1;
+                bool grew = true;
+                while (grew) {
+                    grew = false;
+                    for (const E& e : es) {
+                        if (known[size_t(e.a)] && !known[size_t(e.b)]) {
+                            chainCam[size_t(e.b)] = chainCam[size_t(e.a)] + e.dirW;
+                            known[size_t(e.b)] = 1; ++reached; grew = true;
+                        } else if (known[size_t(e.b)] && !known[size_t(e.a)]) {
+                            chainCam[size_t(e.a)] = chainCam[size_t(e.b)] - e.dirW;
+                            known[size_t(e.a)] = 1; ++reached; grew = true;
+                        }
+                    }
+                }
+                int want = 0;
+                for (int c = 0; c < nCam; ++c) want += isSolved[size_t(c)] ? 1 : 0;
+                chainOk = reached == want;
+            }
+            if (chainOk) {
+                // Points where their rays pass closest, then in front of the
+                // cameras that saw them -- the same step the alternating
+                // solve takes, once.
+                std::vector<double> A(size_t(nTrk) * 9, 0.0);
+                std::vector<Vec3> b;
+                b.resize(size_t(nTrk));
+                for (const Ray& r : rays) {
+                    const Vec3& o = chainCam[size_t(r.camera)];
+                    const Vec3& d = r.dir;
+                    double* a = &A[size_t(r.track) * 9];
+                    a[0] += 1.0 - d.x * d.x; a[1] += -d.x * d.y; a[2] += -d.x * d.z;
+                    a[3] += -d.y * d.x; a[4] += 1.0 - d.y * d.y; a[5] += -d.y * d.z;
+                    a[6] += -d.z * d.x; a[7] += -d.z * d.y; a[8] += 1.0 - d.z * d.z;
+                    b[size_t(r.track)] = b[size_t(r.track)] +
+                        Vec3{o.x - d.x * d.Dot(o), o.y - d.y * d.Dot(o), o.z - d.z * d.Dot(o)};
+                }
+                for (int t = 0; t < nTrk; ++t) {
+                    Vec3 x;
+                    if (solve3(&A[size_t(t) * 9], b[size_t(t)], &x)) chainPt[size_t(t)] = x;
+                }
+                for (const Ray& r : rays) {
+                    const Vec3 rel = chainPt[size_t(r.track)] - chainCam[size_t(r.camera)];
+                    if (rel.Dot(r.dir) <= 1e-6)
+                        chainPt[size_t(r.track)] = chainCam[size_t(r.camera)] + r.dir * 1.0;
+                }
+            }
+        }
+
+        const double costAlt = RefineAngular(rays, isSolved, int(m_refine), 0.035, &camPos, &pt);
+        m_start = "alternating";
+        if (chainOk) {
+            const double costChain =
+                RefineAngular(rays, isSolved, int(m_refine), 0.035, &chainCam, &chainPt);
+            if (costChain < costAlt) {
+                camPos.swap(chainCam);
+                pt.swap(chainPt);
+                m_start = "chained directions";
+            }
+        }
+    }
+
     // --- gauge: centre at the origin, unit mean camera distance -------------
     //
     // Scale and position are free (see the header), so a convention is needed
@@ -390,6 +777,7 @@ bool GlobalPosition::SolveJoint(PointCloud* cloud, std::string* err) {
                   solved, nTrk, int(rays.size()),
                   resid * 180.0 / 3.14159265358979);
     m_note = buf;
+    if (!m_start.empty()) m_note += "; refined from the " + m_start + " start";
     return true;
 }
 

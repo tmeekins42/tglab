@@ -41,6 +41,13 @@ public:
     // ignores the Image* it is handed. That keeps every existing view
     // untouched by the arrival of a data type it will never display.
     virtual void SetPointCloud(std::shared_ptr<const PointCloud>) {}
+
+    // True when the source is switched off (an unticked stage upstream), so
+    // the view can say so instead of "computing..." forever.
+    void SetOff(bool off) { m_off = off; }
+
+protected:
+    bool m_off = false;
 };
 
 } // namespace tglab

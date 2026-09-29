@@ -239,6 +239,20 @@ void MakeThumbnail(Image& src, int maxSide, Image* out, float exposureStops) {
 // what only the palette needs: the file each member came from, and its own
 // thumbnail. Kept in step by RefreshMembers(), which is called wherever the
 // set changes rather than trusted to stay aligned.
+// A NEW VERSION NUMBER FOR A PALETTE SLOT'S CONTENTS, unique across the whole
+// session.
+//
+// The pipeline caches by (slot name, version), so two different contents
+// must never share a pair. Counting per slot did not guarantee that: every
+// new slot started at 1, and one given a video landed on 2 -- exactly where
+// the slot it replaced had been. Delete "group", drop a different video,
+// rename it "group", and the run reused every cached stage of the old clip.
+// One counter for all slots makes a repeat impossible. UI thread only.
+inline uint64_t NextContentVersion() {
+    static uint64_t next = 0;
+    return ++next;
+}
+
 struct PaletteMember {
     std::string path;         // the file this member was loaded from
     GpuTexture  thumb;        // its own preview -- a group is N images, not one
@@ -254,7 +268,9 @@ struct PaletteEntry {
     GpuTexture  thumb;       // small preview, built lazily
     Image       thumbImage;  // downsampled copy the texture is built from
     uint64_t    thumbVersion = 0;   // version thumbImage was built at
-    uint64_t    version = 1;   // bumped on reload so the thumbnail refreshes
+    // Which contents this slot holds: changes whenever they do, and never
+    // repeats -- see NextContentVersion.
+    uint64_t    version = NextContentVersion();
 
     // Capture settings, carried from the load rather than read on demand.
     //
@@ -289,6 +305,20 @@ struct PaletteEntry {
     bool        isGroup = false;
     std::string axis    = "frame";
 
+    // A group decoded from one video file. Expanded, it shows as the clip it
+    // came from -- one picture with play/pause/stop -- rather than a hundred
+    // member rows: "expanding the group with a video should show the video
+    // like a single image". frameTimes is each kept frame's time in the clip,
+    // and the flag is dropped as soon as anything else is appended.
+    bool                isVideo = false;
+    std::vector<double> frameTimes;
+    int                 playFrame   = 0;
+    bool                playing     = false;
+    double              playClock   = 0.0;   // seconds into the clip
+    GpuTexture          playTex;
+    Image               playImage;
+    int                 playBuilt   = -1;    // frame playImage was made from
+
 
     // Auto-exposure measurement, cached.
     //
@@ -311,6 +341,7 @@ public:
     void AppendToGroup(PaletteEntry& e, Image&& img, const std::string& path,
                        ExifData exif = {});
     void RefreshMembers(PaletteEntry& e);
+    void DrawVideoPlayer(PaletteEntry& e, const ImageSet& set);
     std::string UniqueSlotName(const std::string& base) const;
     std::string NewGroupSlot();
     void SortGroupBy(PaletteEntry& e,
@@ -442,6 +473,12 @@ private:
     // Two lists costs a second retirement loop and nothing else, since the
     // names come from the same declaration list.
     std::vector<std::unique_ptr<Viewport3D>> m_views3d;
+
+    // Group viewers' frame selector: the chosen frame per frame count, what
+    // was last handed to the worker, and whether a run is owed to deliver it.
+    std::map<int, int>                  m_frameByCount;
+    std::map<std::string, int>          m_viewerFrames;
+    bool                                m_frameRunWanted = false;
 
     // Which declared viewers want a 3D panel, by name. Decided from the
     // pipeline's DECLARED port types at build time, so the layout settles
@@ -732,7 +769,11 @@ void App::Shutdown() {
     m_views.clear();
     m_retiredViews.clear();
     m_diffTex.Release();
-    for (PaletteEntry& e : m_palette) e.thumb.Release();
+    for (PaletteEntry& e : m_palette) {
+        e.thumb.Release();
+        e.playTex.Release();
+        for (PaletteMember& m : e.members) m.thumb.Release();
+    }
 
     // The viewer results hold references to the worker's GPU textures. Dropping
     // them here, after the worker has stopped and before the device goes, keeps
@@ -860,6 +901,7 @@ void App::AppendToGroup(PaletteEntry& e, Image&& img, const std::string& path,
                         ExifData exif) {
     tglab::AppendToGroup(&e.data, std::move(img), e.axis);
     const auto& set = std::get<ImageSet>(e.data);
+    e.isVideo = false;   // a photo added to a clip makes it an ordinary group
     e.path = set.images.size() == 1 ? path : "";
 
     // Record where this member came from, so the expanded row can name it and
@@ -879,14 +921,14 @@ void App::MakeGroup(PaletteEntry& e) {
     if (e.isGroup) return;
     e.isGroup = true;
     tglab::MakeGroup(&e.data, e.axis);
-    ++e.version;
+    e.version = NextContentVersion();
 }
 
 void App::Ungroup(PaletteEntry& e) {
     if (!e.isGroup) return;
     e.isGroup = false;
     tglab::Ungroup(&e.data);
-    ++e.version;
+    e.version = NextContentVersion();
 }
 
 
@@ -894,6 +936,64 @@ void App::InstallLoadedImage(LoadResult&& r) {
     if (!r.ok) {
         m_error = r.error;
         ReportError("");
+        return;
+    }
+
+    // A VIDEO: its chosen frames become a group, each member labelled with
+    // where in the clip it came from.
+    if (!r.frames.empty()) {
+        std::string file = r.path;
+        if (auto slash = file.find_last_of("/\\"); slash != std::string::npos)
+            file = file.substr(slash + 1);
+        std::string name = file;
+        if (auto dot = name.find_last_of('.'); dot != std::string::npos)
+            name = name.substr(0, dot);
+
+        // Onto a slot, it REPLACES what is there and keeps the slot's
+        // script-visible name -- so dropping a clip on sfm.tgl's "group" row
+        // runs the whole chain on it. Unlike photographs dropped on a group,
+        // it is not appended: a video is a complete capture, and mixing it
+        // into another set's frames would never be what was meant. Otherwise
+        // a new entry named after the file.
+        PaletteEntry* target = nullptr;
+        const std::string& want = r.targetSlot.empty() ? name : r.targetSlot;
+        for (PaletteEntry& e : m_palette)
+            if (e.name == want) { target = &e; break; }
+        if (!target) {
+            PaletteEntry e;
+            e.name = name;
+            m_palette.push_back(std::move(e));
+            target = &m_palette.back();
+        }
+        target->isGroup = false;
+        target->data = Data{};
+        RefreshMembers(*target);   // releases the old members' thumbnails
+        target->exif = ExifData{};
+        for (size_t i = 0; i < r.frames.size(); ++i) {
+            char label[64];
+            std::snprintf(label, sizeof(label), " @ %.2f s",
+                          i < r.frameTimes.size() ? r.frameTimes[i] : 0.0);
+            if (!target->isGroup && std::holds_alternative<std::monostate>(target->data)) {
+                target->data = Data{std::move(r.frames[i])};
+                MakeGroup(*target);
+                RefreshMembers(*target);
+                if (!target->members.empty()) target->members.back().path = file + label;
+            } else {
+                if (!target->isGroup) MakeGroup(*target);
+                AppendToGroup(*target, std::move(r.frames[i]), file + label, ExifData{});
+            }
+        }
+        target->path = r.path;
+        target->isVideo = true;
+        target->frameTimes = r.frameTimes;
+        target->frameTimes.resize(r.frames.size(), 0.0);
+        target->playFrame = 0;
+        target->playing = false;
+        target->playClock = 0.0;
+        target->playBuilt = -1;
+        target->version = NextContentVersion();
+        m_saveReport = file + ": " + r.note;
+        m_dirty = true;
         return;
     }
 
@@ -907,7 +1007,7 @@ void App::InstallLoadedImage(LoadResult&& r) {
                     e.data = Data{std::move(r.image)};
                     e.exif = std::move(r.exif);
                 }
-                ++e.version;            // makes the thumbnail rebuild
+                e.version = NextContentVersion();   // makes the thumbnail rebuild
                 m_dirty = true;
                 return;
             }
@@ -924,7 +1024,7 @@ void App::InstallLoadedImage(LoadResult&& r) {
             e.path = r.path;
             e.data = Data{std::move(r.image)};
             e.exif = std::move(r.exif);
-            ++e.version;
+            e.version = NextContentVersion();
             m_dirty = true;
             return;
         }
@@ -2652,7 +2752,7 @@ void App::SortGroupBy(PaletteEntry& e,
     }
     set->images = std::move(img);
     e.members   = std::move(mem);
-    ++e.version;
+    e.version = NextContentVersion();
 }
 
 static std::string BaseName(const std::string& p) {
@@ -2729,6 +2829,63 @@ void App::RefreshMembers(PaletteEntry& e) {
     } else while (e.members.size() < n) {
         e.members.emplace_back();
     }
+}
+
+// An expanded video group: the clip as one picture, with play/pause/stop and
+// a scrubber. It plays the KEPT frames at their times in the clip, so what is
+// shown is exactly what the scripts receive -- including the gaps where a
+// blurred stretch had no sharp frame to keep.
+void App::DrawVideoPlayer(PaletteEntry& e, const ImageSet& set) {
+    const int n = int(set.images.size());
+    e.playFrame = std::clamp(e.playFrame, 0, n - 1);
+
+    if (e.playing) {
+        e.playClock += double(ImGui::GetIO().DeltaTime);
+        int f = e.playFrame;
+        while (f + 1 < n && e.frameTimes[size_t(f) + 1] <= e.playClock) ++f;
+        e.playFrame = f;
+        if (f == n - 1 && e.playClock >= e.frameTimes.back()) e.playing = false;
+    }
+
+    ImGui::Indent(20.0f);
+    const float side = std::clamp(ImGui::GetContentRegionAvail().x, 64.0f, 320.0f);
+    if (e.playBuilt != e.playFrame) {
+        Image& src = const_cast<Image&>(set.images[size_t(e.playFrame)]);
+        MakeThumbnail(src, int(side) * 2, &e.playImage, 0.0f);
+        e.playBuilt = e.playFrame;
+    }
+    const uint64_t texVersion = (e.version << 20) + uint64_t(e.playFrame) + 1;
+    if (e.playImage.Valid() && e.playTex.Update(m_dev, e.playImage, texVersion)) {
+        const float iw = float(e.playTex.Width()), ih = float(e.playTex.Height());
+        const float sc = std::min(side / iw, side / ih);
+        ImGui::Image(ImTextureRef(static_cast<ImTextureID>(e.playTex.Handle().ptr)),
+                     ImVec2(iw * sc, ih * sc));
+    }
+
+    if (ImGui::SmallButton(e.playing ? "Pause" : "Play")) {
+        if (!e.playing && e.playFrame == n - 1) e.playFrame = 0;   // replay from the top
+        e.playing = !e.playing;
+        e.playClock = e.frameTimes[size_t(e.playFrame)];
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Stop")) {
+        e.playing = false;
+        e.playFrame = 0;
+        e.playClock = e.frameTimes.front();
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("%d / %d  @ %.2f s", e.playFrame + 1, n,
+                        e.frameTimes[size_t(e.playFrame)]);
+
+    ImGui::SetNextItemWidth(side);
+    int shown = e.playFrame + 1;
+    if (ImGui::SliderInt("##frame", &shown, 1, n)) {
+        e.playFrame = shown - 1;
+        e.playClock = e.frameTimes[size_t(e.playFrame)];
+    }
+    const ImageDesc& d = set.images[size_t(e.playFrame)].Desc();
+    ImGui::TextDisabled("%d frames kept, %d x %d", n, d.width, d.height);
+    ImGui::Unindent(20.0f);
 }
 
 void App::DrawPalettePanel() {
@@ -2957,7 +3114,7 @@ void App::DrawPalettePanel() {
                         if (ImGui::MenuItem(ax, nullptr, e.axis == ax)) {
                             e.axis = ax;
                             tglab::SetGroupAxis(&e.data, e.axis);
-                            ++e.version;
+                            e.version = NextContentVersion();
                             m_dirty = true;
                         }
                     }
@@ -2980,7 +3137,7 @@ void App::DrawPalettePanel() {
                 }
                 if (ImGui::MenuItem("Remove last image")) {
                     tglab::RemoveLastFromGroup(&e.data, e.axis);
-                    ++e.version;
+                    e.version = NextContentVersion();
                     m_dirty = true;
                 }
                 if (ImGui::MenuItem("Ungroup (keeps the first)")) {
@@ -2997,7 +3154,13 @@ void App::DrawPalettePanel() {
         // Expanded group: each member on its own row, indented, with its own
         // thumbnail and a remove button. "No way to see, select or delete an
         // individual image in a group" was the third thing reported.
-        if (e.isGroup && e.expanded && setPtr) {
+        const bool videoRow = e.isGroup && e.expanded && setPtr && e.isVideo &&
+                              !setPtr->images.empty() &&
+                              e.frameTimes.size() == setPtr->images.size();
+        if (videoRow) {
+            DrawVideoPlayer(e, *setPtr);
+            e.rowMax.y = std::max(e.rowMax.y, ImGui::GetCursorScreenPos().y);
+        } else if (e.isGroup && e.expanded && setPtr) {
             RefreshMembers(e);
             const float memberSize = 32.0f;
             int removeMember = -1;
@@ -3054,7 +3217,7 @@ void App::DrawPalettePanel() {
                 s->shape = Shape::Of(e.axis, int(s->images.size()));
                 e.members[size_t(removeMember)].thumb.Release();
                 e.members.erase(e.members.begin() + removeMember);
-                ++e.version;
+                e.version = NextContentVersion();
                 m_dirty = true;
             }
 
@@ -3084,6 +3247,8 @@ void App::DrawPalettePanel() {
     if (removeIndex >= 0) {
         // Release the GPU texture before the entry goes, while the device lives.
         m_palette[size_t(removeIndex)].thumb.Release();
+        m_palette[size_t(removeIndex)].playTex.Release();
+        for (PaletteMember& m : m_palette[size_t(removeIndex)].members) m.thumb.Release();
         m_palette.erase(m_palette.begin() + removeIndex);
         m_dirty = true;
     }
@@ -3560,11 +3725,47 @@ void App::Frame() {
         // than re-converting the same pixels because some other viewer moved.
         uint64_t ver = 0;
         std::shared_ptr<SharedGpuTexture> gpuSrc;
+        bool off = false;
         for (const ViewerImage& vi : m_viewerImages)
-            if (vi.name == v->Name()) { ver = vi.version; gpuSrc = vi.gpu; break; }
+            if (vi.name == v->Name()) { ver = vi.version; gpuSrc = vi.gpu; off = vi.off; break; }
         v->SetContentVersion(ver);
         v->SetGpuSource(std::move(gpuSrc));
+        v->SetOff(off);
+
+        // The frame selector. One choice per frame COUNT, so viewers of the
+        // same length move together -- "frames" and "render" then always show
+        // the same camera, side by side -- while a group of another length
+        // (the sweep's three maps per frame) keeps its own.
+        int count = 0, shownFrame = 0;
+        for (const ViewerImage& vi : m_viewerImages)
+            if (vi.name == v->Name()) { count = vi.frameCount; shownFrame = vi.frame; break; }
+        const int want = count > 1 ? std::clamp(m_frameByCount[count], 0, count - 1) : 0;
+        v->SetFrames(count, shownFrame, want);
         v->Draw(m_dev, img);
+        int picked = 0;
+        if (v->TakeFrameRequest(&picked) && count > 1)
+            m_frameByCount[count] = std::clamp(picked, 0, count - 1);
+    }
+
+    // Hand the choices to the worker. A change needs a run to deliver the new
+    // frame; everything upstream is cached, so it costs milliseconds. During a
+    // long run nothing is submitted -- that would cancel it -- and the run
+    // reads the new choice as it finishes.
+    {
+        std::map<std::string, int> frames;
+        for (auto& v : m_views) {
+            const int count = v->FrameCount();
+            if (count > 1) frames[v->Name()] = std::clamp(m_frameByCount[count], 0, count - 1);
+        }
+        if (frames != m_viewerFrames) {
+            m_viewerFrames = frames;
+            m_worker.SetViewerFrames(std::move(frames));
+            m_frameRunWanted = true;
+        }
+        if (m_frameRunWanted && !m_worker.Busy()) {
+            m_frameRunWanted = false;
+            m_dirty = true;
+        }
     }
 
     // The 3D viewports. Drawn in the same place and for the same reason: they
@@ -3572,11 +3773,13 @@ void App::Frame() {
     // its SRV to ImGui.
     for (auto& v : m_views3d) {
         std::shared_ptr<const PointCloud> cloud;
+        bool off = false;
         uint64_t ver = 0;
         for (const ViewerImage& vi : m_viewerImages)
-            if (vi.name == v->Name()) { cloud = vi.cloud; ver = vi.version; break; }
+            if (vi.name == v->Name()) { cloud = vi.cloud; ver = vi.version; off = vi.off; break; }
         v->SetContentVersion(ver);
         v->SetPointCloud(std::move(cloud));
+        v->SetOff(off);
         v->Draw(m_dev, nullptr);
     }
 

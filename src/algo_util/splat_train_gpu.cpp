@@ -821,10 +821,15 @@ bool SplatTrainerGpu::Step(const SplatCam& cam, const RasterOptions& opt,
     // --- loss: L1, as train_splats's CPU loop ------------------------------------
     clk = Clock::now();
     {
-        const float invN = float(1.0 / double(np * 3));
+        // A negative target is a masked pixel (train_splats' MaskUnmeasured):
+        // no gradient, and not counted in the mean.
+        size_t used = 0;
+        for (size_t i = 0; i < np * 3; ++i) if (target[i] >= 0.0) ++used;
+        const float invN = float(1.0 / double(std::max<size_t>(1, used)));
         std::vector<float> d(np * 4);
         for (size_t i = 0; i < np; ++i) {
             for (int ch = 0; ch < 3; ++ch) {
+                if (target[i * 3 + size_t(ch)] < 0.0) { d[i * 4 + size_t(ch)] = 0.0f; continue; }
                 const double diff = double(s.stage[i * 4 + size_t(ch)]) - target[i * 3 + size_t(ch)];
                 d[i * 4 + size_t(ch)] = diff > 0.0 ? invN : (diff < 0.0 ? -invN : 0.0f);
             }

@@ -41,6 +41,13 @@ struct LoadResult {
     // fresh open, seek and parse on the UI THREAD, once per selection change,
     // for a file that was just fully read.
     ExifData    exif;
+
+    // A VIDEO arrives as many frames rather than one image: the sharpest per
+    // time slot (see video_io.h), in time order, with each one's time in
+    // seconds. `image` is then empty, and `note` says what was kept.
+    std::vector<Image>  frames;
+    std::vector<double> frameTimes;
+    std::string         note;
 };
 
 class ImageLoader {

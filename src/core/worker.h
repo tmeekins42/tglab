@@ -73,6 +73,15 @@ struct ViewerImage {
     // costs nothing per frame instead of a full readback and conversion.
     uint64_t    version = 0;
 
+    // The source is switched off (Pipeline::IsOff): nothing to show, and the
+    // viewer says so rather than "computing...".
+    bool        off = false;
+
+    // For a GROUP: which of its images this is, and how many there are. 0/0
+    // for a single image or a cloud.
+    int         frame = 0;
+    int         frameCount = 0;
+
     // Set when the result is still on the GPU and can be drawn from there.
     // `image` is then a descriptor-only shell with no CPU pixels: no readback
     // happened, which is the whole point.
@@ -213,6 +222,13 @@ public:
     // because the panel only ever shows one, and only when the panel is open.
     void SetHistogramViewer(std::string name);
 
+    // Which frame each GROUP viewer should show, by viewer name; a viewer not
+    // named shows frame 0. Read when a run finishes and sends its viewers, so
+    // a choice made during a long run takes effect as that run ends -- it
+    // never cancels the run. Changing frames between runs costs a re-run that
+    // is entirely cached.
+    void SetViewerFrames(std::map<std::string, int> frames);
+
     // Runs the pipeline twice (CPU then GPU) and diffs the chosen stage.
     // Deliberately not coalesced with normal runs in the caller's mind: it is
     // an explicit, one-off request, not something a slider triggers.
@@ -273,6 +289,10 @@ private:
     // which viewers are worth cloning.
     std::vector<std::string>        m_visibleViewers;
     std::string                     m_histViewer;
+    std::map<std::string, int>      m_viewerFrames;
+    // Worker-thread only: the frame last sent per viewer, so a new choice
+    // bumps the version and the panel re-uploads.
+    std::map<std::string, int>      m_sentFrames;
     uint64_t              m_nextSeq = 1;
     ID3D12Device*         m_device = nullptr;
 };

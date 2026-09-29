@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(tglab VERSION 0.16.0 LANGUAGES CXX)
+project(tglab VERSION 0.17.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -37,6 +37,7 @@ add_library(tglab_core STATIC
     src/core/image.cpp
     src/core/image_io.cpp
     src/core/ply_io.cpp
+    src/core/video_io.cpp
     src/core/param.cpp
     src/core/lut.cpp
     src/core/algorithm.cpp
@@ -71,7 +72,8 @@ target_include_directories(tglab_core PUBLIC
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/third_party/stb
 )
-target_link_libraries(tglab_core PUBLIC imgui libraw d3d12 dxgi dxcompiler)
+target_link_libraries(tglab_core PUBLIC imgui libraw d3d12 dxgi dxcompiler
+                      mfplat mfreadwrite mfuuid ole32 propsys)
 
 # ---------------------------------------------------------------------------
 # Algorithms, one subfolder per category.

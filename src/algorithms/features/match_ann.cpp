@@ -40,6 +40,7 @@
 
 #include "../../algo_util/features.h"
 #include "../../core/algorithm.h"
+#include "../../core/parallel.h"
 
 namespace tglab {
 namespace {
@@ -410,42 +411,41 @@ public:
             }
         }
 
-        // The index is built ONCE over the reference and queried by every other
-        // frame. That is the whole reason an approximate matcher pays off in a
-        // group: the build is amortised over N-1 searches.
-        //
-        // Chain mode gives that up, necessarily: each frame queries a different
-        // neighbour, so there are N-1 builds over N-1 searches and the
-        // amortisation is gone. The index still beats brute force on a single
-        // pair -- that is what the checks/trees parameters buy -- but the
-        // margin is much smaller here than in the fixed-reference case, and a
-        // chained group is the one place brute force may well be the better
-        // choice. Said plainly rather than hidden: `builtFor` is what makes the
-        // rebuild explicit instead of accidental.
-        KdForest  forest;
-        LshTables lsh;
-        bool      isFloat  = false;
-        int       builtFor = -1;
+        // An index is built ONCE per frame that serves as a reference and
+        // queried by every frame matching against it: with a fixed reference
+        // that is one build over N-1 searches, and in a chain each frame's
+        // index serves its `window` successors and any revisits.
+        bool isFloat = false;
 
         // See match_brute's `window`: a chain alone holds no constraint
         // relating frame 8 to frame 5, so bundle adjustment has nothing to
         // correct drift with unless each frame matches several neighbours.
         const int window = chain ? std::max(1, int(m_window)) : 1;
 
-        for (size_t i = 0; i < images->size(); ++i) {
-            Image& img = (*images)[i];
-            const FeatureSidecar* fs = FeaturesOf(img);
+        // REVISITS: frames far apart in the sequence that see the same thing,
+        // matched as well as the neighbours. See SelectRevisits.
+        std::vector<std::vector<int>> revisitFor;
+        revisitFor.resize(images->size());
+        m_revisits = 0;
+        if (chain && int(m_revisit) > 0)
+            m_revisits = SelectRevisits(*images, window, int(m_revisit), &revisitFor);
+
+        // Which pairs, decided up front so the indexes can be built for
+        // exactly the frames that need them.
+        const size_t nImg = images->size();
+        const int nNeighbours = chain ? window : 1;
+        std::vector<std::vector<std::pair<int, bool>>> refsOf(nImg);   // (reference, revisit)
+        std::vector<char> isRef(nImg, 0), isQuery(nImg, 0);
+        for (size_t i = 0; i < nImg; ++i) {
+            const FeatureSidecar* fs = FeaturesOf((*images)[i]);
             if (!fs || fs->keypoints.empty()) continue;
-
-            auto ms = std::make_shared<MatchSidecar>();
-
-            for (int w = 1; w <= window; ++w) {
-                const int refIdx = chain ? int(i) - w : fixedRef;
+            const int nTotal = nNeighbours + int(revisitFor[i].size());
+            for (int w = 1; w <= nTotal; ++w) {
+                const int refIdx = w > nNeighbours ? revisitFor[i][size_t(w - nNeighbours - 1)]
+                                 : chain ? int(i) - w : fixedRef;
                 if (refIdx < 0 || int(i) == refIdx) continue;
-
                 const FeatureSidecar* ref = FeaturesOf((*images)[size_t(refIdx)]);
                 if (!ref || ref->keypoints.empty()) continue;
-
                 if (fs->descriptors.kind != ref->descriptors.kind ||
                     fs->descriptors.dim  != ref->descriptors.dim) {
                     *err = "match_ann: frame " + std::to_string(i) +
@@ -454,36 +454,64 @@ public:
                            ") -- one detector for the whole group";
                     return false;
                 }
+                isFloat = ref->descriptors.kind == DescriptorKind::Float;
+                refsOf[i].push_back({refIdx, w > nNeighbours});
+                isRef[size_t(refIdx)] = 1;
+                isQuery[i] = 1;
+                if (!chain) break;
+            }
+        }
 
-                if (builtFor != refIdx) {
-                    forest = KdForest{};
-                    lsh    = LshTables{};
-                    isFloat = ref->descriptors.kind == DescriptorKind::Float;
-                    if (isFloat)
-                        forest.Build(ref->descriptors, std::max(1, int(m_trees)), 8, 12345u);
-                    else
-                        lsh.Build(ref->descriptors, std::max(1, int(m_trees)),
-                                  int(m_keyBits), 12345u);
-                    builtFor = refIdx;
-                }
+        // EACH FRAME'S INDEX BUILT ONCE, in parallel, rather than once per
+        // pair: a chain of window 2 with 3 revisits rebuilt every frame's
+        // index about five times, plus a reverse index per pair for the cross
+        // check. The forward and reverse indexes keep their own seeds, so the
+        // matches are exactly what the pair-by-pair loop produced -- in about
+        // a sixth of the time on a 100-frame video (49 s to 8 s).
+        std::vector<KdForest>  fwdF(nImg), revF(nImg);
+        std::vector<LshTables> fwdL(nImg), revL(nImg);
+        const bool cross = bool(m_crossCheck);
+        ParallelFor(nImg, [&](size_t i) {
+            const FeatureSidecar* fs = FeaturesOf((*images)[i]);
+            if (!fs) return;
+            const int trees = std::max(1, int(m_trees));
+            if (isRef[i]) {
+                if (isFloat) fwdF[i].Build(fs->descriptors, trees, 8, 12345u);
+                else         fwdL[i].Build(fs->descriptors, trees, int(m_keyBits), 12345u);
+            }
+            if (isQuery[i] && cross) {
+                if (isFloat) revF[i].Build(fs->descriptors, trees, 8, 54321u);
+                else         revL[i].Build(fs->descriptors, trees, int(m_keyBits), 54321u);
+            }
+        });
 
+        std::vector<std::shared_ptr<MatchSidecar>> made(nImg);
+        ParallelFor(nImg, [&](size_t i) {
+            if (refsOf[i].empty()) return;
+            const FeatureSidecar* fs = FeaturesOf((*images)[i]);
+            auto ms = std::make_shared<MatchSidecar>();
+            for (const auto& [refIdx, revisit] : refsOf[i]) {
+                const FeatureSidecar* ref = FeaturesOf((*images)[size_t(refIdx)]);
                 MatchSet set;
                 set.reference = refIdx;
-                MatchPair(*ref, *fs, forest, lsh, isFloat, &set);
+                set.revisit = revisit;
+                MatchPair(*ref, *fs, fwdF[size_t(refIdx)], fwdL[size_t(refIdx)],
+                          revF[i], revL[i], isFloat, &set);
+                ms->considered += set.considered;
+                ms->sets.push_back(std::move(set));
+            }
+            made[i] = std::move(ms);
+        });
 
+        for (size_t i = 0; i < nImg; ++i) {
+            if (!made[i] || made[i]->sets.empty()) continue;
+            for (const MatchSet& set : made[i]->sets) {
                 m_total += set.considered;
                 m_kept  += int(set.matches.size());
                 ++m_pairs;
-                ms->considered += set.considered;
-                ms->sets.push_back(std::move(set));
-
-                if (!chain) break;
             }
-
-            if (!ms->sets.empty()) {
-                ms->matcher = isFloat ? "ann (kd-forest)" : "ann (lsh)";
-                img.Sidecars().Set(kMatchSidecar, ms);
-            }
+            made[i]->matcher = isFloat ? "ann (kd-forest)" : "ann (lsh)";
+            (*images)[i].Sidecars().Set(kMatchSidecar, made[i]);
         }
         return true;
     }
@@ -495,7 +523,11 @@ public:
         std::snprintf(buf, sizeof buf,
                       "matched %d pair%s approximately: %d of %d candidates kept",
                       m_pairs, m_pairs == 1 ? "" : "s", m_kept, m_total);
-        return buf;
+        std::string s = buf;
+        if (m_revisits > 0)
+            s += "; " + std::to_string(m_revisits) + " of them revisits -- far apart "
+                 "in the sequence, alike in view";
+        return s;
     }
 
     // Sidecar coordinates are in IMAGE PIXELS and nothing rescales them, so a
@@ -508,7 +540,8 @@ public:
 
 private:
     void MatchPair(const FeatureSidecar& ref, const FeatureSidecar& other,
-                   const KdForest& forest, const LshTables& lsh, bool isFloat,
+                   const KdForest& forest, const LshTables& lsh,
+                   const KdForest& revForest, const LshTables& revLsh, bool isFloat,
                    MatchSet* out) const {
         const float maxRatio = float(m_ratio);
         const int   checks   = std::max(1, int(m_checks));
@@ -526,18 +559,12 @@ private:
         //
         // Built by searching the same structures in reverse, so it is another
         // N approximate queries rather than an exact scan -- the point of this
-        // matcher is that nothing in it is O(n*m).
+        // matcher is that nothing in it is O(n*m). The reverse index over
+        // `other` is built once per frame by the caller.
         std::vector<int> backBest;
         if (bool(m_crossCheck)) {
             std::vector<Candidate> rc;
             backBest.assign(ref.descriptors.Count(), -1);
-
-            KdForest  revForest;
-            LshTables revLsh;
-            if (isFloat) revForest.Build(other.descriptors, std::max(1, int(m_trees)),
-                                         8, 54321u);
-            else         revLsh.Build(other.descriptors, std::max(1, int(m_trees)),
-                                      int(m_keyBits), 54321u);
 
             for (size_t i = 0; i < ref.descriptors.Count(); ++i) {
                 if (isFloat) revForest.Search(ref.descriptors.FloatAt(i), checks, &rc);
@@ -658,9 +685,126 @@ private:
                  "as the runner-up. See match_brute."},
     };
 
+    // REVISITS, which a chain alone never matches: frames far apart in the
+    // sequence that see the same thing. The end of a walk around an object
+    // is back where it started; a sweep that doubles back passes the same
+    // view twice. Matched only to their neighbours, those frames are joined
+    // by a long thin chain, along which scale and position errors
+    // accumulate with nothing to close them -- measured on a 100-frame video
+    // walking a full circle round a subject, the camera path opened into a
+    // spiral whose end landed three radii from its start.
+    //
+    // FOUND BY VOTING, not by trying every pair: a sample of each frame's
+    // descriptors goes into one index over the whole group, each sample
+    // votes for the frame its nearest match came from (when that match
+    // clearly beats the runner-up), and a pair's score is its votes in both
+    // directions. A frame's revisit candidates are the highest-scoring
+    // frames outside its neighbour window, kept when they reach a quarter of
+    // the typical NEIGHBOUR score -- relative, so the threshold means the same
+    // at any feature count or scene. The chosen pairs then go through the
+    // same matching as the neighbours, and relative_pose decides whether
+    // each one is real.
+    int SelectRevisits(const std::vector<Image>& images, int window, int perFrame,
+                       std::vector<std::vector<int>>* out) const {
+        const int n = int(images.size());
+        const size_t kSample = 300;
+        DescriptorSet pool;
+        std::vector<int> owner;
+        std::vector<std::vector<size_t>> mine;   // each frame's rows in the pool
+        mine.resize(size_t(n));
+        for (int f = 0; f < n; ++f) {
+            const FeatureSidecar* fs = FeaturesOf(images[size_t(f)]);
+            if (!fs || fs->descriptors.Count() == 0) continue;
+            const DescriptorSet& d = fs->descriptors;
+            if (pool.kind == DescriptorKind::None) { pool.kind = d.kind; pool.dim = d.dim; }
+            if (d.kind != pool.kind || d.dim != pool.dim) return 0;
+            const size_t cnt = d.Count();
+            const size_t stride = std::max<size_t>(1, cnt / kSample);
+            for (size_t k = 0; k < cnt && mine[size_t(f)].size() < kSample; k += stride) {
+                mine[size_t(f)].push_back(owner.size());
+                owner.push_back(f);
+                if (d.kind == DescriptorKind::Float)
+                    pool.f.insert(pool.f.end(), d.FloatAt(k), d.FloatAt(k) + d.dim);
+                else
+                    pool.b.insert(pool.b.end(), d.BinaryAt(k),
+                                  d.BinaryAt(k) + d.BytesPerBinary());
+            }
+        }
+        if (owner.empty()) return 0;
+        const bool isFloat = pool.kind == DescriptorKind::Float;
+        KdForest forest;
+        LshTables lsh;
+        if (isFloat) forest.Build(pool, std::max(1, int(m_trees)), 8, 777u);
+        else         lsh.Build(pool, std::max(1, int(m_trees)), int(m_keyBits), 777u);
+
+        std::vector<float> votes(size_t(n) * size_t(n), 0.0f);
+        const float ratio = float(m_ratio);
+        const int checks = std::max(1, int(m_checks));
+        // Each frame writes only its own row of votes.
+        ParallelFor(size_t(n), [&](size_t fi) {
+            const int f = int(fi);
+            std::vector<Candidate> c;
+            for (size_t row : mine[size_t(f)]) {
+                if (isFloat) forest.Search(pool.FloatAt(row), checks, &c);
+                else         lsh.Search(pool.BinaryAt(row), checks, &c);
+                // Best and runner-up among OTHER frames' samples.
+                float b1 = std::numeric_limits<float>::max(), b2 = b1;
+                int who = -1;
+                for (const Candidate& cd : c) {
+                    if (cd.index < 0 || owner[size_t(cd.index)] == f) continue;
+                    if (cd.dist < b1) { b2 = b1; b1 = cd.dist; who = owner[size_t(cd.index)]; }
+                    else if (cd.dist < b2) b2 = cd.dist;
+                }
+                if (who >= 0 && b1 < ratio * b2) votes[size_t(f) * size_t(n) + size_t(who)] += 1.0f;
+            }
+        });
+        auto score = [&](int a, int b) {
+            return votes[size_t(a) * size_t(n) + size_t(b)] + votes[size_t(b) * size_t(n) + size_t(a)];
+        };
+
+        // The typical NEIGHBOUR score, which every revisit is judged against.
+        std::vector<float> nb;
+        for (int f = 1; f < n; ++f) nb.push_back(score(f, f - 1));
+        if (nb.empty()) return 0;
+        std::nth_element(nb.begin(), nb.begin() + long(nb.size() / 2), nb.end());
+        const float bar = 0.25f * nb[nb.size() / 2];
+
+        // Each unordered pair once, stored on the later frame with the earlier
+        // as its reference -- the chain's own convention.
+        std::vector<char> taken(size_t(n) * size_t(n), 0);
+        int added = 0;
+        for (int f = 0; f < n; ++f) {
+            std::vector<std::pair<float, int>> cand;
+            for (int g = 0; g < n; ++g) {
+                if (std::abs(g - f) <= window) continue;
+                const float s = score(f, g);
+                if (s >= bar && s > 0.0f) cand.emplace_back(s, g);
+            }
+            std::sort(cand.begin(), cand.end(), std::greater<>());
+            for (size_t k = 0; k < cand.size() && int(k) < perFrame; ++k) {
+                const int a = std::min(f, cand[k].second), b = std::max(f, cand[k].second);
+                char& t = taken[size_t(a) * size_t(n) + size_t(b)];
+                if (t) continue;
+                t = 1;
+                (*out)[size_t(b)].push_back(a);
+                ++added;
+            }
+        }
+        return added;
+    }
+
+    Param<int> m_revisit{this, "revisit", 0, 0, 8,
+        {.help = "In a chain, ALSO match each frame against up to this many "
+                 "frames elsewhere in the sequence that look most like it -- "
+                 "the end of a walk around an object meeting its start, a "
+                 "sweep passing the same view twice. What closes the loop, so "
+                 "drift has something to correct against. 0 matches "
+                 "neighbours only."}};
+
     int         m_pairs = 0;
     int         m_total = 0;
     int         m_kept  = 0;
+    int         m_revisits = 0;
     std::string m_note;
 };
 

@@ -91,6 +91,8 @@ Names are the filename without extension and are case-sensitive, so
 
 A group holds several images in one slot and expands to show its members.
 Collapsed, it draws as a stack. That is what feeds the merge algorithms.
+A group decoded from a video expands to a player instead, with Play/Pause,
+Stop and a scrubber over the frames that were kept.
 
 ### Camera raw
 
@@ -361,6 +363,14 @@ skipped.
 This is what makes a long stack practical — twenty effects with three in use
 allocates three intermediates, not twenty.
 
+**A stage that cannot pass its input through switches its branch off.** A
+stage with several inputs, or one that turns a group into a cloud
+(`init_splats`, `plane_sweep`, `solve_cameras`), has nothing to hand on when
+unticked. It produces nothing, and **every stage reading it goes off too**, so
+one box turns off a whole branch. Their viewers say *off* instead of showing a
+result. `sfm.tgl` starts with `init_splats` unticked for exactly this: tune the
+solve in seconds, then tick one box to train.
+
 **Effects start switched off.** `orton`, `bloom`, `vignette`, `film_grain` and
 `dehaze` are looks rather than corrections, so they do nothing until you tick
 their `enabled` box; their control group starts collapsed to match, and opens
@@ -427,7 +437,7 @@ defaults.
 
 ## Algorithms
 
-76 registered. `choose("x", "category")` offers every algorithm in a category,
+77 registered. `choose("x", "category")` offers every algorithm in a category,
 so these names are the ones that matter in a script.
 
 | Category | Algorithms |
@@ -443,7 +453,7 @@ so these names are the ones that matter in a script.
 | **edge** | `sobel`, `canny`, `non_max_suppression`, `hysteresis` |
 | **threshold** | `threshold`, `threshold_otsu`, `threshold_isodata`, `threshold_triangle`, `threshold_adaptive_mean`, `threshold_adaptive_gaussian`, `threshold_niblack`, `threshold_sauvola`, `threshold_bernsen` |
 | **color** | `grayscale`, `apply_lut` (3D .cube LUTs) |
-| **sfm** | `relative_pose`, `build_tracks`, `rotation_average`, `global_position`, `triangulate`, `bundle_adjust_sfm`; dense: `plane_sweep` (depth maps), `fuse_depth`; splats: `init_splats`, `train_splats`, `carve_splats`, `render_splats`, `load_ply` |
+| **sfm** | `solve_cameras` (the whole chain, focal found automatically), `relative_pose`, `build_tracks`, `rotation_average`, `global_position`, `triangulate`, `bundle_adjust_sfm`; dense: `plane_sweep` (depth maps), `fuse_depth`; splats: `init_splats`, `train_splats`, `carve_splats`, `render_splats`, `load_ply` |
 
 Most have a GPU kernel and fall back to the CPU if it fails — **always saying
 so** in Status rather than merely running slower. `demosaic_vng` is CPU-only.
@@ -623,8 +633,8 @@ and each one is a separate algorithm so it can be swapped:
 
 ```
 frames => detect_akaze(max_features = 10000)
-       => match_ann(chain = 1, window = 1)
-       => relative_pose(fov_deg = 50)      # essential matrix per pair
+       => match_ann(chain = 1, window = 2, revisit = 3)
+       => relative_pose()                  # essential matrix per pair
        => build_tracks()                   # union-find over the matches
        => rotation_average()               # one orientation per camera
        => global_position()                # where the cameras are
@@ -633,9 +643,18 @@ frames => detect_akaze(max_features = 10000)
        => display("reconstruction")        # a 3D viewport, orbit camera
 ```
 
+**`solve_cameras` runs that chain for you**, from `relative_pose` to a second
+round of triangulation and bundle adjustment, and finds the focal length on
+the way (below). `scripts/sfm.tgl` uses it, so a capture reconstructs with
+nothing to set; the stages remain separate algorithms for when one is being
+compared against an alternative.
+
 The reconstruction is a `PointCloud` rather than an image, so `display()`
 routes it to a 3D viewport with its own graphics pipeline — depth testing on,
-points drawn as camera-facing quads, mouse-orbit camera.
+points drawn as camera-facing quads, mouse-orbit camera. **Drag** orbits,
+**right-, middle- or shift-drag** pans (the scene follows the mouse), the
+**wheel** zooms toward whatever is under the cursor, and **double-click**
+makes the point clicked the centre of the orbit. **Frame** resets the view.
 
 **`relative_pose` has two estimators.** The eight-point algorithm is a linear
 solve, and `method = 1` selects Nistér's five-point instead. The difference is
@@ -660,20 +679,38 @@ can tell when you are in that situation.
 **Run triangulate and bundle adjustment twice.** The first triangulation judges
 every track against cameras nothing has refined yet, and bundle adjustment then
 moves them a long way. Re-running the pair re-judges the rejects against the
-refined cameras. Measured on a 19-frame courtyard walk: 2889 points at a 10.6 px
-reprojection median after one round, **7659 points at 1.1 px** after two.
+refined cameras. Measured on castle-P19, a 19-frame courtyard walk: 1669 points
+at a 2.5 px reprojection median after one round, **2168 at 0.9 px** after two.
 
-**Read the field of view off the pipeline, not off the lens.** `fov_deg` is the
-most consequential number in an SfM script — a wrong focal biases every
-recovered rotation, and the errors are inconsistent between pairs, so the view
-graph becomes contradictory rather than merely imprecise. Bundle adjustment
-solves for the focal against reprojection error, so its report says what the
-lens actually was: run the chain, read `focal refined to fov`, set `fov_deg` to
-that. On the stock test set it converges to 50.0° from starting guesses of 36,
-45, 52 and 58 — four independent starts agreeing is what makes it trustworthy.
-Reasoning from the sensor size and an assumed lens gave 36°, and was wrong.
+**The field of view is found, not asked for.** It is the most consequential
+number in the chain — a wrong focal biases every recovered rotation, and on a
+walk around a subject the errors add up: a video circling a toy cat, solved at
+42° where the lens was about 33°, failed to close its circle by 31° and broke
+apart. So `relative_pose` *estimates* it from the matches when `fov_deg` is 0
+(the default): the right focal lets the most correspondences fit an essential
+matrix at a tight threshold, as measured with the five-point solver, which
+builds the essential constraints in. Bundle adjustment then *measures* it
+against reprojection error, and `solve_cameras` solves again with that until
+the two agree. With nothing given:
 
-**Do not tune `fov_deg` by the rotation residual.** It falls monotonically as
+| capture | estimated | settled at | truth |
+|---|---|---|---|
+| fountain-P11 | 56.5° | 57.8° | 58.2° (calibrated) |
+| castle-P19 | 58.5° | 57.9° | 58.2° (calibrated) |
+| cat video | 30.5° | 33.3° | ~33° (where its loop closes) |
+
+`build_tracks` takes the focal `relative_pose` used rather than holding its
+own. It once did, and two settings that had to agree were, in practice, set
+apart — a capture solved at 36° and positioned at 58° came out as three copies
+of its subject.
+
+(This paragraph used to say the stock set converges to **50.0°** from every
+starting guess. That agreement was the symptom of a bug, not evidence: camera
+positioning stopped far short of converging, and bundle adjustment settled on
+whatever focal fit the mis-placed cameras. The fix is in `global_position`,
+and so is the measurement that found it.)
+
+**Why not the rotation residual, which looks like the obvious measure.** It falls monotonically as
 the assumed field of view rises, all the way to physically impossible values,
 because too long a focal shrinks every recovered rotation toward the identity
 and near-identity rotations agree with each other trivially. The residual
@@ -689,11 +726,27 @@ SIGGRAPH 2023) that renders like the photographs:
 ```
 dense   = params( plane_sweep, planes = 48 )( cloud, small )    # depth per frame
 fused   = params( fuse_depth, min_views = 3 )( cloud, dense )   # dense cloud
-splats  = params( init_splats )( fused )                        # a flat Gaussian per point
+splats  = params( init_splats, enabled = 0 )( fused )           # a flat Gaussian per point
 trained = params( train_splats, iterations = 1000 )( splats, small, dense )
 carved  = params( carve_splats )( trained, dense )              # floaters removed
 display( carved, "splats" )
 ```
+
+A viewer showing a group (the frames, the sweep's maps, `render_splats`'s
+renders) has **Play/Pause, Stop and a frame slider** across its top. Viewers
+with the same number of frames step together, so "frames" and "render" always
+show the same camera side by side. Changing frames re-runs the script, which
+is entirely cached and so takes milliseconds. A choice made during a long run
+waits for that run to finish rather than cancelling it.
+
+`render_splats` is also **off by default**. It is for checking a fit, not
+making one, and on a 100-frame video it took 44 s. Tick its `enabled` to
+validate.
+
+The splat branch **starts switched off**. Training takes minutes where the
+solve takes seconds, so tune the cameras first, then tick `enabled` under
+`init_splats`. Training, carving and rendering all read from it, so they switch
+on with it.
 
 **`plane_sweep`** sweeps inverse-depth planes through each frame's neighbours
 and scores them by NCC; it emits a depth, confidence and colour map per frame,
@@ -702,6 +755,17 @@ plane: 2 s for fountain-P11's eleven frames at script resolution, 18 s at full
 resolution. **`fuse_depth`** keeps a depth only where other cameras measured
 the same surface (`min_views`), which is the filter that matters — a wrong
 depth is wrong in one view's own way.
+
+**Only what the sweep can bracket is measured.** The planes span the sparse
+points' depths, plus a few guard planes, so a background far behind the
+subject lies past the far end. Its score keeps rising toward that end, and
+every view would put it there. Those views then *agree*: on a selfie video a
+wall six feet back came through fusion as a shell of points around the head.
+So a pixel is measured only when its best score stands `min_bracket` (0.15)
+above the scores at both ends of the range. A plain wall that correlates
+equally at every depth fails the same test. That cleared the selfie's halo
+entirely, and cost fountain-P11 and castle-P19 about a tenth of their dense
+points at unchanged accuracy.
 
 **`train_splats`** is the paper's optimiser: a differentiable rasteriser with a
 hand-derived backward pass (checked against finite differences, and the GPU
@@ -717,14 +781,15 @@ cameras 2 and 7 held out:
 
 | iterations | depth | training | held out |
 |---|---|---|---|
-| 300 | no | 18.1 dB | 17.2 dB |
-| 1000 | no | 25.3 dB | 24.2 dB |
-| 1000 | **yes** | 24.9 dB | **24.8 dB** |
-| 3000 | no | 30.9 dB | 23.9 dB |
-| 3000 | **yes** | 30.6 dB | **25.0 dB** |
+| 300 | no | 18.0 dB | 17.1 dB |
+| 1000 | no | 25.0 dB | 22.8 dB |
+| 1000 | **yes** | 24.4 dB | **24.0 dB** |
+| 3000 | no | 31.2 dB | 23.3 dB |
+| 3000 | **yes** | 30.7 dB | **24.6 dB** |
 
-Past about 1000 iterations the training score keeps rising while the held-out
-one falls — false colour and smears between the viewpoints. What pushes back:
+Past about 1000 iterations the training score climbs six more decibels while
+the held-out one gains half of one — the extra fit is to the photographs
+themselves, and shows between them as false colour and smears. What pushes back:
 
 - **Depth supervision** — the sweep's maps as the third input. Rendered depth
   is pulled toward them (`depth_weight`, 0.3), pinning Gaussians to the
@@ -738,9 +803,36 @@ one falls — false colour and smears between the viewpoints. What pushes back:
 - **Pruning outlives growth.** Oversized Gaussians are still removed after
   densification stops; the paper stops both together, and with eleven views a
   Gaussian edge-on to every camera grew into a sheet across the whole scene.
+- **Only the reconstructed part of each photograph is fitted.** A photo shows
+  more than the dense cloud holds: the wall behind a face, sky over a
+  building. Training used to paint that in with Gaussians stretched around the
+  subject, which from any other angle are smears and blobs. Now `mask` (on
+  when the depth input is given) fits only the pixels the starting Gaussians
+  cover, grown by `mask_grow` pixels to close thin gaps. Everything else
+  targets a background colour drawn at random each step, which only
+  transparency can match, so leftovers there fade and are pruned.
+  `init_splats` also drops isolated points first (`isolated`), since each
+  stray would otherwise mark its own patch of background as subject.
+  *The cost:* a real surface the sweep could not measure is left out too.
+  Castle-P19's cobbled courtyard, seen at a grazing angle, now renders
+  empty like its sky. Set `mask = 0` for a scene where that matters more
+  than clean edges.
 - **Colour is clamped to 0..1.** Unclamped, the optimiser cancelled
   over-bright Gaussians against darker ones in front — right from the training
   views, bright red patches from anywhere else.
+
+**From a video.** Drop an `.mp4` or `.mov` on the palette — onto `sfm.tgl`'s
+`group` row to run the chain on it — and it arrives as a group of the clip's
+sharpest frame from each of 100 even time slots, decoded by Windows' own Media
+Foundation and turned upright if the phone recorded in portrait. Nothing needs
+setting: the field of view is found, and `match_ann`'s `revisit` also matches
+frames that see the same view from far apart in the clip, which is what closes
+the loop of a walk-around. For a good
+capture: walk slowly *around* the subject rather than turning on the spot,
+since sideways movement is the parallax; lock exposure and focus; use plenty
+of light so frames are not blurred. iPhones record HEVC by default, which
+Windows decodes only with the free *HEVC Video Extensions* from the Microsoft
+Store — or set Camera → Formats → *Most Compatible* for H.264.
 
 **`.ply` in and out.** `save( carved, "scene.ply" )` writes the Gaussians in the
 standard 3DGS layout that SuperSplat and other splat viewers read; a cloud
@@ -977,20 +1069,16 @@ src/
   sequence's parallax — the camera centre does move a little when handheld —
   as anything in the solver. Worth revisiting against a tripod set and a
   second scene, where the two can be told apart.
-- **SfM needs imagery with texture variety, and says so loudly when it lacks
-  it.** On a 19-frame courtyard walk the first twelve frames reconstruct well
-  — 0.51° mean ray residual, 86% of tracks triangulated, a smooth camera path
-  — while the last seven fail *on their own*, with no bad link between them to
-  blame: 6.80° residual and 41% of tracks. Those frames are dominated by flat
-  plastered wall with five near-identical window bays repeating across it.
-  Matches land on the wrong bay, are self-consistent enough that RANSAC cannot
-  reject them, and never chain across three frames: exactly **one** track
-  longer than four views survives across the seven. Nothing constrains the
-  geometry, and no choice of estimator, field of view or filter recovers
-  information the imagery does not contain. The fix is either capture (texture
-  variety, or a loop closure so the view graph has a second path) or
-  track-guided matching, where a bay already resolved constrains the next
-  frame rather than each pair being matched blind.
+- **Repetitive texture still produces some wrong pairs.** On castle-P19 three
+  of the 35 relative poses, all across frames 11–17 where the walk faces a
+  wall of near-identical window bays, disagree with the rest by 15–30°:
+  matches land on the wrong bay and are self-consistent enough that RANSAC
+  keeps them. Robust rotation averaging down-weights them and the scene
+  reconstructs (0.8° mean ray residual), but nothing yet *removes* them.
+  (This entry once said those seven frames could not be reconstructed at
+  all, blaming the imagery. That was the positioning bug — see
+  `global_position`. A limitation attributed to the data deserves the same
+  suspicion as any other conclusion.)
 - **Sequential matching caps mean track length near 2.** Measured across five
   configurations — feature count 4×, resolution 1.5×, ratio loosened,
   cross-check disabled — the mean never left 2.2, and 83–87% of tracks are

@@ -758,6 +758,94 @@ int main() {
             }
         }
 
+        // --- A LONG, WEAKLY LINKED CHAIN: the case that exposed the solver ---
+        //
+        // Thirty cameras walking a circle and looking inward, each point
+        // seen by only FOUR consecutive cameras -- how a walk-around or a
+        // video actually links up. The fixtures above are the easy case: five
+        // cameras that all see all the points, where anything converges.
+        //
+        // The alternating distance solve that positioning used to end with
+        // is the thing this catches: on castle-P19 it left even the best
+        // cameras at a 1 degree median ray residual and the reconstruction
+        // unusable, while every test here passed. So the contrast is checked
+        // too -- the refinement OFF must fail on this fixture, or the fixture
+        // cannot express the bug it is here for.
+        {
+            const int N = 30;
+            std::vector<Vec3> ring;
+            PointCloud pc;
+            const Vec3 up{0, 1, 0};
+            for (int c = 0; c < N; ++c) {
+                const double a = 2.0 * 3.14159265358979 * c / N;
+                const Vec3 pos{4.0 * std::cos(a), 0.3 * std::sin(3 * a), 4.0 * std::sin(a)};
+                ring.push_back(pos);
+                Camera cam;
+                cam.width = 1024; cam.height = 768;
+                cam.cx = 512.0; cam.cy = 384.0;
+                cam.focal = 600.0;
+                const Vec3 z = (Vec3{0, 0, 0} - pos).Normalized();
+                const Vec3 x = up.Cross(z).Normalized();
+                const Vec3 y = z.Cross(x);
+                cam.R.m[0] = x.x; cam.R.m[1] = x.y; cam.R.m[2] = x.z;
+                cam.R.m[3] = y.x; cam.R.m[4] = y.y; cam.R.m[5] = y.z;
+                cam.R.m[6] = z.x; cam.R.m[7] = z.y; cam.R.m[8] = z.z;
+                cam.t = cam.R * pos * -1.0;
+                cam.solved = true;
+                pc.cameras.push_back(cam);
+            }
+            uint32_t seed = 4242u;
+            auto rnd = [&]() {
+                seed = seed * 1664525u + 1013904223u;
+                return double(seed >> 8) / double(1u << 24);
+            };
+            for (int i = 0; i < 600; ++i) {
+                const Vec3 wp{rnd() * 2.0 - 1.0, rnd() * 2.0 - 1.0, rnd() * 2.0 - 1.0};
+                Track tr;
+                const int first = i % N;
+                for (int k = 0; k < 4; ++k) {
+                    const int c = (first + k) % N;
+                    double px, py;
+                    if (!pc.cameras[size_t(c)].Project(wp, &px, &py)) continue;
+                    Observation o;
+                    o.frame = c;
+                    o.x = float(px + (rnd() - 0.5) * 0.6);   // +-0.3 px
+                    o.y = float(py + (rnd() - 0.5) * 0.6);
+                    tr.obs.push_back(o);
+                }
+                if (tr.obs.size() >= 2) pc.tracks.push_back(tr);
+            }
+
+            auto run = [&](int refine, double* shape) {
+                std::vector<Data> s;
+                s.push_back(Data{pc});
+                Pipeline p;
+                auto gp = Registry::Get().Create("global_position");
+                std::string e;
+                gp->FindParam("refine")->SetFromScript(Value(double(refine)), &e);
+                p.AddStage(std::move(gp), "global_position", {{-1, 0}}, 1, 1);
+                std::string err;
+                if (!p.Execute(&s, nullptr, &err)) return false;
+                const Data* d = p.Resolve({0, 0}, &s);
+                const PointCloud* out = d ? std::get_if<PointCloud>(d) : nullptr;
+                if (!out) return false;
+                *shape = shapeError(*out, ring);
+                return true;
+            };
+            double withRefine = 1e9, without = 1e9;
+            const bool okA = run(100, &withRefine);
+            const bool okB = run(0, &without);
+            std::printf("       30-camera ring, 4 views per point: shape error %.4f "
+                        "refined, %.4f with the alternating solve alone\n",
+                        withRefine, without);
+            Check(okA && withRefine < 0.02,
+                  "a long weakly-linked ring is positioned (shape error " +
+                      std::to_string(withRefine) + ")");
+            Check(okB && without > 5.0 * withRefine,
+                  "...where the alternating solve alone is not -- so this "
+                  "fixture can see the bug it guards against");
+        }
+
         // --- THE COLLINEAR DEGENERACY ----------------------------------------
         //
         // The reason the joint method exists. Five cameras on a straight line:
@@ -1675,6 +1763,69 @@ int main() {
                       std::to_string(d.distance) + " vs " +
                       std::to_string(start) + ")");
         }
+
+        // PAN AND ZOOM KEEP WHAT IS UNDER THE CURSOR UNDER THE CURSOR -- the
+        // whole point of them. Checked against the RENDERED projection (the
+        // ViewProj matrix, through `project`), not against the camera's own
+        // helpers, so a flipped axis in the new maths cannot agree with
+        // itself: this file has seen that happen once already.
+        {
+            const double W = 800.0, H = 500.0;
+            OrbitCamera c;
+            c.target = Vec3{0.3, -0.2, 4.0};
+            c.distance = 3.0;
+            c.yaw = 0.4;
+            c.pitch = -0.3;
+            // Pixel (from top-left) where the rendered matrix puts a point.
+            auto pixel = [&](const OrbitCamera& cc, const Vec3& p, double* px, double* py) {
+                double nx, ny, nz;
+                if (!project(cc, p, &nx, &ny, &nz)) return false;
+                nx /= W / H;   // the viewport's aspect correction (viewport3d.cpp)
+                *px = (nx + 1.0) * 0.5 * W;
+                *py = (1.0 - ny) * 0.5 * H;
+                return true;
+            };
+
+            // Each projection is taken BEFORE its Check: the message is an
+            // argument too, and C++ may build it before the condition runs,
+            // which printed the previous check's numbers the first time.
+            auto at = [](double x, double y) {
+                return "(" + std::to_string(x) + ", " + std::to_string(y) + ")";
+            };
+
+            const Vec3 grab = c.OnTargetPlane(620.0, 140.0, W, H);
+            double px = 0, py = 0;
+            bool ok = pixel(c, grab, &px, &py);
+            Check(ok && std::hypot(px - 620.0, py - 140.0) < 0.01,
+                  "the point found under a pixel renders at that pixel " + at(px, py));
+
+            double tx = 0, ty = 0, tz = 0;
+            ok = c.ToScreen(grab, W, H, &tx, &ty, &tz);
+            Check(ok && std::hypot(tx - px, ty - py) < 0.01,
+                  "ToScreen agrees with the rendered projection " + at(tx, ty));
+
+            OrbitCamera p2 = c;
+            p2.Pan(35.0, -20.0, H);
+            ok = pixel(p2, grab, &px, &py);
+            Check(ok && std::hypot(px - 655.0, py - 120.0) < 0.05,
+                  "a pan drags the scene with the mouse, pixel for pixel " + at(px, py) +
+                      " vs (655, 120)");
+
+            OrbitCamera z = c;
+            z.DollyAt(4.0, 620.0, 140.0, W, H);
+            ok = pixel(z, grab, &px, &py);
+            Check(z.distance < c.distance && ok && std::hypot(px - 620.0, py - 140.0) < 0.05,
+                  "zooming at the cursor keeps the point under it " + at(px, py));
+            Check(z.nearZ < z.distance,
+                  "...and the near plane follows in, so the target is not clipped");
+
+            OrbitCamera f = c;
+            const Vec3 other{1.0, 0.5, 5.0};
+            f.FocusOn(other);
+            ok = pixel(f, other, &px, &py);
+            Check(ok && std::hypot(px - W * 0.5, py - H * 0.5) < 0.05,
+                  "focusing on a point puts it in the middle of the view " + at(px, py));
+        }
     }
 
     // --- relative_pose, against known two-view geometry ---------------------
@@ -1829,6 +1980,131 @@ int main() {
                               std::to_string(dot) + ")");
                 }
             }
+        }
+    }
+
+    // --- relative_pose ESTIMATES the focal, and CHECKS revisits ---------------
+    //
+    // Six cameras on an arc with a known focal, matched in a chain of window
+    // 2, with 0.3 px of noise -- the estimate must land near the truth with
+    // no fov given. Then two REVISIT pairs onto the last frame: a true one
+    // against frame 0, and a look-alike whose matches come from a different
+    // point cloud seen as if camera 5 were turned 25 degrees further. RANSAC
+    // accepts both -- each is consistent with some essential matrix -- and
+    // only the chain can tell them apart.
+    {
+        std::printf("\n--- relative_pose: focal estimate and revisit check ---\n");
+        const int W = 1600, H = 1200, N = 6;
+        const double focal = 1400.0;
+        const double trueFov = 2.0 * std::atan2(0.5 * W, focal) * 180.0 / 3.14159265358979;
+        std::vector<Camera> cams;
+        for (int c = 0; c < N; ++c) {
+            Camera cam;
+            cam.width = W; cam.height = H; cam.cx = 0.5 * W; cam.cy = 0.5 * H;
+            cam.focal = focal;
+            cam.R = AxisAngleToMat(Vec3{0.02 * c, 0.09 * c - 0.2, 0.01 * c});
+            const Vec3 C{-1.0 + 0.4 * c, 0.05 * c, 0.1 * std::sin(double(c))};
+            cam.t = cam.R * C * -1.0;
+            cam.solved = true;
+            cams.push_back(cam);
+        }
+        uint32_t seed = 99u;
+        auto noise = [&]() {
+            seed = seed * 1664525u + 1013904223u;
+            return (double(seed >> 8) / double(1u << 24) - 0.5) * 0.6;
+        };
+        std::vector<Vec3> world;
+        for (int i = 0; i < 500; ++i) {
+            const double a = double(i) * 0.61;
+            world.push_back(Vec3{std::cos(a) * 2.2, std::sin(a * 1.7) * 1.6,
+                                 7.0 + std::fmod(double(i) * 0.37, 4.0)});
+        }
+        std::vector<std::shared_ptr<FeatureSidecar>> fs;
+        for (int c = 0; c < N; ++c) fs.push_back(std::make_shared<FeatureSidecar>());
+        // Matches between two cameras from a list of points: each visible
+        // point becomes a keypoint in both and a match between them.
+        auto addPair = [&](int a, int b, const Camera& ca, const Camera& cb,
+                           const std::vector<Vec3>& pts, bool revisit) {
+            MatchSet ms;
+            ms.reference = a;
+            ms.revisit = revisit;
+            for (const Vec3& wp : pts) {
+                double ax, ay, bx, by;
+                if (!ca.Project(wp, &ax, &ay) || !cb.Project(wp, &bx, &by)) continue;
+                if (ax < 0 || ay < 0 || ax >= W || ay >= H) continue;
+                if (bx < 0 || by < 0 || bx >= W || by >= H) continue;
+                Keypoint ka; ka.x = float(ax + noise()); ka.y = float(ay + noise());
+                Keypoint kb; kb.x = float(bx + noise()); kb.y = float(by + noise());
+                Match m;
+                m.a = int(fs[size_t(a)]->keypoints.size());
+                m.b = int(fs[size_t(b)]->keypoints.size());
+                fs[size_t(a)]->keypoints.push_back(ka);
+                fs[size_t(b)]->keypoints.push_back(kb);
+                ms.matches.push_back(m);
+            }
+            return ms;
+        };
+        std::vector<std::shared_ptr<MatchSidecar>> msc;
+        for (int c = 0; c < N; ++c) msc.push_back(std::make_shared<MatchSidecar>());
+        for (int b = 1; b < N; ++b)
+            for (int w = 1; w <= 2 && b - w >= 0; ++w)
+                msc[size_t(b)]->sets.push_back(addPair(b - w, b, cams[size_t(b - w)],
+                                                       cams[size_t(b)], world, false));
+        // The true revisit, and the look-alike.
+        msc[N - 1]->sets.push_back(addPair(0, N - 1, cams[0], cams[N - 1], world, true));
+        Camera turned = cams[N - 1];
+        turned.R = AxisAngleToMat(Vec3{0, 0.44, 0}) * turned.R;   // 25 deg further
+        std::vector<Vec3> other;
+        for (const Vec3& p : world) other.push_back(Vec3{p.x * 0.8 + 0.5, p.y, p.z + 1.0});
+        {
+            // Matched against frame 1 so it does not collide with the true
+            // revisit's reference.
+            MatchSet fake = addPair(1, N - 1, cams[1], turned, other, true);
+            msc[N - 1]->sets.push_back(std::move(fake));
+        }
+        ImageSet set;
+        for (int c = 0; c < N; ++c) {
+            Image im;
+            im.Alloc({W, H, Format::RGBA8});
+            im.Sidecars().Set(kFeatureSidecar, fs[size_t(c)]);
+            if (!msc[size_t(c)]->sets.empty()) im.Sidecars().Set(kMatchSidecar, msc[size_t(c)]);
+            set.images.push_back(std::move(im));
+        }
+        set.shape = Shape{{{"frame", N}}};
+        std::vector<Data> s;
+        s.push_back(Data{std::move(set)});
+        Pipeline p;
+        auto rp = Registry::Get().Create("relative_pose");   // fov_deg left at 0
+        p.AddStage(std::move(rp), "relative_pose", {{-1, 0}}, 1, 1);
+        std::string err;
+        const bool ok = p.Execute(&s, nullptr, &err);
+        Check(ok, "relative_pose runs with no fov given" + (ok ? "" : ": " + err));
+        const Data* d = ok ? p.Resolve({0, 0}, &s) : nullptr;
+        const ImageSet* out = d ? std::get_if<ImageSet>(d) : nullptr;
+        const RelativePoseSidecar* last = out ? RelativePosesOf(out->images[N - 1]) : nullptr;
+        if (last) {
+            char m[160];
+            std::snprintf(m, sizeof m, "the field of view is estimated from the matches "
+                          "(%.1f deg against a true %.1f)", last->fovDeg, trueFov);
+            Check(std::fabs(last->fovDeg - trueFov) < 0.05 * trueFov, m);
+            bool trueKept = false, fakeKept = false;
+            for (const auto& e : last->edges) {
+                if (e.revisit && e.reference == 0) trueKept = true;
+                if (e.revisit && e.reference == 1) fakeKept = true;
+            }
+            Check(trueKept, "a true revisit is kept");
+            Check(!fakeKept, "...and a look-alike one is dropped");
+            const MatchSidecar* mm = MatchesOf(out->images[N - 1]);
+            bool fakeCleared = false;
+            if (mm)
+                for (const MatchSet& ms : mm->sets)
+                    if (ms.revisit && ms.reference == 1) {
+                        fakeCleared = !ms.inlier.empty();
+                        for (uint8_t v : ms.inlier) fakeCleared &= v == 0;
+                    }
+            Check(fakeCleared, "...along with its matches, so no track is built through it");
+        } else {
+            Check(false, "the last frame carries relative poses");
         }
     }
 
@@ -2758,10 +3034,14 @@ int main() {
         }
 
         // Sparse points spread across the plane, so the swept range covers it.
+        // Across the WHOLE visible wall: at 0.35 apart they spanned only the
+        // middle, the right band lay past the far end of the sweep, and this
+        // test passed on depths pinned to the boundary plane -- which the
+        // sweep now refuses to report.
         for (int i = 0; i < 64; ++i) {
             Track t;
             t.hasPoint = true;
-            const double ux = (double(i % 8) - 3.5) * 0.35;
+            const double ux = (double(i % 8) - 3.5) * 0.6;
             const double uy = (double(i / 8) - 3.5) * 0.25;
             t.point = Vec3{ux, uy, z0 + slope * ux};
             pc.tracks.push_back(t);
@@ -2986,6 +3266,68 @@ int main() {
             }
             dev->Release();
         }
+    }
+
+    // --- unticking a stage that cannot pass through turns its branch off ----
+    //
+    // init_splats turns a cloud into Gaussians, so it cannot alias its input
+    // the way an unticked blur does. It used to ignore the box and run; now it
+    // produces nothing and the stage reading it goes off too -- render_splats
+    // here has no cameras and would fail if it ran, so success means skipped.
+    {
+        std::printf("\n--- switched-off branches ---\n");
+        PointCloud pc;
+        for (int i = 0; i < 50; ++i) {
+            Track t;
+            t.hasPoint = true;
+            t.point = Vec3{double(i % 7), double(i / 7), 5.0};
+            pc.tracks.push_back(t);
+        }
+        std::vector<Data> s;
+        s.push_back(Data{std::move(pc)});
+        Pipeline p;
+        auto init = Registry::Get().Create("init_splats");
+        std::string perr;
+        init->FindParam("enabled")->SetFromScript(Value(0.0), &perr);
+        p.AddStage(std::move(init), "init_splats", {{-1, 0}}, 1, 1);
+        p.AddStage(Registry::Get().Create("render_splats"), "render_splats", {{0, 0}}, 1, 2);
+        std::string err;
+        const bool ok = p.Execute(&s, nullptr, &err);
+        Check(ok, "an unticked init_splats does not fail the run" + (ok ? "" : ": " + err));
+        Check(ok && p.IsOff({0, 0}), "...it is reported off");
+        Check(ok && p.IsOff({1, 0}), "...and so is everything reading it");
+        Check(!p.IsOff({-1, 0}), "...but not the palette source");
+    }
+
+    // --- init_splats drops isolated points -----------------------------------
+    //
+    // A dense patch and a handful of strays far from it and from each other:
+    // the strays are what survived fusion from a background on a selfie
+    // video, and each would train into a blob. Exactly they must go.
+    {
+        std::printf("\n--- init_splats: isolated points ---\n");
+        PointCloud pc;
+        for (int i = 0; i < 40; ++i)
+            for (int j = 0; j < 40; ++j) {
+                Track t;
+                t.hasPoint = true;
+                t.point = Vec3{i * 0.05, j * 0.05, 5.0};
+                pc.tracks.push_back(t);
+            }
+        const int strays = 6;
+        for (int s = 0; s < strays; ++s) {
+            Track t;
+            t.hasPoint = true;
+            t.point = Vec3{-3.0 + s * 1.3, 4.0 - s * 0.9, 9.0 + s};
+            pc.tracks.push_back(t);
+        }
+        auto algo = Registry::Get().Create("init_splats");
+        std::string err;
+        const bool ok = algo && algo->RunReconstruct(nullptr, &pc, &err);
+        Check(ok, "init_splats runs with strays" + (ok ? std::string() : ": " + err));
+        Check(ok && pc.splats.size() == 1600,
+              "the strays are dropped and the patch kept (" +
+                  std::to_string(pc.splats.size()) + " of 1606)");
     }
 
     // --- init_splats: discs lying in a known surface ------------------------
@@ -3567,6 +3909,36 @@ int main() {
             Check(pOn > pOff + 2.0, m);
         }
 
+        // --- max_gaussians CAPS THE START, not only growth ---------------------
+        //
+        // A 100-frame video fused to 2.6 million points, past what the GPU
+        // trainer's state texture can hold, and training fell back to hours on
+        // the CPU because the cap only limited densification. Twice the cap
+        // in: exactly the cap out, and each kept Gaussian wider than before.
+        {
+            const size_t cap = start.splats.size() / 2;
+            auto a = Registry::Get().Create("train_splats");
+            std::string e;
+            a->FindParam("iterations")->SetFromScript(Value(0.0), &e);
+            a->FindParam("densify")->SetFromScript(Value(0.0), &e);
+            a->FindParam("max_gaussians")->SetFromScript(Value(double(cap)), &e);
+            PointCloud out = start;
+            std::string err;
+            const bool ok = a->RunReconstruct(&frames, &out, &err);
+            Check(ok && out.splats.size() == cap,
+                  "a start larger than max_gaussians is thinned to it (" +
+                      std::to_string(start.splats.size()) + " -> " +
+                      std::to_string(out.splats.size()) + ")" + (ok ? "" : ": " + err));
+            if (ok && !out.splats.empty()) {
+                const Splat& before = start.splats[0];
+                const Splat& after = out.splats[0];
+                const double wb = std::max({before.scale.x, before.scale.y, before.scale.z});
+                const double wa = std::max({after.scale.x, after.scale.y, after.scale.z});
+                Check(wa > wb * 1.3,
+                      "...and the kept ones widened to cover for the rest");
+            }
+        }
+
         // --- training on the GPU matches training on the CPU -----------------
         //
         // The GPU trainer keeps the whole state on the device and runs its
@@ -3810,7 +4182,9 @@ int main() {
                         s.algoName == "fuse_depth") break;
                     lastSparse = s.algoName;
                 }
-                Check(lastSparse == "bundle_adjust_sfm",
+                // solve_cameras counts: it runs the chain internally and ends
+                // with bundle adjustment -- see its header.
+                Check(lastSparse == "bundle_adjust_sfm" || lastSparse == "solve_cameras",
                       "the sparse chain ends at bundle adjustment (" +
                           lastSparse + ")");
 

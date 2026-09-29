@@ -74,6 +74,23 @@ public:
     // converting from it needs no readback.
     void SetGpuSource(std::shared_ptr<SharedGpuTexture> g) override { m_gpuSrc = std::move(g); }
 
+    // FRAME SELECTOR, for a viewer showing a group: how many frames it has,
+    // which one arrived, and which one the app is asking for. The panel draws
+    // a slider and play/stop when there is more than one, and reports a new
+    // choice through TakeFrameRequest.
+    void SetFrames(int count, int shown, int wanted) {
+        m_frameCount = count;
+        m_frameShown = shown;
+        m_frameWant  = wanted;
+    }
+    bool TakeFrameRequest(int* frame) {
+        if (m_frameRequest < 0) return false;
+        *frame = m_frameRequest;
+        m_frameRequest = -1;
+        return true;
+    }
+    int FrameCount() const { return m_frameCount; }
+
     // The 1:1 loupe, for inspecting individual pixels.
     void SetLoupe(bool on) { m_loupe = on; }
     bool Loupe() const { return m_loupe; }
@@ -100,6 +117,15 @@ private:
     ImageRect   m_visRect{};        // see VisibleRect
     bool        m_visible = false;
     bool        m_loupe   = false;
+
+    // See SetFrames. m_frameRequest is -1 when nothing new was picked.
+    void DrawFrameBar();
+    int         m_frameCount   = 0;
+    int         m_frameShown   = 0;
+    int         m_frameWant    = 0;
+    int         m_frameRequest = -1;
+    bool        m_playing      = false;
+    double      m_lastStep     = 0.0;   // ImGui time of the last advance
 };
 
 } // namespace tglab

@@ -259,8 +259,23 @@ public:
             //
             // Still only a starting point -- bundle adjustment solves it --
             // but a starting point the rest of the chain agrees with.
-            c.focal = 0.5 * d.width /
-                      std::tan(0.5 * double(m_fovDeg) * 3.14159265358979 / 180.0);
+            //
+            // TAKEN FROM relative_pose when it ran, which is now the rule
+            // rather than something to arrange by hand: two settings that had
+            // to agree were set apart in practice -- a capture solved at 36
+            // degrees and positioned at 58, and the reconstruction came out
+            // as three copies of its subject. This stage's own fov_deg is the
+            // fallback for a chain without relative_pose, or an override when
+            // set to anything but 0.
+            double fov = double(m_fovDeg);
+            if (fov <= 0.0) {
+                fov = 50.0;
+                for (const Image& im : *images)
+                    if (const RelativePoseSidecar* rp = RelativePosesOf(im))
+                        if (rp->fovDeg > 0.0) { fov = rp->fovDeg; break; }
+            }
+            m_usedFov = fov;
+            c.focal = 0.5 * d.width / std::tan(0.5 * fov * 3.14159265358979 / 180.0);
         }
 
         // The view graph, if relative_pose has already run. Carried on the
@@ -408,15 +423,15 @@ private:
     // camera slots filled in here -- so two different values mean the
     // reconstruction is solved in one geometry and measured in another.
     //
-    // Not read from relative_pose directly because the stages are
-    // independent by design: a chain may run build_tracks without it. Set
-    // both in the script, which sfm.tgl does.
-    Param<float> m_fovDeg{this, "fov_deg", 50.0f, 5.0f, 150.0f,
+    // 0, the default, takes relative_pose's value -- see where it is read.
+    double m_usedFov = 0.0;
+    Param<float> m_fovDeg{this, "fov_deg", 0.0f, 0.0f, 150.0f,
         {.help = "Starting horizontal field of view, in degrees, for the "
-                 "camera slots this stage fills in. Set it to the same value "
-                 "as relative_pose's fov_deg: that stage solves in this "
-                 "geometry and everything downstream measures in it. Bundle "
-                 "adjustment refines it afterwards."}};
+                 "camera slots this stage fills in. 0 (the default) uses "
+                 "whatever relative_pose solved with, which is almost always "
+                 "what is wanted: that stage solved in that geometry. Set a "
+                 "value only to override it. Bundle adjustment refines it "
+                 "afterwards."}};
 
     Param<int> m_minLength{this, "min_length", 2, 2, 20,
         {.help = "Fewest frames a track must appear in. Two is the minimum "

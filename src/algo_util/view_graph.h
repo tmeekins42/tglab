@@ -51,9 +51,19 @@ public:
         // edge backed by four hundred points deserves more say than one backed
         // by twenty, and weighting by it is the cheapest robustness available.
         int inliers = 0;
+
+        // From a revisit match rather than a neighbour -- see MatchSet.
+        bool revisit = false;
     };
 
     std::vector<Edge> edges;
+
+    // The horizontal field of view these poses were solved with, in degrees
+    // -- given, or estimated by relative_pose. Carried so later stages start
+    // from the SAME focal: two stages each holding their own copy, set
+    // separately, was how a capture came to be solved at 36 degrees and
+    // positioned at 58.
+    double fovDeg = 0.0;
 
     // Derived from the pixels: the poses were solved from features found in
     // this image, so re-developing it invalidates them.

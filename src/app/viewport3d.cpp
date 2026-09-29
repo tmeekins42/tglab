@@ -585,6 +585,33 @@ bool Viewport3D::UploadSplats(Device& dev) {
 // sort is the obvious next step if it stops being enough, and the reason it
 // is not the first step is this machine's history with multi-dispatch GPU
 // work.
+// A linear pass over what is drawn -- a million points is a few milliseconds,
+// and this runs once per double-click. Within 6 px first, so a click on a
+// surface picks that surface; widened to 20 px when nothing is that close,
+// so a click on a sparse cloud still lands.
+bool Viewport3D::PickPoint(const OrbitCamera& cam, double sx, double sy, double w,
+                           double h, Vec3* out) const {
+    if (!m_cloud) return false;
+    std::vector<Vec3> pts;
+    if (DrawingSplats())
+        for (const Splat& s : m_cloud->splats) pts.push_back(s.mean);
+    else
+        for (const Track& t : m_cloud->tracks)
+            if (t.hasPoint) pts.push_back(t.point);
+    for (double radius : {6.0, 20.0}) {
+        double bestZ = 1e300;
+        for (const Vec3& p : pts) {
+            double px = 0.0, py = 0.0, z = 0.0;
+            if (!cam.ToScreen(p, w, h, &px, &py, &z)) continue;
+            if (std::hypot(px - sx, py - sy) > radius || z >= bestZ) continue;
+            bestZ = z;
+            *out = p;
+        }
+        if (bestZ < 1e300) return true;
+    }
+    return false;
+}
+
 bool Viewport3D::SortSplats(Device& dev, const OrbitCamera& cam) {
     const Vec3 eye = cam.Eye();
     if (m_orderBuf && (eye - m_sortedEye).Norm() < 1e-9 &&
@@ -742,6 +769,11 @@ void Viewport3D::Draw(Device& dev, Image*) {
 
     // Nothing yet. A cloud with Gaussians but no points -- one imported from
     // a .ply -- is ready, not computing.
+    if (m_off) {
+        ImGui::TextDisabled("off -- a stage feeding this view is switched off");
+        ImGui::End();
+        return;
+    }
     if (!m_cloud || (m_cloud->tracks.empty() && m_cloud->splats.empty())) {
         ImGui::TextDisabled("computing...");
         ImGui::End();
@@ -929,18 +961,50 @@ void Viewport3D::Draw(Device& dev, Image*) {
         ImGui::GetWindowDrawList()->AddImage(
             ImTextureRef(static_cast<ImTextureID>(m_target.Srv().ptr)), origin,
             ImVec2(origin.x + float(w), origin.y + float(h)));
-        ImGui::InvisibleButton("##canvas", ImVec2(float(w), float(h)));
+        ImGui::InvisibleButton("##canvas", ImVec2(float(w), float(h)),
+                               ImGuiButtonFlags_MouseButtonLeft |
+                               ImGuiButtonFlags_MouseButtonRight |
+                               ImGuiButtonFlags_MouseButtonMiddle);
 
-        // --- camera control, mirroring the 2D panels ------------------------
+        // --- camera control ---------------------------------------------------
+        //
+        //   left drag                      orbit about the target
+        //   right / middle / shift+left    pan -- move the target
+        //   wheel                          zoom toward the cursor
+        //   double-click                   orbit about the point clicked
+        //
+        // Pan on several bindings because there is no one standard: Blender
+        // pans on shift+middle, Maya on alt+middle, most CAD and web viewers
+        // on right or middle. Each of these is free here, so all of them work.
+        const ImGuiIO& io = ImGui::GetIO();
+        const double mx = double(io.MousePos.x - origin.x);
+        const double my = double(io.MousePos.y - origin.y);
         if (ImGui::IsItemHovered()) {
-            const ImGuiIO& io = ImGui::GetIO();
-            if (io.MouseWheel != 0.0f) cam.Dolly(double(io.MouseWheel));
+            if (io.MouseWheel != 0.0f)
+                cam.DollyAt(double(io.MouseWheel), mx, my, double(w), double(h));
+            if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                Vec3 hit;
+                if (PickPoint(cam, mx, my, double(w), double(h), &hit)) cam.FocusOn(hit);
+            }
         }
-        if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
-            const ImVec2 d = ImGui::GetIO().MouseDelta;
-            if (ImGui::GetIO().KeyShift) cam.Pan(double(d.x), double(d.y));
-            else cam.Rotate(double(d.x) * 0.008, double(-d.y) * 0.008);
+        if (ImGui::IsItemActive()) {
+            const ImVec2 d = io.MouseDelta;
+            const bool panning =
+                ImGui::IsMouseDragging(ImGuiMouseButton_Right) ||
+                ImGui::IsMouseDragging(ImGuiMouseButton_Middle) ||
+                (io.KeyShift && ImGui::IsMouseDragging(ImGuiMouseButton_Left));
+            if (panning)
+                cam.Pan(double(d.x), double(d.y), double(h));
+            else if (ImGui::IsMouseDragging(ImGuiMouseButton_Left))
+                cam.Rotate(double(d.x) * 0.008, double(-d.y) * 0.008);
         }
+
+        // The controls, said where they are used, faint enough to ignore.
+        ImGui::GetWindowDrawList()->AddText(
+            ImVec2(origin.x + 6.0f, origin.y + float(h) - ImGui::GetTextLineHeight() - 4.0f),
+            IM_COL32(200, 200, 200, 110),
+            "drag: orbit   right/middle/shift-drag: pan   wheel: zoom to cursor   "
+            "double-click: orbit about that point");
     }
 
     ImGui::End();

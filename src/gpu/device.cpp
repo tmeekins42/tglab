@@ -8,8 +8,9 @@
 namespace tglab {
 
 // SRV heap must hold the ImGui font atlas plus one descriptor per live view
-// texture. 256 is far more than M1 needs and costs almost nothing.
-static constexpr uint32_t kSrvCapacity = 256;
+// texture -- and one per palette thumbnail, which an expanded group of a few
+// hundred frames multiplies. 256 ran out; 4096 descriptors is 128 KB.
+static constexpr uint32_t kSrvCapacity = 4096;
 
 // Set TGLAB_VERBOSE=1 to trace startup when the window never appears.
 static void Trace(const char* stage, HRESULT hr = S_OK) {

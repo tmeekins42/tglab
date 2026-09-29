@@ -233,6 +233,12 @@ struct MatchSet {
     // works.
     std::vector<uint8_t> inlier;
 
+    // A REVISIT pair: matched because the two frames look alike, not because
+    // they are neighbours (see match_ann's revisit). Such a pair is the one
+    // most likely to be a look-alike rather than the same view, so
+    // relative_pose checks it against the neighbour chain before trusting it.
+    bool revisit = false;
+
     bool IsInlier(size_t i) const {
         return inlier.empty() || (i < inlier.size() && inlier[i] != 0);
     }

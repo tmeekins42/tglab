@@ -79,7 +79,11 @@ bool GpuTexture::Create(Device& dev, const ImageDesc& d) {
     srv.ViewDimension           = D3D12_SRV_DIMENSION_TEXTURE2D;
     srv.Texture2D.MipLevels     = 1;
 
-    dev.Srv().Alloc(&m_cpu, &m_gpu);
+    if (!dev.Srv().Alloc(&m_cpu, &m_gpu)) {
+        m_res->Release();   // never drawn, so nothing to defer
+        m_res = nullptr;
+        return false;
+    }
     dev.Get()->CreateShaderResourceView(m_res, &srv, m_cpu);
 
     m_desc = d;

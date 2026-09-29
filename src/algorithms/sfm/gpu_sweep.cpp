@@ -30,7 +30,7 @@ uint32_t Bits(float f) {
 //
 //   t0..t3  the neighbours, luma in .x
 //   u0      running state: best, prev, next, rival
-//   u1      running state: bestPlane, rivalPlane, lastScore, -
+//   u1      running state: bestPlane, rivalPlane, lastScore, firstScore
 //   u2      the reference: luma, sA, sAA, -     (read only; a UAV slot
 //                                                because the SRVs are full)
 //   u3      homographies: 3 texels per (plane, neighbour), row = plane*4+nb
@@ -49,7 +49,7 @@ Texture2D<float4>   T1 : register(t1);
 Texture2D<float4>   T2 : register(t2);
 Texture2D<float4>   T3 : register(t3);
 RWTexture2D<float4> U0 : register(u0);   // best, prev, next, rival
-RWTexture2D<float4> U1 : register(u1);   // bestPlane, rivalPlane, lastScore, -
+RWTexture2D<float4> U1 : register(u1);   // bestPlane, rivalPlane, lastScore, firstScore
 RWTexture2D<float4> U2 : register(u2);   // reference: luma, sA, sAA, -
 RWTexture2D<float4> U3 : register(u3);   // homographies
 
@@ -192,7 +192,10 @@ void main(uint3 tid : SV_DispatchThreadID) {
     }
 
     U0[tid.xy] = s;
-    U1[tid.xy] = float4(float(bestP), float(rivalP), combined, 1);
+    // w: the FIRST plane's score, kept so the winner can be checked for a
+    // peak that falls away at both ends of the range; z ends up holding the
+    // last plane's.
+    U1[tid.xy] = float4(float(bestP), float(rivalP), combined, p == 0 ? combined : pi.w);
 }
 )";
 
@@ -342,7 +345,7 @@ bool GpuSweepSession::Begin(ComputeContext* gpu, const SweepPlane& ref,
         m->staging[i * 4 + 0] = -1.0f;   // bestPlane
         m->staging[i * 4 + 1] = -1.0f;   // rivalPlane
         m->staging[i * 4 + 2] = -2.0f;   // lastScore
-        m->staging[i * 4 + 3] = 1.0f;
+        m->staging[i * 4 + 3] = -2.0f;   // first plane's score
     }
     if (!gpu->Upload(ViewOf(m->staging, m->w, m->h), &m->planeIdx)) {
         *err = "could not initialise the plane indices";
@@ -433,7 +436,8 @@ bool GpuSweepSession::Plane(int planeIndex, std::string* err) {
 
 bool GpuSweepSession::Finish(std::vector<float>* best, std::vector<float>* prev,
                              std::vector<float>* next, std::vector<float>* rival,
-                             std::vector<int>* bestPlane, std::string* err) {
+                             std::vector<int>* bestPlane, std::vector<float>* edge,
+                             std::string* err) {
     if (!m->gpu) { *err = "session not started"; return false; }
     const size_t n = size_t(m->w) * size_t(m->h);
 
@@ -457,6 +461,9 @@ bool GpuSweepSession::Finish(std::vector<float>* best, std::vector<float>* prev,
     bestPlane->resize(n);
     for (size_t i = 0; i < n; ++i)
         (*bestPlane)[i] = int(m->readback[i * 4 + 0]);
+    edge->resize(n);
+    for (size_t i = 0; i < n; ++i)
+        (*edge)[i] = std::max(m->readback[i * 4 + 2], m->readback[i * 4 + 3]);
     return true;
 }
 

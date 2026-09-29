@@ -94,10 +94,13 @@ public:
 
     // Reads the accumulated per-pixel state back: the winning score, the
     // scores either side of it (for the parabola fit), the best separated
-    // rival (for the margin) and which plane won. Each sized ref.w * ref.h.
+    // rival (for the margin), which plane won, and the higher of the first
+    // and last planes' scores (for the bracketing test). Each sized
+    // ref.w * ref.h.
     bool Finish(std::vector<float>* best, std::vector<float>* prev,
                 std::vector<float>* next, std::vector<float>* rival,
-                std::vector<int>* bestPlane, std::string* err);
+                std::vector<int>* bestPlane, std::vector<float>* edge,
+                std::string* err);
 
 private:
     struct Impl;

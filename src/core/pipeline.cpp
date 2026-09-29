@@ -211,6 +211,16 @@ void Pipeline::AddViewer(std::string name, PortRef src) {
     m_viewers.push_back({std::move(name), src});
 }
 
+bool Pipeline::IsOff(PortRef r) const {
+    for (size_t guard = 0; guard <= m_stages.size(); ++guard) {
+        if (r.stage < 0 || size_t(r.stage) >= m_stages.size()) return false;
+        const Stage& s = m_stages[size_t(r.stage)];
+        if (s.bypassOf.stage == -2) return s.off;
+        r = s.bypassOf;
+    }
+    return false;
+}
+
 const Data* Pipeline::Resolve(PortRef r, const std::vector<Data>* sources) const {
     // Follow bypassed stages to whatever actually produced the pixels.
     //
@@ -1172,6 +1182,7 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
             // it, or the next stage resolves this one to no data and the run
             // fails with "has an input that produced no data".
             m_stages[firstDirty].bypassOf = ps.bypassOf;
+            m_stages[firstDirty].off      = ps.off;
             ++m_cachedStages;
             ++firstDirty;
         }
@@ -1407,6 +1418,7 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
         }
 
         s.valid = false;
+        s.off   = false;
 
         // A reduction whose input is a straight line of broadcast stages runs
         // them per FRAME rather than per stage, so one frame is live at a time
@@ -1417,6 +1429,30 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
                                    sources, gpu, mode, cancel, progress, err))
                 return false;
             continue;
+        }
+
+        // SWITCHED OFF: produces nothing, and so does everything reading it.
+        //
+        // A single-input stage with its box unticked aliases its input further
+        // down. One that cannot -- train_splats reads three things, a solve
+        // turns a group into a cloud -- used to ignore the box and run anyway,
+        // which is what made "untick the splats while tuning the solve" wait
+        // out the whole training. Now it stops, and the stages after it stop
+        // too, so unticking the FIRST stage of a branch turns the branch off.
+        {
+            const bool passable = s.inputs.size() == 1 && s.outputs.size() == 1 &&
+                                  !s.algo->IsReduction() && !s.algo->IsReshape() &&
+                                  !s.algo->IsAligner() && !s.algo->IsReconstruct();
+            bool upstreamOff = false;
+            for (const PortRef& r : s.inputs) upstreamOff = upstreamOff || IsOff(r);
+            s.off = (!s.algo->Enabled() && !passable) || upstreamOff;
+            if (s.off) {
+                s.outputs.clear();
+                s.outputs.resize(std::max<size_t>(1, s.algo->Outputs().size()));
+                s.valid = true;
+                ++m_bypassedStages;
+                continue;
+            }
         }
 
         // Gather inputs.

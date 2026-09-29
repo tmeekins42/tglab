@@ -118,7 +118,10 @@ bool RenderTarget::Ensure(Device& dev, int w, int h) {
     srv.Format                  = rd.Format;
     srv.ViewDimension           = D3D12_SRV_DIMENSION_TEXTURE2D;
     srv.Texture2D.MipLevels     = 1;
-    dev.Srv().Alloc(&m_srvCpu, &m_srv);
+    if (!dev.Srv().Alloc(&m_srvCpu, &m_srv)) {
+        Release();
+        return false;
+    }
     dev.Get()->CreateShaderResourceView(m_colour, &srv, m_srvCpu);
 
     m_w = w;

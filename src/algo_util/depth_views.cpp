@@ -47,9 +47,10 @@ bool ReadDepthViews(const std::vector<Image>& images, int nCam, const char* stag
 }
 
 int CountSeenThrough(const PointCloud& cloud, const std::vector<DepthView>& views,
-                     const Vec3& world, int skip, double minConf, double tol) {
+                     const Vec3& world, int skip, double minConf, double tol,
+                     int* measured) {
     const int nCam = int(cloud.cameras.size());
-    int seen = 0;
+    int seen = 0, meas = 0;
     for (int cj = 0; cj < nCam; ++cj) {
         if (cj == skip) continue;
         const Camera& oc = cloud.cameras[size_t(cj)];
@@ -66,8 +67,10 @@ int CountSeenThrough(const PointCloud& cloud, const std::vector<DepthView>& view
         const float od = ov.At(ix, iy);
         if (od <= 0.0f) continue;                    // it measured nothing
         if (ov.Conf(ix, iy) < float(minConf)) continue;
+        ++meas;
         if ((double(od) - local.z) / local.z > tol) ++seen;
     }
+    if (measured) *measured = meas;
     return seen;
 }
 

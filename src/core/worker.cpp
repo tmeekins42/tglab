@@ -1,5 +1,6 @@
 #include "worker.h"
 
+#include <algorithm>
 #include <cmath>
 #include <chrono>
 
@@ -154,6 +155,11 @@ uint64_t PipelineWorker::SubmitCompare(Pipeline pipe, std::shared_ptr<std::vecto
 void PipelineWorker::SetVisibleViewers(std::vector<std::string> names) {
     std::lock_guard<std::mutex> lock(m_mtx);
     m_visibleViewers = std::move(names);
+}
+
+void PipelineWorker::SetViewerFrames(std::map<std::string, int> frames) {
+    std::lock_guard<std::mutex> lock(m_mtx);
+    m_viewerFrames = std::move(frames);
 }
 
 void PipelineWorker::SetHistogramViewer(std::string name) {
@@ -365,6 +371,13 @@ void PipelineWorker::Run() {
             // the version check skips both.
             const size_t firstDirty = job->pipe.FirstDirtyStage();
             for (const ViewerDecl& vd : job->pipe.Viewers()) {
+                if (job->pipe.IsOff(vd.source)) {
+                    ViewerImage vi;
+                    vi.name = vd.name;
+                    vi.off  = true;
+                    outcome->viewers.push_back(std::move(vi));
+                    continue;
+                }
                 const Data* d = job->pipe.Resolve(vd.source, job->sources.get());
                 if (!d) continue;
 
@@ -400,12 +413,23 @@ void PipelineWorker::Run() {
                 // is what this panel eventually wants: a group of nineteen
                 // photographs has nineteen things worth looking at. Showing
                 // one is a poor answer and showing none is a bug report.
+                // NOW A FRAME SELECTOR: the panel asks for a frame, and that
+                // one is sent. Only one frame travels -- a hundred-frame video
+                // would otherwise be a hundred readbacks per run.
                 const Data* shown = d;
-                Data firstFrame;
+                Data oneFrame;
+                int frameIdx = 0, frameCount = 0;
                 if (const ImageSet* set = std::get_if<ImageSet>(d)) {
                     if (set->images.empty()) continue;
-                    firstFrame = Data{const_cast<Image&>(set->images[0]).Clone()};
-                    shown = &firstFrame;
+                    frameCount = int(set->images.size());
+                    {
+                        std::lock_guard<std::mutex> lock(m_mtx);
+                        auto it = m_viewerFrames.find(vd.name);
+                        if (it != m_viewerFrames.end()) frameIdx = it->second;
+                    }
+                    frameIdx = std::clamp(frameIdx, 0, frameCount - 1);
+                    oneFrame = Data{const_cast<Image&>(set->images[size_t(frameIdx)]).Clone()};
+                    shown = &oneFrame;
                 }
 
                 if (!std::holds_alternative<Image>(*shown)) continue;
@@ -416,7 +440,11 @@ void PipelineWorker::Run() {
                                          ? sourcesChanged
                                          : size_t(vd.source.stage) >= firstDirty;
                 uint64_t& ver = m_viewerVersions[vd.name];
-                if (changed || ver == 0) ++ver;
+                // A different frame of an unchanged group is new pixels too.
+                auto sent = m_sentFrames.find(vd.name);
+                const bool frameMoved = sent == m_sentFrames.end() || sent->second != frameIdx;
+                m_sentFrames[vd.name] = frameIdx;
+                if (changed || frameMoved || ver == 0) ++ver;
 
                 const Image& result = std::get<Image>(*shown);
 
@@ -432,6 +460,8 @@ void PipelineWorker::Run() {
                 ViewerImage vi;
                 vi.name    = vd.name;
                 vi.version = ver;
+                vi.frame = frameIdx;
+                vi.frameCount = frameCount;
                 vi.gpu     = shared;
                 if (shared) {
                     // Descriptor only -- deliberately NOT Image(desc), which

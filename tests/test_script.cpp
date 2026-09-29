@@ -27,6 +27,7 @@
 #include "../src/core/image_io.h"
 #include "../src/core/image_stats.h"
 #include "../src/core/ply_io.h"
+#include "../src/core/video_io.h"
 #include "../src/core/raw_io.h"
 #include "../src/core/cancel.h"
 #include "../src/core/pipeline.h"
@@ -138,6 +139,192 @@ static bool WriteExifFixture(const std::string& path) {
 
 // The .ply tests, in a function of their own: main's frame is already near
 // the 1 MB stack, since MSVC reserves every block's locals at entry.
+// Video: decoding, choosing the sharpest frame per time slot, and turning a
+// phone's rotation flag into upright frames. Its own function for the same
+// stack-size reason as TestPly.
+static void TestVideo() {
+    std::printf("\n--- video frames ---\n");
+
+    // A textured frame: 2x2-pixel noise, which has the fine detail blur
+    // removes, and a red band across the TOP so orientation is checkable.
+    const int W = 320, H = 240;
+    auto makeFrame = [&](uint32_t seed, bool blur) {
+        std::vector<uint8_t> g(size_t(W) * H);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                uint32_t s = seed + uint32_t((y / 2) * 7919 + (x / 2) * 104729);
+                s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+                g[size_t(y) * W + x] = uint8_t(40 + (s % 180));
+            }
+        if (blur) {   // a 9x9 box, twice: heavy motion-blur stand-in
+            for (int pass = 0; pass < 2; ++pass) {
+                std::vector<uint8_t> o(g.size());
+                for (int y = 0; y < H; ++y)
+                    for (int x = 0; x < W; ++x) {
+                        int sum = 0, n = 0;
+                        for (int dy = -4; dy <= 4; ++dy)
+                            for (int dx = -4; dx <= 4; ++dx) {
+                                const int xx = std::clamp(x + dx, 0, W - 1);
+                                const int yy = std::clamp(y + dy, 0, H - 1);
+                                sum += g[size_t(yy) * W + xx];
+                                ++n;
+                            }
+                        o[size_t(y) * W + x] = uint8_t(sum / n);
+                    }
+                g.swap(o);
+            }
+        }
+        Image im;
+        im.Alloc(ImageDesc{W, H, Format::RGBA8});
+        ImageView v = im.MapCpuWrite();
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                uint8_t* p = v.At<uint8_t>(x, y);
+                const uint8_t l = g[size_t(y) * W + x];
+                if (y < 16) { p[0] = 230; p[1] = 20; p[2] = 20; }
+                else { p[0] = p[1] = p[2] = l; }
+                p[3] = 255;
+            }
+        return im;
+    };
+
+    // --- the blur score ---
+    {
+        Image a = makeFrame(1, false), b = makeFrame(1, true);
+        ImageView va = a.MapCpuRead(), vb = b.MapCpuRead();
+        const double sa = FrameSharpness(va.data, W, H, int(va.Pitch()));
+        const double sb = FrameSharpness(vb.data, W, H, int(vb.Pitch()));
+        char m[160];
+        std::snprintf(m, sizeof(m), "the blur score ranks sharp above blurred "
+                                    "(%.0f against %.0f)", sa, sb);
+        Check(sa > 4.0 * sb, m);
+    }
+
+    // --- decoder padding: the buffer lengths an iPhone H.264 decode really
+    // produced. A portrait front-camera clip pads the ROWS (1080 -> 1088
+    // pixels), a landscape one pads the ROW COUNT; reading the first with a
+    // tight pitch drifted every row 32 bytes and smeared the frame diagonally.
+    Check(BufferPitch(8355840, 1080, 1920) == 1088 * 4,
+          "a portrait frame with padded rows is read at the padded pitch");
+    Check(BufferPitch(8355840, 1920, 1080) == 1920 * 4,
+          "a landscape frame with padded row count keeps the tight pitch");
+    Check(BufferPitch(64 * 48 * 4, 64, 48) == 64 * 4, "an unpadded frame is tight");
+
+    // --- rotation and channel order, on known pixels ---
+    {
+        // 3 x 2, BGRX, each pixel's blue channel its index: 0 1 2 / 3 4 5.
+        uint8_t src[2 * 3 * 4] = {};
+        for (int i = 0; i < 6; ++i) { src[i * 4 + 0] = uint8_t(i); src[i * 4 + 2] = 200; }
+        auto at = [](Image& im, int x, int y) {   // blue, in RGBA
+            ImageView v = im.MapCpuRead();
+            return int(v.At<uint8_t>(x, y)[2]);
+        };
+        Image r0 = FrameToImage(src, 3, 2, 12, 1, 0, true);
+        Image r90 = FrameToImage(src, 3, 2, 12, 1, 90, true);
+        Image r180 = FrameToImage(src, 3, 2, 12, 1, 180, true);
+        Image r270 = FrameToImage(src, 3, 2, 12, 1, 270, true);
+        const bool shape = r90.Desc().width == 2 && r90.Desc().height == 3 &&
+                           r0.Desc().width == 3;
+        // Clockwise 90: the left column, read bottom to top, becomes the top row.
+        const bool cw90 = at(r90, 0, 0) == 3 && at(r90, 1, 0) == 0 && at(r90, 0, 2) == 5;
+        const bool cw180 = at(r180, 0, 0) == 5 && at(r180, 2, 1) == 0;
+        const bool cw270 = at(r270, 0, 0) == 2 && at(r270, 1, 0) == 5 && at(r270, 0, 2) == 0;
+        ImageView v0 = r0.MapCpuRead();
+        const bool bgr = v0.At<uint8_t>(0, 0)[0] == 200;   // red came from byte 2
+        Check(shape && cw90 && cw180 && cw270 && bgr,
+              "frames rotate clockwise by the flag, and BGRX becomes RGBA");
+    }
+
+    // --- a real clip, out and back in ---
+    //
+    // 48 frames at 24 fps, in six slots of eight. Every frame is blurred
+    // except ONE per slot, at a known position -- so which frames come back
+    // says whether the slotting and the sharpness choice both work.
+    const int kFrames = 48, kSlots = 6, kSharpAt = 5;
+    std::vector<Image> clip;
+    for (int i = 0; i < kFrames; ++i)
+        clip.push_back(makeFrame(uint32_t(100 + i), i % 8 != kSharpAt));
+    std::string err;
+    const bool wrote = WriteTestVideo("video_test.mp4", clip, 24.0, 0, &err);
+    Check(wrote, "an H.264 test clip is written" + (wrote ? "" : ": " + err));
+    if (wrote) {
+        VideoOptions o;
+        o.frames = kSlots;
+        std::vector<Image> got;
+        VideoInfo info;
+        const bool ok = LoadVideoFrames("video_test.mp4", o, &got, &info, &err);
+        char m[200];
+        std::snprintf(m, sizeof(m), "...and decodes: %d frames read, %.2f s at %.1f fps",
+                      info.decoded, info.seconds, info.fps);
+        Check(ok && info.decoded == kFrames && std::fabs(info.fps - 24.0) < 0.1,
+              ok ? std::string(m) : "the clip decodes: " + err);
+        Check(ok && int(got.size()) == kSlots,
+              "one frame per slot (" + std::to_string(got.size()) + ")");
+        if (ok && int(got.size()) == kSlots) {
+            bool sharp = true;
+            std::string times;
+            for (int s = 0; s < kSlots; ++s) {
+                const double want = double(s * 8 + kSharpAt) / 24.0;
+                sharp &= std::fabs(info.times[size_t(s)] - want) < 0.5 / 24.0;
+                char t[16];
+                std::snprintf(t, sizeof(t), " %.3f", info.times[size_t(s)]);
+                times += t;
+            }
+            Check(sharp, "...each slot keeps its sharp frame (times" + times + ")");
+
+            ImageView v = got[0].MapCpuRead();
+            const uint8_t* top = v.At<uint8_t>(W / 2, 4);
+            const uint8_t* mid = v.At<uint8_t>(W / 2, H / 2);
+            Check(got[0].Desc().width == W && got[0].Desc().height == H &&
+                      top[0] > 180 && top[1] < 80 && !(mid[0] > 180 && mid[1] < 80),
+                  "...upright: the red band is still at the top");
+        }
+
+        // Downscaling: asked for at most 160 px, a 320 px clip halves.
+        VideoOptions small;
+        small.frames = 2;
+        small.maxDim = 160;
+        std::vector<Image> half;
+        VideoInfo hi;
+        const bool hok = LoadVideoFrames("video_test.mp4", small, &half, &hi, &err);
+        Check(hok && !half.empty() && half[0].Desc().width == W / 2,
+              "maxDim downscales the frames");
+    }
+    std::remove("video_test.mp4");
+
+    // A PORTRAIT phone clip: stored landscape, flagged to rotate 90° clockwise.
+    // The band stored at the top must come out down the RIGHT edge.
+    {
+        std::vector<Image> few;
+        for (int i = 0; i < 8; ++i) few.push_back(clip[size_t(i)].Clone());
+        const bool rw = WriteTestVideo("video_rot.mp4", few, 24.0, 90, &err);
+        VideoOptions o;
+        o.frames = 1;
+        std::vector<Image> got;
+        VideoInfo info;
+        const bool ok = rw && LoadVideoFrames("video_rot.mp4", o, &got, &info, &err);
+        if (ok && info.rotation == 0) {
+            std::printf("       the MP4 writer did not store the rotation flag; "
+                        "rotation checked on pixels only\n");
+        } else {
+            bool right = false;
+            if (ok && !got.empty() && got[0].Desc().width == H) {
+                ImageView v = got[0].MapCpuRead();
+                const uint8_t* edge = v.At<uint8_t>(H - 4, W / 2);
+                const uint8_t* left = v.At<uint8_t>(4, W / 2);
+                right = edge[0] > 180 && edge[1] < 80 && !(left[0] > 180 && left[1] < 80);
+            }
+            Check(right, "a clip flagged 90° comes out upright (rotation " +
+                             std::to_string(info.rotation) + ")" +
+                             (ok ? "" : ": " + err));
+        }
+        std::remove("video_rot.mp4");
+    }
+
+    Check(IsVideoPath("clip.MP4") && IsVideoPath("a/b.mov") && !IsVideoPath("x.png"),
+          "video files are recognised by extension");
+}
+
 static void TestPly() {
     // --- .ply: Gaussians and points, out and back in --------------------------
     //
@@ -4254,6 +4441,7 @@ int main() {
     }
 
     TestPly();
+    TestVideo();
 
     // A GROUP writes one file per frame, numbered -- a single path cannot name
     // N images, and a reduction consumes them in order so the numbering has to

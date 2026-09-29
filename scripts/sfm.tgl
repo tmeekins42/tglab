@@ -4,6 +4,16 @@
 # several -- then right-click the group and "Sort by filename" so the order is
 # the capture order. The matchers chain against neighbours, so order matters.
 #
+# Or drop a VIDEO on the "group" row: it replaces the photographs with the
+# clip's sharpest frame from each of 100 even time slots. Walk slowly around
+# the subject with exposure locked; see README for capture tips. A phone's
+# field of view differs from fountain-P11's -- about 33 degrees against 58.
+#
+# NOTHING NEEDS SETTING FOR EITHER. The field of view is estimated and then
+# measured (see solve_cameras below), and frames that see the same thing from
+# far apart are matched as well as neighbours (revisit, below), which is what
+# closes the loop on a walk around a subject.
+#
 # WHAT EACH STAGE DOES, because the chain is long and every stage solves a
 # genuinely different problem:
 #
@@ -110,10 +120,11 @@ frames = image("group")
 # with it. Measured on fountain-P11:
 #
 #   resize   sparse points   dense points   sweep, GPU   sweep, CPU
-#     0.4             2032         508582          2 s         15 s
+#     0.4             2032         476619          2 s         15 s
 #     off             2894        2507256         18 s         33 s
 #
-# (Dense counts from bench_sfm at the script's settings; the app has produced
+# (Dense counts from bench_sfm at the script's settings -- the "off" row from
+# before plane_sweep's min_bracket, which costs about a tenth; the app has produced
 # around six million at full resolution with looser fuse_depth settings.)
 #
 # FULL RESOLUTION IS NOW BETTER, not worse: 40% more sparse points and five
@@ -131,17 +142,17 @@ small = params( resize, scale = 0.4 )( frames )
 #
 # A detector that hits its cap is discarding candidates, and what it discards
 # is decided by response ranking rather than by which points the NEXT frame
-# will also find. Measured on castle-P19 at 1536 px, window 1, fov 58:
+# will also find. Measured on castle-P19 with this script as it stands:
 #
 #    cap     inliers/pair  cameras  points  ray residual
-#    5000        200        16/19     618      3.30 deg
-#   10000        537        19/19    1120      2.95 deg
-#   20000       1063        19/19    1506      3.40 deg
+#    5000        359        19/19     987      0.99 deg
+#   10000        505        19/19    1669      0.80 deg
+#   20000        505        19/19    1669      0.80 deg
 #
-# 10000 is the knee. The jump from 5000 is what registers all 19 cameras;
-# going on to 20000 doubles the matcher's work for more points that are no
-# better placed -- the ray residual gets WORSE, because the extra features
-# are low-response texture that matches ambiguously.
+# At this resolution (resize 0.4, max_dim 1200) AKAZE finds fewer than 10000
+# features a frame, so the cap stops binding there and 20000 changes nothing.
+# At higher resolution it does bind, and more is not simply better: the extra
+# features are low-response texture that matches ambiguously.
 #
 # The cost is quadratic in the matcher, so this is the first control to lower
 # if a large set is slow.
@@ -150,22 +161,20 @@ small = params( resize, scale = 0.4 )( frames )
 # bricks of different colour with the same relief are indistinguishable to it.
 # On a scene of repetitive masonry that is exactly the ambiguity that matters.
 #
-# MEASURED ON fountain-P11, and it does more than add points:
+# MEASURED ON fountain-P11:
 #
-#   colour   points   worst rotation residual   depth profile
-#        0     1636                   1.64 deg   TWO sheets
-#        1     1928                   0.74 deg   one sheet
+#   colour   inliers/pair   points   worst rotation residual
+#        0            582     1733                  1.61 deg
+#        1            685     2027                  0.78 deg
 #
-# THE LAST COLUMN IS THE REAL RESULT. Without the colour bits the brick wall
-# reconstructs as two surfaces a course apart -- greyscale descriptors cannot
-# tell one course from the next, so a fraction of matches land on the wrong
-# one, and being mutually consistent they survive RANSAC and triangulate into
-# a phantom wall. The colour bits break that symmetry, and the cloud collapses
-# to a single sheet.
+# More matches survive RANSAC, and the ones that do disagree with each other
+# half as much.
 #
-# See bench_sfm's planarity and depth-profile report for how that is measured:
-# no other number in this pipeline shows it, because both sheets reproject
-# correctly and the point count goes UP when the phantom appears.
+# (An earlier version of this table also claimed colour turned a phantom
+# second brick wall into one sheet. That was measured while camera
+# positioning was broken -- see global_position -- and does not reproduce:
+# with it fixed, the depth profile shows two peaks either way, which on this
+# scene are the fountain and the wall behind it.)
 #
 # Turn it off for a monochrome or near-monochrome capture, where the extra
 # bits carry no information and only cost matching time.
@@ -200,115 +209,74 @@ feat  = params( detect_akaze, max_features = 10000, colour = 1 )( small )
 # skip edges are good. Match the window to how fast the camera turns: check
 # `mean rotation` in the relative_pose report, and if frames two apart are more
 # than about 30 degrees apart, stay at 1.
-pairs = params( match_ann, chain = 1, window = 2 )( feat )
+#
+# revisit = 3 ALSO MATCHES EACH FRAME TO THE THREE FRAMES ELSEWHERE THAT LOOK
+# MOST LIKE IT: the end of a walk around a subject meeting its start, a sweep
+# passing the same view twice. Without it a loop never closes and its error
+# piles up -- a 100-frame video circling a toy cat came out as a spiral whose
+# end sat three radii from its start. Each revisit is then CHECKED by
+# relative_pose against the rotation the neighbour chain predicts, because on
+# repetitive structure frames look alike without being the same view: castle-
+# P19's window bays produced revisits that took its ray residual from 0.8
+# degrees to 4.3 before the check, and 0.97 after it (23 of 35 dropped).
+# Measured with it on, nothing else set:
+#
+#   capture        ray residual   revisits kept / dropped
+#   fountain-P11       0.17 deg          8 / 6
+#   castle-P19         0.97               12 / 23
+#   cat video          0.32              113 / 24     one closed ring
+#   rose video         0.29              112 / 33
+pairs = params( match_ann, chain = 1, window = 2, revisit = 3 )( feat )
 
 # NO align_features here, unlike the panorama script. It fits a homography,
 # which describes a pure camera ROTATION -- exactly what SfM does not have.
 # relative_pose runs its own RANSAC against the essential matrix instead, and
 # writes those inliers back for build_tracks.
-# FOV IS THE MOST CONSEQUENTIAL NUMBER IN THIS SCRIPT, and a guess here biases
-# every recovered rotation.
+# --- THE CAMERAS -------------------------------------------------------------
 #
-# HOW TO FIND IT, since guessing from the lens is unreliable: run the chain and
-# read `focal refined to fov` off the bundle_adjust_sfm report. Bundle
-# adjustment solves for the focal against reprojection error in pixels, so
-# where it settles is a measurement rather than an assumption. On castle-P19 it
-# converges to 50.0 degrees from starting guesses of 36, 45, 52 and 58 -- four
-# independent starts landing on the same value, which is what makes it
-# trustworthy. Set fov_deg to that and the upstream stages stop fighting it.
+# solve_cameras runs the whole chain that turns matched frames into cameras
+# and a sparse cloud:
 #
-# An earlier version of this script said 36 degrees, reasoning from a Canon D60
-# APS-C sensor and an assumed 35 mm lens. The measurement says the lens was
-# nearer 24 mm. Reasoning about the equipment was the wrong move when the
-# pipeline can measure it.
+#   relative_pose     the essential matrix for each pair, and the rotation
+#                     and direction inside it
+#   build_tracks      pairwise matches joined into multi-frame tracks
+#   rotation_average  one orientation per camera from all the pairs
+#   global_position   where the cameras are, jointly with the points
+#   triangulate, bundle_adjust_sfm, twice
 #
-# DO NOT TUNE THIS BY THE ROTATION RESIDUAL. It falls monotonically as the fov
-# rises, all the way to physically impossible values, because too long a focal
-# shrinks every recovered rotation toward the identity (34 deg at fov 30, 15.6
-# at fov 115) and near-identity rotations agree with each other trivially. The
-# residual rewards the collapse.
-posed = params( relative_pose, fov_deg = 50 )( pairs )
-
-
-# max_distance = 3 BECAUSE THIS IS A WALK AROUND A SUBJECT. The stages default
-# to 20, which is loose enough for a scene shot from outside -- cameras
-# clustered together, subject in front, every point legitimately ten or more
-# camera radii away. Here the cameras ring the subject, so the real structure
-# sits within a few radii and anything beyond is a stray.
+# Each of those is still a stage of its own, and can be chained by hand to
+# compare one against an alternative. This one exists so a capture simply
+# reconstructs, with nothing to set.
 #
-# Measured on castle-P19: bundle adjustment returned a cloud 65.9 units across
-# where triangulation had handed it one 13.3 across, from about 45 points of
-# 1129. Minimising reprojection error alone lets a point on nearly parallel
-# rays slide a long way outward while the error FALLS, so the check has to
-# happen after the solve as well as before it.
+# THE FOCAL LENGTH IS FOUND, NOT ASKED FOR. It is the most consequential
+# number in the chain -- on a video walked around a toy cat, solving at 42
+# degrees where the lens was about 33 made the rotations fail to close the
+# circle by 31 degrees and the reconstruction broke apart. relative_pose
+# estimates a starting value from the matches, bundle adjustment measures the
+# real one, and solve_cameras solves again with it until the two agree.
+# Measured with nothing given:
 #
-# TIGHTENED FROM 4 TO 3 on fountain-P11, where a phantom cluster appeared off
-# to one side that no camera was looking at. The limit is a multiple of the
-# camera radius, and on that set 4 allowed points twice as far out as the real
-# structure:
+#   capture        estimate   settled at   truth
+#   fountain-P11      51.6       57.8       58.2 (calibrated)
+#   castle-P19        60.8       58.4       58.2 (calibrated)
+#   cat video         30.3       33.3       ~33 (the loop closes there)
 #
-#   limit  points   raw Z extent   2-98% Z extent
-#     4     7434        9.64            3.80
-#     3     7258        5.76            3.21
-#     2.5   6939        4.20            1.34   <- eating real structure
+# If the lens is known, fov_deg on solve_cameras skips the estimate.
 #
-# 3 is the knee: the raw extent nearly halves while the robust extent barely
-# moves, for 176 points. castle-P19 is unchanged at 4019 points either way.
-# TRIANGULATE AND BUNDLE TWICE, which is worth more than any single parameter
-# in this script.
+# ITS OTHER SETTINGS, each measured:
 #
-# The first triangulation judges every track against cameras that global
-# positioning placed and nothing has yet refined. Bundle adjustment then moves
-# those cameras a long way -- rms 2.09 to 0.45 px on castle-P19 -- so tracks
-# rejected for reprojecting badly were often rejected against the wrong
-# cameras rather than for being wrong.
-#
-# Running the pair again re-judges them against the refined cameras. Measured:
-#
-#     round 1:  2889 points, reprojection median 10.6 px
-#     round 2:  7659 points, reprojection median  1.1 px
-#     round 3:  8324 points, reprojection median  0.5 px
-#
-# 2.6x the structure from re-running two stages that were already written to
-# support it -- triangulate's header describes this explicitly, and COLMAP
-# alternates the two until neither improves. A third round still helps but is
-# clearly converging, and costs another full bundle solve.
-# fov_deg HERE MUST MATCH relative_pose's, above. That stage normalises its
-# correspondences with this focal; build_tracks fills in the camera slots every
-# later stage reads. Two different values solve the reconstruction in one
-# geometry and measure it in another -- and it is silent, because both are
-# plausible numbers. This stage used to hardcode 50, which quietly overrode
-# whatever relative_pose was told.
-# min_length = 3 REJECTS TWO-VIEW TRACKS, and on a well-connected capture it
-# is the single largest improvement in this script.
-#
-# A track seen by only two cameras is triangulated from one ray intersection.
-# It reprojects perfectly -- it was placed to -- and its depth is whatever the
-# match noise decided. Requiring a third view means the depth has to satisfy
-# something it was not fitted to.
-#
-# Measured on fountain-P11 with window 2: the reconstruction's extent falls
-# from 4.95 to 1.42 units, and the phantom planes and most of the stray
-# structure go with it.
-#
-# DO NOT JUDGE THIS BY THE REPROJECTION RMS, which gets WORSE (0.93 to 1.18).
-# That number is computed over the points that SURVIVE, and this filter keeps
-# the hard ones -- a long track spans a wide baseline and is harder to fit --
-# while discarding the easy two-view ones that fit trivially. A filter that
-# removes difficult data always improves the average of what is left. I
-# initially read that as the filter being harmful and was wrong; the cloud is
-# plainly better on screen.
-#
-# NEEDS A CAPTURE THAT CHAINS. castle-P19's mean track length is 2.2, so this
-# leaves it 399 points of 4019 -- it deletes the reconstruction. Check the
-# len2 percentage in the build_tracks report: two thirds or less, use 3.
-cloud = params( build_tracks, fov_deg = 50, min_length = 3 )( posed )
-     => params( rotation_average )()
-     => params( global_position )()
-     => params( triangulate, max_distance = 3 )()
-     => params( bundle_adjust_sfm, max_distance = 3 )()
-     => params( triangulate, max_distance = 3 )()
-     => params( bundle_adjust_sfm, max_distance = 3 )()
+#   min_length 3      no two-view tracks. A track seen twice reprojects
+#                     perfectly -- it was placed to -- whatever its depth.
+#                     On fountain-P11 the cloud's extent fell from 4.95 to
+#                     1.42 units, and the phantom planes went with it.
+#   max_distance 3    points no further than 3 camera-ring radii: right for a
+#                     walk around a subject, where anything beyond is a stray.
+#                     Raise it for an open scene shot from one side.
+#   triangulate and bundle twice: the first triangulation judges tracks
+#                     against cameras nothing has refined yet; the second
+#                     re-judges them. castle-P19: 1669 points at 2.5 px after
+#                     one round, 2168 at 0.9 px after two.
+cloud = params( solve_cameras )( pairs )
 
 # --- DENSE RECONSTRUCTION ----------------------------------------------------
 #
@@ -353,18 +321,17 @@ fused = params( fuse_depth, min_views = 3 )( cloud, dense )
 
 # --- GAUSSIAN SPLATS -----------------------------------------------------------
 #
+# OFF BY DEFAULT: training is minutes where everything above is seconds, and
+# while tuning the solve you want to see the cameras, not wait out a fit.
+# Tick `enabled` under init_splats to switch the whole branch on -- training,
+# carving and rendering all read from it, so they go off and on with it and
+# their own boxes can stay ticked. (Unticking plane_sweep does the same for
+# the dense branch and everything after it.)
+#
 # One Gaussian per dense point: a small disc lying in the surface its
-# neighbours fit, as wide as the gap to them. Drawn sorted and blended, the
-# discs overlap into a continuous surface where the same points read as dots.
-#
-# UNTRAINED. This is the starting point Gaussian-splatting training optimises
-# from -- positions, shapes, colours and opacities fitted to the photographs --
-# and that stage does not exist yet. What you see here is only the dense
-# cloud, given area.
-#
-# The "splats" checkbox in the viewer switches back to dots, and "scale"
-# grows or shrinks every Gaussian at draw time without re-running anything.
-splats = params( init_splats )( fused )
+# neighbours fit, as wide as the gap to them -- the starting point training
+# optimises from.
+splats = params( init_splats, enabled = 0 )( fused )
 
 # TRAINING: the splats fitted to the photographs. Each iteration renders one
 # camera, compares it with that camera's photograph, and nudges every
@@ -384,22 +351,23 @@ splats = params( init_splats )( fused )
 #   iterations   PSNR after   GPU     CPU
 #          100     13.7 dB     7 s    85 s
 #          300     17.6 dB    15 s   308 s
-#         3000     30.9 dB   143 s
+#         3000     31.2 dB   143 s
 #
 # Those are scores on the photographs being trained on, which rewards fitting
 # them exactly. Setting `holdout = 5` leaves cameras 2 and 7 out and scores
 # them separately -- how it looks from somewhere it was not fitted to:
 #
 #   iterations   depth   training   held out
-#          300      no    18.1 dB    17.2 dB
-#         1000      no    25.3       24.2
-#         1000     yes    24.9       24.8
-#         3000      no    30.9       23.9     <- memorising the photographs
-#         3000     yes    30.6       25.0
+#          300      no    18.0 dB    17.1 dB
+#         1000      no    25.0       22.8
+#         1000     yes    24.4       24.0
+#         3000      no    31.2       23.3     <- mostly memorising
+#         3000     yes    30.7       24.6
 #
-# 1000 is the default because that is where the held-out score peaks; past
-# it, training fits the eleven photographs ever more closely and the views
-# between them get worse -- false colour, smears.
+# Past 1000 the training score climbs six more decibels while the held-out one
+# gains half of one: the extra fit is almost all to the eleven photographs
+# themselves, and shows between them as false colour and smears. 1000 is the
+# default for that trade -- a third of the time for most of what is real.
 #
 # DEPTH SUPERVISION is the third input: the sweep's depth maps. Rendered depth
 # is pulled toward them (depth_weight, 0.3), which pins Gaussians to the
@@ -416,13 +384,22 @@ trained = params( train_splats, iterations = 1000 )( splats, small, dense )
 # those views, floating in front of the fountain from everywhere else.
 # 1 removes most of them; 0 is stricter but punches holes in the basin,
 # because then one camera's depth noise is enough to condemn a Gaussian.
+# With many cameras a count alone is too easy to reach, so the dissenters
+# must also be a fifth of the cameras that measured there (max_seen_fraction):
+# on the 100-frame videos that took carving from removing 62-77% of the
+# Gaussians, holes and all, to 6-11%.
 # It also removes LARGE Gaussians that fewer than `large_min_views` cameras
 # have in view: at the edges of the capture nothing stops one smearing.
 carved = params( carve_splats )( trained, dense )
 
 # The trained splats rendered from each camera, through the same rasteriser
 # training scored against -- for comparing frame N with render N directly.
-rendered = params( render_splats )( carved )
+# The "frames" and "render" viewers step through their frames together.
+#
+# OFF BY DEFAULT: it is for checking a fit, not part of making one, and on
+# a hundred-frame video it is the better part of a minute. Tick `enabled`
+# under render_splats to validate.
+rendered = params( render_splats, enabled = 0 )( carved )
 
 display( small, "frames" )
 display( cloud, "reconstruction" )

@@ -157,15 +157,75 @@ bool LoadView(const Image& img, int k, std::vector<double>* rgb, int* ow,
 }
 
 // Mean absolute error and PSNR of a render against its photograph.
+// THE PIXELS TRAINING IS ALLOWED TO FIT: those the starting Gaussians --
+// the fused dense cloud -- cover when projected into this view, grown by
+// `grow` pixels. Everything else has its target colour set to -1, which the
+// loss treats as background (see the random background in the loop) and
+// every score skips.
+//
+// WHY. A photograph shows more than the reconstruction holds -- the wall
+// behind a face, sky over a building -- and with nothing in the scene to
+// explain those pixels, training grows and stretches Gaussians near the
+// subject until they paint the background in. From any other viewpoint
+// those are the smears and blobs around the edge.
+//
+// FROM THE FUSED CLOUD, not the depth maps. A single view's depth map still
+// holds speckles of background it measured on its own; grown, they covered
+// most of a selfie's wall and left only 28% masked. The fused points are
+// the ones several cameras agreed on, which is exactly the subject.
+//
+// GROWN because the cloud has thin gaps ON the subject -- mortar lines on a
+// brick wall, a horizontal edge the camera moved along -- and those should
+// still be fitted. A few pixels closes them; a background region is far
+// wider and stays out.
+void MaskUncovered(const std::vector<Splat>& points, const SplatCam& cam, int grow,
+                   std::vector<double>* rgb) {
+    const int w = cam.w, h = cam.h;
+    std::vector<uint8_t> in(size_t(w) * size_t(h), 0);
+    for (const Splat& s : points) {
+        const Vec3 q = cam.R * s.mean + cam.t;
+        if (q.z <= 1e-9) continue;
+        const int x = int(cam.fx * q.x / q.z + cam.cx);
+        const int y = int(cam.fy * q.y / q.z + cam.cy);
+        if (x >= 0 && y >= 0 && x < w && y < h) in[size_t(y) * size_t(w) + size_t(x)] = 1;
+    }
+    // Dilation by a square of side 2*grow+1, separably: rows, then columns.
+    std::vector<uint8_t> tmp(in.size(), 0);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            uint8_t v = 0;
+            for (int d = -grow; d <= grow && !v; ++d) {
+                const int xx = x + d;
+                if (xx >= 0 && xx < w) v = in[size_t(y) * size_t(w) + size_t(xx)];
+            }
+            tmp[size_t(y) * size_t(w) + size_t(x)] = v;
+        }
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            uint8_t v = 0;
+            for (int d = -grow; d <= grow && !v; ++d) {
+                const int yy = y + d;
+                if (yy >= 0 && yy < h) v = tmp[size_t(yy) * size_t(w) + size_t(x)];
+            }
+            if (!v)
+                for (int ch = 0; ch < 3; ++ch)
+                    (*rgb)[(size_t(y) * size_t(w) + size_t(x)) * 3 + size_t(ch)] = -1.0;
+        }
+}
+
+// L1 and PSNR over the pixels with a target (see MaskUnmeasured).
 void Score(const std::vector<double>& a, const std::vector<double>& b,
            double* l1, double* psnr) {
     double s1 = 0.0, s2 = 0.0;
+    size_t used = 0;
     for (size_t i = 0; i < a.size(); ++i) {
+        if (b[i] < 0.0) continue;
         const double d = a[i] - b[i];
         s1 += std::fabs(d);
         s2 += d * d;
+        ++used;
     }
-    const double n = double(std::max<size_t>(1, a.size()));
+    const double n = double(std::max<size_t>(1, used));
     *l1 = s1 / n;
     const double mse = s2 / n;
     *psnr = (mse > 1e-20) ? 10.0 * std::log10(1.0 / mse) : 99.0;
@@ -220,11 +280,15 @@ public:
         std::vector<ImageView> depthHolds;   // keep the mappings alive
         const double depthWeight = double(m_depthWeight);
         const bool useDepth = ReconstructExtra() && depthWeight > 0.0;
+        // The mask marks where the dense cloud is, so it needs the dense
+        // path; the depth input is what says this is one.
+        const bool useMask = ReconstructExtra() && bool(m_mask);
         if (useDepth &&
             !ReadDepthViews(*ReconstructExtra(), int(cloud->cameras.size()),
                             "train_splats", &depthViews, &depthHolds, err))
             return false;
         std::vector<View> views, heldOut;
+        size_t maskedPx = 0, totalPx = 0;   // for the report
         for (size_t i = 0; i < cloud->cameras.size(); ++i) {
             const Camera& c = cloud->cameras[i];
             if (!c.solved) continue;
@@ -234,6 +298,11 @@ public:
             vw.cam = SplatCamFrom(c, w, h);
             if (useDepth)
                 vw.depth = DepthTarget(depthViews[i], w, h, double(m_depthConfidence));
+            if (useMask) {
+                MaskUncovered(cloud->splats, vw.cam, std::max(0, int(m_maskGrow)), &vw.rgb);
+                for (double v : vw.rgb) if (v < 0.0) ++maskedPx;
+                totalPx += vw.rgb.size();
+            }
             // Every Nth camera from the middle of each run of N, so the held-
             // out ones sit BETWEEN training cameras: interpolation, which is
             // the question. Holding out an end camera would ask about
@@ -249,6 +318,35 @@ public:
         std::vector<SplatParam> params;
         params.reserve(cloud->splats.size());
         for (const Splat& s : cloud->splats) params.push_back(ToParam(s));
+
+        // THE CAP APPLIES TO THE START TOO. max_gaussians used to limit only
+        // what densification added, so a dense cloud bigger than it went
+        // straight through -- and a hundred-frame video fused to 2.6 million
+        // points, whose GPU state (13 texels a Gaussian) needs a texture past
+        // Direct3D's 16384-row limit. Training fell back to the CPU, which at
+        // that size is hours. Thinned evenly, with each kept Gaussian widened
+        // to cover the area of those it stands for: thinning by r leaves each
+        // flat disc r times the surface, so its two larger axes grow by
+        // sqrt(r).
+        const size_t cap = size_t(std::max(1, int(m_maxGaussians)));
+        size_t thinnedFrom = 0;
+        if (params.size() > cap) {
+            thinnedFrom = params.size();
+            const double r = double(params.size()) / double(cap);
+            const double grow = 0.5 * std::log(r);
+            std::vector<SplatParam> kept;
+            kept.reserve(cap);
+            for (size_t k = 0; k < cap; ++k) {
+                SplatParam p = params[size_t(double(k) * r)];
+                int flat = 0;   // the thin axis stays as it is
+                for (int a = 1; a < 3; ++a)
+                    if (p.logScale[a] < p.logScale[flat]) flat = a;
+                for (int a = 0; a < 3; ++a)
+                    if (a != flat) p.logScale[a] += grow;
+                kept.push_back(p);
+            }
+            params.swap(kept);
+        }
         size_t n = params.size();   // changes as densification adds and prunes
 
         RasterOptions opt;
@@ -299,6 +397,7 @@ public:
         std::vector<double> m1(n * 14, 0.0), m2(n * 14, 0.0);
         std::vector<SplatParam> grad(n, SplatParam::Zero());
         std::vector<double> img, dImg;
+        std::vector<double> maskedTarget;   // see the random background below
         std::vector<double> rDepth, dDepth;          // the CPU path's depth term
         double    cpuDepthErr = 0.0;
         long long cpuDepthCount = 0;
@@ -383,6 +482,31 @@ public:
             const View& vw = views[size_t(order.back())];
             order.pop_back();
 
+            // MASKED PIXELS TARGET A RANDOM BACKGROUND. Leaving them out of
+            // the loss alone stops training painting the background in, but
+            // it also makes a Gaussian already sitting there free: nothing
+            // pulls on it, so the blobs grown from the subject's edge stayed.
+            // Rendering over a colour drawn fresh each step, and asking the
+            // masked pixels to BE that colour, can only be met by being
+            // transparent there -- so anything in front of the background is
+            // driven to zero opacity and pruned. (The trick object-centric
+            // NeRF and splatting work uses with masks.) Measured pixels see
+            // the same background wherever the Gaussians are not yet opaque,
+            // which pushes the subject solid as well.
+            const std::vector<double>* target = &vw.rgb;
+            if (useMask) {
+                const Vec3 bgc{rnd(256) / 255.0, rnd(256) / 255.0, rnd(256) / 255.0};
+                opt.background = bgc;
+                maskedTarget = vw.rgb;
+                for (size_t i = 0; i < maskedTarget.size(); i += 3)
+                    if (maskedTarget[i] < 0.0) {
+                        maskedTarget[i] = bgc.x;
+                        maskedTarget[i + 1] = bgc.y;
+                        maskedTarget[i + 2] = bgc.z;
+                    }
+                target = &maskedTarget;
+            }
+
             const double frac = (iters > 1) ? double(it) / double(iters - 1) : 1.0;
             const double lrMean = lrMean0 * std::pow(lrMean1 / lrMean0, frac);
             const double c1 = 1.0 - std::pow(b1, double(it + 1));
@@ -392,7 +516,7 @@ public:
             // take this step, and every later one, on the CPU.
             bool stepped = false;
             if (gpuTrainer) {
-                if (gpuTrainer->Step(vw.cam, opt, vw.rgb, lrMean, c1, c2, &gpuNote,
+                if (gpuTrainer->Step(vw.cam, opt, *target, lrMean, c1, c2, &gpuNote,
                                      vw.depth.empty() ? nullptr : &vw.depth,
                                      depthWeight)) {
                     visibleSum += gpuTrainer->Visible();
@@ -417,11 +541,15 @@ public:
                            vw.depth.empty() ? nullptr : &rDepth);
             visibleSum += raster.Visible();
 
-            // L1: the gradient is the sign of each difference, over the mean.
+            // L1: the gradient is the sign of each difference, over the mean
+            // -- of the pixels with a target; masked ones pull nothing.
             dImg.resize(img.size());
-            const double invN = 1.0 / double(img.size());
+            size_t used = 0;
+            for (double v : *target) if (v >= 0.0) ++used;
+            const double invN = 1.0 / double(std::max<size_t>(1, used));
             for (size_t i = 0; i < img.size(); ++i) {
-                const double d = img[i] - vw.rgb[i];
+                if ((*target)[i] < 0.0) { dImg[i] = 0.0; continue; }
+                const double d = img[i] - (*target)[i];
                 dImg[i] = (d > 0.0 ? invN : (d < 0.0 ? -invN : 0.0));
             }
 
@@ -686,6 +814,7 @@ public:
         }
 
         // --- how well it fits after ------------------------------------------
+        opt.background = Vec3{bg, bg, bg};   // the random one was for training
         double l1After = l1Before, psnrAfter = psnrBefore;
         depthAfter = depthBefore;
         if (iters > 0)
@@ -752,6 +881,9 @@ public:
                       l1Before, l1After, psnrBefore, psnrAfter, secs, dens,
                       timing);
         m_note = buf;
+        if (thinnedFrom > 0)
+            m_note += "; started from " + std::to_string(thinnedFrom) +
+                      " Gaussians, thinned evenly to max_gaussians";
         if (useDepth) {
             char db[200];
             std::snprintf(db, sizeof(db),
@@ -759,6 +891,14 @@ public:
                           "%.2f%% -> %.2f%%",
                           depthWeight, depthBefore * 100.0, depthAfter * 100.0);
             m_note += db;
+        }
+        if (useMask && totalPx > 0) {
+            char mb[160];
+            std::snprintf(mb, sizeof(mb),
+                          "; %.0f%% of pixels masked out (no depth measured there), "
+                          "scores over the rest",
+                          100.0 * double(maskedPx) / double(totalPx));
+            m_note += mb;
         }
         if (!heldOut.empty()) {
             char hb[200];
@@ -826,18 +966,30 @@ private:
     // PSNR on the training views / the held-out ones:
     //
     //   iterations   depth_weight   training   held out
-    //         1000              0    25.27      24.18
-    //         1000            0.1    25.42      24.38
-    //         1000            0.3    24.93      24.78
-    //         1000            0.5    24.01      24.27
-    //         3000              0    30.86      23.93
-    //         3000            0.3    30.60      25.04
-    //         3000            1.0    27.42      22.87
+    //         1000              0    24.97      22.82
+    //         1000            0.1    25.40      23.40
+    //         1000            0.3    24.40      23.98
+    //         1000            0.5    24.02      23.86
+    //         3000              0    31.17      23.32
+    //         3000            0.3    30.66      24.59
+    //         3000            1.0    27.39      22.55
     //
-    // 0.3 is best at both lengths, and at 1000 iterations it all but closes
-    // the gap between the photographs trained on and the ones held out --
-    // the gap that IS overfitting. Stronger, and the sweep's own errors
-    // start to win over the photographs.
+    // 0.3 is best at both lengths, and at 1000 iterations it narrows the gap
+    // between the photographs trained on and the ones held out from 2.2 dB
+    // to 0.4 -- the gap that IS overfitting. Stronger, and the sweep's own
+    // errors start to win over the photographs.
+    // See MaskUnmeasured. Needs the depth input; without it every pixel trains.
+    Param<bool> m_mask{this, "mask", true,
+        "Fit only the pixels the dense cloud covers (grown by "
+        "mask_grow). Background with no geometry behind it -- a wall behind "
+        "a face -- is then left out rather than painted in by Gaussians "
+        "stretched around the subject. Needs the depth input."};
+    Param<int> m_maskGrow{this, "mask_grow", 4, 0, 32,
+        {.help = "Pixels, at training resolution, the measured region is "
+                 "grown by before masking, so thin unmeasured gaps on the "
+                 "subject -- mortar lines, edges along the camera's motion -- "
+                 "are still fitted. Wide unmeasured regions stay out."}};
+
     Param<float> m_depthWeight{this, "depth_weight", 0.3f, 0.0f, 10.0f,
         {.help = "How strongly rendered depth is pulled toward the plane "
                  "sweep's, relative to the colour loss. The error is "
@@ -914,7 +1066,7 @@ private:
     // Gaussian costs time on every iteration, so an unbounded set grows the
     // cost of the run as it goes. When the cap binds, the Gaussians with the
     // largest gradients divide first.
-    Param<int> m_maxGaussians{this, "max_gaussians", 1000000, 1000, 100000000,
+    Param<int> m_maxGaussians{this, "max_gaussians", 1000000, 1, 100000000,
         {.help = "Upper limit on the number of Gaussians. Training on the CPU "
                  "costs time in proportion to it.",
          .softMax = 5000000.0}};

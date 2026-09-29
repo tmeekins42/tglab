@@ -38,6 +38,12 @@ void ImageViewPanel::Draw(Device& dev, Image* img) {
     // Getting this wrong showed every GPU-resident viewer as "computing..."
     // forever, on a run the status bar reported as finished.
     const bool haveSomething = m_gpuSrc || (img && img->Valid());
+    if (m_off) {
+        ImGui::TextDisabled("off -- a stage feeding this view is switched off");
+        ImGui::End();
+        return;
+    }
+    DrawFrameBar();
     if (!haveSomething || !img || !img->Desc().Valid()) {
         ImGui::TextDisabled("computing...");
         ImGui::End();
@@ -315,6 +321,38 @@ void ImageViewPanel::Draw(Device& dev, Image* img) {
 // a GPU-resident result is converted on the device and never read. So the loupe
 // fetches just its own window -- 15x15 samples, a few kilobytes -- rather than
 // the whole image, and only while it is switched on.
+// The frame selector for a group: play/stop and a slider across the top.
+//
+// Playing advances only once the frame asked for has ARRIVED, so a slow
+// re-run never queues a backlog of requests -- the playback simply runs at
+// whatever rate the pipeline can hand frames over, up to about ten a second.
+void ImageViewPanel::DrawFrameBar() {
+    if (m_frameCount <= 1) { m_playing = false; return; }
+    const double now = ImGui::GetTime();
+    if (m_playing && m_frameShown == m_frameWant && now - m_lastStep >= 0.1) {
+        m_frameRequest = (m_frameWant + 1) % m_frameCount;
+        m_lastStep = now;
+    }
+    if (ImGui::SmallButton(m_playing ? "Pause" : "Play")) {
+        m_playing = !m_playing;
+        m_lastStep = now;
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Stop")) {
+        m_playing = false;
+        m_frameRequest = 0;
+    }
+    ImGui::SameLine();
+    int shown = (m_frameRequest >= 0 ? m_frameRequest : m_frameWant) + 1;
+    ImGui::SetNextItemWidth(std::max(80.0f, ImGui::GetContentRegionAvail().x - 90.0f));
+    if (ImGui::SliderInt("##frame", &shown, 1, m_frameCount, "frame %d")) {
+        m_playing = false;
+        m_frameRequest = shown - 1;
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("of %d", m_frameCount);
+}
+
 void ImageViewPanel::DrawLoupe(Device& dev, Image& img, const ImVec2& mouse,
                                const ImVec2& imgOrigin, float zoom, ImDrawList* dl) {
     if (zoom <= 1e-6f) return;

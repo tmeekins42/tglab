@@ -3,6 +3,9 @@
 #include <algorithm>
 
 #include "image_io.h"
+#include "video_io.h"
+
+#include <cstdio>
 
 namespace tglab {
 
@@ -73,7 +76,28 @@ void ImageLoader::Run() {
         res.path       = req.path;
         res.targetSlot = req.targetSlot;
         res.seq        = req.seq;
-        res.ok         = LoadImageFile(req.path, &res.image, &res.error);
+        if (IsVideoPath(req.path)) {
+            // A video decodes to a group of frames. Here on the worker like
+            // any decode, and the slowest one there is: every frame of the
+            // clip is read to find the sharpest in each slot.
+            VideoInfo vi;
+            res.ok = LoadVideoFrames(req.path, VideoOptions{}, &res.frames, &vi,
+                                     &res.error);
+            res.frameTimes = vi.times;
+            if (res.ok) {
+                char buf[200];
+                std::snprintf(buf, sizeof(buf),
+                              "%d frames kept of %d (%.1f s at %.0f fps, %dx%d%s)",
+                              int(res.frames.size()), vi.decoded, vi.seconds,
+                              vi.fps, vi.width, vi.height,
+                              vi.rotation ? (", rotated " + std::to_string(vi.rotation) +
+                                             "°").c_str()
+                                          : "");
+                res.note = buf;
+            }
+        } else {
+            res.ok = LoadImageFile(req.path, &res.image, &res.error);
+        }
 
         // EXIF on the worker too, for the same reason the pixels are here. Read
         // even when the decode failed: a file can be an unsupported format and

@@ -63,6 +63,12 @@ struct Stage {
     // detected as a change rather than looking identical.
     uint64_t             sourceHash = 0;
     bool                 valid     = false;   // outputs hold a usable result
+
+    // Switched off and producing NOTHING: its `enabled` box is unticked but it
+    // cannot pass its input through (several inputs, or a group becoming a
+    // cloud), or something it reads is itself off. Everything downstream goes
+    // off with it, so unticking init_splats stops the whole splat chain.
+    bool                 off       = false;
     int                  line      = 0;       // for error messages
 
     // Wall-clock milliseconds this stage last spent running, and how many
@@ -284,6 +290,10 @@ public:
     // stacked script can show "12 stages, 9 bypassed" rather than leaving the
     // user to wonder whether an effect they turned off is still costing them.
     int BypassedStageCount() const { return m_bypassedStages; }
+
+    // Whether a port comes from a switched-off stage (see Stage::off), so a
+    // viewer can say "off" rather than "computing..." forever.
+    bool IsOff(PortRef r) const;
 
     // Index of the first stage that actually re-ran. Everything below it kept
     // its cached output, so a viewer reading from there shows the same pixels

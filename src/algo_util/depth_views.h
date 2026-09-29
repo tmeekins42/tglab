@@ -61,7 +61,10 @@ bool ReadDepthViews(const std::vector<Image>& images, int nCam, const char* stag
 // confidence, and that surface is more than `tol` (a fraction of the
 // distance) BEHIND the point along their line of sight. Each such camera saw
 // empty space where the point claims to be. Pass skip = -1 to ask them all.
+// `measured`, when given, receives how many cameras had a depth there at all
+// -- the denominator for judging how many seeing through is many.
 int CountSeenThrough(const PointCloud& cloud, const std::vector<DepthView>& views,
-                     const Vec3& world, int skip, double minConf, double tol);
+                     const Vec3& world, int skip, double minConf, double tol,
+                     int* measured = nullptr);
 
 }  // namespace tglab

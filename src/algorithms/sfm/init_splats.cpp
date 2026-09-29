@@ -231,6 +231,8 @@ public:
 
         std::vector<Splat> out(static_cast<size_t>(n));
         std::vector<char>  planar(static_cast<size_t>(n), 0);
+        std::vector<double> spacings(static_cast<size_t>(n), 0.0);
+        std::vector<int>    found(static_cast<size_t>(n), 0);
 
         ParallelFor(n, [&](int i) {
             const Vec3& p = pts[size_t(i)];
@@ -255,6 +257,8 @@ public:
             double spacing = 0.0;
             for (int j = 0; j < m; ++j) spacing += std::sqrt(near[size_t(j)].first);
             spacing = (m > 0) ? spacing / double(m) : cell * 0.5;
+            spacings[size_t(i)] = spacing;
+            found[size_t(i)] = m;
 
             Splat s;
             s.mean = p;
@@ -298,15 +302,42 @@ public:
             out[size_t(i)] = s;
         });
 
+        // ISOLATED POINTS ARE DROPPED. A point whose neighbours are several
+        // times further off than is typical for this cloud is not on a
+        // surface with the rest: it is a stray that survived fusion -- on a
+        // selfie video, a sprinkle of wall far behind the head. Kept, each
+        // becomes a Gaussian that training grows into a blob to paint the
+        // background it sits in front of.
+        int dropped = 0;
+        const double factor = double(m_isolated);
+        if (factor > 0.0) {
+            std::vector<double> sorted = spacings;
+            std::nth_element(sorted.begin(), sorted.begin() + long(sorted.size() / 2),
+                             sorted.end());
+            const double limit = factor * sorted[sorted.size() / 2];
+            std::vector<Splat> kept;
+            std::vector<char> keptPlanar;
+            kept.reserve(out.size());
+            for (size_t i = 0; i < out.size(); ++i) {
+                if (found[i] < 3 || spacings[i] > limit) { ++dropped; continue; }
+                kept.push_back(out[i]);
+                keptPlanar.push_back(planar[i]);
+            }
+            out.swap(kept);
+            planar.swap(keptPlanar);
+        }
+
         int nPlanar = 0;
         for (char c : planar) nPlanar += c;
+        const int nOut = int(out.size());
         cloud->splats = std::move(out);
 
-        char buf[256];
+        char buf[320];
         std::snprintf(buf, sizeof(buf),
                       "init_splats: %d Gaussians from %d points, %d oriented to "
-                      "the surface, %d left spherical (too few neighbours)",
-                      n, n, nPlanar, n - nPlanar);
+                      "the surface, %d left spherical (too few neighbours); "
+                      "%d isolated points dropped",
+                      nOut, n, nPlanar, nOut - nPlanar, dropped);
         m_note = buf;
         return true;
     }
@@ -331,6 +362,12 @@ private:
         const double ez = pct([](const Vec3& p) { return p.z; });
         return std::max(1e-9, std::sqrt(ex * ex + ey * ey + ez * ez));
     }
+
+    Param<float> m_isolated{this, "isolated", 3.0f, 0.0f, 20.0f,
+        {.help = "Drop a point whose nearest neighbours are more than this "
+                 "many times further off than the cloud's median spacing -- a "
+                 "stray, not part of a surface. 0 keeps every point.",
+         .step = 0.5}};
 
     Param<int> m_neighbours{this, "neighbours", 8, 3, 32,
         {.help = "How many nearest points define each Gaussian's size and the "

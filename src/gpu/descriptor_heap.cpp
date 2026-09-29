@@ -72,12 +72,17 @@ bool SrvHeap::Reserve(uint32_t count, D3D12_CPU_DESCRIPTOR_HANDLE* outCpu,
     outGpu->ptr = m_gpuStart.ptr + UINT64(runStart) * m_stride;
     return true;
 }
-void SrvHeap::Alloc(D3D12_CPU_DESCRIPTOR_HANDLE* outCpu, D3D12_GPU_DESCRIPTOR_HANDLE* outGpu) {
-    assert(!m_free.empty() && "SRV heap exhausted — raise the capacity");
+bool SrvHeap::Alloc(D3D12_CPU_DESCRIPTOR_HANDLE* outCpu, D3D12_GPU_DESCRIPTOR_HANDLE* outGpu) {
+    if (m_free.empty()) {
+        outCpu->ptr = 0;
+        outGpu->ptr = 0;
+        return false;
+    }
     const uint32_t idx = m_free.back();
     m_free.pop_back();
     outCpu->ptr = m_cpuStart.ptr + SIZE_T(idx) * m_stride;
     outGpu->ptr = m_gpuStart.ptr + UINT64(idx) * m_stride;
+    return true;
 }
 
 void SrvHeap::Free(D3D12_CPU_DESCRIPTOR_HANDLE cpu, D3D12_GPU_DESCRIPTOR_HANDLE gpu) {
