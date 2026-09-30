@@ -387,6 +387,31 @@ static void TestPly() {
             named &= header.find(p) != std::string::npos;
         Check(named, "...in the 3DGS layout other tools read");
 
+        // VIEW-DEPENDENT COLOUR, out and back: degree 3, every coefficient
+        // distinct, so a channel/coefficient transposition in either
+        // direction shows as a mismatch rather than cancelling out.
+        {
+            PointCloud shc = pc;
+            shc.shDegree = 3;
+            shc.splatSh.resize(shc.splats.size() * 45);
+            for (size_t q = 0; q < shc.splatSh.size(); ++q)
+                shc.splatSh[q] = float(0.01 * double(q) - 0.3);
+            PointCloud shBack;
+            std::string shErr, shNote;
+            const bool ok = SavePly("ply_sh.ply", shc, &shErr) &&
+                            LoadPly("ply_sh.ply", &shBack, &shNote, &shErr);
+            Check(ok && shBack.shDegree == 3 && shBack.splatSh == shc.splatSh,
+                  "view-dependent colour saves and loads back exactly (" +
+                      (ok ? shNote : shErr) + ")");
+            std::ifstream sf("ply_sh.ply", std::ios::binary);
+            std::string sh, ln;
+            while (std::getline(sf, ln) && ln != "end_header") sh += ln + "\n";
+            Check(sh.find("property float f_rest_44") != std::string::npos &&
+                      sh.find("f_rest_45") == std::string::npos &&
+                      sh.find("f_dc_2\nproperty float f_rest_0") != std::string::npos,
+                  "...as f_rest_0..44 straight after f_dc, the reference layout");
+        }
+
         // A plain point cloud: no Gaussians, so points with 8-bit colour.
         PointCloud pts;
         for (int i = 0; i < 3; ++i) {
@@ -429,7 +454,8 @@ static void TestPly() {
         // A FILE AS THE 3DGS REFERENCE WRITES IT, which is what a download
         // is: normals, then f_dc, then 45 f_rest values, then opacity, scale
         // and rotation -- properties this writer never emits, in an order it
-        // does not use. The f_rest values must be skipped and reported.
+        // does not use. The f_rest values must come in, reordered from its
+        // one-channel-after-another to rest[k * 3 + channel].
         {
             std::ofstream rf("ply_inria.ply", std::ios::binary);
             rf << "ply\nformat binary_little_endian 1.0\nelement vertex 2\n"
@@ -446,7 +472,7 @@ static void TestPly() {
                 r.insert(r.end(), {float(i), 1.0f, 2.0f, 0.0f, 0.0f, 0.0f});
                 // f_dc of 0 is colour 0.5; of 1/C0 is colour 1.5, clamped to 1.
                 r.insert(r.end(), {0.0f, float(1.0 / 0.28209479177387814), -1.0f});
-                for (int k = 0; k < 45; ++k) r.push_back(9.0f);   // must be ignored
+                for (int k = 0; k < 45; ++k) r.push_back(0.01f * float(k) + float(i));
                 r.push_back(0.0f);                                 // logit 0: 0.5
                 r.insert(r.end(), {std::log(0.1f), std::log(0.2f), std::log(0.3f)});
                 r.insert(r.end(), {2.0f, 0.0f, 0.0f, 0.0f});       // not unit
@@ -466,8 +492,14 @@ static void TestPly() {
             std::fabs(ib.splats[0].rot[0] - 1.0) < 1e-9;
         Check(right, "a 3DGS reference file with f_rest decodes (" +
                          (iok ? note : err) + ")");
-        Check(iok && note.find("dropped") != std::string::npos,
-              "...and says its view-dependent colour was dropped");
+        bool shRight = iok && ib.shDegree == 3 && ib.splatSh.size() == 2 * 45;
+        for (int i = 0; shRight && i < 2; ++i)
+            for (int ch = 0; ch < 3; ++ch)
+                for (int k = 0; k < 15; ++k)
+                    shRight &= std::fabs(ib.splatSh[size_t(i) * 45 + size_t(k * 3 + ch)] -
+                                         (0.01f * float(ch * 15 + k) + float(i))) < 1e-6f;
+        Check(shRight, "...keeping its view-dependent colour, each coefficient in "
+                       "its place");
 
         // THROUGH A SCRIPT: load_ply takes no inputs, and save() writes a
         // reconstruction as .ply.
@@ -497,7 +529,7 @@ static void TestPly() {
                   "saving an image as .ply is refused (" + e2 + ")");
         }
         for (const char* f : {"ply_splats.ply", "ply_points.ply", "ply_ascii.ply", "ply_inria.ply",
-                              "ply_resaved.ply", "ply_img.ply"})
+                              "ply_resaved.ply", "ply_img.ply", "ply_sh.ply"})
             std::remove(f);
     }
 }
@@ -6191,6 +6223,110 @@ int main() {
                     } else {
                         Check(false, "the mirrored-frame pipeline ran: " + e);
                     }
+                }
+
+                // A CAMERA PITCHED DOWN WHILE IT PANS. Tim's phone video of a
+                // desk: every link carried a small roll of the same sign, as a
+                // turn about a vertical axis does when seen from a tilted
+                // camera, and the far end of the panorama ran off at 45
+                // degrees. Straightening turns the cylinder about the true
+                // pan axis instead of frame 0's own vertical.
+                //
+                // Frames here are known rotations, attached directly: 25 of
+                // them over 120 degrees of yaw, from a camera pitched 35
+                // degrees down. Ref -> frame i is P Y(i) P^T, with P the pitch.
+                {
+                    ImageView pv2 = photo.MapCpuRead();
+                    const float cx = 0.5f * float(pv2.desc.width);
+                    const float cy = 0.5f * float(pv2.desc.height);
+                    const int srcH = pv2.desc.height;
+                    auto homog = [&](const double R[9]) {
+                        float N[9];
+                        // K R K^-1, written out as in panBy above.
+                        for (int r = 0; r < 3; ++r) {
+                            const double kr0 = (r == 0) ? kFocal * R[0] + cx * R[6]
+                                             : (r == 1) ? kFocal * R[3] + cy * R[6] : R[6];
+                            const double kr1 = (r == 0) ? kFocal * R[1] + cx * R[7]
+                                             : (r == 1) ? kFocal * R[4] + cy * R[7] : R[7];
+                            const double kr2 = (r == 0) ? kFocal * R[2] + cx * R[8]
+                                             : (r == 1) ? kFocal * R[5] + cy * R[8] : R[8];
+                            N[r * 3 + 0] = float(kr0 / kFocal);
+                            N[r * 3 + 1] = float(kr1 / kFocal);
+                            N[r * 3 + 2] = float(kr2 - (cx / kFocal) * kr0 - (cy / kFocal) * kr1);
+                        }
+                        // Normalised so the last entry is 1, as Affine stores it.
+                        const float s = N[8];
+                        for (float& v : N) v /= s;
+                        return Affine::From3x3(N);
+                    };
+                    auto mul = [](const double A[9], const double B[9], double C[9]) {
+                        for (int r = 0; r < 3; ++r)
+                            for (int c = 0; c < 3; ++c)
+                                C[r * 3 + c] = A[r * 3 + 0] * B[0 * 3 + c] +
+                                               A[r * 3 + 1] * B[1 * 3 + c] +
+                                               A[r * 3 + 2] * B[2 * 3 + c];
+                    };
+                    const double ph = 35.0 * 3.14159265 / 180.0;
+                    // Pitch about x (camera y points down, so +pitch looks down).
+                    const double P[9] = {1, 0, 0, 0, std::cos(ph), -std::sin(ph),
+                                         0, std::sin(ph), std::cos(ph)};
+                    const double Pt[9] = {P[0], P[3], P[6], P[1], P[4], P[7], P[2], P[5], P[8]};
+
+                    auto run = [&](bool straighten, double yawDeg, int* w, int* h, std::string* rep) {
+                        ImageSet set;
+                        const int n = 25;
+                        for (int i = 0; i < n; ++i) {
+                            set.images.push_back(photo.Clone());
+                            const double a = (yawDeg * i / (n - 1)) * 3.14159265 / 180.0;
+                            const double Y[9] = {std::cos(a), 0, std::sin(a), 0, 1, 0,
+                                                 -std::sin(a), 0, std::cos(a)};
+                            double T[9], R[9];
+                            mul(P, Y, T);
+                            mul(T, Pt, R);
+                            if (i > 0) AttachTransform(&set.images.back(), homog(R));
+                        }
+                        set.shape = Shape{{{"frame", n}}};
+                        std::vector<Data> s;
+                        s.push_back(Data{std::move(set)});
+                        Pipeline p;
+                        auto st = Registry::Get().Create("stitch_panorama");
+                        std::string e;
+                        st->FindParam("focal")->SetFromScript(Value(double(kFocal)), &e);
+                        st->FindParam("straighten")->SetFromScript(Value(straighten ? 1.0 : 0.0), &e);
+                        p.AddStage(std::move(st), "stitch_panorama", {{-1, 0}}, 1, 0);
+                        if (!p.Execute(&s, nullptr, &e)) { *rep = e; return false; }
+                        const Data* out = p.Resolve({0, 0}, &s);
+                        const auto* im = out ? std::get_if<Image>(out) : nullptr;
+                        if (!im) return false;
+                        *w = im->Desc().width;
+                        *h = im->Desc().height;
+                        *rep = p.Stages()[0].Report();
+                        return true;
+                    };
+                    // LEVEL means the height does not depend on how far the pan
+                    // went: a tilted strip climbs further the longer it runs,
+                    // a level one is as tall at 120 degrees as at 60. (Not
+                    // one frame tall: a camera looking 35 degrees down sees a
+                    // band 12-58 degrees below the horizon, which a level
+                    // cylinder genuinely draws taller than the frame.)
+                    int w0 = 0, h0 = 0, w1 = 0, h1 = 0, wh0 = 0, hh0 = 0, wh1 = 0, hh1 = 0;
+                    std::string r0, r1, rh0, rh1;
+                    const bool ok = run(false, 120.0, &w0, &h0, &r0) &&
+                                    run(true, 120.0, &w1, &h1, &r1) &&
+                                    run(false, 60.0, &wh0, &hh0, &rh0) &&
+                                    run(true, 60.0, &wh1, &hh1, &rh1);
+                    Check(ok, "a pitched pan stitches both ways" +
+                                  (ok ? std::string() : ": " + r0 + " / " + r1));
+                    Check(ok && h0 > hh0 * 5 / 4,
+                          "about frame 0's own axis the strip climbs as the pan "
+                          "goes on (" + std::to_string(hh0) + " px tall at 60 deg, " +
+                              std::to_string(h0) + " at 120)");
+                    Check(ok && std::abs(h1 - hh1) <= hh1 / 20 && w1 > h1 * 2,
+                          "straightened, it lies level (" + std::to_string(hh1) +
+                              " px tall at 60 deg, " + std::to_string(h1) + " at 120, " +
+                              std::to_string(w1) + " wide)");
+                    Check(r1.find("straightened") != std::string::npos,
+                          "...and the report says it straightened");
                 }
             }
 

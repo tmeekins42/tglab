@@ -294,10 +294,11 @@ public:
         char buf[384];
         std::snprintf(buf, sizeof buf,
                       "%s: %d frames onto %dx%d, focal %.0f px (%.0f deg fov), "
-                      "overlap %.0f%% disagreeing %.1f%%%s%s",
+                      "overlap %.0f%% disagreeing %.1f%%%s%s%s",
                       ProjName(), m_placed, m_outW, m_outH, double(m_focal),
                       double(FovDeg()), 100.0 * m_overlapPixels,
-                      100.0 * double(m_disagree), gain, flip);
+                      100.0 * double(m_disagree), gain, flip,
+                      m_straightened ? "; straightened about the pan axis" : "");
         return buf;
     }
 
@@ -525,11 +526,121 @@ private:
         "is that exposure steps between frames become visible seams, since "
         "there is no longer a cross-fade to hide them."};
 
+    // See Straighten.
+    Param<bool> m_straighten{this, "straighten", true,
+        "Turn the panorama about the axis the camera actually panned around, "
+        "estimated from all the frames, rather than about the first frame's "
+        "own vertical. A camera tilted down while it panned otherwise lays the "
+        "panorama out along a slope that steepens across the sweep."};
+
     Param<int> m_maxPixels{this, "max_megapixels", 400, 1, 4000,
         {.help = "Refuses to allocate a canvas larger than this. A diverging "
                  "chain asks for an enormous canvas, and the useful response "
                  "is an error naming the size rather than an allocation that "
                  "takes the machine down."}};
+
+    // STRAIGHTEN: re-express every rotation about the axis the camera panned
+    // around, instead of about frame 0's own axes.
+    //
+    // A cylinder wraps about its reference frame's vertical. That is right
+    // when the camera was level, and wrong when it was pitched: a phone
+    // tilted down at a desk while it turns about a vertical axis sees, in its
+    // OWN coordinates, a roll of yaw x sin(pitch) as well as the yaw. Every
+    // link of a real 100-frame video measured 0.2-2 degrees of that roll,
+    // all the same sign, adding to about 70 -- so the strip leaned further
+    // off the cylinder with every frame and the far end ran off at 45 degrees
+    // to the start. No link was wrong; the axis was.
+    //
+    // The pan axis is recoverable from the frames alone, which is OpenCV's
+    // wave correction and Hugin's "straighten": turning about a vertical axis
+    // keeps every camera's X axis horizontal, so the vertical is the one
+    // direction perpendicular to all of them -- the least eigenvector of the
+    // sum of their outer products. Forward becomes the frames' mean viewing
+    // direction, levelled, which also centres the panorama.
+    //
+    // DECLINED when the X axes do not span a plane: a pan of under about 20
+    // degrees leaves the axis undetermined, and a guess would tilt a result
+    // that was fine. Returns whether it applied.
+    bool Straighten() {
+        double A[3][3] = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}};
+        double ys[3] = {0, 0, 0}, zs[3] = {0, 0, 0};
+        int n = 0;
+        for (const Frame& f : m_frames) {
+            if (!f.invertible) continue;
+            // R maps reference space into the frame, so its ROWS are the
+            // frame's own axes expressed in reference space.
+            for (int r = 0; r < 3; ++r)
+                for (int c = 0; c < 3; ++c) A[r][c] += double(f.R[r]) * double(f.R[c]);
+            for (int k = 0; k < 3; ++k) {
+                ys[k] += f.R[3 + k];
+                zs[k] += f.R[6 + k];
+            }
+            ++n;
+        }
+        if (n < 3) return false;
+
+        // Symmetric 3x3 eigen-decomposition by Jacobi rotations.
+        double V[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+        for (int sweep = 0; sweep < 50; ++sweep) {
+            const double off = A[0][1] * A[0][1] + A[0][2] * A[0][2] + A[1][2] * A[1][2];
+            if (off < 1e-24) break;
+            for (int p = 0; p < 2; ++p)
+                for (int q = p + 1; q < 3; ++q) {
+                    if (std::abs(A[p][q]) < 1e-30) continue;
+                    const double th = 0.5 * std::atan2(2.0 * A[p][q], A[q][q] - A[p][p]);
+                    const double c = std::cos(th), s = std::sin(th);
+                    for (int k = 0; k < 3; ++k) {
+                        const double akp = A[k][p], akq = A[k][q];
+                        A[k][p] = c * akp - s * akq;
+                        A[k][q] = s * akp + c * akq;
+                    }
+                    for (int k = 0; k < 3; ++k) {
+                        const double apk = A[p][k], aqk = A[q][k];
+                        A[p][k] = c * apk - s * aqk;
+                        A[q][k] = s * apk + c * aqk;
+                    }
+                    for (int k = 0; k < 3; ++k) {
+                        const double vkp = V[k][p], vkq = V[k][q];
+                        V[k][p] = c * vkp - s * vkq;
+                        V[k][q] = s * vkp + c * vkq;
+                    }
+                }
+        }
+        int order[3] = {0, 1, 2};
+        std::sort(order, order + 3, [&](int a, int b) { return A[a][a] < A[b][b]; });
+        const double lMid = A[order[1]][order[1]], lMax = A[order[2]][order[2]];
+        if (lMax <= 0.0 || lMid < 0.01 * lMax) return false;
+
+        // Down: the least eigenvector, signed like the frames' own y (down).
+        double d[3] = {V[0][order[0]], V[1][order[0]], V[2][order[0]]};
+        if (d[0] * ys[0] + d[1] * ys[1] + d[2] * ys[2] < 0.0)
+            for (double& v : d) v = -v;
+        // Forward: the mean viewing direction with its vertical part removed.
+        const double dz = zs[0] * d[0] + zs[1] * d[1] + zs[2] * d[2];
+        double z[3] = {zs[0] - dz * d[0], zs[1] - dz * d[1], zs[2] - dz * d[2]};
+        const double zl = std::sqrt(z[0] * z[0] + z[1] * z[1] + z[2] * z[2]);
+        if (zl < 1e-9) return false;
+        for (double& v : z) v /= zl;
+        // Right = down x forward, which keeps the basis right-handed
+        // (camera x = y x z with y down and z forward).
+        const double x[3] = {d[1] * z[2] - d[2] * z[1], d[2] * z[0] - d[0] * z[2],
+                             d[0] * z[1] - d[1] * z[0]};
+        const double W[3][3] = {{x[0], x[1], x[2]}, {d[0], d[1], d[2]}, {z[0], z[1], z[2]}};
+
+        // New reference = W . old, so each frame's R becomes R . W^T.
+        for (Frame& f : m_frames) {
+            if (!f.invertible) continue;
+            float R2[9];
+            for (int r = 0; r < 3; ++r)
+                for (int c = 0; c < 3; ++c)
+                    R2[r * 3 + c] = float(double(f.R[r * 3 + 0]) * W[c][0] +
+                                          double(f.R[r * 3 + 1]) * W[c][1] +
+                                          double(f.R[r * 3 + 2]) * W[c][2]);
+            std::copy(R2, R2 + 9, f.R);
+        }
+        return true;
+    }
+    bool m_straightened = false;
 
     std::vector<Frame> m_frames;
     ImageDesc          m_desc{};
@@ -688,6 +799,7 @@ bool StitchPanorama::Finish(Image* out, std::string* err) {
                                      L[r * 3 + 1] * P[1 * 3 + c] +
                                      L[r * 3 + 2] * P[2 * 3 + c];
         }
+        m_straightened = bool(m_straighten) && Straighten();
     }
 
     // A pixel in frame `f` -> the ray it came from, in REFERENCE camera space.

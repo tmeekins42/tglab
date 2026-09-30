@@ -159,6 +159,7 @@ void SplatRaster::Project(const std::vector<SplatParam>& splats,
         const double reach2 = 2.0 * std::log(P.opac / opt.minAlpha);
         if (!(reach2 > 0.0)) return;
         const double r = std::sqrt(reach2 * lmax) + 1.0;
+        P.reach = r;
         if (P.u + r < 0 || P.v + r < 0 || P.u - r >= cam.w || P.v - r >= cam.h)
             return;
         P.x0 = std::clamp(int(std::floor((P.u - r) / kTile)), 0, m_tilesX - 1);

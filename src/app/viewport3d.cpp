@@ -5,6 +5,8 @@
 #include <cstdio>
 #include <cstring>
 
+#include "../algo_util/splat_sh.h"
+#include "../core/parallel.h"
 #include "../gpu/device.h"
 #include "../gpu/shader.h"
 #include "imgui.h"
@@ -568,12 +570,78 @@ bool Viewport3D::UploadSplats(Device& dev) {
     if (m_splatBuf) { dev.DeferRelease(m_splatBuf); m_splatBuf = nullptr; }
     m_splatBuf = MakeUploadBuffer(dev, g.data(), g.size() * sizeof(GpuSplat));
     if (!m_splatBuf) { m_splatCount = 0; return false; }
+    static_assert(sizeof(GpuSplat) == 16 * sizeof(float), "GpuSplat is 16 floats");
+    m_splatPacked.assign(reinterpret_cast<const float*>(g.data()),
+                         reinterpret_cast<const float*>(g.data()) + g.size() * 16);
 
     m_splatCount = int(src.size());
     m_splatVersion = m_version;
-    // New splats need a new order even if the camera has not moved.
+    // New splats need a new order, and new colours, even if the camera has
+    // not moved.
     m_sortedEye = Vec3{1e30, 1e30, 1e30};
+    m_colouredEye = Vec3{1e30, 1e30, 1e30};
     m_dev = &dev;
+    return true;
+}
+
+// VIEW-DEPENDENT COLOUR, for the viewer's own eye.
+//
+// Splats trained with spherical harmonics (splat_sh.h) change colour with
+// the viewpoint, so the colours packed at upload are only right from where
+// they were computed. Rewritten when the eye has moved by more than 2% of
+// its distance to the target since the last time: the colour changes slowly
+// with direction, and rewriting on every mouse move would re-send the whole
+// buffer -- tens of megabytes -- each frame of a drag.
+//
+// REFLECTIONS too, when the splats were trained with them (splat_reflect.h).
+// Training shades per PIXEL: reflectivity and normal are composited like
+// colour and the environment is read once per pixel. The viewer blends
+// splats in hardware and cannot, so it shades each SPLAT instead -- its own
+// colour mixed with the environment seen in the mirror direction of the ray
+// from the eye to its centre. Close where one splat dominates a pixel, and
+// what matters most: without it the viewer drew each splat's colour BEFORE
+// the environment was mixed in, which training pushes away from the
+// photograph by about 1/(1 - r) to compensate -- visibly oversaturated.
+bool Viewport3D::RecolourSplats(Device& dev, const OrbitCamera& cam) {
+    if (!m_cloud || m_splatCount <= 0) return true;
+    const size_t n = size_t(m_splatCount);
+    const bool refl = m_cloud->envRes > 0 && m_cloud->splatRefl.size() == n * 4;
+    if (m_cloud->shDegree <= 0 && !refl) return true;
+    if (refl && m_envVersion != m_splatVersion) {
+        m_env.res = m_cloud->envRes;
+        m_env.texels.assign(m_cloud->envMap.begin(), m_cloud->envMap.end());
+        m_envVersion = m_splatVersion;
+    }
+    const bool useEnv = refl && m_env.Valid();
+    const Vec3 eye = cam.Eye();
+    if ((eye - m_colouredEye).Norm() < 0.02 * cam.distance) return true;
+    if (m_splatPacked.size() < n * 16) return false;
+    ParallelFor(n, [&](size_t i) {
+        const Splat& s = m_cloud->splats[i];
+        Vec3 c = ShColour(s.color, m_cloud->ShOf(i), m_cloud->shDegree, s.mean, eye);
+        if (useEnv) {
+            const float* rf = &m_cloud->splatRefl[i * 4];
+            const double r = rf[0];
+            Vec3 nrm{rf[1], rf[2], rf[3]};
+            const double nl = nrm.Norm();
+            const Vec3 ray = s.mean - eye;
+            if (r > 1e-9 && nl > 1e-9 && ray.Norm() > 1e-12) {
+                nrm = nrm * (1.0 / nl);
+                if (nrm.Dot(eye - s.mean) < 0.0) nrm = nrm * -1.0;   // facing the eye
+                const Vec3 v = ray.Normalized();
+                const Vec3 e = m_env.Sample(v - nrm * (2.0 * v.Dot(nrm)));
+                c = c * (1.0 - r) + e * r;
+            }
+        }
+        float* rec = &m_splatPacked[i * 16];
+        rec[12] = float(c.x);
+        rec[13] = float(c.y);
+        rec[14] = float(c.z);
+    });
+    if (m_splatBuf) { dev.DeferRelease(m_splatBuf); m_splatBuf = nullptr; }
+    m_splatBuf = MakeUploadBuffer(dev, m_splatPacked.data(), n * 16 * sizeof(float));
+    if (!m_splatBuf) { m_splatCount = 0; return false; }
+    m_colouredEye = eye;
     return true;
 }
 
@@ -865,7 +933,7 @@ void Viewport3D::Draw(Device& dev, Image*) {
     // leave no dots at all -- but not both.
     const bool havePoints = UploadGeometry(dev);
     const bool haveSplats = DrawingSplats() && EnsureSplatPipeline(dev) &&
-                            UploadSplats(dev) && SortSplats(dev, cam);
+                            UploadSplats(dev) && SortSplats(dev, cam) && RecolourSplats(dev, cam);
     if (!havePoints && !haveSplats) {
         ImGui::TextDisabled(DrawingSplats() ? "could not create the splat pipeline"
                                             : "nothing to draw");

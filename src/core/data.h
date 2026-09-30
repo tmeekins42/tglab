@@ -90,6 +90,27 @@ struct PointCloud {
     // show either representation.
     std::vector<Splat> splats;
 
+    // View-dependent colour for the splats: the spherical-harmonic terms
+    // beyond each one's base colour, kShRest floats per Gaussian in splat
+    // order (see algo_util/splat_sh.h), and the degree they go up to. Empty
+    // and 0 for plain colour. Every stage that adds, removes or reorders
+    // splats keeps this in step, or clears it.
+    std::vector<float> splatSh;
+    int                shDegree = 0;
+
+    // The coefficients of splat i, or null when there are none.
+    const float* ShOf(size_t i) const {
+        return (shDegree > 0 && splatSh.size() >= (i + 1) * 45) ? &splatSh[i * 45] : nullptr;
+    }
+
+    // Reflections, when training modelled them (algo_util/splat_reflect.h):
+    // per splat its reflectivity (0..1) and unit normal, four floats in
+    // splat order; and the learned environment, a cube map of envRes x
+    // envRes RGB texels per face, six faces. Empty and 0 otherwise.
+    std::vector<float> splatRefl;
+    std::vector<float> envMap;
+    int                envRes = 0;
+
     // The group this was reconstructed from, for reporting and for viewers
     // that want to show a camera's image.
     Shape shape;

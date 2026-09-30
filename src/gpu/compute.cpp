@@ -24,10 +24,10 @@ namespace {
 
 // Descriptors a single dispatch can bind. Kept small and fixed so the root
 // signature is a constant, which keeps kernels interchangeable.
-constexpr UINT kMaxSrv       = 4;
-constexpr UINT kMaxUav       = 4;
+constexpr UINT kMaxSrv       = 8;
+constexpr UINT kMaxUav       = 8;
 constexpr UINT kNumConstants = 32;   // b0: width, height, then parameters
-constexpr UINT kHeapSize     = 64;   // (kMaxSrv + kMaxUav) * a few dispatches
+constexpr UINT kHeapSize     = 256;  // (kMaxSrv + kMaxUav) * a few dispatches
 
 DXGI_FORMAT ToDxgi(Format f) {
     switch (f) {
@@ -35,6 +35,7 @@ DXGI_FORMAT ToDxgi(Format f) {
         case Format::R32F:    return DXGI_FORMAT_R32_FLOAT;
         case Format::RGBA32F: return DXGI_FORMAT_R32G32B32A32_FLOAT;
         case Format::RGBA16F: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+        case Format::R32U:    return DXGI_FORMAT_R32_UINT;
         default:              return DXGI_FORMAT_UNKNOWN;
     }
 }
@@ -128,7 +129,11 @@ bool ComputeContext::CreateKernel(const std::string& hlsl, const std::string& en
     if (!m_compiler.CompileCompute(hlsl, entry, debugName, &blob, errors)) return false;
 
     // Fixed layout so every kernel binds the same way:
-    //   b0 = 32 root constants, t0..t3 = inputs, u0..u3 = outputs.
+    //   b0 = 32 root constants, t0..t7 = inputs, u0..u7 = outputs.
+    //   Eight each since reflections composite colour, reflectivity and
+    //   normal in one pass and differentiate them in one: the backward
+    //   kernel then reads six images and writes four. Eight UAVs is what
+    //   every D3D12 device supports; unused slots get null descriptors.
     D3D12_DESCRIPTOR_RANGE ranges[2] = {};
     ranges[0].RangeType          = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     ranges[0].NumDescriptors     = kMaxSrv;

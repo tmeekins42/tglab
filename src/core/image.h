@@ -19,6 +19,8 @@ enum class Format : uint8_t {
     R32F,       // 1 x float  — intermediates, signed gradients, Bayer mosaics
     RGBA32F,    // 4 x float  — high-precision intermediates
     RGBA16F,    // 4 x half   — the working format for raw
+    R32U,       // 1 x uint32 — GPU-side integer atomics (fixed-point sums);
+                //   device scratch only, never a pipeline image
 };
 
 // Colour filter array layout, naming the 2x2 tile's top-left quad.

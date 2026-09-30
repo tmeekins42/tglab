@@ -62,6 +62,7 @@
 
 #include "../../algo_util/depth_views.h"
 #include "../../algo_util/splat_raster.h"
+#include "../../algo_util/splat_reflect.h"
 #include "../../algo_util/splat_train_gpu.h"
 #include "../../core/algorithm.h"
 #include "../../core/parallel.h"
@@ -328,6 +329,19 @@ public:
         // to cover the area of those it stands for: thinning by r leaves each
         // flat disc r times the surface, so its two larger axes grow by
         // sqrt(r).
+        // VIEW-DEPENDENT COLOUR (splat_sh.h): the spherical-harmonic terms
+        // beyond each base colour, trained alongside it. Carried over from the
+        // input when it has them -- a .ply from another tool, or a second pass
+        // -- and zero otherwise, which is plain colour until training moves
+        // them.
+        const int shMax = std::clamp(int(m_shDegree), 0, kShMaxDegree);
+        std::vector<double> sh;
+        if (shMax > 0) {
+            sh.assign(params.size() * size_t(kShRest), 0.0);
+            if (cloud->shDegree > 0 && cloud->splatSh.size() == sh.size())
+                for (size_t i = 0; i < sh.size(); ++i) sh[i] = double(cloud->splatSh[i]);
+        }
+
         const size_t cap = size_t(std::max(1, int(m_maxGaussians)));
         size_t thinnedFrom = 0;
         if (params.size() > cap) {
@@ -335,19 +349,88 @@ public:
             const double r = double(params.size()) / double(cap);
             const double grow = 0.5 * std::log(r);
             std::vector<SplatParam> kept;
+            std::vector<double> keptSh;
             kept.reserve(cap);
             for (size_t k = 0; k < cap; ++k) {
-                SplatParam p = params[size_t(double(k) * r)];
+                const size_t src = size_t(double(k) * r);
+                SplatParam p = params[src];
                 int flat = 0;   // the thin axis stays as it is
                 for (int a = 1; a < 3; ++a)
                     if (p.logScale[a] < p.logScale[flat]) flat = a;
                 for (int a = 0; a < 3; ++a)
                     if (a != flat) p.logScale[a] += grow;
                 kept.push_back(p);
+                if (!sh.empty())
+                    keptSh.insert(keptSh.end(), sh.begin() + long(src * kShRest),
+                                  sh.begin() + long((src + 1) * kShRest));
             }
             params.swap(kept);
+            if (!sh.empty()) sh.swap(keptSh);
         }
         size_t n = params.size();   // changes as densification adds and prunes
+
+        // Adam's moments for the coefficients, and the degree schedule: the
+        // paper starts from plain colour and adds a band at a time, so the
+        // base colour settles before the finer view dependence is fitted to
+        // what is left. Band d switches on at iteration d * sh_every.
+        std::vector<double> shM1(sh.size(), 0.0), shM2(sh.size(), 0.0);
+        const int shEvery = std::max(1, int(m_shEvery));
+        auto degreeAt = [&](int it) { return std::min(shMax, it / shEvery); };
+        const double lrSh = double(m_shLr);
+        std::vector<SplatParam> viewParams;   // params coloured for this camera
+
+        // REFLECTIONS (splat_reflect.h): per Gaussian a reflectivity logit
+        // and a normal, with Adam's moments (4 each); for the scene an
+        // environment cube map. The normal starts as the disc's thin axis --
+        // init_splats fitted each disc to its neighbours' surface, so that is
+        // already the surface normal. Reflectivity starts near zero, so the
+        // model begins as plain colour and reflects only where it pays.
+        const bool reflect = bool(m_reflect) && int(m_iterations) > 0;
+        const int  reflFrom = std::max(0, int(m_reflectFrom));
+        std::vector<ReflParam> refl;
+        std::vector<double> rM1, rM2;
+        EnvMap env;
+        std::vector<double> eM1, eM2, envGrad;
+        if (reflect) {
+            refl.resize(params.size());
+            for (size_t i = 0; i < params.size(); ++i) {
+                const Splat s = FromParam(params[i]);
+                int thin = 0;
+                for (int a = 1; a < 3; ++a)
+                    if (params[i].logScale[a] < params[i].logScale[thin]) thin = a;
+                const Mat3 R = s.Rotation();
+                refl[i].normal[0] = R.m[0 * 3 + size_t(thin)];
+                refl[i].normal[1] = R.m[1 * 3 + size_t(thin)];
+                refl[i].normal[2] = R.m[2 * 3 + size_t(thin)];
+            }
+            rM1.assign(params.size() * 4, 0.0);
+            rM2.assign(params.size() * 4, 0.0);
+            env.Init(std::clamp(int(m_envRes), 4, 512), 0.5);
+            eM1.assign(env.texels.size(), 0.0);
+            eM2.assign(env.texels.size(), 0.0);
+        }
+        const double lrRefl = 5e-2, lrNormal = 2e-3, lrEnv = 1e-2;
+        const double reflSparsity = double(m_reflectSparsity);
+        // The environment's Adam step, texel by texel, from envGrad. On the
+        // CPU whichever path trained the rest: the map is small, and the GPU
+        // step hands back its gradient.
+        auto stepEnv = [&](double c1, double c2) {
+            const double eb1 = 0.9, eb2 = 0.999;
+            for (size_t t = 0; t < env.texels.size(); ++t) {
+                const double g = envGrad[t];
+                eM1[t] = eb1 * eM1[t] + (1.0 - eb1) * g;
+                eM2[t] = eb2 * eM2[t] + (1.0 - eb2) * g * g;
+                env.texels[t] = std::clamp(
+                    env.texels[t] - lrEnv * (eM1[t] / c1) / (std::sqrt(eM2[t] / c2) + 1e-15),
+                    0.0, 1.0);
+            }
+        };
+        // The reflectivity and normal passes' own rasterisers, kept across
+        // steps as the main one is: each holds its forward state for its
+        // backward, so three passes need three.
+        SplatRaster rasterR, rasterN;
+        std::vector<SplatParam> payR, payN, gradR, gradN;
+        std::vector<double> flipN, Cd, Rm, Nm, dCd, dRm, dNm;
 
         RasterOptions opt;
         const double bg = double(m_background);
@@ -356,11 +439,8 @@ public:
         // --- how well it fits before -----------------------------------------
         double l1Before = 0.0, psnrBefore = 0.0;
         double depthBefore = -1.0, depthAfter = -1.0;
-        Evaluate(params, views, opt, GroupGpu(), &l1Before, &psnrBefore,
-                 useDepth ? &depthBefore : nullptr);
         double heldBefore = 0.0, heldAfter = 0.0, heldL1 = 0.0;
-        if (!heldOut.empty())
-            Evaluate(params, heldOut, opt, GroupGpu(), &heldL1, &heldBefore);
+        // Measured below, once the device holds the splats: see Evaluate.
 
         // --- the scene's scale, for the position learning rate ------------------
         // A step size for positions has to be in scene units, and a
@@ -405,6 +485,8 @@ public:
         // The per-pixel passes on the device when the run has one; the
         // rasteriser falls back to the CPU on its own if the device fails.
         raster.SetGpu(GroupGpu());
+        rasterR.SetGpu(GroupGpu());
+        rasterN.SetGpu(GroupGpu());
 
         // --- densification bookkeeping ------------------------------------------
         // The screen-position gradient, summed per Gaussian over the
@@ -464,13 +546,33 @@ public:
         // from the last good step and training carries on here.
         std::unique_ptr<SplatTrainerGpu> gpuTrainer;
         std::string gpuNote;
+        // The whole state to and from the device, view-dependent colour
+        // included. One place each, so the two halves cannot drift apart.
+        auto upGpu = [&](SplatTrainerGpu& t, std::string* e) {
+            return t.Upload(params, m1, m2, gradAccum, gradCount, maxScreen, e) &&
+                   (sh.empty() || t.UploadSh(sh, shM1, shM2, e)) &&
+                   (refl.empty() || t.UploadRefl(refl, rM1, rM2, e));
+        };
+        auto downGpu = [&](SplatTrainerGpu& t, std::string* e) {
+            if (!t.Download(&params, &m1, &m2, &gradAccum, &gradCount, &maxScreen, e))
+                return false;
+            n = params.size();
+            return (sh.empty() || t.DownloadSh(&sh, &shM1, &shM2, e)) &&
+                   (refl.empty() || t.DownloadRefl(&refl, &rM1, &rM2, e));
+        };
         if (ComputeContext* dev = GroupGpu()) {
             auto t = std::make_unique<SplatTrainerGpu>(dev);
             t->SetClampColour(clampColour);
-            if (t->Upload(params, m1, m2, gradAccum, gradCount, maxScreen, &gpuNote))
-                gpuTrainer = std::move(t);
+            if (upGpu(*t, &gpuNote)) gpuTrainer = std::move(t);
         }
         int gpuIters = 0;
+
+        // --- how well it fits before, through the device when there is one -----
+        Evaluate(params, sh, shMax, {}, EnvMap{}, views, opt, GroupGpu(), &l1Before,
+                 &psnrBefore, useDepth ? &depthBefore : nullptr, gpuTrainer.get());
+        if (!heldOut.empty())
+            Evaluate(params, sh, shMax, {}, EnvMap{}, heldOut, opt, GroupGpu(), &heldL1,
+                     &heldBefore, nullptr, gpuTrainer.get());
 
         for (int it = 0; it < iters; ++it) {
             if (order.empty()) {
@@ -516,16 +618,29 @@ public:
             // take this step, and every later one, on the CPU.
             bool stepped = false;
             if (gpuTrainer) {
+                // Reflections, once they have switched on: the device does
+                // the three passes, the environment's step stays here.
+                const bool reflGpu = reflect && it >= reflFrom;
+                ReflStepArgs ra;
+                if (reflGpu) {
+                    envGrad.assign(env.texels.size(), 0.0);
+                    ra.env = &env;
+                    ra.envGrad = &envGrad;
+                    ra.lrRefl = lrRefl;
+                    ra.lrNormal = lrNormal;
+                    ra.sparsity = reflSparsity;
+                }
                 if (gpuTrainer->Step(vw.cam, opt, *target, lrMean, c1, c2, &gpuNote,
                                      vw.depth.empty() ? nullptr : &vw.depth,
-                                     depthWeight)) {
+                                     depthWeight, degreeAt(it), lrSh,
+                                     reflGpu ? &ra : nullptr)) {
+                    if (reflGpu) stepEnv(c1, c2);
                     visibleSum += gpuTrainer->Visible();
                     ++gpuIters;
                     stepped = true;
                 } else {
                     std::string derr;
-                    if (!gpuTrainer->Download(&params, &m1, &m2, &gradAccum,
-                                              &gradCount, &maxScreen, &derr)) {
+                    if (!downGpu(*gpuTrainer, &derr)) {
                         *err = "train_splats: the GPU failed (" + gpuNote +
                                ") and its state could not be recovered (" + derr + ")";
                         return false;
@@ -537,9 +652,34 @@ public:
             }
 
             if (!stepped) {
-            raster.Forward(params, vw.cam, opt, &img,
+            // Each Gaussian coloured for this camera; the rasteriser then
+            // works exactly as for plain colour, and its colour gradient is
+            // the gradient of the colour SHOWN, split into base and
+            // coefficients after Backward.
+            const int degNow = degreeAt(it);
+            const Vec3 eye = CentreOf(vw.cam);
+            const std::vector<SplatParam>* fwd = &params;
+            if (degNow > 0) {
+                ShadeForView(params, sh, degNow, eye, &viewParams);
+                fwd = &viewParams;
+            }
+            raster.Forward(*fwd, vw.cam, opt, &img,
                            vw.depth.empty() ? nullptr : &rDepth);
             visibleSum += raster.Visible();
+
+            // REFLECTIONS: the reflectivity and normal passes, then the
+            // deferred shading, so the loss below sees the shaded image.
+            const bool reflNow = reflect && it >= reflFrom;
+            RasterOptions black = opt;
+            black.background = Vec3{0, 0, 0};
+            if (reflNow) {
+                Cd = img;
+                ReflPayload(params, refl, &payR);
+                NormalPayload(params, refl, eye, &payN, &flipN);
+                rasterR.Forward(payR, vw.cam, black, &Rm);
+                rasterN.Forward(payN, vw.cam, black, &Nm);
+                ShadeDeferred(Cd, Rm, Nm, vw.cam, env, &img);
+            }
 
             // L1: the gradient is the sign of each difference, over the mean
             // -- of the pixels with a target; masked ones pull nothing.
@@ -557,9 +697,97 @@ public:
             if (!vw.depth.empty())
                 DepthLossGrad(rDepth, raster.FinalT(), vw.depth, depthWeight, &dDepth,
                               &cpuDepthErr, &cpuDepthCount);
-            raster.Backward(params, vw.cam, opt, dImg, &grad,
-                            vw.depth.empty() ? nullptr : &dDepth,
-                            vw.depth.empty() ? nullptr : &vw.depth);
+            if (!reflNow) {
+                raster.Backward(*fwd, vw.cam, opt, dImg, &grad,
+                                vw.depth.empty() ? nullptr : &dDepth,
+                                vw.depth.empty() ? nullptr : &vw.depth);
+            } else {
+                // The shading's gradient into the three maps and the
+                // environment, then each map's backward. Geometry gradients
+                // ADD across the passes -- the pixel depends on position,
+                // shape and opacity through all three -- and each payload's
+                // colour gradient belongs to its own parameter.
+                envGrad.assign(env.texels.size(), 0.0);
+                ShadeDeferredBackward(Cd, Rm, Nm, vw.cam, env, dImg, &dCd, &dRm, &dNm,
+                                      &envGrad);
+                // reflect_sparsity: lambda times the mean composited R over
+                // the measured pixels (invN is per channel, three a pixel).
+                if (reflSparsity > 0.0)
+                    for (size_t p = 0; p < dRm.size(); p += 3) dRm[p] += reflSparsity * 3.0 * invN;
+                raster.Backward(*fwd, vw.cam, opt, dCd, &grad,
+                                vw.depth.empty() ? nullptr : &dDepth,
+                                vw.depth.empty() ? nullptr : &vw.depth);
+                gradR.assign(n, SplatParam::Zero());
+                gradN.assign(n, SplatParam::Zero());
+                rasterR.Backward(payR, vw.cam, black, dRm, &gradR);
+                rasterN.Backward(payN, vw.cam, black, dNm, &gradN);
+                ParallelFor(n, [&](size_t i) {
+                    double* g = grad[i].Data();
+                    const double* a = gradR[i].Data();
+                    const double* b = gradN[i].Data();
+                    for (int q = 0; q < 11; ++q) g[q] += a[q] + b[q];   // all but colour
+
+                    // Reflectivity: the R pass put dLoss/dr in channel 0;
+                    // r is the sigmoid of the logit.
+                    const double r = 1.0 / (1.0 + std::exp(-refl[i].reflLogit));
+                    double gp[4];
+                    gp[0] = gradR[i].color[0] * r * (1.0 - r);
+                    // Normal: the payload was flip * n / |n|.
+                    const Vec3 raw{refl[i].normal[0], refl[i].normal[1], refl[i].normal[2]};
+                    const double len = std::max(1e-12, raw.Norm());
+                    const Vec3 u = raw * (1.0 / len);
+                    const Vec3 gu = Vec3{gradN[i].color[0], gradN[i].color[1],
+                                         gradN[i].color[2]} * flipN[i];
+                    const Vec3 gn = (gu - u * u.Dot(gu)) * (1.0 / len);
+                    gp[1] = gn.x; gp[2] = gn.y; gp[3] = gn.z;
+                    double* p[4] = {&refl[i].reflLogit, &refl[i].normal[0],
+                                    &refl[i].normal[1], &refl[i].normal[2]};
+                    for (int q = 0; q < 4; ++q) {
+                        double& a1 = rM1[i * 4 + size_t(q)];
+                        double& a2 = rM2[i * 4 + size_t(q)];
+                        a1 = b1 * a1 + (1.0 - b1) * gp[q];
+                        a2 = b2 * a2 + (1.0 - b2) * gp[q] * gp[q];
+                        *p[q] -= (q == 0 ? lrRefl : lrNormal) * (a1 / c1) /
+                                 (std::sqrt(a2 / c2) + adamEps);
+                    }
+                });
+                stepEnv(c1, c2);
+            }
+
+            // THE COLOUR GRADIENT, SPLIT. What Backward returned is dLoss by
+            // the colour shown. That colour is base + sum Y_k rest_k, clamped
+            // to 0..1: the base takes the gradient as it is, each coefficient
+            // takes it times Y_k -- and a channel held at a clamp passes
+            // nothing to either, since moving them would not change what is
+            // seen.
+            if (degNow > 0) {
+                const int nk = ShCoeffsAt(degNow);
+                ParallelFor(n, [&](size_t i) {
+                    double* gc = grad[i].color;
+                    const double* shown = viewParams[i].color;
+                    for (int ch = 0; ch < 3; ++ch)
+                        if (shown[ch] <= 0.0 || shown[ch] >= 1.0) gc[ch] = 0.0;
+                    if (gc[0] == 0.0 && gc[1] == 0.0 && gc[2] == 0.0) return;
+                    const SplatParam& p = params[i];
+                    Vec3 d = Vec3{p.mean[0], p.mean[1], p.mean[2]} - eye;
+                    const double len = d.Norm();
+                    if (len < 1e-12) return;
+                    d = d * (1.0 / len);
+                    double Y[kShCoeffs];
+                    ShBasis(d.x, d.y, d.z, degNow, Y);
+                    double* c = &sh[i * size_t(kShRest)];
+                    double* a = &shM1[i * size_t(kShRest)];
+                    double* b = &shM2[i * size_t(kShRest)];
+                    for (int k = 0; k < nk; ++k)
+                        for (int ch = 0; ch < 3; ++ch) {
+                            const int q = k * 3 + ch;
+                            const double g = Y[k] * gc[ch];
+                            a[q] = b1 * a[q] + (1.0 - b1) * g;
+                            b[q] = b2 * b[q] + (1.0 - b2) * g * g;
+                            c[q] -= lrSh * (a[q] / c1) / (std::sqrt(b[q] / c2) + adamEps);
+                        }
+                });
+            }
 
             // Accumulate the screen-position gradient for densification, in
             // the paper's units. The paper measures it against NDC, which
@@ -597,23 +825,37 @@ public:
 
             auto tDens = Clock::now();
 
-            // Densification and the opacity reset work on the CPU copy, so on
-            // the GPU path the state comes down before either and goes back
-            // up after. Every `densify_every` iterations, not every one.
+            // Densification, every `densify_every` iterations, not every one.
             // Growth stops at densify_until; PRUNING DOES NOT, see below.
             const bool growing   = it + 1 <= until;
             const bool doDensify = densify && (it + 1) % every == 0;
             const bool doReset = densify && resetEvery > 0 &&
                                  (it + 1) % resetEvery == 0 && it + 1 < until;
-            if (gpuTrainer && (doDensify || doReset)) {
-                std::string derr;
-                if (!gpuTrainer->Download(&params, &m1, &m2, &gradAccum,
-                                          &gradCount, &maxScreen, &derr)) {
-                    *err = "train_splats: could not read the GPU state back to "
-                           "densify: " + derr;
-                    return false;
+            // ON THE DEVICE, only a summary comes down: per Gaussian its
+            // opacity, largest scale, mean screen gradient and largest screen
+            // size -- all the decision below reads. The plan it makes goes
+            // back up and the device rebuilds its own state from it. Moving
+            // the whole state instead -- with view-dependent colour, 0.8 GB
+            // each way for a million Gaussians -- was a fifth of a run.
+            std::vector<DensifyIn> dIn;
+            if (doDensify) {
+                if (gpuTrainer) {
+                    std::string derr;
+                    if (!gpuTrainer->DensifyStats(&dIn, &derr)) {
+                        *err = "train_splats: could not read the densification "
+                               "statistics back from the GPU: " + derr;
+                        return false;
+                    }
+                } else {
+                    dIn.resize(n);
+                    for (size_t i = 0; i < n; ++i) {
+                        const SplatParam& p = params[i];
+                        dIn[i].opacityLogit = p.opacity;
+                        dIn[i].maxLogScale = std::max({p.logScale[0], p.logScale[1], p.logScale[2]});
+                        dIn[i].gradAvg = gradCount[i] > 0 ? gradAccum[i] / double(gradCount[i]) : -1.0;
+                        dIn[i].maxScreen = maxScreen[i];
+                    }
                 }
-                n = params.size();
             }
 
             // --- densify and prune ----------------------------------------------
@@ -645,35 +887,21 @@ public:
             //   world and screen          16.63 dB        28.37 dB
             //   world only                17.59 dB        30.92 dB
             if (doDensify) {
-                std::vector<SplatParam> np;
-                std::vector<double> nm1, nm2;
-                np.reserve(n + n / 4);
-                nm1.reserve((n + n / 4) * 14);
-                nm2.reserve((n + n / 4) * 14);
-
-                // Kept: carries its own optimiser state. New: starts with
-                // none, as the paper's new tensors do -- which is also what
-                // lets a clone drift apart from the original it copies,
-                // since the two then take different steps.
-                auto keep = [&](size_t i) {
-                    np.push_back(params[i]);
-                    nm1.insert(nm1.end(), m1.begin() + long(i * 14), m1.begin() + long(i * 14 + 14));
-                    nm2.insert(nm2.end(), m2.begin() + long(i * 14), m2.begin() + long(i * 14 + 14));
-                };
-                auto fresh = [&](const SplatParam& p) {
-                    np.push_back(p);
-                    nm1.insert(nm1.end(), 14, 0.0);
-                    nm2.insert(nm2.end(), 14, 0.0);
-                };
+                // THE PLAN: what becomes of each Gaussian, made from the
+                // summary alone, so the CPU and the device take the same
+                // decisions and each then applies it to its own state. The
+                // offsets of split children are drawn here, in the order the
+                // loop has always drawn them.
+                std::vector<DensifyPlan> plan;
+                plan.reserve(n + n / 4);
 
                 // WHICH GAUSSIANS MAY GROW: those whose average screen
                 // gradient passed the threshold, strongest first, so that
                 // when the cap binds it is the most needed ones that divide.
                 std::vector<std::pair<double, size_t>> grow;
                 for (size_t i = 0; i < n; ++i) {
-                    if (gradCount[i] == 0) continue;
-                    const double avg = gradAccum[i] / double(gradCount[i]);
-                    if (avg >= threshold) grow.emplace_back(avg, i);
+                    if (dIn[i].gradAvg < 0.0) continue;   // never seen
+                    if (dIn[i].gradAvg >= threshold) grow.emplace_back(dIn[i].gradAvg, i);
                 }
                 std::sort(grow.begin(), grow.end(), std::greater<>());
                 const size_t room = (growing && maxCount > n) ? maxCount - n : 0;
@@ -689,10 +917,10 @@ public:
                 // inside it, each 1/1.6 of its size.
                 const double smallLimit = 0.01 * extent;
                 for (size_t i = 0; i < n; ++i) {
-                    const SplatParam& p = params[i];
+                    const DensifyIn& d = dIn[i];
                     // PRUNE the nearly transparent: they cost a slot in every
                     // tile they touch and contribute nothing.
-                    if (1.0 / (1.0 + std::exp(-p.opacity)) < pruneOpacity) {
+                    if (1.0 / (1.0 + std::exp(-d.opacityLogit)) < pruneOpacity) {
                         ++pruned;
                         ++prunedFaint;
                         continue;
@@ -719,54 +947,115 @@ public:
                                                ? (it + 1 > resetEvery)
                                                : (densifySteps > 0);
                     if (sizePrune) {
-                        const double big = std::exp(std::max({p.logScale[0],
-                                                              p.logScale[1],
-                                                              p.logScale[2]}));
+                        const double big = std::exp(d.maxLogScale);
                         if ((worldLimit > 0.0 && big > worldLimit) ||
                             (growing && screenLimit > 0.0 &&
-                             maxScreen[i] > screenLimit)) {
+                             d.maxScreen > screenLimit)) {
                             ++pruned;
                             ++prunedBig;
                             continue;
                         }
                     }
-                    if (!grows[i]) { keep(i); continue; }
-
-                    const double s[3] = {std::exp(p.logScale[0]),
-                                         std::exp(p.logScale[1]),
-                                         std::exp(p.logScale[2])};
-                    if (std::max({s[0], s[1], s[2]}) <= smallLimit) {
-                        keep(i);
-                        fresh(p);
-                        ++cloned;
+                    if (!grows[i] || std::exp(d.maxLogScale) <= smallLimit) {
+                        plan.push_back({uint32_t(i), DensifyPlan::kKeep, {0, 0, 0}});
+                        if (grows[i]) {
+                            plan.push_back({uint32_t(i), DensifyPlan::kCopy, {0, 0, 0}});
+                            ++cloned;
+                        }
                         continue;
                     }
-
-                    const Splat asSplat = FromParam(p);
-                    const Mat3 R = asSplat.Rotation();
                     for (int c = 0; c < 2; ++c) {
-                        SplatParam child = p;
-                        const double z[3] = {normal() * s[0], normal() * s[1],
-                                             normal() * s[2]};
-                        for (int a = 0; a < 3; ++a)
-                            child.mean[a] += R.m[a * 3 + 0] * z[0] +
-                                             R.m[a * 3 + 1] * z[1] +
-                                             R.m[a * 3 + 2] * z[2];
-                        for (int a = 0; a < 3; ++a)
-                            child.logScale[a] -= std::log(1.6);
-                        fresh(child);
+                        DensifyPlan child{uint32_t(i), DensifyPlan::kSplit, {0, 0, 0}};
+                        for (float& z : child.z) z = float(normal());
+                        plan.push_back(child);
                     }
                     ++split;
                 }
 
-                params.swap(np);
-                m1.swap(nm1);
-                m2.swap(nm2);
-                n = params.size();
-                grad.assign(n, SplatParam::Zero());
-                gradAccum.assign(n, 0.0);
-                gradCount.assign(n, 0);
-                maxScreen.assign(n, 0.0);
+                if (gpuTrainer) {
+                    std::string derr;
+                    if (!gpuTrainer->ApplyPlan(plan, &derr)) {
+                        *err = "train_splats: the GPU could not apply densification: " + derr;
+                        return false;
+                    }
+                    n = plan.size();
+                } else {
+                    // Kept: carries its own optimiser state. New: starts with
+                    // none, as the paper's new tensors do -- which is also
+                    // what lets a clone drift apart from the original it
+                    // copies, since the two then take different steps. The
+                    // view-dependent colour, reflectivity and normal travel
+                    // with their Gaussian the same way: kept with their
+                    // moments, inherited without them by a clone or a split
+                    // child, as the paper's densification copies features.
+                    std::vector<SplatParam> np;
+                    std::vector<double> nm1, nm2, nsh, nshM1, nshM2, nrM1, nrM2;
+                    std::vector<ReflParam> nrefl;
+                    np.reserve(plan.size());
+                    nm1.reserve(plan.size() * 14);
+                    nm2.reserve(plan.size() * 14);
+                    const long R = kShRest;
+                    for (const DensifyPlan& pl : plan) {
+                        const size_t i = pl.src;
+                        const bool kept = pl.kind == DensifyPlan::kKeep;
+                        SplatParam p = params[i];
+                        if (pl.kind == DensifyPlan::kSplit) {
+                            const double z[3] = {pl.z[0] * std::exp(p.logScale[0]),
+                                                 pl.z[1] * std::exp(p.logScale[1]),
+                                                 pl.z[2] * std::exp(p.logScale[2])};
+                            const Mat3 Rm = FromParam(params[i]).Rotation();
+                            for (int a = 0; a < 3; ++a)
+                                p.mean[a] += Rm.m[a * 3 + 0] * z[0] +
+                                             Rm.m[a * 3 + 1] * z[1] +
+                                             Rm.m[a * 3 + 2] * z[2];
+                            for (int a = 0; a < 3; ++a)
+                                p.logScale[a] -= std::log(1.6);
+                        }
+                        np.push_back(p);
+                        if (kept) {
+                            nm1.insert(nm1.end(), m1.begin() + long(i * 14), m1.begin() + long(i * 14 + 14));
+                            nm2.insert(nm2.end(), m2.begin() + long(i * 14), m2.begin() + long(i * 14 + 14));
+                        } else {
+                            nm1.insert(nm1.end(), 14, 0.0);
+                            nm2.insert(nm2.end(), 14, 0.0);
+                        }
+                        if (!sh.empty()) {
+                            nsh.insert(nsh.end(), sh.begin() + long(i) * R, sh.begin() + long(i + 1) * R);
+                            if (kept) {
+                                nshM1.insert(nshM1.end(), shM1.begin() + long(i) * R, shM1.begin() + long(i + 1) * R);
+                                nshM2.insert(nshM2.end(), shM2.begin() + long(i) * R, shM2.begin() + long(i + 1) * R);
+                            } else {
+                                nshM1.insert(nshM1.end(), size_t(R), 0.0);
+                                nshM2.insert(nshM2.end(), size_t(R), 0.0);
+                            }
+                        }
+                        if (!refl.empty()) {
+                            nrefl.push_back(refl[i]);
+                            for (int q = 0; q < 4; ++q) {
+                                nrM1.push_back(kept ? rM1[i * 4 + size_t(q)] : 0.0);
+                                nrM2.push_back(kept ? rM2[i * 4 + size_t(q)] : 0.0);
+                            }
+                        }
+                    }
+                    params.swap(np);
+                    m1.swap(nm1);
+                    m2.swap(nm2);
+                    if (!sh.empty()) {
+                        sh.swap(nsh);
+                        shM1.swap(nshM1);
+                        shM2.swap(nshM2);
+                    }
+                    if (!refl.empty()) {
+                        refl.swap(nrefl);
+                        rM1.swap(nrM1);
+                        rM2.swap(nrM2);
+                    }
+                    n = params.size();
+                    grad.assign(n, SplatParam::Zero());
+                    gradAccum.assign(n, 0.0);
+                    gradCount.assign(n, 0);
+                    maxScreen.assign(n, 0.0);
+                }
                 if (growing) ++densifySteps; else ++pruneSteps;
             }
 
@@ -779,33 +1068,29 @@ public:
             // removed at the next densification step. The paper's other
             // weapon against floaters, and only run while densification is,
             // since pruning is what finishes the job.
-            if (densify && resetEvery > 0 && (it + 1) % resetEvery == 0 &&
-                it + 1 < until) {
+            if (doReset) {
                 const double cap = std::log(0.01 / 0.99);
-                for (size_t i = 0; i < n; ++i) {
-                    params[i].opacity = std::min(params[i].opacity, cap);
-                    m1[i * 14 + 10] = 0.0;
-                    m2[i * 14 + 10] = 0.0;
+                if (gpuTrainer) {
+                    std::string derr;
+                    if (!gpuTrainer->ResetOpacity(cap, &derr)) {
+                        *err = "train_splats: the GPU could not reset opacity: " + derr;
+                        return false;
+                    }
+                } else {
+                    for (size_t i = 0; i < n; ++i) {
+                        params[i].opacity = std::min(params[i].opacity, cap);
+                        m1[i * 14 + 10] = 0.0;
+                        m2[i * 14 + 10] = 0.0;
+                    }
                 }
                 ++resets;
-            }
-
-            if (gpuTrainer && (doDensify || doReset)) {
-                if (!gpuTrainer->Upload(params, m1, m2, gradAccum, gradCount,
-                                        maxScreen, &gpuNote)) {
-                    // Nothing lost: the CPU copy is current, so the run simply
-                    // continues there.
-                    gpuTrainer.reset();
-                    grad.assign(n, SplatParam::Zero());
-                }
             }
         }
 
         // The final state, home from the device.
         if (gpuTrainer) {
             std::string derr;
-            if (!gpuTrainer->Download(&params, &m1, &m2, &gradAccum, &gradCount,
-                                      &maxScreen, &derr)) {
+            if (!downGpu(*gpuTrainer, &derr)) {
                 *err = "train_splats: could not read the trained splats back from "
                        "the GPU: " + derr;
                 return false;
@@ -818,15 +1103,34 @@ public:
         double l1After = l1Before, psnrAfter = psnrBefore;
         depthAfter = depthBefore;
         if (iters > 0)
-            Evaluate(params, views, opt, GroupGpu(), &l1After, &psnrAfter,
-                     useDepth ? &depthAfter : nullptr);
+            Evaluate(params, sh, shMax, refl, env, views, opt, GroupGpu(), &l1After, &psnrAfter,
+                     useDepth ? &depthAfter : nullptr, gpuTrainer.get());
         heldAfter = heldBefore;
         if (iters > 0 && !heldOut.empty())
-            Evaluate(params, heldOut, opt, GroupGpu(), &heldL1, &heldAfter);
+            Evaluate(params, sh, shMax, refl, env, heldOut, opt, GroupGpu(), &heldL1, &heldAfter,
+                     nullptr, gpuTrainer.get());
 
         const size_t startCount = cloud->splats.size();
         cloud->splats.resize(n);
         for (size_t i = 0; i < n; ++i) cloud->splats[i] = FromParam(params[i]);
+        cloud->shDegree = sh.empty() ? 0 : shMax;
+        cloud->splatSh.assign(sh.begin(), sh.end());
+        cloud->splatRefl.clear();
+        cloud->envMap.clear();
+        cloud->envRes = 0;
+        if (reflect && refl.size() == n) {
+            cloud->splatRefl.resize(n * 4);
+            for (size_t i = 0; i < n; ++i) {
+                Vec3 nn{refl[i].normal[0], refl[i].normal[1], refl[i].normal[2]};
+                nn = nn.Norm() > 1e-12 ? nn.Normalized() : Vec3{0, 0, 1};
+                cloud->splatRefl[i * 4 + 0] = float(1.0 / (1.0 + std::exp(-refl[i].reflLogit)));
+                cloud->splatRefl[i * 4 + 1] = float(nn.x);
+                cloud->splatRefl[i * 4 + 2] = float(nn.y);
+                cloud->splatRefl[i * 4 + 3] = float(nn.z);
+            }
+            cloud->envMap.assign(env.texels.begin(), env.texels.end());
+            cloud->envRes = env.res;
+        }
 
         const double secs = std::chrono::duration<double>(
                                 std::chrono::steady_clock::now() - t0).count();
@@ -892,6 +1196,67 @@ public:
                           depthWeight, depthBefore * 100.0, depthAfter * 100.0);
             m_note += db;
         }
+        // GAUSSIANS BEHIND THE SURFACE. A reflection drawn without a
+        // reflection model is drawn as geometry: Gaussians placed where the
+        // reflected object APPEARS to be, behind the mirror, seen through it
+        // -- the glasses on a selfie video showed the room this way. Counted
+        // here as a Gaussian, reasonably opaque, whose centre is more than 5%
+        // behind the measured depth in most of the views that see it and
+        // measured something there. Reported so a reflection model can be
+        // judged on whether it removes them, not only on PSNR.
+        if (useDepth) {
+            std::vector<char> behind(n, 0);
+            ParallelFor(n, [&](size_t i) {
+                const SplatParam& p = params[i];
+                if (1.0 / (1.0 + std::exp(-p.opacity)) < 0.2) return;
+                const Vec3 X{p.mean[0], p.mean[1], p.mean[2]};
+                int seen = 0, back = 0;
+                for (const View& v : views) {
+                    if (v.depth.empty()) continue;
+                    const Vec3 q = v.cam.R * X + v.cam.t;
+                    if (q.z <= 1e-9) continue;
+                    const int x = int(v.cam.fx * q.x / q.z + v.cam.cx + 0.5);
+                    const int y = int(v.cam.fy * q.y / q.z + v.cam.cy + 0.5);
+                    if (x < 0 || y < 0 || x >= v.cam.w || y >= v.cam.h) continue;
+                    const float d = v.depth[size_t(y) * size_t(v.cam.w) + size_t(x)];
+                    if (d <= 0.0f) continue;
+                    ++seen;
+                    if (q.z > double(d) * 1.05) ++back;
+                }
+                behind[i] = (seen >= 2 && back * 2 > seen) ? 1 : 0;
+            });
+            size_t nb = 0;
+            for (char b : behind) nb += b ? 1 : 0;
+            char bb[200];
+            std::snprintf(bb, sizeof(bb),
+                          "; %zu Gaussians (%.1f%%) sit behind the measured surface in "
+                          "most views that see them",
+                          nb, 100.0 * double(nb) / double(std::max<size_t>(1, n)));
+            m_note += bb;
+        }
+        // How reflective the result came out, and how far the environment
+        // moved from its flat start: whether the model USED reflections, as
+        // opposed to whether they helped.
+        if (reflect && !refl.empty()) {
+            double sum = 0.0;
+            size_t above = 0;
+            for (const ReflParam& r : refl) {
+                const double v = 1.0 / (1.0 + std::exp(-r.reflLogit));
+                sum += v;
+                above += v > 0.3 ? 1 : 0;
+            }
+            double lo = 1.0, hi = 0.0;
+            for (double t : env.texels) { lo = std::min(lo, t); hi = std::max(hi, t); }
+            char rb[240];
+            std::snprintf(rb, sizeof(rb),
+                          "; REFLECTIONS from iteration %d: mean reflectivity %.3f, "
+                          "%.1f%% of Gaussians above 0.3, environment %dx%d per face "
+                          "spanning %.2f..%.2f",
+                          reflFrom, sum / double(refl.size()),
+                          100.0 * double(above) / double(refl.size()), env.res, env.res,
+                          lo, hi);
+            m_note += rb;
+        }
         if (useMask && totalPx > 0) {
             char mb[160];
             std::snprintf(mb, sizeof(mb),
@@ -921,23 +1286,37 @@ private:
     // RELATIVE depth error against the views' sweep depth, over the pixels
     // that have one -- or -1 if none do.
     static void Evaluate(const std::vector<SplatParam>& params,
+                         const std::vector<double>& sh, int shDegree,
+                         const std::vector<ReflParam>& refl, const EnvMap& env,
                          const std::vector<View>& views,
                          const RasterOptions& opt, ComputeContext* gpu,
-                         double* l1, double* psnr, double* depthErr = nullptr) {
+                         double* l1, double* psnr, double* depthErr = nullptr,
+                         SplatTrainerGpu* dev = nullptr) {
+        // THROUGH THE TRAINER when it holds these splats: training's own
+        // forward pass on the device. The CPU path projects every Gaussian
+        // for every view -- on a hundred-frame video, scoring before and
+        // after took more of a run than the training did.
         SplatRaster r;
         r.SetGpu(gpu);
-        std::vector<double> img, dep, unused;
+        std::vector<double> img, dep, tfin, unused;
         double sl = 0.0, sp = 0.0, de = 0.0;
         long long dn = 0;
+        const EnvMap* envUse = (refl.size() == params.size() && env.Valid()) ? &env : nullptr;
         for (const View& v : views) {
             const bool withDepth = depthErr && !v.depth.empty();
-            r.Forward(params, v.cam, opt, &img, withDepth ? &dep : nullptr);
+            std::string e;
+            const bool onDev = dev && dev->Render(v.cam, opt, shDegree, envUse, &img, &e,
+                                                 withDepth ? &dep : nullptr,
+                                                 withDepth ? &tfin : nullptr);
+            if (!onDev)
+                RenderShaded(r, params, sh, shDegree, refl, env, v.cam, opt, &img,
+                             withDepth ? &dep : nullptr);
             double a = 0.0, b = 0.0;
             Score(img, v.rgb, &a, &b);
             sl += a;
             sp += b;
             if (withDepth)
-                DepthLossGrad(dep, r.FinalT(), v.depth, 1.0, &unused, &de, &dn);
+                DepthLossGrad(dep, onDev ? tfin : r.FinalT(), v.depth, 1.0, &unused, &de, &dn);
         }
         *l1 = sl / double(views.size());
         *psnr = sp / double(views.size());
@@ -978,6 +1357,75 @@ private:
     // between the photographs trained on and the ones held out from 2.2 dB
     // to 0.4 -- the gap that IS overfitting. Stronger, and the sweep's own
     // errors start to win over the photographs.
+    // VIEW-DEPENDENT COLOUR. See splat_sh.h.
+    Param<int> m_shDegree{this, "sh_degree", 3, 0, 3,
+        {.help = "Spherical-harmonic degree of each Gaussian's colour: 0 is one "
+                 "colour from every direction, 3 (the paper's) lets it change "
+                 "with the viewpoint enough for sheen and broad highlights. "
+                 "Sharp mirror reflections are beyond any degree here. Each "
+                 "band adds memory: degree 3 is about four times degree 0."}};
+    Param<int> m_shEvery{this, "sh_every", 150, 1, 10000,
+        {.help = "Iterations between switching on each band of view "
+                 "dependence, as the paper does: plain colour settles first, "
+                 "then the finer view-dependent detail is fitted to what "
+                 "remains. Degree 3 is fully on after three times this."}};
+
+    // REFLECTIONS. See splat_reflect.h.
+    Param<bool> m_reflect{this, "reflect", false,
+        "Model reflections (3DGS-DR, deferred): each Gaussian gets a "
+        "reflectivity and a normal, the scene a learned environment map, and "
+        "each pixel adds the environment seen in the mirror direction. For "
+        "glossy and mirror-like surfaces that view-dependent colour cannot "
+        "draw sharply."};
+    Param<int> m_reflectFrom{this, "reflect_from", 300, 0, 100000,
+        {.help = "Iteration reflections switch on, so geometry and colour "
+                 "settle first and the reflection is fitted to what is "
+                 "left."}};
+    // A PRICE ON REFLECTING, so matte surfaces stay matte. Without it the
+    // reflection branch is simply more colour capacity: on fountain-P11 --
+    // stone and brick -- mean reflectivity climbed to 0.29 by 1000
+    // iterations and 0.60 by 3000, for 0.1-0.3 dB, with each Gaussian's own
+    // colour pushed ever further from the photograph to compensate (60% more
+    // saturated at 3000, where only the full render showed the photo's
+    // colour). Charged per pixel on the composited reflectivity, on the same
+    // scale as the L1 loss: a reflection must cut a pixel's error by this
+    // much times its reflectivity to be worth keeping.
+    //
+    // A TRADE, measured (fountain-P11 at 3000 iterations; the synthetic mirror
+    // test; IMG_1534, a real clip with a mirror, at 1000, held out):
+    //
+    //   sparsity   mirror    fountain: reflectivity  PSNR    IMG_1534
+    //       0      45.1 dB             0.60          31.13    17.67 dB
+    //       0.005  43.9                0.42          31.36
+    //       0.01   42.9                0.27          31.46    17.31
+    //       0.02   39.9                0.11          31.49    15.82
+    //
+    // The matte scene FITS BETTER as reflecting is priced -- the spurious
+    // reflections were costing it -- while real mirrors pay more the higher
+    // it goes. 0.01 keeps nearly all of the mirror, IMG_1534 within its
+    // run-to-run noise, and fountain's colours within 3% of the photos'
+    // saturation as the viewer draws them.
+    Param<float> m_reflectSparsity{this, "reflect_sparsity", 0.01f, 0.0f, 1.0f,
+        {.help = "Penalty on reflectivity, per pixel, on the photo-error "
+                 "scale. Keeps surfaces matte unless reflecting clearly pays; "
+                 "0 lets every surface reflect as much as fits."}};
+    Param<int> m_envRes{this, "env_res", 64, 4, 512,
+        {.help = "Environment map resolution, per cube face. Higher can "
+                 "draw a sharper reflection, and needs more views of it."}};
+
+    // THE PAPER'S RATE DOES NOT CARRY OVER. It gives the coefficients a
+    // twentieth of colour's rate, 1.25e-4, over 30000 iterations. Adam moves
+    // a parameter at most about its rate per step, so over the few hundred
+    // steps a run here gives them, a coefficient could not pass 0.03, and a
+    // test scene needing +-2 gained 0.08 dB from degree 1. So: colour's own
+    // rate. That is still gentler on the picture than it sounds, since a
+    // coefficient reaches the colour through Y_k, at most 0.49 at degree 1.
+    Param<float> m_shLr{this, "sh_lr", 2.5e-3f, 0.0f, 0.05f,
+        {.help = "Learning rate of the view-dependent colour terms. The "
+                 "paper's 1.25e-4 is for 30000 iterations; this default suits "
+                 "the hundreds to low thousands a run here takes.",
+         .step = 1e-4}};
+
     // See MaskUnmeasured. Needs the depth input; without it every pixel trains.
     Param<bool> m_mask{this, "mask", true,
         "Fit only the pixels the dense cloud covers (grown by "

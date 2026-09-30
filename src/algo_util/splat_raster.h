@@ -44,6 +44,7 @@
 #include <vector>
 
 #include "../core/geometry.h"
+#include "splat_sh.h"
 
 namespace tglab {
 
@@ -88,6 +89,28 @@ static_assert(sizeof(SplatParam) == SplatParam::kCount * sizeof(double),
 
 SplatParam ToParam(const Splat& s);
 Splat      FromParam(const SplatParam& p);
+
+// The parameters with each colour replaced by the one it shows the camera
+// centred at `eye`: base colour plus spherical harmonics (splat_sh.h). `sh`
+// holds kShRest values per Gaussian in the same order, or is empty for plain
+// colour, in which case `out` is a copy. The rasterisers composite whatever
+// colour they are given, which is why view dependence needs nothing else.
+template <typename F>
+void ShadeForView(const std::vector<SplatParam>& params, const std::vector<F>& sh,
+                  int degree, const Vec3& eye, std::vector<SplatParam>* out) {
+    *out = params;
+    if (degree < 1 || sh.size() < params.size() * size_t(kShRest)) return;
+    for (size_t i = 0; i < params.size(); ++i) {
+        SplatParam& p = (*out)[i];
+        const Vec3 c = ShColour(Vec3{p.color[0], p.color[1], p.color[2]},
+                                &sh[i * size_t(kShRest)], degree,
+                                Vec3{p.mean[0], p.mean[1], p.mean[2]}, eye);
+        p.color[0] = c.x; p.color[1] = c.y; p.color[2] = c.z;
+    }
+}
+
+// The centre of a rasteriser camera, in world space.
+inline Vec3 CentreOf(const SplatCam& c) { return c.R.Transpose() * c.t * -1.0; }
 
 // A solved camera as the rasteriser wants it, rendering at w x h.
 //
@@ -264,6 +287,7 @@ private:
         double u = 0, v = 0;           // centre, pixels
         double depth = 0;              // camera-space z
         double conic[3] = {0, 0, 0};   // inverse 2D covariance: a, b, c
+        double reach = 0;              // pixels out to where alpha < minAlpha
         double cov2[3] = {0, 0, 0};    // 2D covariance: A, B, C
         double tc[3] = {0, 0, 0};      // camera-space centre
         double J[6] = {0, 0, 0, 0, 0, 0};   // projection Jacobian, 2x3

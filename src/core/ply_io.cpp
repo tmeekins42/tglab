@@ -79,18 +79,27 @@ bool SavePly(const std::string& path, const PointCloud& cloud, std::string* err)
 
     if (!cloud.splats.empty()) {
         const size_t n = cloud.splats.size();
+        // The view-dependent colour, in the reference layout: f_rest after
+        // f_dc, one channel's coefficients after another.
+        const int deg = (cloud.shDegree > 0 && cloud.splatSh.size() >= n * 45)
+                            ? std::min(cloud.shDegree, 3) : 0;
+        const int perChannel = (deg + 1) * (deg + 1) - 1;
+        const int nRest = 3 * perChannel;
         f << "ply\nformat binary_little_endian 1.0\n"
-          << "comment written by tglab: 3D Gaussian splats, degree-0 colour\n"
+          << "comment written by tglab: 3D Gaussian splats, degree-" << deg << " colour\n"
           << "element vertex " << n << "\n";
-        const char* names[] = {"x", "y", "z", "nx", "ny", "nz",
-                               "f_dc_0", "f_dc_1", "f_dc_2", "opacity",
-                               "scale_0", "scale_1", "scale_2",
-                               "rot_0", "rot_1", "rot_2", "rot_3"};
-        for (const char* nm : names) f << "property float " << nm << "\n";
+        const char* head[] = {"x", "y", "z", "nx", "ny", "nz",
+                              "f_dc_0", "f_dc_1", "f_dc_2"};
+        const char* tail[] = {"opacity", "scale_0", "scale_1", "scale_2",
+                              "rot_0", "rot_1", "rot_2", "rot_3"};
+        for (const char* nm : head) f << "property float " << nm << "\n";
+        for (int q = 0; q < nRest; ++q) f << "property float f_rest_" << q << "\n";
+        for (const char* nm : tail) f << "property float " << nm << "\n";
         f << "end_header\n";
 
-        std::vector<float> rec(17);
-        for (const Splat& s : cloud.splats) {
+        std::vector<float> rec(size_t(17 + nRest));
+        for (size_t si = 0; si < n; ++si) {
+            const Splat& s = cloud.splats[si];
             const double o = std::clamp(s.opacity, 1e-6, 1.0 - 1e-6);
             const double c[3] = {s.color.x, s.color.y, s.color.z};
             const double sc[3] = {s.scale.x, s.scale.y, s.scale.z};
@@ -99,10 +108,15 @@ bool SavePly(const std::string& path, const PointCloud& cloud, std::string* err)
             rec[2] = float(s.mean.z);
             rec[3] = rec[4] = rec[5] = 0.0f;
             for (int k = 0; k < 3; ++k) rec[size_t(6 + k)] = float((c[k] - 0.5) / kC0);
-            rec[9] = float(std::log(o / (1.0 - o)));
+            for (int ch = 0; ch < 3; ++ch)
+                for (int k = 0; k < perChannel; ++k)
+                    rec[size_t(9 + ch * perChannel + k)] =
+                        cloud.splatSh[si * 45 + size_t(k * 3 + ch)];
+            const size_t t0 = size_t(9 + nRest);
+            rec[t0] = float(std::log(o / (1.0 - o)));
             for (int k = 0; k < 3; ++k)
-                rec[size_t(10 + k)] = float(std::log(std::max(sc[k], 1e-12)));
-            for (int k = 0; k < 4; ++k) rec[size_t(13 + k)] = float(s.rot[k]);
+                rec[t0 + 1 + size_t(k)] = float(std::log(std::max(sc[k], 1e-12)));
+            for (int k = 0; k < 4; ++k) rec[t0 + 4 + size_t(k)] = float(s.rot[k]);
             f.write(reinterpret_cast<const char*>(rec.data()),
                     std::streamsize(rec.size() * sizeof(float)));
         }
@@ -252,6 +266,24 @@ bool LoadPly(const std::string& path, PointCloud* cloud, std::string* note,
     int rest = 0;
     for (const Prop& p : props) rest += p.name.rfind("f_rest_", 0) == 0 ? 1 : 0;
 
+    // VIEW-DEPENDENT COLOUR, when the file has it: the reference layout is
+    // f_rest_{channel * perChannel + k}, 9 / 24 / 45 values for degree 1 / 2
+    // / 3. Kept in tglab's order, rest[k * 3 + channel] (algo_util/
+    // splat_sh.h), with any degree the file stops short of left zero.
+    int shDeg = 0, perChannel = 0;
+    std::vector<int> iRest;
+    if (isSplat && rest >= 9) {
+        perChannel = rest / 3;
+        for (int d = 3; d >= 1; --d)
+            if (perChannel >= (d + 1) * (d + 1) - 1) { shDeg = d; break; }
+        perChannel = (shDeg + 1) * (shDeg + 1) - 1;
+        for (int q = 0; q < 3 * perChannel; ++q) {
+            const int at = index(("f_rest_" + std::to_string(q)).c_str());
+            if (at < 0) { shDeg = 0; iRest.clear(); break; }
+            iRest.push_back(at);
+        }
+    }
+
     // --- body ---
     std::vector<double> v(props.size());
     const bool swap = (fmt == Fmt::BE);
@@ -313,6 +345,14 @@ bool LoadPly(const std::string& path, PointCloud* cloud, std::string* note,
             s.color = Vec3{std::clamp(c[0], 0.0, 1.0), std::clamp(c[1], 0.0, 1.0),
                            std::clamp(c[2], 0.0, 1.0)};
             out.splats.push_back(s);
+            if (shDeg > 0) {
+                const size_t base = out.splatSh.size();
+                out.splatSh.resize(base + 45, 0.0f);
+                for (int ch = 0; ch < 3; ++ch)
+                    for (int k = 0; k < perChannel; ++k)
+                        out.splatSh[base + size_t(k * 3 + ch)] =
+                            float(v[size_t(iRest[size_t(ch * perChannel + k)])]);
+            }
         } else {
             Track t;
             t.point = pos;
@@ -330,12 +370,15 @@ bool LoadPly(const std::string& path, PointCloud* cloud, std::string* note,
         }
     }
 
+    out.shDegree = shDeg;
     *cloud = std::move(out);
     char buf[240];
-    if (isSplat)
+    if (isSplat && shDeg > 0)
+        std::snprintf(buf, sizeof(buf), "%zu Gaussians, view-dependent colour to degree %d",
+                      count, shDeg);
+    else if (isSplat)
         std::snprintf(buf, sizeof(buf), "%zu Gaussians%s", count,
-                      rest > 0 ? (", view-dependent colour (" + std::to_string(rest) +
-                                  " f_rest values each) dropped").c_str()
+                      rest > 0 ? ", view-dependent colour dropped (an unrecognised layout)"
                                : "");
     else
         std::snprintf(buf, sizeof(buf), "%zu points%s", count,

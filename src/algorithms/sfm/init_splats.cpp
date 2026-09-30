@@ -331,6 +331,12 @@ public:
         for (char c : planar) nPlanar += c;
         const int nOut = int(out.size());
         cloud->splats = std::move(out);
+        // New Gaussians have plain colour; any coefficients were someone else's.
+        cloud->splatSh.clear();
+        cloud->shDegree = 0;
+        cloud->splatRefl.clear();
+        cloud->envMap.clear();
+        cloud->envRes = 0;
 
         char buf[320];
         std::snprintf(buf, sizeof(buf),

@@ -3,7 +3,7 @@
 //
 // Layout conventions both callers follow: flat arrays in rows of TexW
 // texels, index i at (i % TexW, i / TexW); a projected Gaussian is three
-// texels -- (u, v, opacity, radius), (conic a, b, c, -), (r, g, b, depth),
+// texels -- (u, v, opacity, radius), (conic a, b, c, reach), (r, g, b, depth),
 // depth being the centre's camera-space z; a tile
 // list entry is one R32F texel holding the Gaussian's index; a tile's offset
 // texel holds (start, count).
@@ -18,6 +18,14 @@ namespace splat_kernels {
 // tile's list near to far exactly as the CPU loop does. Writes the colour
 // with the final transmittance in .w, and how many list entries were used --
 // both of which the backward pass needs.
+//
+// The list is fetched 256 entries at a time by the whole group, a thread an
+// entry, rather than by every thread reading each entry and then the
+// Gaussian it names -- a dependent pair of reads per entry with nothing to
+// hide them. The group stops once every pixel is opaque, and a wave skips a
+// Gaussian whose reach misses all its pixels. Measured on a 100-frame video
+// (720k Gaussians in view at 180x320, 240 tiles): 10.1 ms a step before,
+// 2.9 after.
 inline constexpr const char* kForward = R"(
 Texture2D<float4>   Proj    : register(t0);   // per Gaussian: 3 texels
 Texture2D<float>    List    : register(t1);   // tile lists, flattened
@@ -25,6 +33,13 @@ Texture2D<float4>   Offs    : register(t2);   // per tile: start, count
 RWTexture2D<float4> OutRGBT : register(u0);
 RWTexture2D<float>  OutLast : register(u1);
 RWTexture2D<float>  OutDepth: register(u2);   // expected depth, background 0
+#ifdef REFL
+// Reflections in the same pass (splat_reflect.h): each Gaussian's
+// reflectivity and camera-facing normal, composited with the same weights
+// as its colour over a background of 0.
+Texture2D<float4>   Extra   : register(t3);   // per Gaussian: r, normal
+RWTexture2D<float4> OutRN   : register(u3);   // R, normal
+#endif
 
 cbuffer Params : register(b0) {
     uint Width; uint Height;
@@ -35,10 +50,22 @@ cbuffer Params : register(b0) {
 
 uint2 At(uint i) { return uint2(i % TexW, i / TexW); }
 
+// A batch of the tile's list, fetched by the whole group at once.
+#define kFB 256
+groupshared float4 fA[kFB];     // u, v, opacity
+groupshared float4 fC[kFB];     // conic
+groupshared float4 fCol[kFB];   // colour, depth
+#ifdef REFL
+groupshared float4 fX[kFB];     // reflectivity, normal
+#endif
+groupshared uint   fAlive;      // any pixel still compositing
+
 [numthreads(16, 16, 1)]
-void main(uint3 gid : SV_GroupID, uint3 gt : SV_GroupThreadID) {
+void main(uint3 gid : SV_GroupID, uint3 gt : SV_GroupThreadID,
+          uint gi : SV_GroupIndex) {
     uint px = gid.x * 16 + gt.x, py = gid.y * 16 + gt.y;
-    if (px >= Width || py >= Height) return;
+    // No early return: every thread takes part in fetching and the barriers.
+    bool inside = px < Width && py < Height;
 
     float4 o = Offs[At(gid.y * TilesX + gid.x)];
     uint start = uint(o.x), count = uint(o.y);
@@ -47,28 +74,72 @@ void main(uint3 gid : SV_GroupID, uint3 gt : SV_GroupThreadID) {
     float T = 1.0;
     float3 C = float3(0, 0, 0);
     float D = 0.0;
+#ifdef REFL
+    float4 RN = float4(0, 0, 0, 0);
+#endif
     uint last = 0;
-    for (uint k = 0; k < count; ++k) {
-        uint j = uint(List[At(start + k)]);
-        float4 a = Proj[At(j * 3)];        // u, v, opacity
-        float4 c = Proj[At(j * 3 + 1)];    // conic a, b, c
-        float dx = float(px) - a.x, dy = float(py) - a.y;
-        float power = -0.5 * (c.x * dx * dx + c.z * dy * dy) - c.y * dx * dy;
-        if (power > 0.0) continue;
-        float alpha = min(maxA, a.z * exp(power));
-        if (alpha < minA) continue;
-        float nextT = T * (1.0 - alpha);
-        if (nextT < tStop) break;          // before blending, as the CPU
-        float4 col = Proj[At(j * 3 + 2)];
-        C += col.rgb * alpha * T;
-        D += col.w * alpha * T;
-        T = nextT;
-        last = k + 1;
+    bool done = !inside;
+    // The wave's pixels as a rectangle. A Gaussian whose reach -- the
+    // radius past which its alpha is below minA -- misses the rectangle is
+    // skipped by every pixel in it anyway, so the whole wave skips it
+    // without the arithmetic. Most Gaussians in a tile's list touch a few of
+    // its waves at most.
+    float wx0 = float(WaveActiveMin(inside ? px : 0xffffffffu));
+    float wx1 = float(WaveActiveMax(inside ? px : 0u));
+    float wy0 = float(WaveActiveMin(inside ? py : 0xffffffffu));
+    float wy1 = float(WaveActiveMax(inside ? py : 0u));
+    for (uint base = 0; base < count; base += kFB) {
+        // Fetch the batch, one entry a thread, and find out whether any
+        // pixel still needs it: once all are opaque the group stops.
+        if (gi == 0) fAlive = 0;
+        GroupMemoryBarrierWithGroupSync();
+        if (!done) fAlive = 1;
+        if (base + gi < count) {
+            uint j = uint(List[At(start + base + gi)]);
+            fA[gi]   = Proj[At(j * 3)];
+            fC[gi]   = Proj[At(j * 3 + 1)];
+            fCol[gi] = Proj[At(j * 3 + 2)];
+#ifdef REFL
+            fX[gi] = Extra[At(j)];
+#endif
+        }
+        GroupMemoryBarrierWithGroupSync();
+        if (fAlive == 0) break;
+
+        // Walk it near to far, exactly as one entry at a time did.
+        uint nb = min(uint(kFB), count - base);
+        for (uint b = 0; b < nb && !done; ++b) {
+            float4 a = fA[b];                  // u, v, opacity
+            float4 c = fC[b];                  // conic a, b, c, reach
+            float ex = clamp(a.x, wx0, wx1) - a.x, ey = clamp(a.y, wy0, wy1) - a.y;
+            if (ex * ex + ey * ey > c.w * c.w) continue;
+            float dx = float(px) - a.x, dy = float(py) - a.y;
+            float power = -0.5 * (c.x * dx * dx + c.z * dy * dy) - c.y * dx * dy;
+            if (power > 0.0) continue;
+            float alpha = min(maxA, a.z * exp(power));
+            if (alpha < minA) continue;
+            float nextT = T * (1.0 - alpha);
+            if (nextT < tStop) { done = true; break; }   // before blending, as the CPU
+            float4 col = fCol[b];
+            C += col.rgb * alpha * T;
+            D += col.w * alpha * T;
+#ifdef REFL
+            RN += fX[b] * (alpha * T);
+#endif
+            T = nextT;
+            last = base + b + 1;
+        }
+        // The next fetch overwrites the batch: wait for everyone to finish it.
+        GroupMemoryBarrierWithGroupSync();
     }
+    if (!inside) return;
     float3 bg = float3(asfloat(BgR), asfloat(BgG), asfloat(BgB));
     OutRGBT[uint2(px, py)] = float4(C + T * bg, T);
     OutLast[uint2(px, py)] = float(last);
     OutDepth[uint2(px, py)] = D;
+#ifdef REFL
+    OutRN[uint2(px, py)] = RN;
+#endif
 }
 )";
 
@@ -103,6 +174,16 @@ void main(uint3 gid : SV_GroupID, uint3 gt : SV_GroupThreadID) {
 // it changes. On fountain-P11 that moved the final L1 in its fourth digit
 // and densification's thresholds by six Gaussians in half a million.
 // Measured there: 31 ms an iteration one entry at a time, 12 batched.
+//
+// THE WAVE SUMS were then most of what was left. Summing each of the ten to
+// fourteen values on its own is five exchanges apiece; halving -- each lane
+// keeping half its values and adding its partner's copy of that half -- sums
+// all sixteen in sixteen exchanges, and leaves them spread across the lanes
+// to be written at once. On NVIDIA it pairs lanes in the same order the
+// built-in sum does, so the result is the same to the bit. With the per-wave
+// skip of Gaussians out of reach (see kForward) and waves that miss writing
+// nothing: 15.8 ms a step on the video above, 6.7 after, same training
+// result to the last digit.
 inline constexpr const char* kBackward = R"(
 Texture2D<float4>   Proj  : register(t0);
 Texture2D<float>    List  : register(t1);
@@ -112,6 +193,20 @@ RWTexture2D<float4> EGrad : register(u0);   // per entry: 3 texels
 RWTexture2D<float>  Last  : register(u1);   // from the forward pass
 RWTexture2D<float>  DDepth: register(u2);   // dLoss/d(expected depth); 0 = no depth loss
 RWTexture2D<float>  DShift: register(u3);   // per-pixel depth shift: see DepthLossGrad
+#ifdef REFL
+// Reflections in the same pass: each Gaussian's reflectivity and normal as
+// the forward composited them, and dLoss by the composited R and normal per
+// pixel. Four more values per entry -- dLoss by the Gaussian's r and normal
+// -- in a fourth EGrad texel, and four more running "behind" sums feeding
+// dAlpha, exactly as colour's three do. Background 0 in all four.
+Texture2D<float4>   Extra : register(t4);   // per Gaussian: r, normal
+Texture2D<float4>   DRN   : register(t5);   // per pixel: dLoss/dR, dLoss/dnormal
+#define kQ   14                             // gradient values per entry
+#define kTex 4                              // EGrad texels per entry
+#else
+#define kQ   10
+#define kTex 3
+#endif
 
 cbuffer Params : register(b0) {
     uint D0; uint D1;                        // EGrad's size; unused
@@ -131,7 +226,11 @@ groupshared uint   gMax;
 groupshared float4 sA[kBatch];     // u, v, opacity
 groupshared float4 sC[kBatch];     // conic
 groupshared float4 sCol[kBatch];   // colour, depth in .w
+#ifdef REFL
+groupshared float4 sX[kBatch];     // reflectivity, normal
+#endif
 groupshared float  part[kPart];
+groupshared uint   hitW[kBatch];   // per entry: which waves wrote a sum
 
 uint2 At(uint i) { return uint2(i % TexW, i / TexW); }
 
@@ -155,6 +254,10 @@ void main(uint3 gid : SV_GroupID, uint3 gt : SV_GroupThreadID,
     float  dD  = inside ? DDepth[uint2(px, py)] : 0.0;
     float  shift = inside ? DShift[uint2(px, py)] : 0.0;
     float  accD = 0.0;
+#ifdef REFL
+    float4 dX   = inside ? DRN[uint2(px, py)] : float4(0, 0, 0, 0);
+    float4 accX = float4(0, 0, 0, 0);
+#endif
 
     // How far back ANY pixel in the tile needs to go.
     if (gi == 0) gMax = 0;
@@ -165,16 +268,27 @@ void main(uint3 gid : SV_GroupID, uint3 gt : SV_GroupThreadID,
 
     // Entries no pixel reached get zero, written here because the loop
     // below never visits them.
-    for (uint e = kmax + gi; e < count; e += 256) {
-        EGrad[At((start + e) * 3)]     = float4(0, 0, 0, 0);
-        EGrad[At((start + e) * 3 + 1)] = float4(0, 0, 0, 0);
-        EGrad[At((start + e) * 3 + 2)] = float4(0, 0, 0, 0);
-    }
+    for (uint e = kmax + gi; e < count; e += 256)
+        [unroll] for (uint zt = 0; zt < kTex; ++zt)
+            EGrad[At((start + e) * kTex + zt)] = float4(0, 0, 0, 0);
 
     uint lanes = WaveGetLaneCount();
     uint wid = gi / lanes;
     uint nw = (256 + lanes - 1) / lanes;
-    uint batch = min(uint(kBatch), uint(kPart) / (nw * 10));
+    uint batch = min(uint(kBatch), uint(kPart) / (nw * kQ));
+    // A wave that no pixel of hits writes nothing, and the sum skips it --
+    // with a bit per wave, so up to 32 of them; narrower waves than 8 lanes
+    // fall back to writing zeros.
+    bool useMask = nw <= 32;
+    // The halving reduction below needs at least 16 lanes, a power of two.
+    bool useXp = lanes >= 16 && (lanes & (lanes - 1)) == 0;
+
+    // The wave's pixels as a rectangle, for skipping Gaussians that cannot
+    // reach any of them; see kForward.
+    float wx0 = float(WaveActiveMin(inside ? px : 0xffffffffu));
+    float wx1 = float(WaveActiveMax(inside ? px : 0u));
+    float wy0 = float(WaveActiveMin(inside ? py : 0xffffffffu));
+    float wy1 = float(WaveActiveMax(inside ? py : 0u));
 
     for (uint top = kmax; top > 0; ) {
         uint nb = min(batch, top);          // entries top-1 down to top-nb
@@ -182,22 +296,28 @@ void main(uint3 gid : SV_GroupID, uint3 gt : SV_GroupThreadID,
         // 1. Fetch the batch. The barrier also orders this batch's writes to
         //    `part` after the previous batch's reads of it.
         if (gi < nb) {
+            hitW[gi] = 0;
             uint j = uint(List[At(start + top - 1 - gi)]);
             sA[gi]   = Proj[At(j * 3)];
             sC[gi]   = Proj[At(j * 3 + 1)];
             sCol[gi] = Proj[At(j * 3 + 2)];
+#ifdef REFL
+            sX[gi] = Extra[At(j)];
+#endif
         }
         GroupMemoryBarrierWithGroupSync();
 
         // 2. Walk it back to front, as one entry at a time did.
         for (uint b = 0; b < nb; ++b) {
             uint k = top - 1 - b;
-            float g[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+            float g[kQ];
+            [unroll] for (uint gz = 0; gz < kQ; ++gz) g[gz] = 0.0;
             bool hit = false;
 
-            if (inside && k < last) {
-                float4 a = sA[b];
-                float4 c = sC[b];
+            float4 a = sA[b];
+            float4 c = sC[b];
+            float ex = clamp(a.x, wx0, wx1) - a.x, ey = clamp(a.y, wy0, wy1) - a.y;
+            if (inside && k < last && ex * ex + ey * ey <= c.w * c.w) {
                 float dx = float(px) - a.x, dy = float(py) - a.y;
                 float power = -0.5 * (c.x * dx * dx + c.z * dy * dy) - c.y * dx * dy;
                 if (power <= 0.0) {
@@ -218,6 +338,17 @@ void main(uint3 gid : SV_GroupID, uint3 gt : SV_GroupThreadID,
                             dAlpha += Ti * (z - accD) * dD;
                             accD = alpha * z + (1.0 - alpha) * accD;
                         }
+#ifdef REFL
+                        // Reflectivity and normal: four more channels, as
+                        // colour's, over a background of 0.
+                        float4 xv = sX[b];
+                        g[10] = alpha * Ti * dX.x;
+                        g[11] = alpha * Ti * dX.y;
+                        g[12] = alpha * Ti * dX.z;
+                        g[13] = alpha * Ti * dX.w;
+                        dAlpha += Ti * dot(xv - accX, dX);
+                        accX = alpha * xv + (1.0 - alpha) * accX;
+#endif
                         acc = alpha * col + (1.0 - alpha) * acc;
                         T = Ti;
                         if (raw <= maxA) {
@@ -233,30 +364,66 @@ void main(uint3 gid : SV_GroupID, uint3 gt : SV_GroupThreadID,
                 }
             }
 
-            uint p = (b * nw + wid) * 10;
+            uint p = (b * nw + wid) * kQ;
             if (WaveActiveAnyTrue(hit)) {
-                [unroll] for (uint q = 0; q < 10; ++q) {
+                if (useXp) {
+                    // ALL SIXTEEN SUMS AT ONCE, by halving: at each step a
+                    // lane keeps half its values and adds its partner's
+                    // copy of that half, so after four steps each lane holds
+                    // one value's partial sum over sixteen lanes -- 16
+                    // exchanges where one sum per value took 5 each, 70 --
+                    // and the waves' results are written by 16 lanes at once.
+                    float v[16];
+                    [unroll] for (uint q0 = 0; q0 < 16; ++q0) v[q0] = q0 < kQ ? g[q0] : 0.0;
+                    uint l = WaveGetLaneIndex();
+                    [unroll] for (uint s = 0; s < 4; ++s) {
+                        uint o = lanes >> (s + 1);
+                        bool up = (l & o) != 0;
+                        [unroll] for (uint i = 0; i < (8u >> s); ++i) {
+                            float send = up ? v[i] : v[i + (8u >> s)];
+                            float keep = up ? v[i + (8u >> s)] : v[i];
+                            v[i] = keep + WaveReadLaneAt(send, l ^ o);
+                        }
+                    }
+                    float r = v[0];
+                    for (uint o2 = lanes >> 5; o2 > 0; o2 >>= 1) r += WaveReadLaneAt(r, l ^ o2);
+                    if ((l & ((lanes >> 4) - 1)) == 0) {
+                        uint idx = ((l & (lanes >> 1)) ? 8u : 0u) + ((l & (lanes >> 2)) ? 4u : 0u) +
+                                   ((l & (lanes >> 3)) ? 2u : 0u) + ((l & (lanes >> 4)) ? 1u : 0u);
+                        if (idx < kQ) part[p + idx] = r;
+                    }
+                } else
+                [unroll] for (uint q = 0; q < kQ; ++q) {
                     float s = WaveActiveSum(g[q]);
                     if (WaveIsFirstLane()) part[p + q] = s;
                 }
-            } else if (WaveIsFirstLane()) {
-                [unroll] for (uint q = 0; q < 10; ++q) part[p + q] = 0;
+                if (useMask && WaveIsFirstLane()) {
+                    uint prev;
+                    InterlockedOr(hitW[b], 1u << wid, prev);
+                }
+            } else if (!useMask && WaveIsFirstLane()) {
+                [unroll] for (uint q = 0; q < kQ; ++q) part[p + q] = 0;
             }
         }
         GroupMemoryBarrierWithGroupSync();
 
-        // 3. Add the waves' sums and write: one texel per thread.
-        for (uint t = gi; t < nb * 3; t += 256) {
-            uint b = t / 3, r = t % 3;
-            uint n = (r == 2) ? 2 : 4;   // texel 2: opacity, depth
+        // 3. Add the waves' sums and write: one texel per thread. Texels 0
+        //    and 1 hold values 0-7, texel 2 values 8-9 (opacity, depth), and
+        //    with reflections texel 3 values 10-13.
+        for (uint t = gi; t < nb * kTex; t += 256) {
+            uint b = t / kTex, r = t % kTex;
+            uint n = (r == 2) ? 2 : 4;
+            uint off = (r < 3) ? r * 4 : 10;
             float4 v = float4(0, 0, 0, 0);
+            uint mask = useMask ? hitW[b] : 0xffffffffu;
             for (uint w = 0; w < nw; ++w) {
-                uint p = (b * nw + w) * 10 + r * 4;
+                if (useMask && ((mask >> w) & 1u) == 0) continue;
+                uint p = (b * nw + w) * kQ + off;
                 v.x += part[p];
                 v.y += part[p + 1];
                 if (n == 4) { v.z += part[p + 2]; v.w += part[p + 3]; }
             }
-            EGrad[At((start + top - 1 - b) * 3 + r)] = v;
+            EGrad[At((start + top - 1 - b) * kTex + r)] = v;
         }
         top -= nb;
     }

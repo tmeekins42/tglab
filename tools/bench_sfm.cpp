@@ -42,6 +42,7 @@
 
 #include "../src/algo_util/features.h"
 #include "../src/algo_util/splat_raster.h"
+#include "../src/algo_util/splat_reflect.h"
 #include "../src/algo_util/view_graph.h"
 #include "../src/core/algorithm.h"
 #include "../src/core/image.h"
@@ -399,7 +400,48 @@ static void PrintCameras(const PointCloud& pc) {
     for (const Camera& c : pc.cameras)
         if (c.solved) rad += (c.Center() - cm).Norm();
     rad = rad > 1e-12 ? rad / double(n) : 1.0;
-    std::printf("\ncamera path (centroid-relative, in mean radii):\n");
+    // WHERE EACH CAMERA IS LOOKING: its centre plus its viewing axis times
+    // the median depth of the points it observes. An orbit of one object
+    // gives one cluster of these; a solve that split in two gives two, and
+    // says which frames went where -- which the path alone does not, since
+    // each half can be a perfectly smooth arc of its own.
+    std::vector<std::vector<double>> depths(pc.cameras.size());
+    for (const Track& t : pc.tracks) {
+        if (!t.hasPoint) continue;
+        for (const Observation& o : t.obs) {
+            if (o.frame < 0 || size_t(o.frame) >= pc.cameras.size()) continue;
+            const Camera& c = pc.cameras[size_t(o.frame)];
+            if (!c.solved) continue;
+            const Vec3 q = c.R * t.point + c.t;
+            if (q.z > 0) depths[size_t(o.frame)].push_back(q.z);
+        }
+    }
+    // TWO PASSES, ONE OBJECT? With TGLAB_SPLIT=k, the points seen only by
+    // frames before k and only by frames from k on, and those both saw: if
+    // the two passes placed the subject differently, their exclusive points
+    // sit apart and few are shared.
+    if (const char* sp = std::getenv("TGLAB_SPLIT")) {
+        const int k = std::atoi(sp);
+        Vec3 ca{0, 0, 0}, cb{0, 0, 0};
+        long na = 0, nb = 0, both = 0;
+        for (const Track& t : pc.tracks) {
+            if (!t.hasPoint) continue;
+            bool a = false, b = false;
+            for (const Observation& o : t.obs) (o.frame < k ? a : b) = true;
+            if (a && b) { ++both; continue; }
+            if (a) { ca = ca + t.point; ++na; }
+            if (b) { cb = cb + t.point; ++nb; }
+        }
+        if (na > 0 && nb > 0) {
+            ca = (ca * (1.0 / double(na)) - cm) * (1.0 / rad);
+            cb = (cb * (1.0 / double(nb)) - cm) * (1.0 / rad);
+            std::printf("\nsplit at frame %d: %ld points only before (centre %.2f %.2f %.2f), "
+                        "%ld only after (centre %.2f %.2f %.2f), %ld seen by both; "
+                        "centres %.2f radii apart\n",
+                        k, na, ca.x, ca.y, ca.z, nb, cb.x, cb.y, cb.z, both, (ca - cb).Norm());
+        }
+    }
+    std::printf("\ncamera path (centroid-relative, in mean radii; look = where it looks):\n");
     const Camera* prev = nullptr;
     const Camera* first = nullptr;
     for (size_t i = 0; i < pc.cameras.size(); ++i) {
@@ -410,8 +452,15 @@ static void PrintCameras(const PointCloud& pc) {
         const Mat3 rel = c.R * first->R.Transpose();
         const double turned = Mat3::Identity().AngleTo(rel) * 57.2958;
         const double step = prev ? (c.Center() - prev->Center()).Norm() / rad : 0.0;
-        std::printf("  %3zu: %6.2f %6.2f %6.2f   turned %6.1f   step %.3f\n", i, d.x, d.y,
-                    d.z, turned, step);
+        Vec3 look{0, 0, 0};
+        std::vector<double>& ds = depths[i];
+        if (!ds.empty()) {
+            std::nth_element(ds.begin(), ds.begin() + long(ds.size() / 2), ds.end());
+            const Vec3 axis{c.R.m[6], c.R.m[7], c.R.m[8]};   // camera +z in world
+            look = (c.Center() + axis * ds[ds.size() / 2] - cm) * (1.0 / rad);
+        }
+        std::printf("  %3zu: %6.2f %6.2f %6.2f   turned %6.1f   step %.3f   look %6.2f %6.2f %6.2f\n",
+                    i, d.x, d.y, d.z, turned, step, look.x, look.y, look.z);
         prev = &c;
     }
 }
@@ -424,9 +473,20 @@ static void DumpOrbit(const PointCloud& pc, const std::string& prefix) {
     // z-buffered dots, so a dense cloud's floaters show from the side.
     const bool asPoints = pc.splats.empty();
     std::vector<Vec3> pts, cols;
+    // With TGLAB_SPLIT=k (see PrintCameras), points seen only before frame k
+    // are drawn red, only from k on blue, by both white: a subject the two
+    // passes placed differently shows as a red copy beside a blue one.
+    const char* splitEnv = std::getenv("TGLAB_SPLIT");
+    const int splitAt = splitEnv ? std::atoi(splitEnv) : -1;
     if (asPoints)
-        for (const Track& t : pc.tracks)
-            if (t.hasPoint) { pts.push_back(t.point); cols.push_back(t.color); }
+        for (const Track& t : pc.tracks) {
+            if (!t.hasPoint) continue;
+            pts.push_back(t.point);
+            if (splitAt < 0) { cols.push_back(t.color); continue; }
+            bool a = false, b = false;
+            for (const Observation& o : t.obs) (o.frame < splitAt ? a : b) = true;
+            cols.push_back(a && b ? Vec3{1, 1, 1} : a ? Vec3{0.9, 0.2, 0.2} : Vec3{0.2, 0.5, 1.0});
+        }
     if (asPoints && pts.empty()) return;
 
     // Centre: the component-wise median, robust to strays.
@@ -493,7 +553,11 @@ static void DumpOrbit(const PointCloud& pc, const std::string& prefix) {
         } else {
             SplatRaster r;
             RasterOptions opt;
-            r.Forward(params, SplatCamFrom(c, w, h), opt, &rgb);
+            const SplatCam sc = SplatCamFrom(c, w, h);
+            std::vector<ReflParam> refl;
+            EnvMap env;
+            ReflFromCloud(pc, &refl, &env);
+            RenderShaded(r, params, pc.splatSh, pc.shDegree, refl, env, sc, opt, &rgb);
         }
 
         Image im;
@@ -681,7 +745,9 @@ int main(int argc, char** argv) {
 
         UiState ui;
         Pipeline sp;
-        std::vector<SourceImage> names{{"group", 0}};
+        SourceImage src{"group", 0};
+        src.shape = std::get<ImageSet>(s[0]).shape;   // a group, so reductions see a set
+        std::vector<SourceImage> names{src};
         const InterpResult ir = Interpret(prog, names, &ui, &sp);
         if (!ir.ok) { std::printf("interpret: %s\n", ir.error.c_str()); return 1; }
 
@@ -742,6 +808,13 @@ int main(int argc, char** argv) {
             // window, and some things -- a render beside its photograph --
             // cannot be judged from numbers alone.
             if (!dumpDir.empty() && d) {
+                if (const Image* one = std::get_if<Image>(d)) {
+                    std::filesystem::create_directories(dumpDir);
+                    Image copy = const_cast<Image&>(*one).Clone();
+                    std::string e;
+                    if (!SavePng(dumpDir + "/" + vd.name + ".png", copy, &e))
+                        std::printf("dump %s: %s\n", vd.name.c_str(), e.c_str());
+                }
                 if (const ImageSet* set = std::get_if<ImageSet>(d)) {
                     std::filesystem::create_directories(dumpDir);
                     for (size_t i = 0; i < set->images.size(); ++i) {

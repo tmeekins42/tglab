@@ -579,6 +579,16 @@ wanted 169842 megapixels. `stitch_panorama` extracts the *rotation* from each
 transform and projects onto a cylinder (0 plane, 1 cylindrical, 2 spherical).
 Same frames, same links, 11372×3912.
 
+**The cylinder turns about the axis the camera actually panned around**
+(`straighten`, on). A camera tilted down while it pans also rolls slightly, in
+its own view, with every step. A 100-frame phone video of a desk measured
+0.2–2° per link, all the same sign, about 70° in all. About frame 0's own
+vertical, the far end of that panorama ran off at 45°. The true axis comes from
+the frames themselves: panning keeps every camera's sideways axis level, so
+vertical is the one direction perpendicular to all of them. This is what
+OpenCV calls wave correction and Hugin calls straighten. Pans under about 20°
+leave that direction undetermined, so they are left as they were.
+
 Its report gives the focal length it estimated — from the geometry, not from
 EXIF, so it needs no sensor size — and how much the frames **disagree** where
 they overlap. That last number is the direct measure of stitch quality;
@@ -803,6 +813,43 @@ themselves, and shows between them as false colour and smears. What pushes back:
 - **Pruning outlives growth.** Oversized Gaussians are still removed after
   densification stops; the paper stops both together, and with eleven views a
   Gaussian edge-on to every camera grew into a sheet across the whole scene.
+- **Colour depends on the viewpoint** (`sh_degree`, 3). Each Gaussian's
+  colour is its base colour plus a spherical-harmonic expansion in the viewing
+  direction, the paper's model, so a sheen or broad highlight can change as the
+  camera moves. Before this a Gaussian had one colour from everywhere, and a
+  highlight could only be baked in or faked with floaters. Bands switch on one
+  at a time (`sh_every`), after the base colour has settled. The paper's
+  learning rate for the coefficients is for 30000 iterations and barely moved
+  them in 1000, so `sh_lr` uses colour's own. Measured with cameras held out:
+
+  | capture | degree 0 | degree 3 | training time |
+  |---|---|---|---|
+  | fountain-P11, every 5th held out | 26.03 dB | 27.04 dB | 47 → 69 s |
+  | cat video, every 10th held out | 16.58 dB | 16.96 dB | 148 → 208 s |
+
+  The gain holds on the held-out views, so it is real view dependence rather
+  than memorising the photographs. It is small on the cat, whose book cover
+  reflects sharply: a degree-3 expansion is too smooth to draw a mirror image.
+  That is the next step, a reflection model rather than a smoother colour.
+  `.ply` export writes the coefficients as the reference `f_rest_*` fields, so
+  other splat viewers show the view dependence too. Import keeps theirs.
+- **Reflections** (`reflect`, off by default). Deferred reflection after
+  3DGS-DR: each Gaussian also has a reflectivity and a normal, the scene a
+  learned environment cube map (`env_res` per face), and each pixel mixes its
+  colour with the environment seen in the mirror direction,
+  `(1 − R)·C + R·Env(reflect(ray, N))`. Switched on at `reflect_from`, once
+  geometry and colour have settled. On a synthetic mirror, held out: 17.9 dB
+  with harmonics alone, 42.9 with reflections.
+  **Reflecting has a price** (`reflect_sparsity`, 0.01), or matte surfaces
+  use the environment as spare colour capacity: on fountain-P11 mean
+  reflectivity reached 0.60 by 3000 iterations with none of it real, and
+  each Gaussian's own colour was pushed ever further from the photograph to
+  compensate. With the price it stays at 0.27 and the fit is 0.3 dB *better*;
+  see train_splats.cpp for the sweep. Leave `reflect` off for scenes without
+  mirrors or gloss — it costs time and gains little there.
+  The 3D viewer shades each splat with its reflection rather than each pixel,
+  as training does, so a strongly reflective splat's colour there is close
+  but not exact.
 - **Only the reconstructed part of each photograph is fitted.** A photo shows
   more than the dense cloud holds: the wall behind a face, sky over a
   building. Training used to paint that in with Gaussians stretched around the
@@ -1087,10 +1134,10 @@ src/
   ~0.16² ≈ 2.6% and are measured at 2.7%. Disabling cross-check tripled the
   chaining rate and still did not move it, because the extra merges were wrong
   (1156 physically impossible tracks, ray residual doubled).
-- **A Gaussian has one colour.** There is no view-dependent colour (the
-  spherical-harmonic bands of the paper), so reflections and sheen cannot be
-  learned, and a `.ply` from another tool loses them on import — `load_ply`
-  says so when it drops them.
+- **Reflections do not leave the app.** `.ply` export writes base colour and
+  harmonics, which other viewers understand; reflectivity, normals and the
+  environment map have no standard fields, so a reflective splat exports as
+  its colour before the environment is mixed in.
 - **Splats only know what the cameras measured.** A textureless surface gets
   no depth from the sweep, so neither depth supervision nor carving can pin
   it, and colour alone places the Gaussians painting it. Views well outside

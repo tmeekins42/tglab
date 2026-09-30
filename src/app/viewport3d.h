@@ -27,6 +27,7 @@
 #include <string>
 #include <vector>
 
+#include "../algo_util/splat_reflect.h"
 #include "../core/data.h"
 #include "../gpu/render_target.h"
 #include "orbit_camera.h"
@@ -61,6 +62,7 @@ private:
     bool UploadGeometry(Device& dev);
     bool UploadSplats(Device& dev);
     bool SortSplats(Device& dev, const OrbitCamera& cam);
+    bool RecolourSplats(Device& dev, const OrbitCamera& cam);
 
     // The frontmost point drawn within a few pixels of (sx, sy), for
     // double-click to orbit about; false when nothing is near the cursor.
@@ -126,6 +128,15 @@ private:
     // Means kept on the CPU for sorting, and the camera the current order was
     // sorted for. An unchanged camera costs nothing; a moved one costs a sort.
     std::vector<float>    m_splatMeans;           // x y z per splat
+    // The GpuSplat records as last packed, 16 floats each, kept so view-
+    // dependent colour can be rewritten for a new eye without repacking
+    // everything; and the eye they were last coloured for.
+    std::vector<float>    m_splatPacked;
+    Vec3                  m_colouredEye{1e30, 1e30, 1e30};
+    // The learned environment, for splats trained with reflections, and the
+    // splat upload it was built for.
+    EnvMap                m_env;
+    uint64_t              m_envVersion = ~0ull;
     std::vector<uint32_t> m_order, m_orderTmp;
     std::vector<uint32_t> m_keys, m_keysTmp;
     Vec3                  m_sortedEye{1e30, 1e30, 1e30};

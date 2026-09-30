@@ -38,6 +38,8 @@
 #include "../src/gpu/compute.h"
 #include "../src/algorithms/sfm/gpu_sweep.h"
 #include "../src/algo_util/splat_raster.h"
+#include "../src/algo_util/splat_reflect.h"
+#include "../src/algo_util/splat_train_gpu.h"
 
 #include <d3d12.h>
 
@@ -3742,6 +3744,277 @@ int main() {
         }
     }
 
+    // --- densification on the device ------------------------------------------
+    //
+    // The GPU trainer rebuilds its own state from a plan made on the CPU. A
+    // random state with colour and reflections goes up, a plan with every
+    // kind of entry -- kept, copied, split, and sources left out -- is
+    // applied, and what comes back must be the plan applied on the CPU:
+    // moments kept only by kept ones, counters cleared, children moved by
+    // R * (z * scale) and shrunk by 1.6. The summary densification decides
+    // from, and the opacity reset, are checked on the same state.
+    {
+        std::printf("\n--- densification on the GPU ---\n");
+        ID3D12Device* dev = nullptr;
+        if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev)))) {
+            std::printf("       no D3D12 device; not checked\n");
+        } else {
+            ComputeContext gpu;
+            if (gpu.Init(dev)) {
+                std::mt19937 rng(11);
+                std::uniform_real_distribution<double> u(-1.0, 1.0);
+                const size_t n = 3000;   // more than one row of the 2048-wide textures
+                std::vector<SplatParam> params(n);
+                std::vector<double> m1(n * 14), m2(n * 14), acc(n), mx(n);
+                std::vector<int> cnt(n);
+                std::vector<double> sh(n * kShRest), sm1(n * kShRest), sm2(n * kShRest);
+                std::vector<ReflParam> refl(n);
+                std::vector<double> rm1(n * 4), rm2(n * 4);
+                for (size_t i = 0; i < n; ++i) {
+                    double* p = params[i].Data();
+                    for (int q = 0; q < 14; ++q) p[q] = u(rng);
+                    for (int q = 0; q < 14; ++q) {
+                        m1[i * 14 + size_t(q)] = u(rng);
+                        m2[i * 14 + size_t(q)] = u(rng) + 1.0;
+                    }
+                    acc[i] = u(rng) + 1.0;
+                    cnt[i] = int(i % 5);
+                    mx[i] = 10.0 * (u(rng) + 1.0);
+                    for (int q = 0; q < kShRest; ++q) {
+                        sh[i * kShRest + size_t(q)] = u(rng);
+                        sm1[i * kShRest + size_t(q)] = u(rng);
+                        sm2[i * kShRest + size_t(q)] = u(rng) + 1.0;
+                    }
+                    refl[i].reflLogit = u(rng);
+                    for (double& c : refl[i].normal) c = u(rng);
+                    for (int q = 0; q < 4; ++q) {
+                        rm1[i * 4 + size_t(q)] = u(rng);
+                        rm2[i * 4 + size_t(q)] = u(rng) + 1.0;
+                    }
+                }
+                SplatTrainerGpu t(&gpu);
+                std::string e;
+                bool ok = t.Upload(params, m1, m2, acc, cnt, mx, &e) &&
+                          t.UploadSh(sh, sm1, sm2, &e) && t.UploadRefl(refl, rm1, rm2, &e);
+
+                // The summary.
+                std::vector<DensifyIn> din;
+                ok = ok && t.DensifyStats(&din, &e);
+                double worst = 0.0;
+                bool noneRight = true;
+                if (ok) {
+                    for (size_t i = 0; i < n; ++i) {
+                        const SplatParam& p = params[i];
+                        const double want[4] = {
+                            p.opacity, std::max({p.logScale[0], p.logScale[1], p.logScale[2]}),
+                            cnt[i] > 0 ? acc[i] / cnt[i] : -1.0, mx[i]};
+                        const double got[4] = {din[i].opacityLogit, din[i].maxLogScale,
+                                               din[i].gradAvg, din[i].maxScreen};
+                        for (int k = 0; k < 4; ++k)
+                            worst = std::max(worst, std::fabs(want[k] - got[k]) /
+                                                        std::max(1.0, std::fabs(want[k])));
+                        if (cnt[i] == 0 && din[i].gradAvg != -1.0) noneRight = false;
+                    }
+                }
+                char m[200];
+                std::snprintf(m, sizeof m, "the device's densification summary matches "
+                                           "its state (worst %.1e)", worst);
+                Check(ok && worst < 1e-6 && noneRight, ok ? std::string(m) : "summary: " + e);
+
+                // The plan: every third source dropped, the rest kept, with
+                // copies and split pairs mixed in.
+                std::vector<DensifyPlan> plan;
+                for (size_t i = 0; i < n; ++i) {
+                    if (i % 3 == 1) continue;
+                    if (i % 7 == 0) {
+                        for (int c = 0; c < 2; ++c) {
+                            DensifyPlan d{uint32_t(i), DensifyPlan::kSplit, {0, 0, 0}};
+                            for (float& z : d.z) z = float(u(rng));
+                            plan.push_back(d);
+                        }
+                        continue;
+                    }
+                    plan.push_back({uint32_t(i), DensifyPlan::kKeep, {0, 0, 0}});
+                    if (i % 5 == 0) plan.push_back({uint32_t(i), DensifyPlan::kCopy, {0, 0, 0}});
+                }
+                ok = ok && t.ApplyPlan(plan, &e);
+                std::vector<SplatParam> gp;
+                std::vector<double> g1, g2, gacc, gmx, gsh, gs1, gs2, gr1, gr2;
+                std::vector<int> gcnt;
+                std::vector<ReflParam> grefl;
+                ok = ok && t.Download(&gp, &g1, &g2, &gacc, &gcnt, &gmx, &e) &&
+                     t.DownloadSh(&gsh, &gs1, &gs2, &e) && t.DownloadRefl(&grefl, &gr1, &gr2, &e);
+                ok = ok && gp.size() == plan.size() && gsh.size() == plan.size() * kShRest &&
+                     grefl.size() == plan.size();
+                worst = 0.0;
+                auto cmp = [&](double want, double got) {
+                    worst = std::max(worst, std::fabs(want - got) / std::max(1.0, std::fabs(want)));
+                };
+                if (ok) {
+                    for (size_t j = 0; j < plan.size(); ++j) {
+                        const size_t i = plan[j].src;
+                        const bool kept = plan[j].kind == DensifyPlan::kKeep;
+                        SplatParam want = params[i];
+                        if (plan[j].kind == DensifyPlan::kSplit) {
+                            const Mat3 R = FromParam(params[i]).Rotation();
+                            const double z[3] = {plan[j].z[0] * std::exp(want.logScale[0]),
+                                                 plan[j].z[1] * std::exp(want.logScale[1]),
+                                                 plan[j].z[2] * std::exp(want.logScale[2])};
+                            for (int a = 0; a < 3; ++a)
+                                want.mean[a] += R.m[a * 3] * z[0] + R.m[a * 3 + 1] * z[1] +
+                                                R.m[a * 3 + 2] * z[2];
+                            for (double& s : want.logScale) s -= std::log(1.6);
+                        }
+                        for (int q = 0; q < 14; ++q) {
+                            cmp(want.Data()[q], gp[j].Data()[q]);
+                            cmp(kept ? m1[i * 14 + size_t(q)] : 0.0, g1[j * 14 + size_t(q)]);
+                            cmp(kept ? m2[i * 14 + size_t(q)] : 0.0, g2[j * 14 + size_t(q)]);
+                        }
+                        cmp(0.0, gacc[j]);
+                        cmp(0.0, double(gcnt[j]));
+                        cmp(0.0, gmx[j]);
+                        for (int q = 0; q < kShRest; ++q) {
+                            const size_t a = i * kShRest + size_t(q), b = j * kShRest + size_t(q);
+                            cmp(sh[a], gsh[b]);
+                            cmp(kept ? sm1[a] : 0.0, gs1[b]);
+                            cmp(kept ? sm2[a] : 0.0, gs2[b]);
+                        }
+                        cmp(refl[i].reflLogit, grefl[j].reflLogit);
+                        for (int k = 0; k < 3; ++k) cmp(refl[i].normal[k], grefl[j].normal[k]);
+                        for (int q = 0; q < 4; ++q) {
+                            cmp(kept ? rm1[i * 4 + size_t(q)] : 0.0, gr1[j * 4 + size_t(q)]);
+                            cmp(kept ? rm2[i * 4 + size_t(q)] : 0.0, gr2[j * 4 + size_t(q)]);
+                        }
+                    }
+                }
+                std::snprintf(m, sizeof m,
+                              "the device applies a densification plan as the CPU does "
+                              "(%zu -> %zu, worst %.1e)", n, plan.size(), worst);
+                Check(ok && worst < 1e-5, ok ? std::string(m) : "plan: " + e);
+
+                // The opacity reset, on the rebuilt state.
+                const double cap = std::log(0.01 / 0.99);
+                std::vector<SplatParam> rp;
+                std::vector<double> r1, r2, racc, rmx;
+                std::vector<int> rcnt;
+                ok = ok && t.ResetOpacity(cap, &e) &&
+                     t.Download(&rp, &r1, &r2, &racc, &rcnt, &rmx, &e);
+                worst = 0.0;
+                if (ok) {
+                    for (size_t j = 0; j < gp.size(); ++j)
+                        for (int q = 0; q < 14; ++q) {
+                            const bool op = q == 10;
+                            cmp(op ? std::min(gp[j].opacity, cap) : gp[j].Data()[q],
+                                 rp[j].Data()[q]);
+                            cmp(op ? 0.0 : g1[j * 14 + size_t(q)], r1[j * 14 + size_t(q)]);
+                            cmp(op ? 0.0 : g2[j * 14 + size_t(q)], r2[j * 14 + size_t(q)]);
+                        }
+                }
+                std::snprintf(m, sizeof m, "...and resets opacity as the CPU does (worst %.1e)",
+                              worst);
+                Check(ok && worst < 1e-6, ok ? std::string(m) : "reset: " + e);
+            }
+            dev->Release();
+        }
+    }
+
+    // --- deferred reflection shading on the GPU -----------------------------
+    //
+    // The GPU trainer shades and differentiates the reflection on the device;
+    // ShadeDeferred and ShadeDeferredBackward (checked above against finite
+    // differences) are the reference. Random maps -- some pixels with no
+    // reflectivity or no normal, which take the other branch -- a turned
+    // camera, so the ray's rotation is exercised, and a random environment.
+    // The environment's gradient is summed in fixed point on the device.
+    {
+        std::printf("\n--- deferred shading on the GPU ---\n");
+        ID3D12Device* dev = nullptr;
+        if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev)))) {
+            std::printf("       no D3D12 device; not checked\n");
+        } else {
+            ComputeContext gpu;
+            if (gpu.Init(dev)) {
+                std::mt19937 rng(5);
+                std::uniform_real_distribution<double> u(-1.0, 1.0);
+                const int w = 40, h = 30;
+                SplatCam cam;
+                const double a = 0.4, b = 0.25;   // yaw, then pitch
+                const double Ry[9] = {std::cos(a), 0, std::sin(a), 0, 1, 0, -std::sin(a), 0, std::cos(a)};
+                const double Rx[9] = {1, 0, 0, 0, std::cos(b), -std::sin(b), 0, std::sin(b), std::cos(b)};
+                for (int i = 0; i < 3; ++i)
+                    for (int j = 0; j < 3; ++j) {
+                        double v = 0;
+                        for (int k = 0; k < 3; ++k) v += Rx[i * 3 + k] * Ry[k * 3 + j];
+                        cam.R.m[i * 3 + j] = v;
+                    }
+                cam.t = Vec3{0, 0, 0};
+                cam.fx = cam.fy = 30.0; cam.cx = 19.5; cam.cy = 14.5; cam.w = w; cam.h = h;
+                EnvMap env;
+                env.Init(8, 0.0);
+                for (double& t : env.texels) t = 0.5 + 0.5 * u(rng);
+                const size_t np = size_t(w) * size_t(h) * 3;
+                std::vector<double> Cd(np), Rm(np), Nm(np), dOut(np);
+                for (size_t p = 0; p < np; p += 3) {
+                    const size_t pix = p / 3;
+                    const double r = (pix % 7 == 0) ? 0.0 : 0.5 + 0.5 * u(rng);
+                    for (int ch = 0; ch < 3; ++ch) {
+                        Cd[p + size_t(ch)] = 0.5 + 0.5 * u(rng);
+                        Rm[p + size_t(ch)] = r;
+                        Nm[p + size_t(ch)] = (pix % 11 == 0) ? 0.0 : u(rng);
+                        dOut[p + size_t(ch)] = u(rng) / double(np);
+                    }
+                }
+                const double sparsity = 0.3 / double(w * h);
+                std::vector<double> sC, dCdC, dRmC, dNmC, egC(env.texels.size(), 0.0);
+                ShadeDeferred(Cd, Rm, Nm, cam, env, &sC);
+                ShadeDeferredBackward(Cd, Rm, Nm, cam, env, dOut, &dCdC, &dRmC, &dNmC, &egC);
+                for (size_t p = 0; p < np; p += 3) dRmC[p] += sparsity;
+
+                // The trainer builds its kernels on Upload: a token state.
+                SplatTrainerGpu t(&gpu);
+                std::string e;
+                std::vector<SplatParam> one(1);
+                std::vector<double> z14(14, 0.0), z1(1, 0.0);
+                std::vector<int> zi(1, 0);
+                std::vector<double> sG, dCdG, dRmG, dNmG, egG(env.texels.size(), 0.0);
+                const bool ok = t.Upload(one, z14, z14, z1, zi, z1, &e) &&
+                                t.ShadeCheck(cam, env, Cd, Rm, Nm, dOut, sparsity, &sG, &dCdG,
+                                             &dRmG, &dNmG, &egG, &e);
+                auto worstAbs = [&](const std::vector<double>& A, const std::vector<double>& B,
+                                    int stride) {
+                    double m = 0.0;
+                    for (size_t i = 0; i < A.size(); i += size_t(stride))
+                        m = std::max(m, std::fabs(A[i] - B[i]));
+                    return m;
+                };
+                // Aggregate relative: summed difference over summed size. A
+                // reflection landing on a cube seam can pick the other face
+                // in float, which is a kink the CPU's double lands the other
+                // side of -- real, rare, and swamped here by everything else.
+                auto aggRel = [&](const std::vector<double>& A, const std::vector<double>& B) {
+                    double d = 0.0, s = 0.0;
+                    for (size_t i = 0; i < A.size(); ++i) { d += std::fabs(A[i] - B[i]); s += std::fabs(A[i]); }
+                    return s > 0.0 ? d / s : 0.0;
+                };
+                char m[240];
+                if (!ok) {
+                    Check(false, "the GPU shading runs: " + e);
+                } else {
+                    const double ws = worstAbs(sC, sG, 1), wc = worstAbs(dCdC, dCdG, 1);
+                    std::snprintf(m, sizeof m, "the GPU shades as the CPU does (worst %.1e), and "
+                                  "passes the colour gradient back (worst %.1e)", ws, wc * double(np));
+                    Check(ws < 1e-4 && wc * double(np) < 1e-4, m);
+                    const double rR = aggRel(dRmC, dRmG), rN = aggRel(dNmC, dNmG),
+                                 rE = aggRel(egC, egG);
+                    std::snprintf(m, sizeof m, "...the reflectivity, normal and environment "
+                                  "gradients (aggregate relative %.1e, %.1e, %.1e)", rR, rN, rE);
+                    Check(rR < 1e-4 && rN < 1e-3 && rE < 1e-3, m);
+                }
+            }
+            dev->Release();
+        }
+    }
+
     // --- train_splats recovers a known scene -------------------------------
     //
     // Gradients that match finite differences say the derivative is right;
@@ -3853,6 +4126,498 @@ int main() {
                               "training fits the photographs far better "
                               "(PSNR %.2f -> %.2f dB)", before, after);
                 Check(after > before + 8.0, m);
+            }
+        }
+
+        // --- deferred reflection: the shading's gradients -------------------
+        //
+        // C = (1 - R) Cd + R Env(reflect(ray, N / |N|)), per pixel. Every
+        // gradient the backward pass returns -- into Cd, R, the unnormalised
+        // N and the environment's texels -- checked against a central
+        // difference of the forward. The environment is SMOOTH (a low-order
+        // function of direction), since the direction gradient is itself a
+        // difference across half a texel and a sharp map would measure the
+        // texel grid rather than the maths.
+        {
+            const int w = 6, h = 5;
+            SplatCam cam;
+            cam.R = Mat3::Identity();
+            cam.t = Vec3{0, 0, 0};
+            cam.fx = cam.fy = 5.0; cam.cx = 2.5; cam.cy = 2.0; cam.w = w; cam.h = h;
+            EnvMap env;
+            env.Init(32, 0.0);
+            for (int f = 0; f < 6; ++f)
+                for (int y = 0; y < 32; ++y)
+                    for (int x = 0; x < 32; ++x)
+                        for (int ch = 0; ch < 3; ++ch)
+                            env.texels[((size_t(f) * 32 + size_t(y)) * 32 + size_t(x)) * 3 + size_t(ch)] =
+                                0.5 + 0.3 * std::sin(0.1 * x + 0.7 * f + ch) * std::cos(0.08 * y - 0.3 * ch);
+            const size_t np = size_t(w) * size_t(h) * 3;
+            std::vector<double> Cd(np), Rm(np), Nm(np), dOut(np);
+            for (size_t p = 0; p < np; p += 3) {
+                const double r = 0.2 + 0.6 * rnd();
+                Rm[p] = Rm[p + 1] = Rm[p + 2] = r;
+                for (int ch = 0; ch < 3; ++ch) {
+                    Cd[p + size_t(ch)] = rnd();
+                    dOut[p + size_t(ch)] = rnd() - 0.5;
+                }
+                // Facing back toward the camera, as a real normal does.
+                Nm[p] = rnd() - 0.5; Nm[p + 1] = rnd() - 0.5; Nm[p + 2] = -0.8 - 0.4 * rnd();
+            }
+            auto loss = [&]() {
+                std::vector<double> out;
+                ShadeDeferred(Cd, Rm, Nm, cam, env, &out);
+                double s = 0;
+                for (size_t i = 0; i < np; ++i) s += out[i] * dOut[i];
+                return s;
+            };
+            std::vector<double> dCd, dRm, dNm, dEnv(env.texels.size(), 0.0);
+            ShadeDeferredBackward(Cd, Rm, Nm, cam, env, dOut, &dCd, &dRm, &dNm, &dEnv);
+            auto fd = [&](double* x, double hstep) {
+                const double keep = *x;
+                *x = keep + hstep; const double a = loss();
+                *x = keep - hstep; const double b = loss();
+                *x = keep;
+                return (a - b) / (2.0 * hstep);
+            };
+            double worstC = 0, worstR = 0, worstN = 0, scaleN = 0, worstE = 0;
+            double sumErrN = 0, sumN = 0;
+            int envChecked = 0;
+            for (size_t p = 0; p < np; p += 3) {
+                for (int ch = 0; ch < 3; ++ch)
+                    worstC = std::max(worstC, std::fabs(fd(&Cd[p + size_t(ch)], 1e-6) - dCd[p + size_t(ch)]));
+                // R is read from channel 0; perturb all three together.
+                const double keep = Rm[p];
+                auto setR = [&](double v) { Rm[p] = Rm[p + 1] = Rm[p + 2] = v; };
+                setR(keep + 1e-6); const double a = loss();
+                setR(keep - 1e-6); const double b = loss();
+                setR(keep);
+                worstR = std::max(worstR, std::fabs((a - b) / 2e-6 - dRm[p]));
+                for (int ch = 0; ch < 3; ++ch) {
+                    const double num = fd(&Nm[p + size_t(ch)], 1e-3);
+                    // Smooth here? A difference straddling a cube-face seam
+                    // reads the jump, and halving the step changes it.
+                    const double half = fd(&Nm[p + size_t(ch)], 5e-4);
+                    if (std::fabs(num - half) > 0.05 * std::max(0.01, std::fabs(num))) continue;
+                    worstN = std::max(worstN, std::fabs(num - dNm[p + size_t(ch)]));
+                    scaleN = std::max(scaleN, std::fabs(num));
+                    sumErrN += std::fabs(num - dNm[p + size_t(ch)]);
+                    sumN += std::fabs(num);
+                }
+            }
+            // The texels a reflection actually read -- most of the map is
+            // never touched by 30 pixels, and checking those proves nothing.
+            for (size_t t = 0; t < env.texels.size(); ++t) {
+                if (dEnv[t] == 0.0) continue;
+                worstE = std::max(worstE, std::fabs(fd(&env.texels[t], 1e-6) - dEnv[t]));
+                ++envChecked;
+            }
+            char m[240];
+            std::snprintf(m, sizeof m,
+                          "deferred shading's gradients match finite differences "
+                          "(colour %.1e, reflectivity %.1e, environment %.1e over %d texels)",
+                          worstC, worstR, worstE, envChecked);
+            Check(worstC < 1e-6 && worstR < 1e-6 && worstE < 1e-6 && envChecked > 50, m);
+            // The normal's goes through the lookup's change with direction,
+            // which is exact within a face but has kinks at texel and face
+            // edges, so it is compared in AGGREGATE, over the pixels where
+            // the finite difference is itself smooth (see above). A first
+            // version took that change as a central difference across half a
+            // texel, which straddled seams: 127% aggregate error, now 0.3%.
+            std::snprintf(m, sizeof m,
+                          "...and the normal's, through the environment lookup "
+                          "(%.1f%% aggregate error over gradients up to %.2f)",
+                          100.0 * sumErrN / std::max(1e-12, sumN), scaleN);
+            Check(scaleN > 1e-2 && sumErrN < 0.02 * sumN, m);
+            (void)worstN;
+        }
+
+        // --- deferred reflection: a mirror, learned -------------------------
+        //
+        // A flat disc of Gaussians, 70% mirror, reflecting a patterned
+        // environment, seen from nine cameras on an arc with two held out.
+        // The reflection slides across the disc as the camera moves -- what
+        // view-dependent colour can only smear. Trained from the same start
+        // twice: spherical harmonics alone (degree 3, the baseline), and with
+        // reflections. The reflection model must fit the HELD-OUT views
+        // clearly better: that is the difference between drawing a
+        // reflection and memorising each photograph's.
+        {
+            const Vec3 centre{0.0, 0.0, 4.5};
+            PointCloud mirror;
+            for (int i = 0; i < 9; ++i) {
+                const double a = (double(i) - 4.0) * 10.0 * 3.14159265358979 / 180.0;
+                const Vec3 eye = centre + Vec3{3.5 * std::sin(a), -0.6, -3.5 * std::cos(a)};
+                const Vec3 z = (centre - eye).Normalized();
+                const Vec3 x = Vec3{0.0, 1.0, 0.0}.Cross(z).Normalized();
+                const Vec3 y = z.Cross(x);
+                Camera c;
+                c.width = W; c.height = H;
+                c.focal = 60.0; c.cx = W * 0.5 - 0.5; c.cy = H * 0.5 - 0.5;
+                c.R.m[0] = x.x; c.R.m[1] = x.y; c.R.m[2] = x.z;
+                c.R.m[3] = y.x; c.R.m[4] = y.y; c.R.m[5] = y.z;
+                c.R.m[6] = z.x; c.R.m[7] = z.y; c.R.m[8] = z.z;
+                c.t = c.R * eye * -1.0;
+                c.solved = true;
+                mirror.cameras.push_back(c);
+            }
+            for (int gy = 0; gy < 20; ++gy)
+                for (int gx = 0; gx < 20; ++gx) {
+                    Splat s;
+                    s.mean = centre + Vec3{(gx - 9.5) * 0.09, (gy - 9.5) * 0.09, 0.0};
+                    s.scale = Vec3{0.06, 0.06, 0.005};   // flat, facing -z
+                    s.opacity = 0.95;
+                    s.color = Vec3{0.25, 0.3, 0.35};
+                    mirror.splats.push_back(s);
+                }
+            // The truth: 70% mirror, normal toward the cameras, and an
+            // environment with a pattern the reflection can be seen to move.
+            std::vector<ReflParam> tr(mirror.splats.size());
+            for (ReflParam& r : tr) {
+                r.reflLogit = std::log(0.7 / 0.3);
+                r.normal[0] = 0; r.normal[1] = 0; r.normal[2] = -1;
+            }
+            EnvMap trueEnv;
+            trueEnv.Init(16, 0.0);
+            for (int f = 0; f < 6; ++f)
+                for (int y = 0; y < 16; ++y)
+                    for (int x = 0; x < 16; ++x) {
+                        const size_t at = ((size_t(f) * 16 + size_t(y)) * 16 + size_t(x)) * 3;
+                        const double band = 0.5 + 0.45 * std::sin(0.8 * x + 1.3 * f);
+                        trueEnv.texels[at] = band;
+                        trueEnv.texels[at + 1] = 0.5 + 0.4 * std::cos(0.6 * y + f);
+                        trueEnv.texels[at + 2] = 1.0 - band;
+                    }
+            std::vector<SplatParam> tp;
+            for (const Splat& s : mirror.splats) tp.push_back(ToParam(s));
+            std::vector<Image> mirrorFrames;
+            for (const Camera& c : mirror.cameras) {
+                SplatRaster r;
+                std::vector<double> rgb;
+                RenderShaded(r, tp, std::vector<float>{}, 0, tr, trueEnv,
+                             SplatCamFrom(c, W, H), RasterOptions{}, &rgb);
+                Image im;
+                im.Alloc(ImageDesc{W, H, Format::RGBA32F});
+                ImageView v = im.MapCpuWrite();
+                for (int y = 0; y < H; ++y)
+                    for (int x = 0; x < W; ++x) {
+                        float* p = v.At<float>(x, y);
+                        for (int ch = 0; ch < 3; ++ch)
+                            p[ch] = float(rgb[(size_t(y) * W + size_t(x)) * 3 + ch]);
+                        p[3] = 1.0f;
+                    }
+                mirrorFrames.push_back(std::move(im));
+            }
+
+            auto trainMirror = [&](bool withReflect, double* held, double* train,
+                                   PointCloud* outCloud, ComputeContext* device = nullptr,
+                                   std::string* noteOut = nullptr) {
+                auto a = Registry::Get().Create("train_splats");
+                std::string e;
+                a->FindParam("iterations")->SetFromScript(Value(600.0), &e);
+                a->FindParam("downscale")->SetFromScript(Value(1.0), &e);
+                a->FindParam("densify")->SetFromScript(Value(0.0), &e);
+                a->FindParam("holdout")->SetFromScript(Value(4.0), &e);
+                a->FindParam("sh_degree")->SetFromScript(Value(3.0), &e);
+                a->FindParam("sh_every")->SetFromScript(Value(50.0), &e);
+                a->FindParam("reflect")->SetFromScript(Value(withReflect ? 1.0 : 0.0), &e);
+                a->FindParam("reflect_from")->SetFromScript(Value(50.0), &e);
+                a->FindParam("env_res")->SetFromScript(Value(16.0), &e);
+                a->SetGroupGpu(device);
+                PointCloud trained = mirror;
+                for (Splat& s : trained.splats) s.color = Vec3{0.5, 0.5, 0.5};
+                std::string err;
+                if (!a->RunReconstruct(&mirrorFrames, &trained, &err)) {
+                    std::printf("       %s\n", err.c_str());
+                    return false;
+                }
+                const std::string note = a->RunReport();
+                std::printf("       %s\n", note.c_str());
+                if (noteOut) *noteOut = note;
+                double b0 = 0;
+                size_t at = note.find("PSNR ");
+                if (at == std::string::npos) return false;
+                std::sscanf(note.c_str() + at, "PSNR %lf -> %lf", &b0, train);
+                at = note.find("HELD OUT");
+                if (at == std::string::npos) return false;
+                at = note.find("PSNR ", at);
+                if (at == std::string::npos) return false;
+                std::sscanf(note.c_str() + at, "PSNR %lf -> %lf", &b0, held);
+                *outCloud = std::move(trained);
+                return true;
+            };
+            double heldSh = 0, trainSh = 0, heldRefl = 0, trainRefl = 0;
+            PointCloud cSh, cRefl;
+            const bool ok = trainMirror(false, &heldSh, &trainSh, &cSh) &&
+                            trainMirror(true, &heldRefl, &trainRefl, &cRefl);
+            Check(ok, "train_splats runs on the mirror with and without reflections");
+            char m[240];
+            std::snprintf(m, sizeof m,
+                          "reflections draw the mirror on views they never saw "
+                          "(held out: %.2f dB with harmonics alone, %.2f with "
+                          "reflections; trained on: %.2f, %.2f)",
+                          heldSh, heldRefl, trainSh, trainRefl);
+            Check(ok && heldRefl > heldSh + 2.0, m);
+            Check(ok && cRefl.envRes == 16 && cRefl.splatRefl.size() == cRefl.splats.size() * 4,
+                  "...and the trained cloud carries its reflectivity, normals and "
+                  "environment");
+
+            // THE SAME ON THE GPU: three composites per step through the
+            // payload swap, three backwards gathered by kAccum, and the
+            // reflection step on the device; the environment on the CPU.
+            ID3D12Device* dev = nullptr;
+            if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0,
+                                         IID_PPV_ARGS(&dev)))) {
+                std::printf("       no D3D12 device; GPU reflections not checked\n");
+            } else {
+                ComputeContext gpu;
+                if (gpu.Init(dev)) {
+                    double heldG = 0, trainG = 0;
+                    PointCloud cg;
+                    std::string note;
+                    const bool okG = trainMirror(true, &heldG, &trainG, &cg, &gpu, &note);
+                    Check(okG && note.find("iterations on the GPU") != std::string::npos,
+                          "reflection training runs on the GPU");
+                    std::snprintf(m, sizeof m,
+                                  "...and draws the mirror on unseen views as the CPU "
+                                  "does (held out %.2f dB against %.2f)", heldG, heldRefl);
+                    Check(okG && std::fabs(heldG - heldRefl) < 2.0, m);
+
+                    // render_splats ON THE DEVICE, through training's own
+                    // forward pass, against its CPU reference -- on this
+                    // cloud, which has harmonics and reflections, so the
+                    // whole forward path is compared, payload swap included.
+                    if (okG) {
+                        auto renderWith = [&](ComputeContext* device, ImageSet* outSet,
+                                              std::string* rep) {
+                            auto rs = Registry::Get().Create("render_splats");
+                            rs->SetGroupGpu(device);
+                            std::string rerr;
+                            if (!rs->RunDense(nullptr, cg, outSet, &rerr)) { *rep = rerr; return false; }
+                            *rep = rs->RunReport();
+                            return true;
+                        };
+                        ImageSet onDev, onCpu;
+                        std::string repDev, repCpu;
+                        const bool okR = renderWith(&gpu, &onDev, &repDev) &&
+                                         renderWith(nullptr, &onCpu, &repCpu);
+                        int worst = 0;
+                        long long off = 0, total = 0;
+                        if (okR && onDev.images.size() == onCpu.images.size())
+                            for (size_t k = 0; k < onDev.images.size(); ++k) {
+                                ImageView a = onDev.images[k].MapCpuRead();
+                                ImageView b = onCpu.images[k].MapCpuRead();
+                                for (int y = 0; y < a.desc.height; ++y)
+                                    for (int x = 0; x < a.desc.width; ++x)
+                                        for (int ch = 0; ch < 3; ++ch) {
+                                            const int d = std::abs(int(a.At<uint8_t>(x, y)[ch]) -
+                                                                   int(b.At<uint8_t>(x, y)[ch]));
+                                            worst = std::max(worst, d);
+                                            off += d > 2 ? 1 : 0;
+                                            ++total;
+                                        }
+                            }
+                        Check(okR && repDev.find(", " + std::to_string(onDev.images.size()) +
+                                                 " on the GPU") != std::string::npos,
+                              "render_splats renders on the GPU (" + repDev + ")");
+                        std::snprintf(m, sizeof m,
+                                      "...matching its CPU reference (worst %d levels; %lld "
+                                      "of %lld channel values more than 2 apart)",
+                                      worst, off, total);
+                        Check(okR && total > 0 && off * 1000 < total, m);
+                    }
+
+                    // ONE STEP, reflections on from the start, CPU against
+                    // GPU: every parameter's movement, reflectivity and
+                    // normal included. The fit above could come out close
+                    // with a wrong term the optimiser works around; a single
+                    // step cannot.
+                    //
+                    // ELLIPTICAL DISCS, not the round ones above: a round
+                    // disc is unchanged by spinning about its own normal, so
+                    // that quaternion component's gradient is exactly zero --
+                    // and Adam's sign-like first step turned float rounding
+                    // of zero into a full step on the GPU (1% of the whole
+                    // movement, all in that one component) while double
+                    // stayed at 3e-7. Not a kernel error; a symmetry.
+                    auto oneStep = [&](ComputeContext* device, PointCloud* out) {
+                        auto a = Registry::Get().Create("train_splats");
+                        std::string e;
+                        a->FindParam("iterations")->SetFromScript(Value(1.0), &e);
+                        a->FindParam("downscale")->SetFromScript(Value(1.0), &e);
+                        a->FindParam("densify")->SetFromScript(Value(0.0), &e);
+                        a->FindParam("sh_degree")->SetFromScript(Value(0.0), &e);
+                        a->FindParam("reflect")->SetFromScript(Value(1.0), &e);
+                        a->FindParam("reflect_from")->SetFromScript(Value(0.0), &e);
+                        a->FindParam("env_res")->SetFromScript(Value(16.0), &e);
+                        a->SetGroupGpu(device);
+                        *out = mirror;
+                        for (Splat& s : out->splats) { s.color = Vec3{0.5, 0.5, 0.5}; s.scale.y *= 0.8; }
+                        std::string err;
+                        return a->RunReconstruct(&mirrorFrames, out, &err);
+                    };
+                    PointCloud s0 = mirror, sc, sg;
+                    for (Splat& s : s0.splats) { s.color = Vec3{0.5, 0.5, 0.5}; s.scale.y *= 0.8; }
+                    const bool okS = oneStep(nullptr, &sc) && oneStep(&gpu, &sg);
+                    double diff = 0.0, moved = 0.0;
+                    if (okS && sc.splatRefl.size() == sg.splatRefl.size()) {
+                        for (size_t i = 0; i < s0.splats.size(); ++i) {
+                            const SplatParam p0 = ToParam(s0.splats[i]);
+                            const SplatParam pc = ToParam(sc.splats[i]);
+                            const SplatParam pg = ToParam(sg.splats[i]);
+                            for (int q = 0; q < SplatParam::kCount; ++q) {
+                                const double dc = pc.Data()[q] - p0.Data()[q];
+                                const double dg = pg.Data()[q] - p0.Data()[q];
+                                diff += std::fabs(dc - dg);
+                                moved += std::fabs(dc);
+                            }
+                        }
+                        // Reflectivity starts at sigmoid(-4.6) and the normal
+                        // at the disc's axis, identical on both paths, so the
+                        // stored values' difference is the steps' difference.
+                        const double r0 = 1.0 / (1.0 + std::exp(4.6));
+                        for (size_t k = 0; k < sc.splatRefl.size(); ++k) {
+                            const double d = std::fabs(double(sc.splatRefl[k]) - double(sg.splatRefl[k]));
+                            diff += d;
+                            if (k % 4 == 0) moved += std::fabs(double(sc.splatRefl[k]) - r0);
+                        }
+                    }
+                    std::snprintf(m, sizeof m,
+                                  "one GPU reflection step moves every parameter as the "
+                                  "CPU step does (aggregate difference %.1e of the movement)",
+                                  diff / std::max(1e-30, moved));
+                    Check(okS && moved > 0.0 && diff / moved < 0.005, m);
+                }
+                dev->Release();
+            }
+        }
+
+        // --- view-dependent colour: spherical harmonics ---------------------
+        //
+        // Gaussians whose colour CHANGES WITH THE VIEWPOINT -- a degree-1 term
+        // along the horizontal, as a sheen brightening toward one side would --
+        // photographed from seven cameras on an arc of +-60 degrees about the
+        // scene. (Its own cameras: the three above sit within a few degrees of
+        // each other, where every Gaussian looks nearly the same from all of
+        // them and there is no view dependence to fit.) Plain colour can only
+        // average the views; degree 1 can match each. The test is the gap
+        // between the two, trained from the same grey start.
+        {
+            const Vec3 centre{0.0, 0.0, 3.75};
+            PointCloud ring;
+            for (int i = 0; i < 7; ++i) {
+                const double a = (double(i) - 3.0) * (60.0 / 3.0) * 3.14159265358979 / 180.0;
+                const Vec3 eye = centre + Vec3{3.5 * std::sin(a), 0.0, -3.5 * std::cos(a)};
+                const Vec3 z = (centre - eye).Normalized();
+                const Vec3 y{0.0, 1.0, 0.0};                 // down, as OpenCV's
+                const Vec3 x = y.Cross(z).Normalized();      // x = y cross z
+                Camera c;
+                c.width = W; c.height = H;
+                c.focal = 60.0; c.cx = W * 0.5 - 0.5; c.cy = H * 0.5 - 0.5;
+                c.R.m[0] = x.x; c.R.m[1] = x.y; c.R.m[2] = x.z;
+                c.R.m[3] = y.x; c.R.m[4] = y.y; c.R.m[5] = y.z;
+                c.R.m[6] = z.x; c.R.m[7] = z.y; c.R.m[8] = z.z;
+                c.t = c.R * eye * -1.0;
+                c.solved = true;
+                ring.cameras.push_back(c);
+            }
+            ring.splats = truth.splats;
+            for (Splat& s : ring.splats) s.mean = centre + (s.mean - Vec3{0.0, 0.0, 3.75}) * 0.6;
+
+            std::vector<float> trueSh(ring.splats.size() * size_t(kShRest), 0.0f);
+            for (size_t i = 0; i < ring.splats.size(); ++i)
+                for (int ch = 0; ch < 3; ++ch)   // k = 2 is the x term, -C1 x
+                    trueSh[i * size_t(kShRest) + 2 * 3 + size_t(ch)] =
+                        float((rnd() * 2.0 - 1.0) * 0.6);
+            std::vector<SplatParam> tp;
+            for (const Splat& s : ring.splats) tp.push_back(ToParam(s));
+            std::vector<Image> viewFrames;
+            RasterOptions opt;
+            for (const Camera& c : ring.cameras) {
+                const SplatCam sc = SplatCamFrom(c, W, H);
+                std::vector<SplatParam> shaded;
+                ShadeForView(tp, trueSh, 1, CentreOf(sc), &shaded);
+                SplatRaster r;
+                std::vector<double> rgb;
+                r.Forward(shaded, sc, opt, &rgb);
+                Image im;
+                im.Alloc(ImageDesc{W, H, Format::RGBA32F});
+                ImageView v = im.MapCpuWrite();
+                for (int y = 0; y < H; ++y)
+                    for (int x = 0; x < W; ++x) {
+                        float* p = v.At<float>(x, y);
+                        for (int ch = 0; ch < 3; ++ch)
+                            p[ch] = float(rgb[(size_t(y) * W + size_t(x)) * 3 + ch]);
+                        p[3] = 1.0f;
+                    }
+                viewFrames.push_back(std::move(im));
+            }
+            PointCloud ringStart = ring;
+            for (Splat& s : ringStart.splats) s.color = Vec3{0.5, 0.5, 0.5};
+
+            auto trainAt = [&](int degree, double* psnr, PointCloud* outCloud,
+                                ComputeContext* device = nullptr, std::string* noteOut = nullptr) {
+                auto a = Registry::Get().Create("train_splats");
+                std::string e;
+                a->FindParam("iterations")->SetFromScript(Value(400.0), &e);
+                a->FindParam("downscale")->SetFromScript(Value(1.0), &e);
+                a->FindParam("densify")->SetFromScript(Value(0.0), &e);
+                a->FindParam("sh_degree")->SetFromScript(Value(double(degree)), &e);
+                a->FindParam("sh_every")->SetFromScript(Value(50.0), &e);
+                a->SetGroupGpu(device);
+                PointCloud trained = ringStart;
+                std::string err;
+                if (!a->RunReconstruct(&viewFrames, &trained, &err)) return false;
+                const std::string note = a->RunReport();
+                if (noteOut) *noteOut = note;
+                double before = 0;
+                const size_t at = note.find("PSNR ");
+                if (at == std::string::npos) return false;
+                std::sscanf(note.c_str() + at, "PSNR %lf -> %lf", &before, psnr);
+                *outCloud = std::move(trained);
+                return true;
+            };
+            double flat = 0, withSh = 0;
+            PointCloud c0, c1;
+            const bool ok = trainAt(0, &flat, &c0) && trainAt(1, &withSh, &c1);
+            Check(ok, "train_splats runs with and without spherical harmonics");
+            char m[200];
+            std::snprintf(m, sizeof m,
+                          "view-dependent colour fits what one colour cannot "
+                          "(PSNR %.2f dB plain, %.2f with degree 1)", flat, withSh);
+            Check(ok && withSh > flat + 3.0, m);
+            Check(ok && c1.shDegree == 1 &&
+                      c1.splatSh.size() == c1.splats.size() * size_t(kShRest),
+                  "...and the trained cloud carries its coefficients");
+            Check(ok && c0.shDegree == 0 && c0.splatSh.empty(),
+                  "...while degree 0 leaves plain colour, with nothing extra");
+
+            // THE SAME ON THE GPU, where the colour is shaded in the project
+            // kernel and the coefficients stepped by their own. Same scene,
+            // same degree: the fit must match the CPU reference's.
+            ID3D12Device* dev = nullptr;
+            if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0,
+                                         IID_PPV_ARGS(&dev)))) {
+                std::printf("       no D3D12 device; GPU spherical harmonics not checked\n");
+            } else {
+                ComputeContext gpu;
+                if (gpu.Init(dev)) {
+                    double onGpu = 0;
+                    PointCloud cg;
+                    std::string note;
+                    const bool okG = trainAt(1, &onGpu, &cg, &gpu, &note);
+                    Check(okG && note.find("iterations on the GPU") != std::string::npos,
+                          "degree-1 training runs on the GPU");
+                    char mg[200];
+                    std::snprintf(mg, sizeof mg,
+                                  "...and fits the view-dependent scene as the CPU does "
+                                  "(%.2f dB against %.2f)", onGpu, withSh);
+                    Check(okG && std::fabs(onGpu - withSh) < 1.0, mg);
+                    Check(okG && cg.shDegree == 1 &&
+                              cg.splatSh.size() == cg.splats.size() * size_t(kShRest),
+                          "...and brings its coefficients home");
+                }
+                dev->Release();
             }
         }
 

@@ -145,9 +145,19 @@ public:
                 ++thinLarge;
                 continue;
             }
+            // The view-dependent colour moves with its Gaussian.
+            if (cloud->shDegree > 0 && cloud->splatSh.size() >= (i + 1) * 45)
+                std::copy_n(cloud->splatSh.begin() + long(i * 45), 45,
+                            cloud->splatSh.begin() + long(kept * 45));
+            // ...and so does its reflectivity and normal.
+            if (cloud->splatRefl.size() >= (i + 1) * 4)
+                std::copy_n(cloud->splatRefl.begin() + long(i * 4), 4,
+                            cloud->splatRefl.begin() + long(kept * 4));
             cloud->splats[kept++] = cloud->splats[i];
         }
         cloud->splats.resize(kept);
+        if (cloud->shDegree > 0) cloud->splatSh.resize(kept * 45);
+        if (!cloud->splatRefl.empty()) cloud->splatRefl.resize(kept * 4);
 
         char buf[420];
         std::snprintf(buf, sizeof(buf),

@@ -113,7 +113,7 @@ bool SplatRaster::CompositeGpu(const std::vector<SplatParam>& splats,
         if (!P.ok) continue;
         float* t = &g.stage[j * 12];
         t[0] = float(P.u); t[1] = float(P.v); t[2] = float(P.opac);
-        t[4] = float(P.conic[0]); t[5] = float(P.conic[1]); t[6] = float(P.conic[2]);
+        t[4] = float(P.conic[0]); t[5] = float(P.conic[1]); t[6] = float(P.conic[2]); t[7] = float(P.reach);
         t[8] = float(splats[j].color[0]);
         t[9] = float(splats[j].color[1]);
         t[10] = float(splats[j].color[2]);
