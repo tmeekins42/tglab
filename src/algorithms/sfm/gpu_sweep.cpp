@@ -18,12 +18,6 @@ ImageDesc PlaneDesc(int w, int h) {
     return d;
 }
 
-uint32_t Bits(float f) {
-    uint32_t u = 0;
-    std::memcpy(&u, &f, 4);
-    return u;
-}
-
 // --- the kernel --------------------------------------------------------------
 //
 // One thread per reference pixel, one dispatch per plane. Bindings:

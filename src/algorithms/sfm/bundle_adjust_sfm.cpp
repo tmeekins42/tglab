@@ -58,66 +58,12 @@
 #include <string>
 #include <vector>
 
+#include "../../algo_util/least_squares.h"
+#include "../../algo_util/linalg.h"
 #include "../../core/algorithm.h"
 
 namespace tglab {
 namespace {
-
-// Dense Cholesky for the reduced camera system.
-//
-// Symmetric positive-definite by construction once damped, so Cholesky rather
-// than Gaussian elimination: half the work, and backward stable with no
-// pivoting. Returns false when the matrix is not positive definite, which after
-// damping means the problem is genuinely degenerate rather than merely hard.
-bool SolveSpd(std::vector<double>& a, std::vector<double>& b, int n) {
-    for (int i = 0; i < n; ++i) {
-        for (int j = 0; j <= i; ++j) {
-            double s = a[size_t(i) * size_t(n) + size_t(j)];
-            for (int k = 0; k < j; ++k)
-                s -= a[size_t(i) * size_t(n) + size_t(k)] *
-                     a[size_t(j) * size_t(n) + size_t(k)];
-            if (i == j) {
-                if (s <= 0.0) return false;
-                a[size_t(i) * size_t(n) + size_t(i)] = std::sqrt(s);
-            } else {
-                a[size_t(i) * size_t(n) + size_t(j)] =
-                    s / a[size_t(j) * size_t(n) + size_t(j)];
-            }
-        }
-    }
-    for (int i = 0; i < n; ++i) {
-        double s = b[size_t(i)];
-        for (int k = 0; k < i; ++k)
-            s -= a[size_t(i) * size_t(n) + size_t(k)] * b[size_t(k)];
-        b[size_t(i)] = s / a[size_t(i) * size_t(n) + size_t(i)];
-    }
-    for (int i = n - 1; i >= 0; --i) {
-        double s = b[size_t(i)];
-        for (int k = i + 1; k < n; ++k)
-            s -= a[size_t(k) * size_t(n) + size_t(i)] * b[size_t(k)];
-        b[size_t(i)] = s / a[size_t(i) * size_t(n) + size_t(i)];
-    }
-    return true;
-}
-
-// Inverts a 3x3 in place. Used on each point block of C, which is where the
-// Schur complement's whole advantage comes from.
-bool Invert3(const double m[9], double out[9]) {
-    const double det = m[0] * (m[4] * m[8] - m[5] * m[7]) -
-                       m[1] * (m[3] * m[8] - m[5] * m[6]) +
-                       m[2] * (m[3] * m[7] - m[4] * m[6]);
-    if (std::fabs(det) < 1e-14) return false;
-    out[0] = (m[4] * m[8] - m[5] * m[7]) / det;
-    out[1] = (m[2] * m[7] - m[1] * m[8]) / det;
-    out[2] = (m[1] * m[5] - m[2] * m[4]) / det;
-    out[3] = (m[5] * m[6] - m[3] * m[8]) / det;
-    out[4] = (m[0] * m[8] - m[2] * m[6]) / det;
-    out[5] = (m[2] * m[3] - m[0] * m[5]) / det;
-    out[6] = (m[3] * m[7] - m[4] * m[6]) / det;
-    out[7] = (m[1] * m[6] - m[0] * m[7]) / det;
-    out[8] = (m[0] * m[4] - m[1] * m[3]) / det;
-    return true;
-}
 
 // One observation, flattened for the solver.
 struct Obs {
@@ -235,23 +181,8 @@ private:
         return true;
     }
 
-    // Huber weight for a residual of magnitude r.
-    //
-    // WHY A ROBUST LOSS IS NOT OPTIONAL HERE. Squared error weights an
-    // observation by the square of how wrong it is, so a single mismatched
-    // track -- one that survived RANSAC and track conflict filtering -- pulls
-    // the entire solve toward itself. Measured on real data, a few percent of
-    // outliers is enough to double the final RMS. Huber is quadratic within
-    // the threshold and LINEAR outside it, so a gross outlier contributes a
-    // bounded gradient instead of an unbounded one.
-    static double HuberWeight(double r, double delta, int kind) {
-        if (kind == 0) return 1.0;                       // plain squared error
-        const double a = std::fabs(r);
-        if (a <= delta) return 1.0;
-        if (kind == 1) return delta / a;                 // Huber
-        return delta * delta / (delta * delta + a * a);  // Cauchy
-    }
-
+    // The robust loss: see least_squares.h for why it is not optional. The
+    // parameter's 0, 1, 2 are RobustLoss's Squared, Huber, Cauchy.
     static constexpr const char* kLossNames[] = {"squared", "huber", "cauchy"};
 
     Param<int> m_loss{this, "loss", 1, 0, 2,
@@ -486,10 +417,11 @@ bool BundleAdjustSfm::RunReconstruct(const std::vector<Image>*, PointCloud* clou
     double rms0 = 0.0;
     double cost = evaluate(s, &rms0);
 
-    double lambda = 1e-4;
+    LmDamping damp{1e-4, 10.0, 0.3, 1e-10, 1e12};
     int taken = 0;
 
     for (int iter = 0; iter < int(m_iterations); ++iter) {
+        if (GroupCancelled()) { *err = "cancelled"; return false; }   // see SetGroupCancel
         // --- accumulate the blocks ------------------------------------------
         //
         // B: camera-camera, dense per camera but block diagonal across them.
@@ -514,8 +446,8 @@ bool BundleAdjustSfm::RunReconstruct(const std::vector<Image>*, PointCloud* clou
                           &rx, &ry, Jc, Jp, Jf))
                 continue;
 
-            const double wgt = HuberWeight(std::sqrt(rx * rx + ry * ry),
-                                           delta, lossKind);
+            const double wgt = RobustWeight(RobustLoss(lossKind),
+                                            std::sqrt(rx * rx + ry * ry), delta);
 
             // Camera Jacobian rows, with focal appended when refined.
             double A[2][7] = {};
@@ -637,16 +569,19 @@ bool BundleAdjustSfm::RunReconstruct(const std::vector<Image>*, PointCloud* clou
 
         for (int a = 0; a < nS; ++a) {
             double& d = S[size_t(a) * size_t(nS) + size_t(a)];
-            d = d * (1.0 + lambda) + lambda * diagMean[kindOf(a)];
+            d = d * (1.0 + damp.lambda) + damp.lambda * diagMean[kindOf(a)];
         }
 
         std::vector<double> Cinv(size_t(nActivePt) * 9, 0.0);
         std::vector<bool> ptOk(size_t(nActivePt), false);
+        // Each point's own 3x3 block inverted, which is where the Schur
+        // complement's whole advantage comes from.
         for (int p = 0; p < nActivePt; ++p) {
-            double m[9];
-            std::copy(&Cblk[size_t(p) * 9], &Cblk[size_t(p) * 9] + 9, m);
-            for (int k = 0; k < 3; ++k) m[k * 3 + k] *= (1.0 + lambda);
-            ptOk[size_t(p)] = Invert3(m, &Cinv[size_t(p) * 9]);
+            Mat3 m, inv;
+            std::copy(&Cblk[size_t(p) * 9], &Cblk[size_t(p) * 9] + 9, m.m);
+            for (int k = 0; k < 3; ++k) m.m[k * 3 + k] *= (1.0 + damp.lambda);
+            ptOk[size_t(p)] = m.Inverse(&inv);
+            if (ptOk[size_t(p)]) std::copy(inv.m, inv.m + 9, &Cinv[size_t(p) * 9]);
         }
 
         // Group the E blocks by point, so each point's contribution to S is
@@ -707,7 +642,8 @@ bool BundleAdjustSfm::RunReconstruct(const std::vector<Image>*, PointCloud* clou
         // --- solve and step ---------------------------------------------------
         std::vector<double> dCam = gS;
         std::vector<double> Scopy = S;
-        if (!SolveSpd(Scopy, dCam, nS)) { lambda *= 10.0; continue; }
+        // The reduced camera system is SPD once damped: Cholesky.
+        if (!linalg::CholeskySolve(Scopy.data(), dCam.data(), nS)) { damp.FailSingular(); continue; }
 
         // Back-substitution: dP = C^-1 (g_p - E^T dCam).
         std::vector<double> dPt(size_t(nActivePt) * 3, 0.0);
@@ -801,11 +737,10 @@ bool BundleAdjustSfm::RunReconstruct(const std::vector<Image>*, PointCloud* clou
             // to the cap is the honest default.
             s = std::move(trial);
             cost = trialCost;
-            lambda = std::max(1e-10, lambda * 0.3);
+            damp.Succeed();
             ++taken;
-        } else {
-            lambda *= 10.0;
-            if (lambda > 1e12) break;   // no step helps; the solve is done
+        } else if (!damp.Fail()) {
+            break;   // no step helps; the solve is done
         }
     }
 

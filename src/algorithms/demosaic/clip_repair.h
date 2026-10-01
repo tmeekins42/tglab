@@ -183,9 +183,10 @@ inline void CameraMatrixInGamut(const ImageDesc& d, float* rgb) {
 }
 // The same rule in HLSL. Pasted into each demosaicer's shader source; keep it
 // in step with BalanceAndClamp above.
-// The whole colour step in HLSL: white balance with the highlight clamp, then
-// the camera matrix with the in-gamut solve. Paste this into a demosaic shader
-// and call ApplyColour, so the GPU path cannot drift from ApplyColour below.
+// THE HLSL EVERY DEMOSAIC SHADER SHARES, prepended to its source: the CFA
+// layout (CfaColor, as CfaColorAt), and the whole colour step -- white
+// balance with the highlight clamp, then the camera matrix with the in-gamut
+// solve -- so the GPU path cannot drift from ApplyColour below.
 //
 // Written as one string rather than left to each shader because it already
 // drifted once: demosaic_consistent's kernel applied the bare matrix while its
@@ -193,7 +194,18 @@ inline void CameraMatrixInGamut(const ImageDesc& d, float* rgb) {
 // out-of-gamut pixels the solve exists for. gpu_audit reported it clean --
 // its synthetic input never drives a channel negative, so the solve never
 // fires and the difference cannot show.
-inline const char* kClipRepairHlsl = R"(
+inline const char* kDemosaicHlsl = R"(
+// Which colour a mosaic sample carries, as an RGB index, for a CFA code
+// (1 RGGB, 2 BGGR, 3 GRBG, 4 GBRG). Mirrors CfaColorAt().
+int CfaColor(uint cfa, int x, int y) {
+    int q = (y & 1) * 2 + (x & 1);   // 0=TL 1=TR 2=BL 3=BR
+    if (cfa == 1) { int c[4] = {0, 1, 1, 2}; return c[q]; }
+    if (cfa == 2) { int c[4] = {2, 1, 1, 0}; return c[q]; }
+    if (cfa == 3) { int c[4] = {1, 0, 2, 1}; return c[q]; }
+    if (cfa == 4) { int c[4] = {1, 2, 0, 1}; return c[q]; }
+    return 1;
+}
+
 void BalanceAndClamp(inout float3 rgb, float3 camMul) {
     float ceiling = min(camMul.r, min(camMul.g, camMul.b));
     rgb = min(rgb * camMul, ceiling);

@@ -275,17 +275,12 @@ void main(uint3 tid : SV_DispatchThreadID) {
     }
 
     std::vector<uint32_t> GpuConstants(int) const override {
-        auto bits = [](float f) {
-            uint32_t u;
-            std::memcpy(&u, &f, sizeof(u));
-            return u;
-        };
         // No 0..255 scaling here, unlike the RGBA8 kernels: a mosaic is R32F,
         // so an SRV hands the shader the sensor's own units rather than a
         // normalised 0..1. The threshold therefore means the same thing on both
         // paths, which is what the CPU/GPU agreement test checks.
-        return {bits(float(m_threshold)),
-                bits(float(m_spreadFactor)),
+        return {FloatBits(float(m_threshold)),
+                FloatBits(float(m_spreadFactor)),
                 uint32_t(bool(m_repairDark) ? 1 : 0)};
     }
 

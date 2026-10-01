@@ -49,6 +49,8 @@
 
 #include "../../algo_util/features.h"
 #include "../../algo_util/pixel_buffer.h"
+#include "../../algo_util/color.h"
+#include "../../algo_util/fast.h"
 #include "../../core/algorithm.h"
 #include "gpu_pyramid.h"
 
@@ -71,41 +73,6 @@ struct Level {
 //
 // Order matters: the test asks for N CONTIGUOUS pixels, so these have to walk
 // the circle rather than being any 16 points at that radius.
-constexpr int kCircleX[16] = { 0,  1,  2,  3,  3,  3,  2,  1,
-                               0, -1, -2, -3, -3, -3, -2, -1};
-constexpr int kCircleY[16] = {-3, -3, -2, -1,  0,  1,  2,  3,
-                              3,  3,  2,  1,  0, -1, -2, -3};
-
-// FAST-9: is (x, y) a corner?
-//
-// The early rejection is the whole reason this is fast. Pixels 0, 4, 8 and 12
-// are the compass points; for 9 contiguous of 16 to pass, at least three of
-// those four must pass too. Testing them first rejects the great majority of
-// pixels after four reads instead of sixteen.
-bool FastCorner(const Level& L, int x, int y, float t) {
-    const float c = L.At(x, y);
-    const float hi = c + t, lo = c - t;
-
-    int brightAxis = 0, darkAxis = 0;
-    for (int i = 0; i < 16; i += 4) {
-        const float p = L.At(x + kCircleX[i], y + kCircleY[i]);
-        if (p > hi) ++brightAxis;
-        else if (p < lo) ++darkAxis;
-    }
-    if (brightAxis < 3 && darkAxis < 3) return false;
-
-    // The full ring, walked twice so a run can wrap around the end.
-    int runBright = 0, runDark = 0;
-    for (int i = 0; i < 32; ++i) {
-        const int k = i & 15;
-        const float p = L.At(x + kCircleX[k], y + kCircleY[k]);
-        if (p > hi) { runDark = 0; if (++runBright >= 9) return true; }
-        else if (p < lo) { runBright = 0; if (++runDark >= 9) return true; }
-        else { runBright = runDark = 0; }
-    }
-    return false;
-}
-
 // Harris corner response, used to RANK the FAST corners rather than to find
 // them.
 //
@@ -252,7 +219,7 @@ public:
             for (int x = 0; x < w; ++x) {
                 const float* p = in.At(x, y);
                 base.v[size_t(y) * size_t(w) + size_t(x)] = (ch >= 3)
-                    ? (0.2126f * p[0] + 0.7152f * p[1] + 0.0722f * p[2]) / scale
+                    ? Luma(p) / scale
                     : p[0] / scale;
             }
 

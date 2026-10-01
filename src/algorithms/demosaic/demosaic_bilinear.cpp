@@ -133,7 +133,11 @@ public:
     }
 
     const char* GpuSource() const override {
-        return R"(
+        static const std::string src = std::string(kDemosaicHlsl) + kBody;
+        return src.c_str();
+    }
+
+    static constexpr const char* kBody = R"(
 Texture2D<float4>   Src : register(t0);   // R32F mosaic: only .x is a sample
 RWTexture2D<float4> Dst : register(u0);
 
@@ -146,32 +150,6 @@ cbuffer Params : register(b0) {
     uint CamMul0, CamMul1, CamMul2;          // as-shot white balance
     uint M0, M1, M2, M3, M4, M5, M6, M7, M8; // camera -> sRGB, row-major
 };
-
-int CfaColor(uint cfa, int x, int y) {
-    int q = (y & 1) * 2 + (x & 1);
-    if (cfa == 1) { int c[4] = {0, 1, 1, 2}; return c[q]; }
-    if (cfa == 2) { int c[4] = {2, 1, 1, 0}; return c[q]; }
-    if (cfa == 3) { int c[4] = {1, 0, 2, 1}; return c[q]; }
-    if (cfa == 4) { int c[4] = {1, 2, 0, 1}; return c[q]; }
-    return 1;
-}
-
-// The camera matrix with the smallest desaturation that keeps the result in
-// gamut -- keep in step with CameraMatrixInGamut in clip_repair.h.
-void CameraMatrixInGamut(inout float3 rgb, float3x3 M) {
-    float lum = (rgb.r + rgb.g + rgb.b) / 3.0;
-    float3 o = mul(M, rgb);
-    if (all(o >= 0.0)) { rgb = o; return; }
-    float t = 0.0;
-    [unroll] for (int i = 0; i < 3; ++i) {
-        if (o[i] >= 0.0) continue;
-        float span = lum - o[i];
-        if (span <= 1e-9) continue;
-        t = max(t, -o[i] / span);
-    }
-    t = min(t, 1.0);
-    rgb = o + t * (lum - o);
-}
 
 [numthreads(8, 8, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
@@ -219,36 +197,21 @@ void main(uint3 tid : SV_DispatchThreadID) {
     }
     #undef S
 
-    // White balance with the highlight clamp, then camera primaries -> sRGB.
-    // The clamp is what keeps blown highlights from developing magenta; see
-    // clip_repair.h. Keep in step with BalanceAndClamp there.
-    {
-        float3 camMul = float3(asfloat(CamMul0), asfloat(CamMul1), asfloat(CamMul2));
-        float ceiling = min(camMul.r, min(camMul.g, camMul.b));
-        rgb = min(rgb * camMul, ceiling);
-    }
-
-    CameraMatrixInGamut(rgb, float3x3(
-        asfloat(M0), asfloat(M1), asfloat(M2),
-        asfloat(M3), asfloat(M4), asfloat(M5),
-        asfloat(M6), asfloat(M7), asfloat(M8)));
-
-    // Negatives NOT clamped -- matches the CPU path, which carries out-of-gamut
-    // colour into the linear pipeline rather than destroying it here.
+    // White balance with the highlight clamp, then camera primaries -> sRGB
+    // (clip_repair.h). Negatives NOT clamped -- matches the CPU path, which
+    // carries out-of-gamut colour into the linear pipeline.
+    ApplyColour(rgb, float3(asfloat(CamMul0), asfloat(CamMul1), asfloat(CamMul2)),
+                float3x3(asfloat(M0), asfloat(M1), asfloat(M2),
+                         asfloat(M3), asfloat(M4), asfloat(M5),
+                         asfloat(M6), asfloat(M7), asfloat(M8)));
     Dst[tid.xy] = float4(rgb, 1.0);
 }
 )";
-    }
 
     std::vector<uint32_t> GpuConstants(int) const override {
-        auto bits = [](float f) {
-            uint32_t u;
-            std::memcpy(&u, &f, sizeof(u));
-            return u;
-        };
-        std::vector<uint32_t> c{uint32_t(m_cfa), bits(m_black), bits(m_range)};
-        for (int i = 0; i < 3; ++i) c.push_back(bits(m_camMul[i]));
-        for (int i = 0; i < 9; ++i) c.push_back(bits(m_rgbCam[i]));
+        std::vector<uint32_t> c{uint32_t(m_cfa), FloatBits(m_black), FloatBits(m_range)};
+        for (int i = 0; i < 3; ++i) c.push_back(FloatBits(m_camMul[i]));
+        for (int i = 0; i < 9; ++i) c.push_back(FloatBits(m_rgbCam[i]));
         return c;
     }
 

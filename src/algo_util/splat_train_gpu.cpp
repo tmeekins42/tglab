@@ -20,12 +20,6 @@ constexpr int kTile = 16;
 // counters (1) -- gradient sum, view count, largest screen radius.
 constexpr int kStateTexels = 13;
 
-uint32_t Bits(float f) {
-    uint32_t u = 0;
-    std::memcpy(&u, &f, 4);
-    return u;
-}
-
 ImageDesc FlatDesc(size_t texels, Format f) {
     ImageDesc d;
     d.width  = kTexW;
@@ -1340,8 +1334,8 @@ struct SplatTrainerGpu::Impl {
     static std::vector<uint32_t> ShadeC(const SplatCam& cam, int res, double sparsity) {
         std::vector<uint32_t> c{uint32_t(cam.w), uint32_t(cam.h), uint32_t(kTexW),
                                 uint32_t(res)};
-        for (int k = 0; k < 9; ++k) c.push_back(Bits(float(cam.R.m[k])));
-        for (double v : {cam.cx, cam.cy, cam.fx, cam.fy, sparsity}) c.push_back(Bits(float(v)));
+        for (int k = 0; k < 9; ++k) c.push_back(FloatBits(float(cam.R.m[k])));
+        for (double v : {cam.cx, cam.cy, cam.fx, cam.fy, sparsity}) c.push_back(FloatBits(float(v)));
         c.push_back(0u);
         return c;
     }
@@ -1790,7 +1784,7 @@ bool SplatTrainerGpu::ResetOpacity(double cap, std::string* err) {
     if (s.n == 0) return true;
     const uint32_t groups = uint32_t((s.n + 255) / 256);
     if (!s.Run(s.resetOpacity, {&s.stateA}, {&s.stateB},
-               {uint32_t(s.n), uint32_t(kTexW), Bits(float(cap))}, groups, 1, err))
+               {uint32_t(s.n), uint32_t(kTexW), FloatBits(float(cap))}, groups, 1, err))
         return false;
     std::swap(s.stateA, s.stateB);
     return true;
@@ -1840,10 +1834,10 @@ bool SplatTrainerGpu::StepImpl(const SplatCam& cam, const RasterOptions& opt,
     const uint32_t groupsN = uint32_t((n + 255) / 256);
     const double* W = cam.R.m;
     std::vector<uint32_t> camC;
-    for (int k = 0; k < 9; ++k) camC.push_back(Bits(float(W[k])));
-    camC.push_back(Bits(float(cam.t.x)));
-    camC.push_back(Bits(float(cam.t.y)));
-    camC.push_back(Bits(float(cam.t.z)));
+    for (int k = 0; k < 9; ++k) camC.push_back(FloatBits(float(W[k])));
+    camC.push_back(FloatBits(float(cam.t.x)));
+    camC.push_back(FloatBits(float(cam.t.y)));
+    camC.push_back(FloatBits(float(cam.t.z)));
 
     // --- project ------------------------------------------------------------
     auto clk = Clock::now();
@@ -1856,21 +1850,21 @@ bool SplatTrainerGpu::StepImpl(const SplatCam& cam, const RasterOptions& opt,
     {
         std::vector<uint32_t> c{uint32_t(n), uint32_t(kTexW)};
         c.insert(c.end(), camC.begin(), camC.end());
-        c.push_back(Bits(float(cam.fx)));
-        c.push_back(Bits(float(cam.fy)));
-        c.push_back(Bits(float(cam.cx)));
-        c.push_back(Bits(float(cam.cy)));
+        c.push_back(FloatBits(float(cam.fx)));
+        c.push_back(FloatBits(float(cam.fy)));
+        c.push_back(FloatBits(float(cam.cx)));
+        c.push_back(FloatBits(float(cam.cy)));
         c.push_back(uint32_t(cam.w));
         c.push_back(uint32_t(cam.h));
-        c.push_back(Bits(float(opt.lowPass)));
-        c.push_back(Bits(float(opt.minAlpha)));
+        c.push_back(FloatBits(float(opt.lowPass)));
+        c.push_back(FloatBits(float(opt.minAlpha)));
         // The camera centre and degree, for the view-dependent colour. With
         // none on the device the state stands in for the unused binding.
         const int deg = s.haveSh ? std::clamp(shDegree, 0, kShMaxDegree) : 0;
         const Vec3 eye = CentreOf(cam);
-        c.push_back(Bits(float(eye.x)));
-        c.push_back(Bits(float(eye.y)));
-        c.push_back(Bits(float(eye.z)));
+        c.push_back(FloatBits(float(eye.x)));
+        c.push_back(FloatBits(float(eye.y)));
+        c.push_back(FloatBits(float(eye.z)));
         c.push_back(uint32_t(deg));
         const GpuImage* shIn = deg > 0 ? &s.shTex : &s.stateA;
         if (!s.Run(s.project, {&s.stateA, shIn}, {&s.proj, &s.screen}, c, groupsN, 1, err))
@@ -1976,9 +1970,9 @@ bool SplatTrainerGpu::StepImpl(const SplatCam& cam, const RasterOptions& opt,
         }
     }
     const std::vector<uint32_t> bgC{
-        Bits(float(opt.background.x)), Bits(float(opt.background.y)),
-        Bits(float(opt.background.z)), Bits(float(opt.minAlpha)),
-        Bits(float(opt.maxAlpha))};
+        FloatBits(float(opt.background.x)), FloatBits(float(opt.background.y)),
+        FloatBits(float(opt.background.z)), FloatBits(float(opt.minAlpha)),
+        FloatBits(float(opt.maxAlpha))};
     // REFLECTIONS IN THE SAME PASS (splat_reflect.h). Each Gaussian's
     // reflectivity and camera-facing normal go into `saved` (kPayload mode
     // 4), and the REFL build of the composite blends them with the very same
@@ -1993,8 +1987,8 @@ bool SplatTrainerGpu::StepImpl(const SplatCam& cam, const RasterOptions& opt,
             *err = "could not allocate the reflection targets";
             return false;
         }
-        std::vector<uint32_t> c{uint32_t(n), uint32_t(kTexW), Bits(float(eyeR.x)),
-                                Bits(float(eyeR.y)), Bits(float(eyeR.z)), 4u};
+        std::vector<uint32_t> c{uint32_t(n), uint32_t(kTexW), FloatBits(float(eyeR.x)),
+                                FloatBits(float(eyeR.y)), FloatBits(float(eyeR.z)), 4u};
         if (!s.Run(s.payload, {&s.stateA, &s.reflTex}, {&s.proj, &s.saved}, c,
                    groupsN, 1, err))
             return false;
@@ -2002,7 +1996,7 @@ bool SplatTrainerGpu::StepImpl(const SplatCam& cam, const RasterOptions& opt,
     {
         std::vector<uint32_t> c{uint32_t(tilesX), uint32_t(kTexW)};
         c.insert(c.end(), bgC.begin(), bgC.end());
-        c.push_back(Bits(float(opt.tStop)));
+        c.push_back(FloatBits(float(opt.tStop)));
         const bool ok = reflNow
             ? s.Run(s.fwdR, {&s.proj, &s.list, &s.offs, &s.saved},
                     {&s.rgbt, &s.last, &s.depth, &s.rn}, c, uint32_t(tilesX),
@@ -2160,9 +2154,9 @@ bool SplatTrainerGpu::StepImpl(const SplatCam& cam, const RasterOptions& opt,
         const int deg = std::clamp(shDegree, 0, kShMaxDegree);
         const Vec3 eye = CentreOf(cam);
         std::vector<uint32_t> c{uint32_t(n), uint32_t(kTexW),
-                                Bits(float(eye.x)), Bits(float(eye.y)), Bits(float(eye.z)),
-                                uint32_t(deg), Bits(float(shLr)), Bits(float(c1)),
-                                Bits(float(c2))};
+                                FloatBits(float(eye.x)), FloatBits(float(eye.y)), FloatBits(float(eye.z)),
+                                uint32_t(deg), FloatBits(float(shLr)), FloatBits(float(c1)),
+                                FloatBits(float(c2))};
         if (!s.Run(s.shStep, {&s.stateA, &s.proj}, {&s.g2, &s.shTex, &s.shMom}, c,
                    groupsN, 1, err))
             return false;
@@ -2170,9 +2164,9 @@ bool SplatTrainerGpu::StepImpl(const SplatCam& cam, const RasterOptions& opt,
     // Reflectivity and normal, from the gradients the REFL sum gathered.
     if (reflNow) {
         std::vector<uint32_t> c{uint32_t(n), uint32_t(kTexW),
-                                Bits(float(eyeR.x)), Bits(float(eyeR.y)), Bits(float(eyeR.z)),
-                                Bits(float(ra->lrRefl)), Bits(float(ra->lrNormal)),
-                                Bits(float(c1)), Bits(float(c2))};
+                                FloatBits(float(eyeR.x)), FloatBits(float(eyeR.y)), FloatBits(float(eyeR.z)),
+                                FloatBits(float(ra->lrRefl)), FloatBits(float(ra->lrNormal)),
+                                FloatBits(float(c1)), FloatBits(float(c2))};
         if (!s.Run(s.reflStep, {&s.stateA, &s.proj, &s.rg}, {&s.reflTex, &s.reflMom}, c,
                    groupsN, 1, err))
             return false;
@@ -2180,13 +2174,13 @@ bool SplatTrainerGpu::StepImpl(const SplatCam& cam, const RasterOptions& opt,
     {
         std::vector<uint32_t> c{uint32_t(n), uint32_t(kTexW)};
         c.insert(c.end(), camC.begin(), camC.end());
-        c.push_back(Bits(float(cam.fx)));
-        c.push_back(Bits(float(cam.fy)));
-        c.push_back(Bits(float(opt.lowPass)));
-        c.push_back(Bits(float(lrMean)));
-        c.push_back(Bits(float(c1)));
-        c.push_back(Bits(float(c2)));
-        c.push_back(Bits(float(0.5 * double(cam.w))));
+        c.push_back(FloatBits(float(cam.fx)));
+        c.push_back(FloatBits(float(cam.fy)));
+        c.push_back(FloatBits(float(opt.lowPass)));
+        c.push_back(FloatBits(float(lrMean)));
+        c.push_back(FloatBits(float(c1)));
+        c.push_back(FloatBits(float(c2)));
+        c.push_back(FloatBits(float(0.5 * double(cam.w))));
         c.push_back(m_clampColour ? 1u : 0u);
         if (!s.Run(s.update, {&s.stateA, &s.g2, &s.proj}, {&s.stateB}, c,
                    groupsN, 1, err))

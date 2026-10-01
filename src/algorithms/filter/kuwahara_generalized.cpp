@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "../../algo_util/pixel_buffer.h"
+#include "../../algo_util/color.h"
 #include "../../core/algorithm.h"
 
 namespace tglab {
@@ -145,7 +146,7 @@ public:
 private:
     static float Luma(const float* p, int channels) {
         if (channels == 1) return p[0];
-        return 0.299f * p[0] + 0.587f * p[1] + 0.114f * p[2];
+        return tglab::Luma(p);
     }
 
     // A weight map per sector: a wedge of the disc, smoothed across its angular

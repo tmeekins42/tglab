@@ -33,89 +33,12 @@
 #include <string>
 #include <vector>
 
+#include "../../algo_util/linalg.h"
 #include "../../core/algorithm.h"
 #include "../../core/parallel.h"
 
 namespace tglab {
 namespace {
-
-// Eigen-decomposition of a symmetric 3x3 by cyclic Jacobi. Eigenvalues come
-// back in `ev`, eigenvectors as the COLUMNS of `V`, both ascending.
-void SymEigen3(double a[3][3], double ev[3], double V[3][3]) {
-    for (int i = 0; i < 3; ++i)
-        for (int j = 0; j < 3; ++j) V[i][j] = (i == j) ? 1.0 : 0.0;
-
-    for (int sweep = 0; sweep < 16; ++sweep) {
-        int p = 0, q = 1;
-        double big = std::fabs(a[0][1]);
-        if (std::fabs(a[0][2]) > big) { big = std::fabs(a[0][2]); p = 0; q = 2; }
-        if (std::fabs(a[1][2]) > big) { big = std::fabs(a[1][2]); p = 1; q = 2; }
-        if (big < 1e-30) break;
-
-        const double th = 0.5 * std::atan2(2.0 * a[p][q], a[q][q] - a[p][p]);
-        const double c = std::cos(th), s = std::sin(th);
-        for (int k = 0; k < 3; ++k) {
-            const double kp = a[k][p], kq = a[k][q];
-            a[k][p] = c * kp - s * kq;
-            a[k][q] = s * kp + c * kq;
-        }
-        for (int k = 0; k < 3; ++k) {
-            const double pk = a[p][k], qk = a[q][k];
-            a[p][k] = c * pk - s * qk;
-            a[q][k] = s * pk + c * qk;
-        }
-        for (int k = 0; k < 3; ++k) {
-            const double kp = V[k][p], kq = V[k][q];
-            V[k][p] = c * kp - s * kq;
-            V[k][q] = s * kp + c * kq;
-        }
-    }
-
-    // Sort ascending, carrying the vectors.
-    int idx[3] = {0, 1, 2};
-    std::sort(idx, idx + 3, [&](int x, int y) { return a[x][x] < a[y][y]; });
-    double W[3][3];
-    for (int c = 0; c < 3; ++c) {
-        ev[c] = a[idx[c]][idx[c]];
-        for (int r = 0; r < 3; ++r) W[r][c] = V[r][idx[c]];
-    }
-    for (int r = 0; r < 3; ++r)
-        for (int c = 0; c < 3; ++c) V[r][c] = W[r][c];
-}
-
-// Rotation matrix (columns are the axes) to a unit quaternion, w x y z.
-// Shepperd's method: pick the largest of the four candidates so the square
-// root is never taken of something near zero.
-void ToQuaternion(const double R[3][3], double q[4]) {
-    const double tr = R[0][0] + R[1][1] + R[2][2];
-    if (tr > 0.0) {
-        const double s = std::sqrt(tr + 1.0) * 2.0;
-        q[0] = 0.25 * s;
-        q[1] = (R[2][1] - R[1][2]) / s;
-        q[2] = (R[0][2] - R[2][0]) / s;
-        q[3] = (R[1][0] - R[0][1]) / s;
-    } else if (R[0][0] > R[1][1] && R[0][0] > R[2][2]) {
-        const double s = std::sqrt(1.0 + R[0][0] - R[1][1] - R[2][2]) * 2.0;
-        q[0] = (R[2][1] - R[1][2]) / s;
-        q[1] = 0.25 * s;
-        q[2] = (R[0][1] + R[1][0]) / s;
-        q[3] = (R[0][2] + R[2][0]) / s;
-    } else if (R[1][1] > R[2][2]) {
-        const double s = std::sqrt(1.0 + R[1][1] - R[0][0] - R[2][2]) * 2.0;
-        q[0] = (R[0][2] - R[2][0]) / s;
-        q[1] = (R[0][1] + R[1][0]) / s;
-        q[2] = 0.25 * s;
-        q[3] = (R[1][2] + R[2][1]) / s;
-    } else {
-        const double s = std::sqrt(1.0 + R[2][2] - R[0][0] - R[1][1]) * 2.0;
-        q[0] = (R[1][0] - R[0][1]) / s;
-        q[1] = (R[0][2] + R[2][0]) / s;
-        q[2] = (R[1][2] + R[2][1]) / s;
-        q[3] = 0.25 * s;
-    }
-    const double n = std::sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
-    for (int i = 0; i < 4; ++i) q[i] /= (n > 0.0 ? n : 1.0);
-}
 
 // A uniform grid over the points, for nearest-neighbour search.
 //
@@ -280,20 +203,21 @@ public:
                 add(p);
                 for (int j = 0; j < m; ++j) add(pts[size_t(near[size_t(j)].second)]);
 
-                double ev[3], V[3][3];
-                SymEigen3(a, ev, V);
+                double ev[3];
+                Mat3 V;
+                linalg::SymmetricEigen<3>(&a[0][0], ev, V.m);
 
                 // Columns: the two in-plane axes, then the normal (the
                 // SMALLEST eigenvector). Rebuilt as e0 x e1 so the frame is
                 // right-handed whatever sign Jacobi returned -- a reflection
                 // is not a rotation and has no quaternion.
-                const Vec3 e0{V[0][2], V[1][2], V[2][2]};
-                const Vec3 e1{V[0][1], V[1][1], V[2][1]};
+                const Vec3 e0 = V.Column(2), e1 = V.Column(1);
                 const Vec3 nrm = e0.Cross(e1).Normalized();
-                const double R[3][3] = {{e0.x, e1.x, nrm.x},
-                                        {e0.y, e1.y, nrm.y},
-                                        {e0.z, e1.z, nrm.z}};
-                ToQuaternion(R, s.rot);
+                Mat3 R;
+                R.m[0] = e0.x; R.m[1] = e1.x; R.m[2] = nrm.x;
+                R.m[3] = e0.y; R.m[4] = e1.y; R.m[5] = nrm.y;
+                R.m[6] = e0.z; R.m[7] = e1.z; R.m[8] = nrm.z;
+                MatToQuat(R, s.rot);
                 s.scale = Vec3{r, r, std::max(1e-9, r * flat)};
                 planar[size_t(i)] = 1;
             } else {

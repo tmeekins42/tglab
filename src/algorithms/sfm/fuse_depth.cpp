@@ -129,6 +129,7 @@ public:
         const double seeTol  = double(m_seeTolerance);
 
         ParallelFor(nCam, [&](int c) {
+            if (GroupCancelled()) return;   // superseded: see SetGroupCancel
             FuseCamera(c, *cloud, views, minViews, relTol, step, minConf,
                        maxSeen, seeTol, perHist[size_t(c)].data(),
                        &perCam[size_t(c)], &perTested[size_t(c)],

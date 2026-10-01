@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -26,6 +27,7 @@
 #include "../core/pipeline.h"
 #include "../algo_util/histogram.h"
 #include "../algo_util/auto_develop.h"
+#include "../algo_util/color.h"
 #include "../algo_util/white_balance.h"
 #include "../core/exif.h"
 #include "../core/image_loader.h"
@@ -50,6 +52,17 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM,
 
 namespace tglab {
 namespace {
+
+// The palette entry a load will land in: the slot it was dropped on, or else
+// a new (or same-named) entry called after the file -- as InstallLoadedImage
+// names it.
+std::string LoadTarget(const std::string& path, const std::string& targetSlot) {
+    if (!targetSlot.empty()) return targetSlot;
+    std::string name = path;
+    if (auto slash = name.find_last_of("/\\"); slash != std::string::npos) name = name.substr(slash + 1);
+    if (auto dot = name.find_last_of('.'); dot != std::string::npos) name = name.substr(0, dot);
+    return name;
+}
 
 // Mirrors Device's tracing; set TGLAB_VERBOSE=1.
 void AppTrace(const char* stage) {
@@ -87,16 +100,6 @@ std::string ResolveDataPath(const std::string& rel) {
 // Box-downsamples `src` so its longest side is at most `maxSide`. Cheap and
 // done once per image, so the palette never uploads a full-resolution texture
 // just to draw a small icon.
-// sRGB encode for the thumbnail path.
-//
-// basic_adjust has its own copy, but this is app UI rather than pipeline code
-// and reaching into an algorithm for it would couple the two for four lines.
-inline float LinearToSrgbThumb(float c) {
-    c = std::clamp(c, 0.0f, 1.0f);
-    return (c <= 0.0031308f) ? c * 12.92f
-                             : 1.055f * std::pow(c, 1.0f / 2.4f) - 0.055f;
-}
-
 // `exposureStops` develops a raw mosaic for display -- see the R32F branch.
 // Zero for an ordinary image, which needs no development.
 void MakeThumbnail(Image& src, int maxSide, Image* out, float exposureStops) {
@@ -188,7 +191,7 @@ void MakeThumbnail(Image& src, int maxSide, Image* out, float exposureStops) {
                             // the real develop path uses: balance is a property
                             // of the capture, brightness is a choice made after.
                             f = std::clamp(f * wb[cc] * expGain, 0.0f, 1.0f);
-                            f = LinearToSrgbThumb(f);
+                            f = LinearToSrgb(f);   // color.h
                         } else {
                             f = std::clamp(f, 0.0f, 1.0f);
                         }
@@ -594,6 +597,20 @@ private:
     int         m_spinner = 0;             // "working..." animation
     int         m_dropTotal = 0;           // files queued in the current drop burst
 
+    // LOADS AND RUNS. A load still decoding into a palette entry the script
+    // reads means any run now would be on the OLD contents, and its result
+    // thrown away the moment the load lands -- a splat solve is minutes of
+    // that. So runs are held while such a load is pending, and one already
+    // running is cancelled when the load is requested. Loads into an entry
+    // the script does not read hold nothing.
+    std::multiset<std::string> m_loadingInto;   // entries with a load pending
+    std::set<std::string>      m_scriptReads;   // entries the last run read
+    bool LoadPendingIntoScript() const {
+        for (const std::string& n : m_loadingInto)
+            if (m_scriptReads.count(n)) return true;
+        return false;
+    }
+
     // Compare mode (M4). TGLAB_COMPARE=1 opens the panel at startup, which is
     // how the panel gets verified without driving the menus.
     std::shared_ptr<CompareResult> m_compare;
@@ -881,6 +898,13 @@ void App::RequestImageLoad(const std::string& path, const std::string& targetSlo
     // A bare countdown does not tell you how far in you are, which is what Tim
     // asked for when dropping a card full of files.
     ++m_dropTotal;
+
+    // Into something the script reads: whatever is running is now on stale
+    // inputs, so it stops, and runs wait for the load (see m_loadingInto).
+    const std::string into = LoadTarget(path, targetSlot);
+    m_loadingInto.insert(into);
+    if (m_scriptReads.count(into)) m_worker.CancelRunning();
+
     m_loader.Request(path, targetSlot);
 }
 
@@ -933,6 +957,11 @@ void App::Ungroup(PaletteEntry& e) {
 
 
 void App::InstallLoadedImage(LoadResult&& r) {
+    // No longer pending, whether it loaded or failed.
+    if (auto it = m_loadingInto.find(LoadTarget(r.path, r.targetSlot));
+        it != m_loadingInto.end())
+        m_loadingInto.erase(it);
+
     if (!r.ok) {
         m_error = r.error;
         ReportError("");
@@ -1387,6 +1416,20 @@ void App::RunScript() {
             // pipeline. Zooming out then revealed it, which is where it was
             // noticed.
             m_submittedRegion = region.Valid();
+
+            // Which palette entries this run reads -- a source port is
+            // {stage -1, palette index} -- for holding runs while one of them
+            // is still loading (see m_loadingInto).
+            m_scriptReads.clear();
+            auto note = [&](const PortRef& ref) {
+                if (ref.stage != -1) return;
+                for (const SourceImage& si : names)
+                    if (si.index == ref.port) m_scriptReads.insert(si.name);
+            };
+            for (const Stage& s : built.Stages())
+                for (const PortRef& in : s.inputs) note(in);
+            for (const ViewerDecl& d : built.Viewers()) note(d.source);
+            for (const SaveDecl& d : built.Saves()) note(d.source);
 
             m_pendingSeq = m_worker.Submit(std::move(built), m_sources,
                                            std::move(versions));
@@ -3446,7 +3489,12 @@ void App::Frame() {
     // Re-run before NewFrame() so that viewers declared by the script exist
     // when the dock layout is built. This is only phase 1 (parse + interpret);
     // execution happens on the worker.
-    if (m_dirty) {
+    //
+    // HELD while a load is pending into something the script reads: the run
+    // would be on the old contents and replaced the moment the load lands.
+    // m_dirty stays set, so the change waits and runs once, with the new
+    // contents -- the load landing dirties the pipeline anyway.
+    if (m_dirty && !LoadPendingIntoScript()) {
         m_dirty = false;
         RunScript();
     }
@@ -3606,6 +3654,9 @@ void App::Frame() {
                                    "%c loading %d image%s...", spin[m_spinner],
                                    pending, pending == 1 ? "" : "s");
             }
+            // Say why nothing is running, when something is waiting.
+            if (m_dirty && LoadPendingIntoScript())
+                ImGui::TextDisabled("changes run once it has loaded");
         } else if (m_error.empty()) {
             m_dropTotal = 0;   // the burst is over; the next drop counts afresh
             ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1.0f), "OK");

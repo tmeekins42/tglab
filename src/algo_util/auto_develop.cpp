@@ -4,6 +4,7 @@
 #include <cmath>
 #include <vector>
 
+#include "color.h"
 #include "pixel_buffer.h"
 
 namespace tglab {
@@ -171,7 +172,7 @@ AutoDevelopSuggestion SuggestExposure(const Image& mosaic) {
             for (int x = 0; x < pb.Width(); x += stride) {
                 const float* p = pb.At(x, y);
                 const double lum = (ch >= 3)
-                    ? 0.2126 * double(p[0]) + 0.7152 * double(p[1]) + 0.0722 * double(p[2])
+                    ? Luma<double>(p[0], p[1], p[2])
                     : double(p[0]);
                 g.push_back(float(std::clamp(lum / double(pb.ValueScale()), 0.0, 1e6)));
             }

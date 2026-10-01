@@ -2274,10 +2274,17 @@ int main() {
             Image img;
             img.Alloc({kW, kH, Format::RGBA8});
             ImageView v = img.MapCpuWrite();
+            uint32_t seed = 2024;
             for (int y = 0; y < kH; ++y)
                 for (int x = 0; x < kW; ++x) {
-                    // Deterministic ±25 checker-ish perturbation around 128.
-                    const int wobble = (((x * 7 + y * 13) % 11) - 5) * 5;
+                    // Deterministic ±25 NOISE around 128 -- hashed, not a
+                    // periodic pattern. A pattern repeating every few pixels
+                    // gives quadrants of exactly equal variance, and the hard
+                    // choice then measured how ties break rather than how it
+                    // behaves on noise: a change in the last bit of the luma
+                    // weights moved classic Kuwahara from 0.73 to 0.46 off.
+                    seed = seed * 1664525u + 1013904223u;
+                    const int wobble = int((seed >> 16) % 11) * 5 - 25;
                     const uint8_t s = uint8_t(std::clamp(128 + wobble, 0, 255));
                     uint8_t* p = v.At<uint8_t>(x, y);
                     p[0] = p[1] = p[2] = s;
@@ -2304,9 +2311,12 @@ int main() {
                                  {{"radius", 4}, {"sectors", 8}, {"sharpness", 8.0}},
                                  &general, &err);
         if (a && b) {
-            Check(deviationFrom128(general) < deviationFrom128(plain),
-                  "kuwahara_generalized's smooth weighting beats hard quadrant "
-                  "selection on noise");
+            const double dg = deviationFrom128(general), dp = deviationFrom128(plain);
+            char m[200];
+            std::snprintf(m, sizeof m,
+                          "kuwahara_generalized's smooth weighting beats hard quadrant "
+                          "selection on noise (%.3f against %.3f from the true 128)", dg, dp);
+            Check(dg < dp, m);
         } else {
             Check(false, "both kuwahara variants ran: " + err);
         }

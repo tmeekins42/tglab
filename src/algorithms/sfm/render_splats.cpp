@@ -92,6 +92,7 @@ public:
         out->images.clear();
         int rendered = 0;
         for (const Camera& c : cloud.cameras) {
+            if (GroupCancelled()) { *err = "cancelled"; return false; }   // see SetGroupCancel
             const int w = std::max(1, int(std::lround(c.width * scale)));
             const int h = std::max(1, int(std::lround(c.height * scale)));
             Image im;

@@ -52,6 +52,8 @@
 #include <vector>
 
 #include "../../algo_util/features.h"
+#include "../../algo_util/least_squares.h"
+#include "../../algo_util/linalg.h"
 #include "../../algo_util/transform.h"
 #include "../../core/algorithm.h"
 
@@ -65,80 +67,19 @@ struct Obs {
     float xj, yj;          // the same point in frame j
 };
 
-// Angle-axis to a 3x3 rotation, by Rodrigues' formula.
+// geometry.h's angle-axis conversions, on this solver's flat arrays: 3 numbers
+// per frame for the parameters, 9 for the matrix.
 void AxisAngleToR(const double* w, double R[9]) {
-    const double t2 = w[0] * w[0] + w[1] * w[1] + w[2] * w[2];
-    const double t  = std::sqrt(t2);
-    if (t < 1e-12) {
-        // The small-angle limit is the identity plus the skew matrix. Taking it
-        // explicitly rather than dividing by t avoids a 0/0 at exactly zero,
-        // which is where the solve STARTS on a frame with no prior estimate.
-        R[0] = 1.0;   R[1] = -w[2]; R[2] =  w[1];
-        R[3] =  w[2]; R[4] = 1.0;   R[5] = -w[0];
-        R[6] = -w[1]; R[7] =  w[0]; R[8] = 1.0;
-        return;
-    }
-    const double c = std::cos(t), s = std::sin(t);
-    const double x = w[0] / t, y = w[1] / t, z = w[2] / t;
-    const double C = 1.0 - c;
-    R[0] = c + x * x * C;     R[1] = x * y * C - z * s; R[2] = x * z * C + y * s;
-    R[3] = y * x * C + z * s; R[4] = c + y * y * C;     R[5] = y * z * C - x * s;
-    R[6] = z * x * C - y * s; R[7] = z * y * C + x * s; R[8] = c + z * z * C;
+    const Mat3 M = AxisAngleToMat(Vec3{w[0], w[1], w[2]});
+    std::copy(M.m, M.m + 9, R);
 }
-
-// ...and back, for seeding the solve from the transforms align_features found.
 void RToAxisAngle(const double R[9], double* w) {
-    const double tr = R[0] + R[4] + R[8];
-    const double c  = std::clamp((tr - 1.0) * 0.5, -1.0, 1.0);
-    const double t  = std::acos(c);
-    if (t < 1e-9) { w[0] = w[1] = w[2] = 0.0; return; }
-    const double k = t / (2.0 * std::sin(t));
-    w[0] = k * (R[7] - R[5]);
-    w[1] = k * (R[2] - R[6]);
-    w[2] = k * (R[3] - R[1]);
-}
-
-// Solves a dense symmetric positive-definite system by Cholesky.
-//
-// Cholesky rather than the Gaussian elimination in align_features, for two
-// reasons that both matter at this size. Normal equations are symmetric
-// positive-definite by construction, so half the factorisation is redundant
-// work; and Cholesky is backward stable on such a matrix without any pivoting,
-// where Gaussian elimination needs pivoting to be. At n=46 the speed is
-// irrelevant and the stability is not.
-//
-// Returns false when the matrix is not positive definite -- which, with
-// Levenberg damping applied, means the problem is genuinely degenerate rather
-// than merely hard.
-bool SolveSpd(std::vector<double>& a, std::vector<double>& b, int n) {
-    // In-place Cholesky: a = L L^T, lower triangle.
-    for (int i = 0; i < n; ++i) {
-        for (int j = 0; j <= i; ++j) {
-            double s = a[size_t(i) * size_t(n) + size_t(j)];
-            for (int k = 0; k < j; ++k)
-                s -= a[size_t(i) * size_t(n) + size_t(k)] *
-                     a[size_t(j) * size_t(n) + size_t(k)];
-            if (i == j) {
-                if (s <= 0.0) return false;
-                a[size_t(i) * size_t(n) + size_t(i)] = std::sqrt(s);
-            } else {
-                a[size_t(i) * size_t(n) + size_t(j)] =
-                    s / a[size_t(j) * size_t(n) + size_t(j)];
-            }
-        }
-    }
-    // Forward substitution, then back.
-    for (int i = 0; i < n; ++i) {
-        double s = b[size_t(i)];
-        for (int k = 0; k < i; ++k) s -= a[size_t(i) * size_t(n) + size_t(k)] * b[size_t(k)];
-        b[size_t(i)] = s / a[size_t(i) * size_t(n) + size_t(i)];
-    }
-    for (int i = n - 1; i >= 0; --i) {
-        double s = b[size_t(i)];
-        for (int k = i + 1; k < n; ++k) s -= a[size_t(k) * size_t(n) + size_t(i)] * b[size_t(k)];
-        b[size_t(i)] = s / a[size_t(i) * size_t(n) + size_t(i)];
-    }
-    return true;
+    Mat3 M;
+    std::copy(R, R + 9, M.m);
+    const Vec3 a = MatToAxisAngle(M);
+    w[0] = a.x;
+    w[1] = a.y;
+    w[2] = a.z;
 }
 
 class BundleAdjust : public AlgorithmBase {
@@ -435,14 +376,11 @@ bool BundleAdjust::RunAlign(std::vector<Image>* images, std::string* err) {
     };
     rebuild();
 
+    // Huber (least_squares.h): what turns least squares into something an
+    // outlier cannot dominate. 0 turns it off.
     const double huber = double(std::max(0.0f, float(m_huber)));
     auto weight = [&](double r2) {
-        // Huber: quadratic near zero, linear beyond. The weight applied to the
-        // squared residual is what turns least squares into something an
-        // outlier cannot dominate.
-        if (huber <= 0.0) return 1.0;
-        const double r = std::sqrt(r2);
-        return (r <= huber) ? 1.0 : huber / r;
+        return RobustWeight(RobustLoss::Huber, std::sqrt(r2), huber);
     };
 
     auto totalCost = [&]() {
@@ -480,11 +418,13 @@ bool BundleAdjust::RunAlign(std::vector<Image>* images, std::string* err) {
     JA.assign(size_t(nP) * size_t(nP), 0.0);
     JB.assign(size_t(nP), 0.0);
     wSave = w;
-    double lambda = 1e-3;
+    // No ceiling: eight attempts an iteration bound it instead.
+    LmDamping damp{1e-3, 10.0, 0.3, 1e-9, HUGE_VAL};
     double cost = totalCost();
 
     const int maxIter = std::max(1, int(m_iterations));
     for (int iter = 0; iter < maxIter; ++iter) {
+        if (GroupCancelled()) { *err = "cancelled"; return false; }   // see SetGroupCancel
         std::fill(A.begin(), A.end(), 0.0);
         std::fill(B.begin(), B.end(), 0.0);
 
@@ -579,9 +519,10 @@ bool BundleAdjust::RunAlign(std::vector<Image>* images, std::string* err) {
             JA = A;
             JB = B;
             for (int p = 0; p < nP; ++p)
-                JA[size_t(p) * size_t(nP) + size_t(p)] *= (1.0 + lambda);
+                JA[size_t(p) * size_t(nP) + size_t(p)] *= (1.0 + damp.lambda);
 
-            if (!SolveSpd(JA, JB, nP)) { lambda *= 10.0; continue; }
+            // Normal equations are SPD by construction: Cholesky.
+            if (!linalg::CholeskySolve(JA.data(), JB.data(), nP)) { damp.FailSingular(); continue; }
 
             wSave = w;
             const double focalSave = focal;
@@ -596,13 +537,13 @@ bool BundleAdjust::RunAlign(std::vector<Image>* images, std::string* err) {
             const double next = totalCost();
             if (next < cost) {
                 cost = next;
-                lambda = std::max(1e-9, lambda * 0.3);
+                damp.Succeed();
                 stepped = true;
             } else {
                 w = wSave;
                 focal = focalSave;
                 rebuild();
-                lambda *= 10.0;
+                damp.Fail();
             }
         }
 

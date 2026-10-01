@@ -34,62 +34,11 @@
 #include <string>
 #include <vector>
 
+#include "../../algo_util/linalg.h"
 #include "../../core/algorithm.h"
 
 namespace tglab {
 namespace {
-
-// Smallest eigenvector of a symmetric 4x4, by cyclic Jacobi.
-//
-// The DLT system is 2N x 4; forming A^T A makes it 4x4 regardless of how many
-// views saw the point, which matters because a long track can have dozens.
-// Squaring costs condition number in principle, and in practice the normalised
-// image coordinates used here keep the entries within an order of magnitude of
-// each other, which is what makes it safe.
-bool SmallestEigenvector4(const double A[16], double out[4]) {
-    double M[16];
-    std::copy(A, A + 16, M);
-    double V[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
-
-    for (int sweep = 0; sweep < 50; ++sweep) {
-        double off = 0.0;
-        for (int p = 0; p < 4; ++p)
-            for (int q = p + 1; q < 4; ++q) off += M[p * 4 + q] * M[p * 4 + q];
-        if (off < 1e-26) break;
-
-        for (int p = 0; p < 4; ++p) {
-            for (int q = p + 1; q < 4; ++q) {
-                const double apq = M[p * 4 + q];
-                if (std::fabs(apq) < 1e-20) continue;
-                const double theta = 0.5 * (M[q * 4 + q] - M[p * 4 + p]) / apq;
-                const double t = (theta >= 0.0 ? 1.0 : -1.0) /
-                                 (std::fabs(theta) + std::sqrt(theta * theta + 1.0));
-                const double c = 1.0 / std::sqrt(t * t + 1.0), s = t * c;
-
-                for (int k = 0; k < 4; ++k) {
-                    const double mkp = M[k * 4 + p], mkq = M[k * 4 + q];
-                    M[k * 4 + p] = c * mkp - s * mkq;
-                    M[k * 4 + q] = s * mkp + c * mkq;
-                }
-                for (int k = 0; k < 4; ++k) {
-                    const double mpk = M[p * 4 + k], mqk = M[q * 4 + k];
-                    M[p * 4 + k] = c * mpk - s * mqk;
-                    M[q * 4 + k] = s * mpk + c * mqk;
-                }
-                for (int k = 0; k < 4; ++k) {
-                    const double vkp = V[k * 4 + p], vkq = V[k * 4 + q];
-                    V[k * 4 + p] = c * vkp - s * vkq;
-                    V[k * 4 + q] = s * vkp + c * vkq;
-                }
-            }
-        }
-    }
-
-    int best = 0;
-    for (int i = 1; i < 4; ++i) if (M[i * 4 + i] < M[best * 4 + best]) best = i;
-    for (int i = 0; i < 4; ++i) out[i] = V[i * 4 + best];
-    return true;
-}
 
 class Triangulate : public AlgorithmBase {
 public:
@@ -218,8 +167,14 @@ public:
                         A[a * 4 + b] += r0[a] * r0[b] + r1[a] * r1[b];
             }
 
+            // The DLT system is 2N x 4; A^T A makes it 4x4 however many views
+            // saw the point, which matters because a long track can have
+            // dozens. Squaring costs condition number in principle; the
+            // normalised image coordinates here keep the entries within an
+            // order of magnitude of each other, which is what makes it safe.
             double X[4];
-            if (!SmallestEigenvector4(A, X) || std::fabs(X[3]) < 1e-12) {
+            linalg::SmallestEigenvector<4>(A, X);
+            if (std::fabs(X[3]) < 1e-12) {
                 tr.hasPoint = false;
                 ++tooNarrow;
                 continue;

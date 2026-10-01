@@ -575,6 +575,9 @@ public:
                      &heldBefore, nullptr, gpuTrainer.get());
 
         for (int it = 0; it < iters; ++it) {
+            // Superseded -- a parameter moved, a load landed: stop now rather
+            // than finishing a solve nobody will see (see SetGroupCancel).
+            if (GroupCancelled()) { *err = "cancelled"; return false; }
             if (order.empty()) {
                 order.resize(views.size());
                 for (size_t i = 0; i < views.size(); ++i) order[i] = int(i);
@@ -729,7 +732,7 @@ public:
 
                     // Reflectivity: the R pass put dLoss/dr in channel 0;
                     // r is the sigmoid of the logit.
-                    const double r = 1.0 / (1.0 + std::exp(-refl[i].reflLogit));
+                    const double r = Sigmoid(refl[i].reflLogit);
                     double gp[4];
                     gp[0] = gradR[i].color[0] * r * (1.0 - r);
                     // Normal: the payload was flip * n / |n|.
@@ -920,7 +923,7 @@ public:
                     const DensifyIn& d = dIn[i];
                     // PRUNE the nearly transparent: they cost a slot in every
                     // tile they touch and contribute nothing.
-                    if (1.0 / (1.0 + std::exp(-d.opacityLogit)) < pruneOpacity) {
+                    if (Sigmoid(d.opacityLogit) < pruneOpacity) {
                         ++pruned;
                         ++prunedFaint;
                         continue;
@@ -1123,7 +1126,7 @@ public:
             for (size_t i = 0; i < n; ++i) {
                 Vec3 nn{refl[i].normal[0], refl[i].normal[1], refl[i].normal[2]};
                 nn = nn.Norm() > 1e-12 ? nn.Normalized() : Vec3{0, 0, 1};
-                cloud->splatRefl[i * 4 + 0] = float(1.0 / (1.0 + std::exp(-refl[i].reflLogit)));
+                cloud->splatRefl[i * 4 + 0] = float(Sigmoid(refl[i].reflLogit));
                 cloud->splatRefl[i * 4 + 1] = float(nn.x);
                 cloud->splatRefl[i * 4 + 2] = float(nn.y);
                 cloud->splatRefl[i * 4 + 3] = float(nn.z);
@@ -1208,7 +1211,7 @@ public:
             std::vector<char> behind(n, 0);
             ParallelFor(n, [&](size_t i) {
                 const SplatParam& p = params[i];
-                if (1.0 / (1.0 + std::exp(-p.opacity)) < 0.2) return;
+                if (Sigmoid(p.opacity) < 0.2) return;
                 const Vec3 X{p.mean[0], p.mean[1], p.mean[2]};
                 int seen = 0, back = 0;
                 for (const View& v : views) {
@@ -1241,7 +1244,7 @@ public:
             double sum = 0.0;
             size_t above = 0;
             for (const ReflParam& r : refl) {
-                const double v = 1.0 / (1.0 + std::exp(-r.reflLogit));
+                const double v = Sigmoid(r.reflLogit);
                 sum += v;
                 above += v > 0.3 ? 1 : 0;
             }

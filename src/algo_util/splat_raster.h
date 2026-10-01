@@ -44,6 +44,7 @@
 #include <vector>
 
 #include "../core/geometry.h"
+#include "../core/math_util.h"
 #include "splat_sh.h"
 
 namespace tglab {

@@ -31,6 +31,7 @@
 
 #include "../../algo_util/features.h"
 #include "../../algo_util/pixel_buffer.h"
+#include "../../algo_util/color.h"
 #include "../../core/algorithm.h"
 #include "gpu_pyramid.h"
 
@@ -215,7 +216,7 @@ public:
                     for (int sx = x0; sx < x1; ++sx) {
                         const float* p = in.At(sx, sy);
                         if (ch >= 3) {
-                            acc += 0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2];
+                            acc += Luma<double>(p[0], p[1], p[2]);
                             // Opponent axes, carried at the same resolution as
                             // the grey plane so Describe can read them with the
                             // same coordinates. See kColourBits.

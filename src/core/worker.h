@@ -193,6 +193,11 @@ public:
     // Convenience for callers that own their sources outright -- tests and
     // one-shot tools. The app uses the shared form, since it re-submits the
     // same sources on every slider tick.
+    // Abandons the run in flight, if any, without starting another: for when
+    // its inputs are about to change (a load into a source it reads) and
+    // the next run will be submitted once they have.
+    void CancelRunning();
+
     uint64_t Submit(Pipeline pipe, std::vector<Data> sources,
                     std::vector<uint64_t> sourceVersions = {}) {
         return Submit(std::move(pipe),

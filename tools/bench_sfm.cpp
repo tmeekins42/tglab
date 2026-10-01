@@ -41,6 +41,7 @@
 #include <vector>
 
 #include "../src/algo_util/features.h"
+#include "../src/algo_util/linalg.h"
 #include "../src/algo_util/splat_raster.h"
 #include "../src/algo_util/splat_reflect.h"
 #include "../src/algo_util/view_graph.h"
@@ -389,7 +390,42 @@ void ReportPlanarity(const PointCloud& pc) {
 // step from the previous camera. A walk around a subject should read as one
 // smooth ring with the heading advancing steadily; a solve that has broken
 // into pieces shows as jumps in the step or the heading.
+// WHERE THE CHAIN IS THIN: for each point in the clip, how many triangulated
+// tracks were seen both before and after it. A sequence that came out as
+// several copies of the subject has a cut that few tracks cross -- the two
+// sides are then free to sit anywhere relative to each other -- and this
+// says where, and how thin.
+static void PrintWeakCuts(const PointCloud& pc) {
+    const int n = int(pc.cameras.size());
+    if (n < 3) return;
+    // Counted twice: every track build_tracks made, and those still
+    // triangulated. A split shows as the second thin where the first is not
+    // -- tracks that crossed it existed, but did not fit the solved poses.
+    for (int pass = 0; pass < 2; ++pass) {
+        std::vector<int> d(size_t(n) + 1, 0);
+        for (const Track& t : pc.tracks) {
+            if ((pass == 1 && !t.hasPoint) || t.obs.empty()) continue;
+            int lo = n, hi = -1;
+            for (const Observation& o : t.obs) { lo = std::min(lo, o.frame); hi = std::max(hi, o.frame); }
+            if (lo < hi && lo >= 0 && hi < n) { ++d[size_t(lo)]; --d[size_t(hi)]; }
+        }
+        std::vector<std::pair<int, int>> cuts;   // (tracks crossing, cut after frame k)
+        int run = 0;
+        for (int k = 0; k + 1 < n; ++k) { run += d[size_t(k)]; cuts.push_back({run, k}); }
+        std::vector<std::pair<int, int>> sorted = cuts;
+        std::sort(sorted.begin(), sorted.end());
+        std::printf("  thinnest cuts, %s tracks (crossing@after frame):",
+                    pass == 0 ? "all" : "triangulated");
+        for (size_t i = 0; i < std::min<size_t>(6, sorted.size()); ++i)
+            std::printf(" %d@%d", sorted[i].first, sorted[i].second);
+        double mean = 0;
+        for (const auto& c : cuts) mean += c.first;
+        std::printf("; mean %.0f\n", mean / double(std::max<size_t>(1, cuts.size())));
+    }
+}
+
 static void PrintCameras(const PointCloud& pc) {
+    PrintWeakCuts(pc);
     Vec3 cm{0, 0, 0};
     int n = 0;
     for (const Camera& c : pc.cameras)
@@ -579,13 +615,96 @@ static void DumpOrbit(const PointCloud& pc, const std::string& prefix) {
     }
 }
 
+// From above: an orthographic view down the axis of the camera path (the
+// least eigenvector of the camera centres' spread -- for a walk-around, the
+// ring's normal). Points grey, the camera path as a trail coloured by frame,
+// red -> green -> blue. Where a walk-around came out as several copies of
+// the subject, this shows how many and which stretch of the clip made each.
+static void DumpTop(const PointCloud& pc, const std::string& prefix) {
+    std::vector<Vec3> cams;
+    std::vector<int> camIdx;
+    for (size_t i = 0; i < pc.cameras.size(); ++i)
+        if (pc.cameras[i].solved) { cams.push_back(pc.cameras[i].Center()); camIdx.push_back(int(i)); }
+    if (cams.size() < 3) return;
+    Vec3 c0{0, 0, 0};
+    for (const Vec3& p : cams) c0 = c0 + p;
+    c0 = c0 * (1.0 / double(cams.size()));
+    double A[9] = {};
+    for (const Vec3& p : cams) {
+        const Vec3 d = p - c0;
+        const double v[3] = {d.x, d.y, d.z};
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 3; ++c) A[r * 3 + c] += v[r] * v[c];
+    }
+    double ev[3];
+    Mat3 V;
+    linalg::SymmetricEigen<3>(A, ev, V.m);
+    const Vec3 e0 = V.Column(2), e1 = V.Column(1);   // the path's plane
+
+    std::vector<Vec3> pts;
+    for (const Track& t : pc.tracks)
+        if (t.hasPoint) pts.push_back(t.point);
+    // Extent: the cameras and the middle 96% of the points.
+    std::vector<double> us, vs;
+    for (const Vec3& p : pts) { us.push_back((p - c0).Dot(e0)); vs.push_back((p - c0).Dot(e1)); }
+    double lo0 = 0, hi0 = 0, lo1 = 0, hi1 = 0;
+    if (!us.empty()) {
+        std::vector<double> a = us, b = vs;
+        std::sort(a.begin(), a.end());
+        std::sort(b.begin(), b.end());
+        lo0 = a[a.size() / 50]; hi0 = a[a.size() - 1 - a.size() / 50];
+        lo1 = b[b.size() / 50]; hi1 = b[b.size() - 1 - b.size() / 50];
+    }
+    for (const Vec3& p : cams) {
+        const double u = (p - c0).Dot(e0), v = (p - c0).Dot(e1);
+        lo0 = std::min(lo0, u); hi0 = std::max(hi0, u);
+        lo1 = std::min(lo1, v); hi1 = std::max(hi1, v);
+    }
+    const int W = 900;
+    const double span = std::max(hi0 - lo0, hi1 - lo1) * 1.05 + 1e-9;
+    const double s = double(W) / span;
+    const double m0 = 0.5 * (lo0 + hi0), m1 = 0.5 * (lo1 + hi1);
+    std::vector<double> rgb(size_t(W) * W * 3, 0.06);
+    auto put = [&](double u, double v, double r, double g, double b, int rad) {
+        const int x = int((u - m0) * s + 0.5 * W), y = int((v - m1) * s + 0.5 * W);
+        for (int dy = -rad; dy <= rad; ++dy)
+            for (int dx = -rad; dx <= rad; ++dx) {
+                const int xx = x + dx, yy = y + dy;
+                if (xx < 0 || yy < 0 || xx >= W || yy >= W) continue;
+                double* q = &rgb[(size_t(yy) * W + size_t(xx)) * 3];
+                q[0] = r; q[1] = g; q[2] = b;
+            }
+    };
+    for (size_t i = 0; i < pts.size(); ++i) put(us[i], vs[i], 0.55, 0.55, 0.55, 0);
+    const int nFrames = int(pc.cameras.size());
+    for (size_t k = 0; k < cams.size(); ++k) {
+        const double t = double(camIdx[k]) / std::max(1, nFrames - 1);
+        const double r = std::max(0.0, 1.0 - 2.0 * t), b = std::max(0.0, 2.0 * t - 1.0);
+        put((cams[k] - c0).Dot(e0), (cams[k] - c0).Dot(e1), r, 1.0 - r - b, b, 3);
+    }
+    Image im;
+    im.Alloc(ImageDesc{W, W, Format::RGBA8});
+    ImageView v = im.MapCpuWrite();
+    for (int y = 0; y < W; ++y)
+        for (int x = 0; x < W; ++x) {
+            uint8_t* q = v.At<uint8_t>(x, y);
+            const double* p = &rgb[(size_t(y) * W + size_t(x)) * 3];
+            for (int ch = 0; ch < 3; ++ch) q[ch] = uint8_t(std::clamp(p[ch], 0.0, 1.0) * 255.0 + 0.5);
+            q[3] = 255;
+        }
+    v = ImageView{};
+    std::string e;
+    SavePng(prefix + "_top.png", im, &e);
+}
+
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
 
     std::vector<std::string> files;
     std::string detector = "detect_akaze";
     int window = 3, maxDim = 1600, rotMethod = 1, posMethod = 0;
-    int videoFrames = 100;   // --video-frames: time slots for a video input
+    int videoFrames = 0;     // --video-frames N: N time slots; default picks by motion
+    double videoStep = 0.0;  // --video-step F: motion step, a fraction of the short side
     bool printCameras = false;   // --cameras: the camera path, per camera
     double fov = 50.0;
     std::string matcher = "match_ann";
@@ -633,6 +752,7 @@ int main(int argc, char** argv) {
         else if (a == "--gpu")                         useGpu = true;
         else if (a == "--cameras")                     printCameras = true;
         else if (a == "--video-frames" && i + 1 < argc) videoFrames = std::atoi(argv[++i]);
+        else if (a == "--video-step" && i + 1 < argc) videoStep = std::atof(argv[++i]);
         else files.push_back(a);
     }
 
@@ -657,7 +777,11 @@ int main(int argc, char** argv) {
     std::vector<Image> videoSet;
     if (files.size() == 1 && IsVideoPath(files[0])) {
         VideoOptions vo;
-        vo.frames = videoFrames;
+        if (videoFrames > 0) {
+            vo.pick = VideoPick::Time;
+            vo.frames = videoFrames;
+        }
+        if (videoStep > 0.0) vo.step = videoStep;
         VideoInfo vi;
         std::string verr;
         const auto tv = std::chrono::steady_clock::now();
@@ -665,10 +789,27 @@ int main(int argc, char** argv) {
             std::printf("%s\n", verr.c_str());
             return 1;
         }
-        std::printf("video: %d frames kept of %d (%.1f s at %.1f fps, %dx%d, "
-                    "rotation %d) in %.0f ms\n",
-                    int(videoSet.size()), vi.decoded, vi.seconds, vi.fps, vi.width,
-                    vi.height, vi.rotation, Ms(tv, std::chrono::steady_clock::now()));
+        std::printf("video: %s in %.0f ms\n", VideoNote(vi, int(videoSet.size())).c_str(),
+                    Ms(tv, std::chrono::steady_clock::now()));
+        // The spacing, when picked by motion: how far apart kept frames are
+        // in time and in view.
+        if (!vi.motion.empty()) {
+            double lo = 1e9, hi = 0.0;
+            for (size_t i = 1; i < vi.times.size(); ++i) {
+                lo = std::min(lo, vi.times[i] - vi.times[i - 1]);
+                hi = std::max(hi, vi.times[i] - vi.times[i - 1]);
+            }
+            std::printf("video: %d by motion, %d on lost tracking, %d by time, halved %d "
+                        "times; gaps %.2f..%.2f s\n",
+                        vi.byMotion, vi.byTracking, vi.byTime, vi.thinned,
+                        vi.times.size() > 1 ? lo : 0.0, hi);
+        }
+        // --video-frames-detail: each kept frame's time, sharpness and motion.
+        if (std::getenv("TGLAB_VIDEO_DETAIL"))
+            for (size_t i = 0; i < vi.times.size(); ++i)
+                std::printf("  frame %3zu  t %6.2f s  sharpness %7.1f  motion %.3f\n", i,
+                            vi.times[i], vi.sharpness[i],
+                            i < vi.motion.size() ? vi.motion[i] : 0.0);
         files.assign(videoSet.size(), files[0]);
     }
 
@@ -856,6 +997,7 @@ int main(int argc, char** argv) {
                     pc && !pc->cameras.empty()) {
                     std::filesystem::create_directories(dumpDir);
                     DumpOrbit(*pc, dumpDir + "/" + vd.name);
+                    DumpTop(*pc, dumpDir + "/" + vd.name);
                 }
             }
             const char* kind = "nothing";

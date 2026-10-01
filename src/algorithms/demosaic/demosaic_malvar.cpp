@@ -217,7 +217,7 @@ public:
         // Assembled once with the shared colour step, so the kernel cannot
         // drift from ApplyColour in clip_repair.h -- which it had, applying the
         // bare matrix where the CPU used the in-gamut solve.
-        static const std::string src = std::string(kClipRepairHlsl) + kBody;
+        static const std::string src = std::string(kDemosaicHlsl) + kBody;
         return src.c_str();
     }
 
@@ -236,15 +236,6 @@ cbuffer Params : register(b0) {
     uint M0, M1, M2, M3, M4, M5, M6, M7, M8;
 };
 
-
-int CfaColor(uint cfa, int x, int y) {
-    int q = (y & 1) * 2 + (x & 1);
-    if (cfa == 1) { int c[4] = {0, 1, 1, 2}; return c[q]; }
-    if (cfa == 2) { int c[4] = {2, 1, 1, 0}; return c[q]; }
-    if (cfa == 3) { int c[4] = {1, 0, 2, 1}; return c[q]; }
-    if (cfa == 4) { int c[4] = {1, 2, 0, 1}; return c[q]; }
-    return 1;
-}
 
 [numthreads(8, 8, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
@@ -345,16 +336,11 @@ void main(uint3 tid : SV_DispatchThreadID) {
 )";
 
     std::vector<uint32_t> GpuConstants(int) const override {
-        auto bits = [](float f) {
-            uint32_t u;
-            std::memcpy(&u, &f, sizeof(u));
-            return u;
-        };
-        std::vector<uint32_t> c{uint32_t(m_cfa), bits(m_black), bits(m_range),
-                                bits(float(m_alpha)), bits(float(m_beta)),
-                                bits(float(m_gamma))};
-        for (int i = 0; i < 3; ++i) c.push_back(bits(m_camMul[i]));
-        for (int i = 0; i < 9; ++i) c.push_back(bits(m_rgbCam[i]));
+        std::vector<uint32_t> c{uint32_t(m_cfa), FloatBits(m_black), FloatBits(m_range),
+                                FloatBits(float(m_alpha)), FloatBits(float(m_beta)),
+                                FloatBits(float(m_gamma))};
+        for (int i = 0; i < 3; ++i) c.push_back(FloatBits(m_camMul[i]));
+        for (int i = 0; i < 9; ++i) c.push_back(FloatBits(m_rgbCam[i]));
         return c;
     }
 

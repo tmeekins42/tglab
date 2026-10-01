@@ -43,8 +43,10 @@
 #include <string>
 #include <vector>
 
+#include "../../algo_util/linalg.h"
 #include "../../algo_util/pixel_buffer.h"
 #include "../../algo_util/transform.h"
+#include "../../algo_util/color.h"
 #include "../../core/algorithm.h"
 
 namespace tglab {
@@ -137,7 +139,7 @@ Plane MakeLuma(const PixelBuffer& pb, float exposure) {
         for (int x = 0; x < p.w; ++x) {
             const float* q = pb.At(x, y);
             const float l = (ch >= 3)
-                ? 0.2126f * q[0] + 0.7152f * q[1] + 0.0722f * q[2]
+                ? Luma(q)
                 : q[0];
             const size_t i = size_t(y) * size_t(p.w) + size_t(x);
             p.v[i] = l * inv;
@@ -291,29 +293,6 @@ std::vector<Point> PickPoints(const Plane& ref, int want) {
             pts.push_back(p);
         }
     return pts;
-}
-
-// Solves a 6x6 symmetric system by Gaussian elimination with partial pivoting.
-// Six unknowns does not justify pulling in a linear algebra library.
-bool Solve6(double A[6][6], double b[6], double x[6]) {
-    for (int i = 0; i < 6; ++i) {
-        int piv = i;
-        for (int r = i + 1; r < 6; ++r)
-            if (std::abs(A[r][i]) > std::abs(A[piv][i])) piv = r;
-        if (std::abs(A[piv][i]) < 1e-12) return false;   // singular
-        if (piv != i) { std::swap(A[piv], A[i]); std::swap(b[piv], b[i]); }
-        for (int r = i + 1; r < 6; ++r) {
-            const double f = A[r][i] / A[i][i];
-            for (int c = i; c < 6; ++c) A[r][c] -= f * A[i][c];
-            b[r] -= f * b[i];
-        }
-    }
-    for (int i = 5; i >= 0; --i) {
-        double s = b[i];
-        for (int c = i + 1; c < 6; ++c) s -= A[i][c] * x[c];
-        x[i] = s / A[i][i];
-    }
-    return true;
 }
 
 class Align : public AlgorithmBase {
@@ -655,7 +634,10 @@ private:
             for (int a = 0; a < 6; ++a) A[a][a] *= 1.0 + kDamping;
 
             double d[6];
-            if (!Solve6(A, b, d)) break;
+            // Pivoted elimination: a direction with no gradient is singular,
+            // not garbage.
+            std::copy(b, b + 6, d);
+            if (!linalg::LuSolve(&A[0][0], d, 6)) break;
 
             // ADD the increment to the current parameters.
             //

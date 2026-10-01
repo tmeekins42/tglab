@@ -26,6 +26,7 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "../src/algo_util/features.h"
@@ -1975,8 +1976,11 @@ int main() {
                               " vs " + std::to_string(transposedDeg) + " deg)");
 
                     // The translation direction, in frame a's coordinates.
+                    // SIGNED: translation averaging cannot see a flipped sign
+                    // -- the mirrored layout satisfies every direction -- but
+                    // anything weighing the directions against rays can.
                     const Vec3 wantDir = (R_a * (C_b - C_a)).Normalized();
-                    const double dot = std::fabs(e.direction.Dot(wantDir));
+                    const double dot = e.direction.Dot(wantDir);
                     Check(dot > 0.99,
                           "the translation direction points from a to b (cos " +
                               std::to_string(dot) + ")");
@@ -4110,6 +4114,34 @@ int main() {
             // still grey, so everything looked like it needed dividing.
             if (ParamBase* p = algo->FindParam("densify"))
                 p->SetFromScript(Value(0.0), &e);
+            // CANCELLATION: a run superseded part way must stop within an
+            // iteration, not finish. 100000 iterations would take minutes
+            // here; cancelled 100 ms in, it has to be back well inside a
+            // second, saying so.
+            {
+                auto longRun = Registry::Get().Create("train_splats");
+                std::string e2;
+                longRun->FindParam("iterations")->SetFromScript(Value(100000.0), &e2);
+                longRun->FindParam("densify")->SetFromScript(Value(0.0), &e2);
+                CancelToken token;
+                longRun->SetGroupCancel(&token);
+                std::thread canceller([&] {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    token.Cancel();
+                });
+                PointCloud c = start;
+                std::string cerr;
+                const auto t0 = std::chrono::steady_clock::now();
+                const bool ran = longRun->RunReconstruct(&frames, &c, &cerr);
+                const double ms = std::chrono::duration<double, std::milli>(
+                                      std::chrono::steady_clock::now() - t0).count();
+                canceller.join();
+                char m[200];
+                std::snprintf(m, sizeof m, "train_splats stops when its run is cancelled "
+                              "(back in %.0f ms: \"%s\")", ms, cerr.c_str());
+                Check(!ran && cerr == "cancelled" && ms < 1000.0, m);
+            }
+
             PointCloud trained = start;
             std::string err;
             const bool ok = algo->RunReconstruct(&frames, &trained, &err);

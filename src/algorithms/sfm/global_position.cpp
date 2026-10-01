@@ -59,6 +59,8 @@
 #include <string>
 #include <vector>
 
+#include "../../algo_util/least_squares.h"
+#include "../../algo_util/linalg.h"
 #include "../../core/algorithm.h"
 
 namespace tglab {
@@ -132,7 +134,7 @@ double RefineAngular(const std::vector<Ray>& rays, const std::vector<bool>& solv
         return s;
     };
 
-    double lambda = 1e-3;
+    LmDamping damp{1e-3, 5.0, 1.0 / 3.0, 1e-6, 1e8};
     double cur = cost(*camPos, *pts);
     std::vector<double> S, rhs;
     S.resize(size_t(n3) * size_t(n3));
@@ -159,7 +161,7 @@ double RefineAngular(const std::vector<Ray>& rays, const std::vector<bool>& solv
                 const Vec3 u = d * (1.0 / L);
                 const Vec3 res = u - r.dir;
                 const double e = res.Norm();
-                const double w = e <= huber ? 1.0 : huber / e;
+                const double w = RobustWeight(RobustLoss::Huber, e, huber);
                 // du/dX = A = (I - u u^T) / L, symmetric; du/dc = -A.
                 double A[9];
                 const double uu[3] = {u.x, u.y, u.z};
@@ -209,13 +211,13 @@ double RefineAngular(const std::vector<Ray>& rays, const std::vector<bool>& solv
             return true;
         };
         for (int a = 0; a < n3; ++a)
-            S[size_t(a) * size_t(n3) + size_t(a)] *= (1.0 + lambda);
+            S[size_t(a) * size_t(n3) + size_t(a)] *= (1.0 + damp.lambda);
         for (int a = 0; a < n3; ++a) S[size_t(a) * size_t(n3) + size_t(a)] += 1e-12;
         for (int t = 0; t < nTrk; ++t) {
             PointSys& P = psys[size_t(t)];
             double Hd[9];
             std::copy(P.H, P.H + 9, Hd);
-            for (int a = 0; a < 3; ++a) Hd[a * 4] = Hd[a * 4] * (1.0 + lambda) + 1e-12;
+            for (int a = 0; a < 3; ++a) Hd[a * 4] = Hd[a * 4] * (1.0 + damp.lambda) + 1e-12;
             double* Hi = &Hinv[size_t(t) * 9];
             if (!inv3(Hd, Hi)) { std::fill(Hi, Hi + 9, 0.0); continue; }
             // H_ct = -AA per ray (d/dc = -A, d/dX = A). With -g_X = -P.g:
@@ -256,37 +258,9 @@ double RefineAngular(const std::vector<Ray>& rays, const std::vector<bool>& solv
             }
         }
 
-        // Dense Cholesky, in place in a copy.
-        std::vector<double> Lm = S;
-        bool ok = true;
-        for (int j = 0; j < n3 && ok; ++j) {
-            double s = Lm[size_t(j) * size_t(n3) + size_t(j)];
-            for (int k = 0; k < j; ++k) s -= Lm[size_t(j) * size_t(n3) + size_t(k)] *
-                                             Lm[size_t(j) * size_t(n3) + size_t(k)];
-            if (s <= 0.0) { ok = false; break; }
-            const double d = std::sqrt(s);
-            Lm[size_t(j) * size_t(n3) + size_t(j)] = d;
-            for (int i = j + 1; i < n3; ++i) {
-                double v = Lm[size_t(i) * size_t(n3) + size_t(j)];
-                for (int k = 0; k < j; ++k) v -= Lm[size_t(i) * size_t(n3) + size_t(k)] *
-                                                 Lm[size_t(j) * size_t(n3) + size_t(k)];
-                Lm[size_t(i) * size_t(n3) + size_t(j)] = v / d;
-            }
-        }
-        if (!ok) { lambda *= 10.0; continue; }
-        std::vector<double> y, dc;
-        y.resize(size_t(n3));
-        dc.resize(size_t(n3));
-        for (int i = 0; i < n3; ++i) {
-            double v = rhs[size_t(i)];
-            for (int k = 0; k < i; ++k) v -= Lm[size_t(i) * size_t(n3) + size_t(k)] * y[size_t(k)];
-            y[size_t(i)] = v / Lm[size_t(i) * size_t(n3) + size_t(i)];
-        }
-        for (int i = n3 - 1; i >= 0; --i) {
-            double v = y[size_t(i)];
-            for (int k = i + 1; k < n3; ++k) v -= Lm[size_t(k) * size_t(n3) + size_t(i)] * dc[size_t(k)];
-            dc[size_t(i)] = v / Lm[size_t(i) * size_t(n3) + size_t(i)];
-        }
+        // The reduced camera system is SPD once damped: Cholesky, on copies.
+        std::vector<double> Lm = S, dc = rhs;
+        if (!linalg::CholeskySolve(Lm.data(), dc.data(), n3)) { damp.FailSingular(); continue; }
 
         // Candidate: cameras moved, then each point from its own block:
         // dX = Hi (-g_X - H_tc dc) = Hi (-g_X + sum Ai dc_i).
@@ -317,11 +291,10 @@ double RefineAngular(const std::vector<Ray>& rays, const std::vector<bool>& solv
             *pts = std::move(np);
             const bool tiny = cur - next < 1e-9 * cur;
             cur = next;
-            lambda = std::max(1e-6, lambda / 3.0);
+            damp.Succeed();
             if (tiny) break;
-        } else {
-            lambda *= 5.0;
-            if (lambda > 1e8) break;
+        } else if (!damp.Fail()) {
+            break;
         }
     }
     return cur;
@@ -642,6 +615,15 @@ bool GlobalPosition::SolveJoint(PointCloud* cloud, std::string* err) {
         // steps has no such bias: for video, where frames are evenly spaced
         // in time, it is close to the truth, and for photographs it is at
         // least a start with one scale throughout.
+        //
+        // For a long while it was built from directions relative_pose stored
+        // REVERSED, so it was a mirror image -- every camera behind its
+        // points -- and lost to the alternating start every time. Measured on
+        // a hand-held video of a chrome tape measure, where 107 tracks crossed
+        // one quick turn: the alternating start gave each side its own scale,
+        // and the reconstruction came back as two copies of the subject. From
+        // the corrected chain it is one orbit, with 39 tracks triangulated
+        // across the turn instead of none.
         std::vector<Vec3> chainCam = camPos, chainPt = pt;
         bool chainOk = false;
         {
@@ -828,6 +810,7 @@ bool GlobalPosition::SolveAveraging(PointCloud* cloud, std::string* err) {
     for (Vec3& p : pos) p = Vec3{uni(rng), uni(rng), uni(rng)};
 
     for (int it = 0; it < int(m_iterations); ++it) {
+        if (GroupCancelled()) { *err = "cancelled"; return false; }   // see SetGroupCancel
         std::vector<Vec3>   acc;
         acc.resize(size_t(nCam));
         std::vector<double> wsum(size_t(nCam), 0.0);

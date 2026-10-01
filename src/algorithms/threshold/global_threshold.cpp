@@ -89,7 +89,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     if (tid.x >= Width || tid.y >= Height) return;
     float level = asfloat(LevelBits);
     float4 c = Src[tid.xy];
-    float luma = dot(c.rgb, float3(0.299, 0.587, 0.114)) * 255.0;
+    float luma = Luma(c.rgb) * 255.0;
     bool above = luma > level;
     if (Invert != 0) above = !above;
     Dst[tid.xy] = above ? 1.0 : 0.0;

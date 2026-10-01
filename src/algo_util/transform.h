@@ -17,6 +17,7 @@
 
 #include "../core/image.h"
 #include "../core/sidecar.h"
+#include "color.h"
 #include "pixel_buffer.h"
 
 namespace tglab {
@@ -262,7 +263,7 @@ inline float SampleLuma(const PixelBuffer& src, float x, float y) {
     float px[4] = {0, 0, 0, 0};
     SampleBilinear(src, x, y, px);
     return (src.Channels() >= 3)
-        ? 0.2126f * px[0] + 0.7152f * px[1] + 0.0722f * px[2]
+        ? Luma(px)
         : px[0];
 }
 

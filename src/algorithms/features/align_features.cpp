@@ -41,6 +41,7 @@
 #include <vector>
 
 #include "../../algo_util/features.h"
+#include "../../algo_util/linalg.h"
 #include "../../algo_util/transform.h"
 #include "../../core/algorithm.h"
 
@@ -51,43 +52,6 @@ struct Pair {
     float ax, ay;   // in the reference
     float bx, by;   // in this frame
 };
-
-// Solves a small dense linear system by Gaussian elimination with partial
-// pivoting. n is at most 8 here, so the O(n^3) is nothing.
-//
-// Partial pivoting rather than plain elimination: a sample of four nearly
-// collinear points produces a near-singular system, and without pivoting the
-// division by a tiny leading element turns that into garbage rather than into
-// the "singular, reject this sample" that the caller can handle.
-bool SolveDense(std::vector<double>& a, std::vector<double>& b, int n) {
-    for (int col = 0; col < n; ++col) {
-        int piv = col;
-        for (int r = col + 1; r < n; ++r)
-            if (std::abs(a[size_t(r * n + col)]) > std::abs(a[size_t(piv * n + col)]))
-                piv = r;
-        if (std::abs(a[size_t(piv * n + col)]) < 1e-12) return false;
-
-        if (piv != col) {
-            for (int c = 0; c < n; ++c)
-                std::swap(a[size_t(col * n + c)], a[size_t(piv * n + c)]);
-            std::swap(b[size_t(col)], b[size_t(piv)]);
-        }
-
-        const double d = a[size_t(col * n + col)];
-        for (int r = col + 1; r < n; ++r) {
-            const double f = a[size_t(r * n + col)] / d;
-            if (f == 0.0) continue;
-            for (int c = col; c < n; ++c) a[size_t(r * n + c)] -= f * a[size_t(col * n + c)];
-            b[size_t(r)] -= f * b[size_t(col)];
-        }
-    }
-    for (int r = n - 1; r >= 0; --r) {
-        double s = b[size_t(r)];
-        for (int c = r + 1; c < n; ++c) s -= a[size_t(r * n + c)] * b[size_t(c)];
-        b[size_t(r)] = s / a[size_t(r * n + r)];
-    }
-    return true;
-}
 
 // Hartley normalisation: centre the points and scale them to mean distance
 // sqrt(2) from the origin.
@@ -177,7 +141,7 @@ bool SolveSimilarity(const std::vector<Pair>& p, const std::vector<int>& idx,
                 B[size_t(j)] += r[e][j] * t[e];
             }
     }
-    if (!SolveDense(A, B, 4)) return false;
+    if (!linalg::LuSolve(A.data(), B.data(), 4)) return false;
 
     Affine o;
     o.m[0] = float(B[0]); o.m[1] = float(-B[1]); o.m[2] = float(B[2]);
@@ -202,8 +166,8 @@ bool SolveAffine(const std::vector<Pair>& p, const std::vector<int>& idx, Affine
         }
     }
     std::vector<double> A2 = A;
-    if (!SolveDense(A, Bx, 3)) return false;
-    if (!SolveDense(A2, By, 3)) return false;
+    if (!linalg::LuSolve(A.data(), Bx.data(), 3)) return false;
+    if (!linalg::LuSolve(A2.data(), By.data(), 3)) return false;
 
     Affine o;
     o.m[0] = float(Bx[0]); o.m[1] = float(Bx[1]); o.m[2] = float(Bx[2]);
@@ -242,7 +206,7 @@ bool SolveHomography(const std::vector<Pair>& p, const std::vector<int>& idx,
             B[size_t(j)] += r1[j] * u + r2[j] * v;
         }
     }
-    if (!SolveDense(A, B, 8)) return false;
+    if (!linalg::LuSolve(A.data(), B.data(), 8)) return false;
 
     Affine o;
     for (int i = 0; i < 8; ++i) o.m[i] = float(B[size_t(i)]);

@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "../algo_util/color.h"
 #include "device.h"
 
 namespace tglab {
@@ -756,7 +757,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     uint x = tid.x * Step, y = tid.y * Step;
     if (x >= Width || y >= Height) return;
     float4 t = Src[int2(x, y)];
-    float  l = (IsSingle != 0) ? t.x : dot(t.rgb, float3(0.299, 0.587, 0.114));
+    float  l = (IsSingle != 0) ? t.x : Luma(t.rgb);
     uint k = FloatKey(l), prev;
     InterlockedMin(Range[int2(0, 0)], k, prev);
     InterlockedMax(Range[int2(1, 0)], k, prev);
@@ -799,7 +800,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     float span = max(hi - lo, 1e-12);
 
     float4 t = Src[int2(x, y)];
-    float  l = (IsSingle != 0) ? t.x : dot(t.rgb, float3(0.299, 0.587, 0.114));
+    float  l = (IsSingle != 0) ? t.x : Luma(t.rgb);
 
     uint prev;
     if (IsSingle == 0) {

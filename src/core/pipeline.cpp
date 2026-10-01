@@ -18,6 +18,7 @@
 
 #include <filesystem>
 
+#include "../algo_util/color.h"
 #include "../gpu/compute.h"
 #include "../gpu/gpu_image.h"
 
@@ -1802,6 +1803,7 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
             // exists so a result can be compared against the CPU path, and a
             // reconstruct stage reaching past it would defeat that.
             s.algo->SetGroupGpu(mode == ExecMode::ForceCPU ? nullptr : gpu);
+            s.algo->SetGroupCancel(cancel);
 
             // A THIRD INPUT, a second group beside the frames, for a stage
             // that declares one: train_splats(splats, frames, depth). Null
@@ -1836,7 +1838,9 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
             if (wantsImages) {
                 dense.shape = cloud.shape;
                 std::string derr;
-                if (!s.algo->RunDense(frames, cloud, &dense, &derr)) {
+                const bool ok = s.algo->RunDense(frames, cloud, &dense, &derr);
+                if (cancel && cancel->Cancelled()) { *err = kCancelled; return false; }
+                if (!ok) {
                     *err = "line " + std::to_string(s.line) + ": " + derr;
                     return false;
                 }
@@ -1847,8 +1851,12 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
                 continue;
             }
 
+            // Superseded part way: discarded whatever it returned (see
+            // SetGroupCancel).
             std::string rerr;
-            if (!s.algo->RunReconstruct(frames, &cloud, &rerr)) {
+            const bool ok = s.algo->RunReconstruct(frames, &cloud, &rerr);
+            if (cancel && cancel->Cancelled()) { *err = kCancelled; return false; }
+            if (!ok) {
                 *err = "line " + std::to_string(s.line) + ": " + rerr;
                 return false;
             }
@@ -1872,9 +1880,12 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
             for (const Image& im : src->images) out.images.push_back(im.Clone());
 
             s.algo->SetGroupGpu(mode == ExecMode::ForceCPU ? nullptr : gpu);
+            s.algo->SetGroupCancel(cancel);
 
             std::string aerr;
-            if (!s.algo->RunAlign(&out.images, &aerr)) {
+            const bool ok = s.algo->RunAlign(&out.images, &aerr);
+            if (cancel && cancel->Cancelled()) { *err = kCancelled; return false; }
+            if (!ok) {
                 *err = "line " + std::to_string(s.line) + ": " + aerr;
                 return false;
             }
@@ -2115,6 +2126,14 @@ bool Pipeline::RunStageGpu(Stage& s, const std::vector<const Data*>& in,
 
     // Kernels are compiled once per stage and cached on the stage, so dragging
     // a slider does not recompile HLSL every frame.
+    //
+    // Every algorithm's HLSL gets the shared colour functions (color.h's
+    // kColorHlsl) ahead of it, so a kernel calls Luma() like C++ code does,
+    // and `#line 1` after them so compile errors still name the algorithm's
+    // own lines.
+    auto withPrelude = [](const char* src) {
+        return std::string(kColorHlsl) + "\n#line 1\n" + src;
+    };
     const std::vector<AlgorithmBase::GpuPass> passes = s.algo->GpuPasses();
 
     if (!passes.empty()) {
@@ -2124,7 +2143,8 @@ bool Pipeline::RunStageGpu(Stage& s, const std::vector<const Data*>& in,
                 auto k = std::make_shared<ComputeKernel>();
                 std::string compileErr;
                 const std::string label = s.algoName + "." + p.name;
-                if (!gpu->CreateKernel(p.source, "main", label, k.get(), &compileErr)) {
+                if (!gpu->CreateKernel(withPrelude(p.source), "main", label, k.get(),
+                                       &compileErr)) {
                     s.passKernels.clear();
                     *err = compileErr;
                     return false;
@@ -2135,7 +2155,7 @@ bool Pipeline::RunStageGpu(Stage& s, const std::vector<const Data*>& in,
     } else if (!s.kernel) {
         s.kernel = std::make_shared<ComputeKernel>();
         std::string compileErr;
-        if (!gpu->CreateKernel(s.algo->GpuSource(), "main", s.algoName,
+        if (!gpu->CreateKernel(withPrelude(s.algo->GpuSource()), "main", s.algoName,
                                s.kernel.get(), &compileErr)) {
             s.kernel.reset();
             *err = compileErr;

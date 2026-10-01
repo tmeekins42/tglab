@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cstring>
 
+#include "clip_repair.h"
 #include "../../algo_util/pixel_buffer.h"
 #include "../../core/algorithm.h"
 
@@ -81,7 +82,11 @@ public:
     bool HasGPU() const override { return true; }
 
     const char* GpuSource() const override {
-        return R"(
+        static const std::string src = std::string(kDemosaicHlsl) + kBody;
+        return src.c_str();
+    }
+
+    static constexpr const char* kBody = R"(
 // The mosaic is single-channel R32F, so only .x carries a sample.
 Texture2D<float4>   Src : register(t0);
 RWTexture2D<float4> Dst : register(u0);
@@ -94,16 +99,6 @@ cbuffer Params : register(b0) {
     uint BlackBits;
     uint RangeBits;
 };
-
-// Which colour a sample carries, as an RGB index. Mirrors CfaColorAt().
-int CfaColor(uint cfa, int x, int y) {
-    int q = (y & 1) * 2 + (x & 1);   // 0=TL 1=TR 2=BL 3=BR
-    if (cfa == 1) { int c[4] = {0, 1, 1, 2}; return c[q]; }   // RGGB
-    if (cfa == 2) { int c[4] = {2, 1, 1, 0}; return c[q]; }   // BGGR
-    if (cfa == 3) { int c[4] = {1, 0, 2, 1}; return c[q]; }   // GRBG
-    if (cfa == 4) { int c[4] = {1, 2, 0, 1}; return c[q]; }   // GBRG
-    return 1;
-}
 
 [numthreads(8, 8, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
@@ -123,7 +118,6 @@ void main(uint3 tid : SV_DispatchThreadID) {
     Dst[tid.xy] = float4(rgb, 1.0);
 }
 )";
-    }
 
     void PrepareGpu(const std::vector<ImageDesc>& inputs) override {
         if (inputs.empty()) return;
@@ -134,7 +128,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
 
     std::vector<uint32_t> GpuConstants(int) const override {
         return {uint32_t(m_cfa), uint32_t(m_colour ? 1 : 0),
-                Bits(m_black), Bits(m_range)};
+                FloatBits(m_black), FloatBits(m_range)};
     }
 
 private:
@@ -144,12 +138,6 @@ private:
     int   m_cfa   = 0;
     float m_black = 0.0f;
     float m_range = 1.0f;
-
-    static uint32_t Bits(float f) {
-        uint32_t u;
-        std::memcpy(&u, &f, sizeof(u));
-        return u;
-    }
 
     void WriteHalf(ImageView& dst, int w, int h) const {
         for (int y = 0; y < h; ++y)

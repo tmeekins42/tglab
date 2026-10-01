@@ -131,6 +131,11 @@ uint64_t PipelineWorker::Submit(Pipeline pipe, std::shared_ptr<std::vector<Data>
     return seq;
 }
 
+void PipelineWorker::CancelRunning() {
+    std::lock_guard<std::mutex> lock(m_mtx);
+    if (m_running) m_running->Cancel();
+}
+
 uint64_t PipelineWorker::SubmitCompare(Pipeline pipe, std::shared_ptr<std::vector<Data>> sources,
                                        int stageIndex) {
     uint64_t seq;

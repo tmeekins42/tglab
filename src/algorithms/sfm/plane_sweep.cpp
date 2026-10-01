@@ -84,6 +84,7 @@
 #include <memory>
 
 #include "../../algo_util/view_graph.h"
+#include "../../algo_util/color.h"
 #include "../../core/algorithm.h"
 #include "../../core/parallel.h"
 #include "../features/gpu_pyramid.h"
@@ -207,7 +208,7 @@ Plane ToLuma(const Image& img) {
                 default: break;
             }
             p.v[size_t(y) * size_t(p.w) + size_t(x)] =
-                0.2126f * rgb[0] + 0.7152f * rgb[1] + 0.0722f * rgb[2];
+                Luma(rgb);
         }
     }
     return p;
@@ -447,6 +448,7 @@ public:
                               maxNb <= 4;
         if (gpuAvail) {
             for (int f = 0; f < nFrames; ++f) {
+                if (GroupCancelled()) { *err = "cancelled"; return false; }   // see SetGroupCancel
                 if (SweepFrame(f, cloud, images, planes, nPlanes, radius,
                                maxNb, minCorr, zNear, zFar, out,
                                &perMeasured[size_t(f)], &perTotal[size_t(f)],
@@ -462,6 +464,7 @@ public:
         for (int f = 0; f < nFrames; ++f)
             if (!done[size_t(f)]) rest.push_back(f);
         ParallelFor(int(rest.size()), [&](int i) {
+            if (GroupCancelled()) return;   // superseded: see SetGroupCancel
             const int f = rest[size_t(i)];
             SweepFrame(f, cloud, images, planes, nPlanes, radius, maxNb,
                        minCorr, zNear, zFar, out, &perMeasured[size_t(f)],

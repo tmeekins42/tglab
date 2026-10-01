@@ -143,8 +143,11 @@ public:
             s = add("bundle_adjust_sfm", s, {{"max_distance", dist}});
             if (s < 0) { *err = "solve_cameras: a stage it runs is not registered"; return false; }
 
+            // The inner chain is cancelled with this run (SetGroupCancel).
             std::string e;
-            if (!p.Execute(&src, nullptr, &e)) {
+            if (!p.Execute(&src, nullptr, &e, nullptr, ExecMode::Auto, nullptr,
+                           GroupCancelToken())) {
+                if (GroupCancelled()) { *err = "cancelled"; return false; }
                 lastErr = e;
                 break;
             }

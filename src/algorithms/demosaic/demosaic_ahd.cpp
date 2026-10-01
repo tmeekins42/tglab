@@ -149,15 +149,6 @@ cbuffer Params : register(b0) {
 };
 
 
-int CfaColor(uint cfa, int x, int y) {
-    int q = (y & 1) * 2 + (x & 1);
-    if (cfa == 1) { int c[4] = {0, 1, 1, 2}; return c[q]; }
-    if (cfa == 2) { int c[4] = {2, 1, 1, 0}; return c[q]; }
-    if (cfa == 3) { int c[4] = {1, 0, 2, 1}; return c[q]; }
-    if (cfa == 4) { int c[4] = {1, 2, 0, 1}; return c[q]; }
-    return 1;
-}
-
 int2 ClampXY(int x, int y) {
     return clamp(int2(x, y), int2(0, 0), int2(Width - 1, Height - 1));
 }
@@ -863,10 +854,10 @@ private:
         // The sources are assembled once, on first use, because GpuPasses()
         // returns raw pointers and is called per run -- building the strings
         // each time would dangle them the moment the vector went out of scope.
-        static const std::string green   = std::string(kAhdCommon) + kClipRepairHlsl + kGreenHlsl;
-        static const std::string diff    = std::string(kAhdCommon) + kClipRepairHlsl + kDiffHlsl;
-        static const std::string median  = std::string(kAhdCommon) + kClipRepairHlsl + kMedianHlsl;
-        static const std::string combine = std::string(kAhdCommon) + kClipRepairHlsl + kCombineHlsl;
+        static const std::string green   = std::string(kDemosaicHlsl) + kAhdCommon + kGreenHlsl;
+        static const std::string diff    = std::string(kDemosaicHlsl) + kAhdCommon + kDiffHlsl;
+        static const std::string median  = std::string(kDemosaicHlsl) + kAhdCommon + kMedianHlsl;
+        static const std::string combine = std::string(kDemosaicHlsl) + kAhdCommon + kCombineHlsl;
 
         std::vector<GpuPass> p;
         // t0 is always the mosaic, because kAhdCommon's Sample() reads it.
@@ -902,14 +893,9 @@ private:
     }
 
     std::vector<uint32_t> GpuPassConstants(int) const override {
-        auto bits = [](float f) {
-            uint32_t u;
-            std::memcpy(&u, &f, sizeof(u));
-            return u;
-        };
-        std::vector<uint32_t> c{uint32_t(m_cfa), bits(m_black), bits(m_range)};
-        for (int i = 0; i < 3; ++i) c.push_back(bits(m_camMul[i]));
-        for (int i = 0; i < 9; ++i) c.push_back(bits(m_rgbCam[i]));
+        std::vector<uint32_t> c{uint32_t(m_cfa), FloatBits(m_black), FloatBits(m_range)};
+        for (int i = 0; i < 3; ++i) c.push_back(FloatBits(m_camMul[i]));
+        for (int i = 0; i < 9; ++i) c.push_back(FloatBits(m_rgbCam[i]));
         return c;
     }
 

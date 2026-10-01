@@ -1,9 +1,9 @@
 // 3D geometry: the types every Structure-from-Motion stage passes around.
 //
-// Small and concrete rather than a linear algebra library. Eigen arrives with
-// the bundle adjuster and is the right tool for a solve; it is the wrong tool
-// for a struct that crosses a port boundary, where a plain aggregate keeps the
-// data inspectable and the headers cheap.
+// Small and concrete rather than a linear algebra library: a struct that
+// crosses a port boundary is best a plain aggregate, inspectable and cheap to
+// include. The solvers -- eigen-decomposition, Cholesky, elimination -- are in
+// algo_util/linalg.h.
 //
 // CONVENTIONS, stated once because every sign error in a reconstruction traces
 // back to one of them being assumed rather than read:
@@ -82,14 +82,38 @@ struct Mat3 {
         return r;
     }
 
-    // For a ROTATION the transpose is the inverse, which is the only use this
-    // has here -- named Transpose rather than Inverse so a caller who hands it
-    // a non-rotation does not get a wrong answer under a reassuring name.
+    // For a ROTATION the transpose is the inverse -- the common case, and why
+    // it has its own name: Inverse() below is for everything else.
     Mat3 Transpose() const {
         Mat3 r;
         for (int i = 0; i < 3; ++i)
             for (int j = 0; j < 3; ++j) r.At(i, j) = At(j, i);
         return r;
+    }
+
+    Vec3 Column(int c) const { return {m[c], m[3 + c], m[6 + c]}; }
+
+    double Det() const {
+        return m[0] * (m[4] * m[8] - m[5] * m[7]) - m[1] * (m[3] * m[8] - m[5] * m[6]) +
+               m[2] * (m[3] * m[7] - m[4] * m[6]);
+    }
+
+    // The general inverse, by the adjugate. False, leaving *out alone, when
+    // |det| is under `tiny` -- singular for the caller's purposes.
+    bool Inverse(Mat3* out, double tiny = 1e-14) const {
+        const double d = Det();
+        if (!(std::fabs(d) >= tiny)) return false;
+        Mat3& r = *out;
+        r.m[0] = (m[4] * m[8] - m[5] * m[7]) / d;
+        r.m[1] = (m[2] * m[7] - m[1] * m[8]) / d;
+        r.m[2] = (m[1] * m[5] - m[2] * m[4]) / d;
+        r.m[3] = (m[5] * m[6] - m[3] * m[8]) / d;
+        r.m[4] = (m[0] * m[8] - m[2] * m[6]) / d;
+        r.m[5] = (m[2] * m[3] - m[0] * m[5]) / d;
+        r.m[6] = (m[3] * m[7] - m[4] * m[6]) / d;
+        r.m[7] = (m[1] * m[6] - m[0] * m[7]) / d;
+        r.m[8] = (m[0] * m[4] - m[1] * m[3]) / d;
+        return true;
     }
 
     // Angle of the rotation taking `this` to `other`, in radians.
@@ -159,31 +183,16 @@ inline Vec3 MatToAxisAngle(const Mat3& R) {
 //
 // Implemented by iterating M <- (M + M^-T) / 2, which converges to the
 // orthogonal polar factor. Chosen over an SVD because it is twenty lines
-// instead of two hundred, converges in a handful of iterations for a matrix
-// already near a rotation (which is the only case here), and needs no
-// dependency. A full SVD arrives with Eigen in Phase 4 if a harder case turns
-// up.
+// instead of two hundred, and converges in a handful of iterations for a
+// matrix already near a rotation (which is the only case here).
 inline Mat3 NearestRotation(const Mat3& M) {
     Mat3 X = M;
     for (int it = 0; it < 24; ++it) {
-        // Inverse transpose via the adjugate; for a near-rotation the
-        // determinant is near 1, so this is well conditioned.
-        const double d =
-            X.m[0] * (X.m[4] * X.m[8] - X.m[5] * X.m[7]) -
-            X.m[1] * (X.m[3] * X.m[8] - X.m[5] * X.m[6]) +
-            X.m[2] * (X.m[3] * X.m[7] - X.m[4] * X.m[6]);
-        if (std::fabs(d) < 1e-12) break;   // degenerate; leave it as it is
-
-        Mat3 invT;
-        invT.m[0] = (X.m[4] * X.m[8] - X.m[5] * X.m[7]) / d;
-        invT.m[1] = (X.m[5] * X.m[6] - X.m[3] * X.m[8]) / d;
-        invT.m[2] = (X.m[3] * X.m[7] - X.m[4] * X.m[6]) / d;
-        invT.m[3] = (X.m[2] * X.m[7] - X.m[1] * X.m[8]) / d;
-        invT.m[4] = (X.m[0] * X.m[8] - X.m[2] * X.m[6]) / d;
-        invT.m[5] = (X.m[1] * X.m[6] - X.m[0] * X.m[7]) / d;
-        invT.m[6] = (X.m[1] * X.m[5] - X.m[2] * X.m[4]) / d;
-        invT.m[7] = (X.m[2] * X.m[3] - X.m[0] * X.m[5]) / d;
-        invT.m[8] = (X.m[0] * X.m[4] - X.m[1] * X.m[3]) / d;
+        // For a near-rotation the determinant is near 1, so the inverse is
+        // well conditioned.
+        Mat3 inv;
+        if (!X.Inverse(&inv, 1e-12)) break;   // degenerate; leave it as it is
+        const Mat3 invT = inv.Transpose();
 
         double delta = 0.0;
         Mat3 next;
@@ -195,6 +204,53 @@ inline Mat3 NearestRotation(const Mat3& M) {
         if (delta < 1e-14) break;
     }
     return X;
+}
+
+// Unit quaternion (w x y z) to a rotation matrix, and back.
+inline Mat3 QuatToMat(const double q[4]) {
+    const double w = q[0], x = q[1], y = q[2], z = q[3];
+    Mat3 R;
+    R.m[0] = 1 - 2 * (y * y + z * z); R.m[1] = 2 * (x * y - w * z);     R.m[2] = 2 * (x * z + w * y);
+    R.m[3] = 2 * (x * y + w * z);     R.m[4] = 1 - 2 * (x * x + z * z); R.m[5] = 2 * (y * z - w * x);
+    R.m[6] = 2 * (x * z - w * y);     R.m[7] = 2 * (y * z + w * x);     R.m[8] = 1 - 2 * (x * x + y * y);
+    return R;
+}
+
+// Shepperd's method: pick the largest of the four candidates so the square
+// root is never taken of something near zero. R must be a rotation -- a
+// reflection has no quaternion.
+inline void MatToQuat(const Mat3& R, double q[4]) {
+    const double* r = R.m;
+    const double tr = r[0] + r[4] + r[8];
+    if (tr > 0.0) {
+        const double s = std::sqrt(tr + 1.0) * 2.0;
+        q[0] = 0.25 * s;
+        q[1] = (r[7] - r[5]) / s;
+        q[2] = (r[2] - r[6]) / s;
+        q[3] = (r[3] - r[1]) / s;
+    } else if (r[0] > r[4] && r[0] > r[8]) {
+        const double s = std::sqrt(1.0 + r[0] - r[4] - r[8]) * 2.0;
+        q[0] = (r[7] - r[5]) / s;
+        q[1] = 0.25 * s;
+        q[2] = (r[1] + r[3]) / s;
+        q[3] = (r[2] + r[6]) / s;
+    } else if (r[4] > r[8]) {
+        const double s = std::sqrt(1.0 + r[4] - r[0] - r[8]) * 2.0;
+        q[0] = (r[2] - r[6]) / s;
+        q[1] = (r[1] + r[3]) / s;
+        q[2] = 0.25 * s;
+        q[3] = (r[5] + r[7]) / s;
+    } else {
+        const double s = std::sqrt(1.0 + r[8] - r[0] - r[4]) * 2.0;
+        q[0] = (r[3] - r[1]) / s;
+        q[1] = (r[2] + r[6]) / s;
+        q[2] = (r[5] + r[7]) / s;
+        q[3] = 0.25 * s;
+    }
+    // Unit length, against a matrix a hair off orthonormal.
+    const double n = std::sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+    if (n > 0.0)
+        for (int i = 0; i < 4; ++i) q[i] /= n;
 }
 
 // A camera: where it is, and how it projects.
@@ -311,14 +367,7 @@ struct Splat {
 
     // The rotation as a matrix: columns are the Gaussian's local axes in world
     // space, so column 2 is the normal of a flattened splat.
-    Mat3 Rotation() const {
-        const double w = rot[0], x = rot[1], y = rot[2], z = rot[3];
-        Mat3 R;
-        R.m[0] = 1 - 2 * (y * y + z * z); R.m[1] = 2 * (x * y - w * z);     R.m[2] = 2 * (x * z + w * y);
-        R.m[3] = 2 * (x * y + w * z);     R.m[4] = 1 - 2 * (x * x + z * z); R.m[5] = 2 * (y * z - w * x);
-        R.m[6] = 2 * (x * z - w * y);     R.m[7] = 2 * (y * z + w * x);     R.m[8] = 1 - 2 * (x * x + y * y);
-        return R;
-    }
+    Mat3 Rotation() const { return QuatToMat(rot); }
 
     // Sigma = R S S^T R^T, as the six unique entries xx xy xz yy yz zz.
     void Covariance(double c[6]) const {

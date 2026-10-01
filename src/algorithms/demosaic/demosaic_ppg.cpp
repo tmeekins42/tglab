@@ -243,9 +243,9 @@ public:
         // Assembled once: GpuPasses returns raw pointers and is called per run,
         // so rebuilding the strings each time would dangle them.
         static const std::string grn =
-            std::string(kCommon) + kClipRepairHlsl + kGreenHlsl;
+            std::string(kDemosaicHlsl) + kCommon + kGreenHlsl;
         static const std::string col =
-            std::string(kCommon) + kClipRepairHlsl + kColourHlsl;
+            std::string(kDemosaicHlsl) + kCommon + kColourHlsl;
 
         std::vector<GpuPass> p;
         // t0 is the mosaic throughout, because kCommon's Sample() reads it.
@@ -255,10 +255,9 @@ public:
     }
 
     std::vector<uint32_t> GpuPassConstants(int) const override {
-        auto bits = [](float f) { uint32_t u; std::memcpy(&u, &f, sizeof u); return u; };
-        std::vector<uint32_t> c{uint32_t(m_cfa), bits(m_black), bits(m_range)};
-        for (int i = 0; i < 3; ++i) c.push_back(bits(m_camMul[i]));
-        for (int i = 0; i < 9; ++i) c.push_back(bits(m_rgbCam[i]));
+        std::vector<uint32_t> c{uint32_t(m_cfa), FloatBits(m_black), FloatBits(m_range)};
+        for (int i = 0; i < 3; ++i) c.push_back(FloatBits(m_camMul[i]));
+        for (int i = 0; i < 9; ++i) c.push_back(FloatBits(m_rgbCam[i]));
         return c;
     }
 
@@ -292,15 +291,6 @@ cbuffer Params : register(b0) {
     uint CamMul0, CamMul1, CamMul2;
     uint M0, M1, M2, M3, M4, M5, M6, M7, M8;
 };
-
-int CfaColor(uint cfa, int x, int y) {
-    int q = (y & 1) * 2 + (x & 1);
-    if (cfa == 1) { int c[4] = {0, 1, 1, 2}; return c[q]; }
-    if (cfa == 2) { int c[4] = {2, 1, 1, 0}; return c[q]; }
-    if (cfa == 3) { int c[4] = {1, 0, 2, 1}; return c[q]; }
-    if (cfa == 4) { int c[4] = {1, 2, 0, 1}; return c[q]; }
-    return 1;
-}
 
 int2 ClampXY(int x, int y) {
     return clamp(int2(x, y), int2(0, 0), int2(int(Width) - 1, int(Height) - 1));

@@ -249,6 +249,7 @@ static void TestVideo() {
     Check(wrote, "an H.264 test clip is written" + (wrote ? "" : ": " + err));
     if (wrote) {
         VideoOptions o;
+        o.pick = VideoPick::Time;
         o.frames = kSlots;
         std::vector<Image> got;
         VideoInfo info;
@@ -282,6 +283,7 @@ static void TestVideo() {
 
         // Downscaling: asked for at most 160 px, a 320 px clip halves.
         VideoOptions small;
+        small.pick = VideoPick::Time;
         small.frames = 2;
         small.maxDim = 160;
         std::vector<Image> half;
@@ -299,6 +301,7 @@ static void TestVideo() {
         for (int i = 0; i < 8; ++i) few.push_back(clip[size_t(i)].Clone());
         const bool rw = WriteTestVideo("video_rot.mp4", few, 24.0, 90, &err);
         VideoOptions o;
+        o.pick = VideoPick::Time;
         o.frames = 1;
         std::vector<Image> got;
         VideoInfo info;
@@ -319,6 +322,165 @@ static void TestVideo() {
                              (ok ? "" : ": " + err));
         }
         std::remove("video_rot.mp4");
+    }
+
+    // --- picking by motion ---
+    //
+    // A pan across a wide texture, slow then fast: the first 96 frames move
+    // 1 px each, the next 48 move 4 px. Picked by time, the fast half would
+    // get the same few frames as the slow one, each 4x further apart in
+    // view. Picked by motion, the spacing must follow the pan: no two kept
+    // frames more than a step apart (10% of 240 px -- 24 px, with a pixel of
+    // slack for the tracking), and the fast half's frames much closer
+    // together in time.
+    {
+        const int kSlow = 96, kFast = 48, span = kSlow + 4 * kFast;
+        const int TW = W + span;
+        // Rectangles of random grey on grey: corners to track everywhere.
+        std::vector<uint8_t> tex(size_t(TW) * H, 128);
+        uint32_t s = 12345;
+        auto rnd = [&](int n) { s = s * 1664525u + 1013904223u; return int((s >> 8) % uint32_t(n)); };
+        for (int r = 0; r < 260; ++r) {
+            const int x0 = rnd(TW), y0 = rnd(H), rw = 6 + rnd(40), rh = 6 + rnd(40);
+            const uint8_t c = uint8_t(20 + rnd(215));
+            for (int y = y0; y < std::min(H, y0 + rh); ++y)
+                for (int x = x0; x < std::min(TW, x0 + rw); ++x) tex[size_t(y) * TW + x] = c;
+        }
+        auto shiftAt = [&](int i) { return i <= kSlow ? i : kSlow + 4 * (i - kSlow); };
+        std::vector<Image> pan;
+        for (int i = 0; i <= kSlow + kFast; ++i) {
+            Image im;
+            im.Alloc(ImageDesc{W, H, Format::RGBA8});
+            ImageView v = im.MapCpuWrite();
+            const int ox = shiftAt(i);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    uint8_t* p = v.At<uint8_t>(x, y);
+                    p[0] = p[1] = p[2] = tex[size_t(y) * TW + size_t(x + ox)];
+                    p[3] = 255;
+                }
+            pan.push_back(std::move(im));
+        }
+        const bool wrote = WriteTestVideo("video_pan.mp4", pan, 24.0, 0, &err);
+        std::vector<Image> got;
+        VideoInfo info;
+        // The motion mechanism alone: a 10% step, which is 24 px here, and
+        // no floor in time.
+        VideoOptions mo;
+        mo.step = 0.10;
+        mo.floorFrames = 0;
+        const bool ok = wrote && LoadVideoFrames("video_pan.mp4", mo, &got, &info, &err);
+        if (!ok) {
+            Check(false, "a panning clip is picked by motion: " + err);
+        } else {
+            // Each kept frame's index, from its time, and so its shift.
+            std::vector<int> idx;
+            for (double t : info.times) idx.push_back(int(std::lround(t * 24.0)));
+            int worst = 0;
+            double slowGap = 0, fastGap = 0;
+            int nSlow = 0, nFast = 0;
+            std::string where;
+            for (size_t k = 0; k < idx.size(); ++k) {
+                where += " " + std::to_string(idx[k]);
+                if (k == 0) continue;
+                worst = std::max(worst, shiftAt(idx[k]) - shiftAt(idx[k - 1]));
+                const int gap = idx[k] - idx[k - 1];
+                if (idx[k] <= kSlow) { slowGap += gap; ++nSlow; }
+                else if (idx[k - 1] >= kSlow) { fastGap += gap; ++nFast; }
+            }
+            slowGap /= std::max(1, nSlow);
+            fastGap /= std::max(1, nFast);
+            char m[400];
+            std::snprintf(m, sizeof m,
+                          "picked by motion: %zu frames, never more than a step apart "
+                          "(widest %d px of 24), and closer in time where the pan is "
+                          "fast (%.1f frames apart slow, %.1f fast; kept at%s)",
+                          got.size(), worst, slowGap, fastGap, where.c_str());
+            Check(worst <= 25 && nSlow > 0 && nFast > 0 && slowGap > 2.5 * fastGap &&
+                      info.byTracking == 0 && info.byTime == 0 && !info.byTimeSlots,
+                  m);
+
+            // THE FLOOR IN TIME: 12 frames over the 6 s clip means one at
+            // least every half second, even through the slow pan, whose 24
+            // frames a step would otherwise leave a whole second apart.
+            VideoOptions fo = mo;
+            fo.floorFrames = 12;
+            std::vector<Image> got2;
+            VideoInfo i2;
+            const bool ok2 = LoadVideoFrames("video_pan.mp4", fo, &got2, &i2, &err);
+            double widest = 0.0;
+            for (size_t k = 1; k < i2.times.size(); ++k)
+                widest = std::max(widest, i2.times[k] - i2.times[k - 1]);
+            std::snprintf(m, sizeof m,
+                          "...and a floor in time keeps a frame at least every %.2f s "
+                          "(widest gap %.2f s, %zu frames, %d by the floor)",
+                          i2.seconds / 12.0, widest, got2.size(), i2.byTime);
+            Check(ok2 && widest <= i2.seconds / 12.0 + 0.5 / 24.0 && i2.byTime > 0 &&
+                      got2.size() > got.size(),
+                  m);
+        }
+        std::remove("video_pan.mp4");
+
+        // A BLURRED STRETCH: frames 40-53 of a steady 2 px pan are smeared,
+        // so at a 24 px step one whole window (12-24 px, six frames) falls
+        // inside it. The picker must look past the step for a sharp frame
+        // rather than keep a soft one -- none of 40-53 kept -- and still keep
+        // the gap under two steps.
+        {
+            std::vector<Image> blurClip;
+            for (int i = 0; i < 100; ++i) {
+                Image im;
+                im.Alloc(ImageDesc{W, H, Format::RGBA8});
+                ImageView v = im.MapCpuWrite();
+                const int ox = 2 * i;
+                std::vector<uint8_t> g(size_t(W) * H);
+                for (int y = 0; y < H; ++y)
+                    for (int x = 0; x < W; ++x) g[size_t(y) * W + x] = tex[size_t(y) * TW + size_t(x + ox)];
+                if (i >= 40 && i <= 53)
+                    for (int pass = 0; pass < 2; ++pass) {   // a 9x9 box, twice
+                        std::vector<uint8_t> o(g.size());
+                        for (int y = 0; y < H; ++y)
+                            for (int x = 0; x < W; ++x) {
+                                int sum = 0, cnt = 0;
+                                for (int dy = -4; dy <= 4; ++dy)
+                                    for (int dx = -4; dx <= 4; ++dx) {
+                                        sum += g[size_t(std::clamp(y + dy, 0, H - 1)) * W +
+                                                 size_t(std::clamp(x + dx, 0, W - 1))];
+                                        ++cnt;
+                                    }
+                                o[size_t(y) * W + x] = uint8_t(sum / cnt);
+                            }
+                        g.swap(o);
+                    }
+                for (int y = 0; y < H; ++y)
+                    for (int x = 0; x < W; ++x) {
+                        uint8_t* p = v.At<uint8_t>(x, y);
+                        p[0] = p[1] = p[2] = g[size_t(y) * W + x];
+                        p[3] = 255;
+                    }
+                blurClip.push_back(std::move(im));
+            }
+            const bool bw = WriteTestVideo("video_blur.mp4", blurClip, 24.0, 0, &err);
+            std::vector<Image> gotB;
+            VideoInfo ib;
+            const bool okB = bw && LoadVideoFrames("video_blur.mp4", mo, &gotB, &ib, &err);
+            std::string kept;
+            bool soft = false;
+            int widest = 0, prev = -1;
+            for (double t : ib.times) {
+                const int k = int(std::lround(t * 24.0));
+                kept += " " + std::to_string(k);
+                soft |= k >= 40 && k <= 53;
+                if (prev >= 0) widest = std::max(widest, 2 * (k - prev));
+                prev = k;
+            }
+            char m[300];
+            std::snprintf(m, sizeof m,
+                          "...and looks past a blurred stretch for a sharp frame (none of "
+                          "40-53 kept, widest gap %d px of 48; kept at%s)", widest, kept.c_str());
+            Check(okB && !soft && widest <= 50, okB ? std::string(m) : "the blurred clip: " + err);
+            std::remove("video_blur.mp4");
+        }
     }
 
     Check(IsVideoPath("clip.MP4") && IsVideoPath("a/b.mov") && !IsVideoPath("x.png"),

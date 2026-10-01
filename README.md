@@ -869,9 +869,26 @@ themselves, and shows between them as false colour and smears. What pushes back:
   views, bright red patches from anywhere else.
 
 **From a video.** Drop an `.mp4` or `.mov` on the palette — onto `sfm.tgl`'s
-`group` row to run the chain on it — and it arrives as a group of the clip's
-sharpest frame from each of 100 even time slots, decoded by Windows' own Media
-Foundation and turned upright if the phone recorded in portrait. Nothing needs
+`group` row to run the chain on it — and it arrives as a group of frames chosen
+**by how far the view moves**, decoded by Windows' own Media Foundation and
+turned upright if the phone recorded in portrait. Corners are tracked from
+frame to frame, and a frame is kept each time the view has moved 4% of the
+frame's shorter side, or lost track of too much of what it saw — the sharpest
+frame near that point, since blur comes exactly when the camera speeds up. A
+fast stretch gives many frames and a slow one few, with at least 60 over the
+whole clip; past 250 the set is thinned evenly. Equal time slots, which this
+replaced, spread thinner the longer the clip:
+
+| clip | length | 100 time slots | by motion |
+|---|---|---|---|
+| face, close orbit | 8 s | 100 / 100 | 64 / 64 |
+| walk-around | 25 s | 100 / 100 | 191 / 191 |
+| walk-around, mirror | 39 s | **45 / 100** | 241 / 241 |
+| walk-around | 57 s | **40 / 100** | 245 / 245 |
+| walk-around | 59 s | **34 / 100** | 180 / 180 |
+
+(cameras reconstructed / frames kept). The long clips cost more — two to four
+times the SfM time of 100 frames — because they need the frames. Nothing needs
 setting: the field of view is found, and `match_ann`'s `revisit` also matches
 frames that see the same view from far apart in the clip, which is what closes
 the loop of a walk-around. For a good

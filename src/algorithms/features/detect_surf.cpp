@@ -34,6 +34,7 @@
 
 #include "../../algo_util/features.h"
 #include "../../algo_util/pixel_buffer.h"
+#include "../../algo_util/color.h"
 #include "../../core/algorithm.h"
 
 namespace tglab {
@@ -124,7 +125,7 @@ public:
             for (int x = 0; x < w; ++x) {
                 const float* p = in.At(x, y);
                 grey[size_t(y) * size_t(w) + size_t(x)] = (ch >= 3)
-                    ? (0.2126f * p[0] + 0.7152f * p[1] + 0.0722f * p[2]) / scale
+                    ? Luma(p) / scale
                     : p[0] / scale;
             }
 

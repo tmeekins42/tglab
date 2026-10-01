@@ -12,10 +12,10 @@ bool ComputeContext::BuildHistogram(const GpuImage& src, HistogramResult* out,
     // Compiled once and kept: recompiling per slider tick would cost more than
     // the readback this replaces.
     if (!m_histRangeKernel.Valid() &&
-        !CreateKernel(kHistRangeHlsl, "main", "hist_range", &m_histRangeKernel, err))
+        !CreateKernel(std::string(kColorHlsl) + kHistRangeHlsl, "main", "hist_range", &m_histRangeKernel, err))
         return false;
     if (!m_histBinKernel.Valid() &&
-        !CreateKernel(kHistBinHlsl, "main", "hist_bin", &m_histBinKernel, err))
+        !CreateKernel(std::string(kColorHlsl) + kHistBinHlsl, "main", "hist_bin", &m_histBinKernel, err))
         return false;
 
     const int w = src.desc.width, h = src.desc.height;

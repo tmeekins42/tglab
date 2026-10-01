@@ -244,17 +244,16 @@ public:
     }
 
     std::vector<uint32_t> GpuPassConstants(int pass) const override {
-        auto bits = [](float f) { uint32_t u; std::memcpy(&u, &f, sizeof u); return u; };
         // Pass 0 blurs horizontally and pass 1 vertically. The brightening is
         // folded into the horizontal pass so it happens before the spread; the
         // vertical pass must not apply it a second time.
         const float dir    = (pass == 1) ? 1.0f : 0.0f;
         const float bright = (pass == 0) ? float(m_brightness) : 1.0f;
-        return {bits(std::max(0.01f, GpuScaledPx(float(m_blur)))),
-                bits(float(m_strength)),
-                bits(bright),
-                bits(float(m_contrast)),
-                bits(dir)};
+        return {FloatBits(std::max(0.01f, GpuScaledPx(float(m_blur)))),
+                FloatBits(float(m_strength)),
+                FloatBits(bright),
+                FloatBits(float(m_contrast)),
+                FloatBits(dir)};
     }
 
     // The blurred layer, at the same 3-sigma extent the blur loop uses.

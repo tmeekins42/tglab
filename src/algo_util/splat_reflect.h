@@ -110,7 +110,7 @@ inline void ReflFromCloud(const PointCloud& cloud, std::vector<ReflParam>* refl,
     refl->resize(n);
     for (size_t i = 0; i < n; ++i) {
         const double r = std::clamp(double(cloud.splatRefl[i * 4]), 1e-6, 1.0 - 1e-6);
-        (*refl)[i].reflLogit = std::log(r / (1.0 - r));
+        (*refl)[i].reflLogit = Logit(r);
         for (int k = 0; k < 3; ++k) (*refl)[i].normal[k] = cloud.splatRefl[i * 4 + 1 + size_t(k)];
     }
     env->res = cloud.envRes;

@@ -3,17 +3,9 @@
 #include <algorithm>
 #include <cmath>
 
+#include "color.h"
+
 namespace tglab {
-namespace {
-
-// sRGB/Rec.709 primaries with a D65 white: the matrix taking XYZ to linear sRGB.
-inline void XyzToLinearSrgb(float X, float Y, float Z, float* r, float* g, float* b) {
-    *r =  3.2404542f * X - 1.5371385f * Y - 0.4985314f * Z;
-    *g = -0.9692660f * X + 1.8760108f * Y + 0.0415560f * Z;
-    *b =  0.0556434f * X - 0.2040259f * Y + 1.0572252f * Z;
-}
-
-} // namespace
 
 void PlanckianXy(float kelvin, float* outX, float* outY) {
     const float T = std::clamp(kelvin, 1667.0f, 25000.0f);

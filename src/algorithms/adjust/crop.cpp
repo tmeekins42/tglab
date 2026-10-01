@@ -359,11 +359,6 @@ void main(uint3 tid : SV_DispatchThreadID) {
     }
 
     std::vector<uint32_t> GpuConstants(int) const override {
-        auto bits = [](float f) {
-            uint32_t u;
-            std::memcpy(&u, &f, sizeof(u));
-            return u;
-        };
         const float a  = float(m_angle) * 3.14159265f / 180.0f;
         const float rcx = float(m_x0) + 0.5f * float(m_w);
         const float rcy = float(m_y0) + 0.5f * float(m_h);
@@ -371,17 +366,17 @@ void main(uint3 tid : SV_DispatchThreadID) {
         // The line value comes from MeasureForGpu, so both paths draw the
         // same colour. See LineValue for why that measurement is shared.
         return {uint32_t(bool(m_preview) ? 1 : 0),
-                bits(float(m_srcW)), bits(float(m_srcH)),
-                bits(std::cos(a)),   bits(std::sin(a)),
-                bits(rcx),           bits(rcy),
-                bits(float(m_w)),    bits(float(m_h)),
-                bits(std::clamp(float(m_dim), 0.0f, 1.0f)),
-                bits(std::max(1.0f, float(m_lineWidth))),
-                bits(m_lineVal),
+                FloatBits(float(m_srcW)), FloatBits(float(m_srcH)),
+                FloatBits(std::cos(a)),   FloatBits(std::sin(a)),
+                FloatBits(rcx),           FloatBits(rcy),
+                FloatBits(float(m_w)),    FloatBits(float(m_h)),
+                FloatBits(std::clamp(float(m_dim), 0.0f, 1.0f)),
+                FloatBits(std::max(1.0f, float(m_lineWidth))),
+                FloatBits(m_lineVal),
                 // The grid count is a COUNT, not a float -- it indexes the
-                // shader's loop directly, so it must not go through bits().
+                // shader's loop directly, so it must not go through FloatBits().
                 uint32_t(std::clamp(int(m_grid), 0, 8)),
-                bits(std::clamp(float(m_gridOpacity), 0.0f, 1.0f))};
+                FloatBits(std::clamp(float(m_gridOpacity), 0.0f, 1.0f))};
     }
 
 private:

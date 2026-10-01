@@ -256,6 +256,7 @@
 
 #include "clip_repair.h"
 #include "../../algo_util/pixel_buffer.h"
+#include "../../algo_util/color.h"
 #include "../../core/algorithm.h"
 
 namespace tglab {
@@ -563,7 +564,7 @@ public:
 
 private:
     static float Luma(float r, float g, float b) {
-        return 0.2126f * r + 0.7152f * g + 0.0722f * b;
+        return tglab::Luma(r, g, b);
     }
 
     // A 3x3 median over one colour-difference plane, gated on luminance.
@@ -754,15 +755,10 @@ public:
     std::vector<GpuPass> GpuPasses() const override;
 
     std::vector<uint32_t> GpuPassConstants(int) const override {
-        auto bits = [](float f) {
-            uint32_t u;
-            std::memcpy(&u, &f, sizeof(u));
-            return u;
-        };
-        std::vector<uint32_t> c{uint32_t(m_cfa), bits(m_black), bits(m_range),
-                                bits(float(m_strength))};
-        for (int i = 0; i < 3; ++i) c.push_back(bits(m_camMul[i]));
-        for (int i = 0; i < 9; ++i) c.push_back(bits(m_rgbCam[i]));
+        std::vector<uint32_t> c{uint32_t(m_cfa), FloatBits(m_black), FloatBits(m_range),
+                                FloatBits(float(m_strength))};
+        for (int i = 0; i < 3; ++i) c.push_back(FloatBits(m_camMul[i]));
+        for (int i = 0; i < 9; ++i) c.push_back(FloatBits(m_rgbCam[i]));
         return c;
     }
 
@@ -804,15 +800,6 @@ cbuffer Params : register(b0) {
 };
 
 
-int CfaColor(uint cfa, int x, int y) {
-    int q = (y & 1) * 2 + (x & 1);
-    if (cfa == 1) { int c[4] = {0, 1, 1, 2}; return c[q]; }
-    if (cfa == 2) { int c[4] = {2, 1, 1, 0}; return c[q]; }
-    if (cfa == 3) { int c[4] = {1, 0, 2, 1}; return c[q]; }
-    if (cfa == 4) { int c[4] = {1, 2, 0, 1}; return c[q]; }
-    return 1;
-}
-
 int2 ClampXY(int x, int y) {
     return clamp(int2(x, y), int2(0, 0), int2(Width - 1, Height - 1));
 }
@@ -841,7 +828,6 @@ float3 Bilinear(int x, int y) {
     return rgb;
 }
 
-float Luma3(float3 c) { return 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b; }
 )";
 
 // Pass 0: bilinear. Stores the three channels AND luminance, so later passes
@@ -851,7 +837,7 @@ const char* const kBilinearHlsl = R"(
 void main(uint3 tid : SV_DispatchThreadID) {
     if (tid.x >= Width || tid.y >= Height) return;
     float3 rgb = Bilinear(int(tid.x), int(tid.y));
-    U0[tid.xy] = float4(rgb, Luma3(rgb));
+    U0[tid.xy] = float4(rgb, Luma(rgb));
     U1[tid.xy] = float4(0, 0, 0, 1);
 }
 )";
@@ -948,7 +934,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     [unroll] for (int c = 0; c < 3; ++c)
         if (hi[c] >= lo[c]) rgb[c] = clamp(rgb[c], lo[c], hi[c]);
 
-    U0[tid.xy] = float4(rgb, Luma3(rgb));
+    U0[tid.xy] = float4(rgb, Luma(rgb));
 }
 )";
 
@@ -1041,12 +1027,12 @@ void main(uint3 tid : SV_DispatchThreadID) {
 std::vector<AlgorithmBase::GpuPass> DemosaicConsistent::GpuPasses() const {
     // Assembled once: GpuPasses() returns raw pointers and is called per run,
     // so building the strings each time would dangle them.
-    static const std::string bil  = std::string(kCommon) + kClipRepairHlsl + kBilinearHlsl;
-    static const std::string res  = std::string(kCommon) + kClipRepairHlsl + kResidualHlsl;
-    static const std::string spr  = std::string(kCommon) + kClipRepairHlsl + kSpreadHlsl;
-    static const std::string app  = std::string(kCommon) + kClipRepairHlsl + kApplyHlsl;
-    static const std::string chr  = std::string(kCommon) + kClipRepairHlsl + kChromaHlsl;
-    static const std::string comb = std::string(kCommon) + kClipRepairHlsl + kCombineHlsl;
+    static const std::string bil  = std::string(kDemosaicHlsl) + kCommon + kBilinearHlsl;
+    static const std::string res  = std::string(kDemosaicHlsl) + kCommon + kResidualHlsl;
+    static const std::string spr  = std::string(kDemosaicHlsl) + kCommon + kSpreadHlsl;
+    static const std::string app  = std::string(kDemosaicHlsl) + kCommon + kApplyHlsl;
+    static const std::string chr  = std::string(kDemosaicHlsl) + kCommon + kChromaHlsl;
+    static const std::string comb = std::string(kDemosaicHlsl) + kCommon + kCombineHlsl;
 
     std::vector<GpuPass> p;
     // t0 is always the mosaic, because kCommon's Sample() reads it.

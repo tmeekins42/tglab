@@ -63,8 +63,10 @@
 #include <string>
 #include <vector>
 
+#include "../../algo_util/linalg.h"
 #include "../../algo_util/pixel_buffer.h"
 #include "../../algo_util/transform.h"
+#include "../../algo_util/color.h"
 #include "../../core/algorithm.h"
 #include "../../core/reduction.h"
 
@@ -579,40 +581,12 @@ private:
         }
         if (n < 3) return false;
 
-        // Symmetric 3x3 eigen-decomposition by Jacobi rotations.
-        double V[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
-        for (int sweep = 0; sweep < 50; ++sweep) {
-            const double off = A[0][1] * A[0][1] + A[0][2] * A[0][2] + A[1][2] * A[1][2];
-            if (off < 1e-24) break;
-            for (int p = 0; p < 2; ++p)
-                for (int q = p + 1; q < 3; ++q) {
-                    if (std::abs(A[p][q]) < 1e-30) continue;
-                    const double th = 0.5 * std::atan2(2.0 * A[p][q], A[q][q] - A[p][p]);
-                    const double c = std::cos(th), s = std::sin(th);
-                    for (int k = 0; k < 3; ++k) {
-                        const double akp = A[k][p], akq = A[k][q];
-                        A[k][p] = c * akp - s * akq;
-                        A[k][q] = s * akp + c * akq;
-                    }
-                    for (int k = 0; k < 3; ++k) {
-                        const double apk = A[p][k], aqk = A[q][k];
-                        A[p][k] = c * apk - s * aqk;
-                        A[q][k] = s * apk + c * aqk;
-                    }
-                    for (int k = 0; k < 3; ++k) {
-                        const double vkp = V[k][p], vkq = V[k][q];
-                        V[k][p] = c * vkp - s * vkq;
-                        V[k][q] = s * vkp + c * vkq;
-                    }
-                }
-        }
-        int order[3] = {0, 1, 2};
-        std::sort(order, order + 3, [&](int a, int b) { return A[a][a] < A[b][b]; });
-        const double lMid = A[order[1]][order[1]], lMax = A[order[2]][order[2]];
-        if (lMax <= 0.0 || lMid < 0.01 * lMax) return false;
+        double ev[3], V[9];
+        linalg::SymmetricEigen<3>(&A[0][0], ev, V);
+        if (ev[2] <= 0.0 || ev[1] < 0.01 * ev[2]) return false;
 
         // Down: the least eigenvector, signed like the frames' own y (down).
-        double d[3] = {V[0][order[0]], V[1][order[0]], V[2][order[0]]};
+        double d[3] = {V[0], V[3], V[6]};
         if (d[0] * ys[0] + d[1] * ys[1] + d[2] * ys[2] < 0.0)
             for (double& v : d) v = -v;
         // Forward: the mean viewing direction with its vertical part removed.
@@ -1053,7 +1027,7 @@ bool StitchPanorama::Finish(Image* out, std::string* err) {
                             float pm[4] = {0, 0, 0, 0};
                             SampleBilinear(f.buf, qx, qy, pm);
                             acc2 += (ch >= 3)
-                                ? 0.2126 * pm[0] + 0.7152 * pm[1] + 0.0722 * pm[2]
+                                ? Luma<double>(pm[0], pm[1], pm[2])
                                 : pm[0];
                             ++nacc;
                         }
@@ -1290,7 +1264,7 @@ bool StitchPanorama::Finish(Image* out, std::string* err) {
                 // zero exactly at a seam, which is where disagreement matters
                 // most. Weighting this would hide the thing it is measuring.
                 const double y0 = (ch >= 3)
-                    ? 0.2126 * sm[0] + 0.7152 * sm[1] + 0.0722 * sm[2]
+                    ? Luma<double>(sm[0], sm[1], sm[2])
                     : sm[0];
                 lum[pi] += y0;
                 sq[pi]  += y0 * y0;

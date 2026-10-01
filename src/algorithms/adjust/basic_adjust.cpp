@@ -39,24 +39,11 @@
 
 #include "../../algo_util/pixel_buffer.h"
 #include "../../algo_util/white_balance.h"
+#include "../../algo_util/color.h"
 #include "../../core/algorithm.h"
 
 namespace tglab {
 namespace {
-
-// sRGB transfer functions. The piecewise form, not the 2.2 power
-// approximation: the linear toe matters for shadow adjustments, which is
-// exactly where the two disagree most.
-inline float SrgbToLinear(float c) {
-    return (c <= 0.04045f) ? c / 12.92f
-                           : std::pow((c + 0.055f) / 1.055f, 2.4f);
-}
-
-inline float LinearToSrgb(float c) {
-    c = std::clamp(c, 0.0f, 1.0f);
-    return (c <= 0.0031308f) ? c * 12.92f
-                             : 1.055f * std::pow(c, 1.0f / 2.4f) - 0.055f;
-}
 
 // Scene-linear input (a demosaiced raw) is ALREADY linear, so the transfer
 // functions must not be applied to it -- and its values must not be clamped on
@@ -89,11 +76,6 @@ inline float EncodeOut(float c, bool linear) {
     // at or below zero to black, which is the correct behaviour at display and
     // the wrong behaviour in the middle of an edit.
     return linear ? c : LinearToSrgb(c);
-}
-
-// Rec. 709 luminance, matching the primaries the image is already in.
-inline float Luma(float r, float g, float b) {
-    return 0.2126f * r + 0.7152f * g + 0.0722f * b;
 }
 
 // Where the highlight band tops out for scene-linear input.
@@ -270,16 +252,8 @@ cbuffer Params : register(b0) {
     uint  ShadowTop;            // top of the shadow band (0.5 unless linear)
 };
 
-static const float3 kLumaW = float3(0.2126, 0.7152, 0.0722);
-
-float3 SrgbToLinear(float3 c) {
-    // select(), not ?: -- SM 6.x requires it for a per-component condition.
-    return select(c <= 0.04045, c / 12.92, pow((c + 0.055) / 1.055, 2.4));
-}
-float3 LinearToSrgb(float3 c) {
-    c = saturate(c);
-    return select(c <= 0.0031308, c * 12.92, 1.055 * pow(c, 1.0 / 2.4) - 0.055);
-}
+// kLumaW, Luma, SrgbToLinear and LinearToSrgb: color.h's kColorHlsl,
+// prepended at compile time.
 float SmoothBand(float x, float lo, float hi) {
     float t = saturate((x - lo) / (hi - lo));
     return t * t * (3.0 - 2.0 * t);
@@ -303,7 +277,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     // --- highlights / shadows ---
     // Each targets a tonal band via a smooth window, so the correction fades
     // out rather than leaving a visible edge where it stops applying.
-    float lum = dot(c, kLumaW);
+    float lum = Luma(c);
 
     float hi = asfloat(Highlights);
     if (abs(hi) > 1e-4) {
@@ -338,17 +312,17 @@ void main(uint3 tid : SV_DispatchThreadID) {
 
     // --- whites / blacks: the endpoints, not bands ---
     float wh = asfloat(Whites);
-    if (abs(wh) > 1e-4) c *= (1.0 + wh * saturate(dot(c, kLumaW)));
+    if (abs(wh) > 1e-4) c *= (1.0 + wh * saturate(Luma(c)));
     float bl = asfloat(Blacks);
     // Shifts the black point: negative crushes, positive lifts.
-    if (abs(bl) > 1e-4) c = max(c + bl * 0.1 * (1.0 - saturate(dot(c, kLumaW))), 0.0);
+    if (abs(bl) > 1e-4) c = max(c + bl * 0.1 * (1.0 - saturate(Luma(c))), 0.0);
 
     // --- contrast, pivoted on middle grey (0.18 in linear) ---
     float ct = asfloat(Contrast);
     if (abs(ct) > 1e-4) c = max((c - 0.18) * (1.0 + ct) + 0.18, 0.0);
 
     // --- vibrance / saturation ---
-    lum = dot(c, kLumaW);
+    lum = Luma(c);
     float sat = asfloat(Saturation);
     float vib = asfloat(Vibrance);
     if (abs(vib) > 1e-4) {
@@ -374,18 +348,13 @@ void main(uint3 tid : SV_DispatchThreadID) {
         float wbR = 1.0f, wbG = 1.0f, wbB = 1.0f;
         WhiteBalanceGains(&wbR, &wbG, &wbB);
 
-        auto bits = [](float f) {
-            uint32_t u;
-            std::memcpy(&u, &f, sizeof(u));
-            return u;
-        };
-        return {bits(wbR), bits(wbG), bits(wbB),
-                bits(std::pow(2.0f, float(m_exposure))),
-                bits(float(m_contrast)),
-                bits(float(m_highlights)), bits(float(m_shadows)),
-                bits(float(m_whites)),     bits(float(m_blacks)),
-                bits(float(m_vibrance)),   bits(float(m_saturation)),
-                uint32_t(m_linear ? 1 : 0), bits(m_white), bits(m_shadowTop)};
+        return {FloatBits(wbR), FloatBits(wbG), FloatBits(wbB),
+                FloatBits(std::pow(2.0f, float(m_exposure))),
+                FloatBits(float(m_contrast)),
+                FloatBits(float(m_highlights)), FloatBits(float(m_shadows)),
+                FloatBits(float(m_whites)),     FloatBits(float(m_blacks)),
+                FloatBits(float(m_vibrance)),   FloatBits(float(m_saturation)),
+                uint32_t(m_linear ? 1 : 0), FloatBits(m_white), FloatBits(m_shadowTop)};
     }
 
     // HasGPU() is consulted before PrepareGpu(), so this is where the input

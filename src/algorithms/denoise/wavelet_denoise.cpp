@@ -408,11 +408,6 @@ void main(uint3 tid : SV_DispatchThreadID) {
     }
 
     std::vector<uint32_t> GpuConstants(int iteration) const override {
-        auto bits = [](float f) {
-            uint32_t u;
-            std::memcpy(&u, &f, sizeof(u));
-            return u;
-        };
         const int levels = std::clamp(int(m_levels), 1, 6);
         // Thresholds are a fraction of the intensity range on both paths. A
         // float image reaches the shader in its own units and ValueScale() is
@@ -420,11 +415,11 @@ void main(uint3 tid : SV_DispatchThreadID) {
         // the CPU/GPU agreement test is what catches getting that backwards.
         // Order must match the cbuffer declaration exactly -- LevelDepBits
         // sits before Colour, so it goes here rather than appended.
-        return {bits(float(m_lumaStrength)),
-                bits(float(m_chromaStrength)),
+        return {FloatBits(float(m_lumaStrength)),
+                FloatBits(float(m_chromaStrength)),
                 uint32_t(iteration),
                 uint32_t(levels - 1),
-                bits(float(m_levelDep)),
+                FloatBits(float(m_levelDep)),
                 1u};
     }
 

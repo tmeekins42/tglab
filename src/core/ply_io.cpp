@@ -1,5 +1,7 @@
 #include "ply_io.h"
 
+#include "math_util.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -64,8 +66,6 @@ struct Prop {
     int         offset = 0;   // within one vertex record, binary only
 };
 
-double Sigmoid(double x) { return 1.0 / (1.0 + std::exp(-x)); }
-
 }  // namespace
 
 // --- writing ---------------------------------------------------------------------
@@ -113,7 +113,7 @@ bool SavePly(const std::string& path, const PointCloud& cloud, std::string* err)
                     rec[size_t(9 + ch * perChannel + k)] =
                         cloud.splatSh[si * 45 + size_t(k * 3 + ch)];
             const size_t t0 = size_t(9 + nRest);
-            rec[t0] = float(std::log(o / (1.0 - o)));
+            rec[t0] = float(Logit(o));
             for (int k = 0; k < 3; ++k)
                 rec[t0 + 1 + size_t(k)] = float(std::log(std::max(sc[k], 1e-12)));
             for (int k = 0; k < 4; ++k) rec[t0 + 4 + size_t(k)] = float(s.rot[k]);

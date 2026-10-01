@@ -29,12 +29,6 @@ namespace {
 
 constexpr int kTexW = 2048;
 
-uint32_t Bits(float f) {
-    uint32_t u = 0;
-    std::memcpy(&u, &f, 4);
-    return u;
-}
-
 ImageDesc FlatDesc(size_t texels, Format f) {
     ImageDesc d;
     d.width  = kTexW;
@@ -151,9 +145,9 @@ bool SplatRaster::CompositeGpu(const std::vector<SplatParam>& splats,
     std::string err;
     const std::vector<uint32_t> c{
         uint32_t(m_tilesX), uint32_t(kTexW),
-        Bits(float(opt.background.x)), Bits(float(opt.background.y)),
-        Bits(float(opt.background.z)), Bits(float(opt.minAlpha)),
-        Bits(float(opt.maxAlpha)), Bits(float(opt.tStop))};
+        FloatBits(float(opt.background.x)), FloatBits(float(opt.background.y)),
+        FloatBits(float(opt.background.z)), FloatBits(float(opt.minAlpha)),
+        FloatBits(float(opt.maxAlpha)), FloatBits(float(opt.tStop))};
     if (!g.ctx->Dispatch(g.fwd, {&g.proj, &g.list, &g.offs},
                          {&g.rgbt, &g.last, &g.depth},
                          c, &err, uint32_t(m_tilesX), uint32_t(m_tilesY))) {
@@ -242,9 +236,9 @@ bool SplatRaster::BackPixelGpu(const SplatCam& cam, const RasterOptions& opt,
     std::string err;
     const std::vector<uint32_t> c{
         uint32_t(cam.w), uint32_t(cam.h), uint32_t(g.tilesX), uint32_t(kTexW),
-        Bits(float(opt.background.x)), Bits(float(opt.background.y)),
-        Bits(float(opt.background.z)), Bits(float(opt.minAlpha)),
-        Bits(float(opt.maxAlpha))};
+        FloatBits(float(opt.background.x)), FloatBits(float(opt.background.y)),
+        FloatBits(float(opt.background.z)), FloatBits(float(opt.minAlpha)),
+        FloatBits(float(opt.maxAlpha))};
     if (!g.ctx->Dispatch(g.bwd, {&g.proj, &g.list, &g.offs, &g.drgbt},
                          {&g.egrad, &g.last, &g.ddepth, &g.dshift}, c, &err,
                          uint32_t(m_tilesX),

@@ -249,15 +249,14 @@ void main(uint3 tid : SV_DispatchThreadID) {
     }
 
     std::vector<uint32_t> GpuConstants(int) const override {
-        auto bits = [](float f) { uint32_t u; std::memcpy(&u, &f, sizeof u); return u; };
         // A UNORM SRV hands the shader 0..1 whatever the storage format, so the
         // shader's own white is always 1.0 -- unlike the CPU path, which works
         // in the image's own units. Matching brightness.cpp's note.
-        return {bits(float(m_lut.Size())),
-                bits(float(m_strength)),
-                bits(1.0f),
-                bits(m_lut.Valid() ? m_lut.DomainMin()[0] : 0.0f),
-                bits(m_lut.Valid() ? m_lut.DomainMax()[0] : 1.0f)};
+        return {FloatBits(float(m_lut.Size())),
+                FloatBits(float(m_strength)),
+                FloatBits(1.0f),
+                FloatBits(m_lut.Valid() ? m_lut.DomainMin()[0] : 0.0f),
+                FloatBits(m_lut.Valid() ? m_lut.DomainMax()[0] : 1.0f)};
     }
 
     // The status line is where a mis-ordered pipeline announces itself: a LUT

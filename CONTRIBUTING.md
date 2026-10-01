@@ -292,6 +292,24 @@ being algorithms themselves. Currently:
   Note that pinning: a stored rotation-induced homography does **not** have
   determinant 1, because `From3x3` normalises by h22. Do not use the
   determinant as a health check.
+- `linalg.h` — the dense linear algebra: `SymmetricEigen<N>` and
+  `SmallestEigenvector<N>` (cyclic Jacobi, for the nullspaces and covariances
+  SfM is full of), `CholeskySolve` for normal equations, `LuSolve` for
+  anything else. `Mat3` in `src/core/geometry.h` has `Det`, `Inverse`, and the
+  angle-axis and quaternion conversions beside it. These used to be private
+  copies in each algorithm — seven eigen-solvers, three Cholesky solves —
+  whose tolerances had drifted apart. **Reach for these before writing a
+  solver**; if one is missing, add it here.
+- `least_squares.h` — what the Levenberg-Marquardt solvers share:
+  `RobustWeight` (Huber, Cauchy) and `LmDamping`, each solver's damping policy
+  as one line instead of scattered literals.
+- `color.h` — the colour conventions: `Luma` (Rec. 709, everywhere — there
+  used to be two), the sRGB transfer curve, XYZ to linear sRGB. Every
+  pipeline kernel gets the same functions in HLSL (`kColorHlsl`, prepended by
+  the pipeline), so a shader calls `Luma()` exactly as C++ does.
+- `fast.h` — the FAST-9 corner test ORB and BRISK share.
+- `math_util.h` (in `src/core/`) — `Sigmoid`, `Logit`, and `FloatBits`, the
+  float-to-root-constant cast every `GpuConstants()` needs.
 - `splat_raster.h` — the differentiable Gaussian rasteriser: `Forward` renders
   colour (and optionally expected depth), `Backward` returns every
   parameter's gradient, on the GPU when given a device. `DepthLossGrad` is the

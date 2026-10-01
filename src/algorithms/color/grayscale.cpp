@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "../../algo_util/pixel_buffer.h"
+#include "../../algo_util/color.h"
 #include "../../core/algorithm.h"
 
 namespace tglab {
@@ -38,7 +39,7 @@ public:
 
         const int w = m_in.Width(), h = m_in.Height(), ch = m_in.Channels();
 
-        // Rec.601 by default; the sliders let the weights be explored, which
+        // Rec. 709 by default; the sliders let the weights be explored, which
         // is the kind of thing this lab is for.
         const float wr = m_wr, wg = m_wg, wb = m_wb;
         const float sum = std::max(0.0001f, wr + wg + wb);
@@ -91,23 +92,19 @@ void main(uint3 tid : SV_DispatchThreadID) {
     }
 
     std::vector<uint32_t> GpuConstants(int) const override {
-        auto bits = [](float f) {
-            uint32_t u;
-            std::memcpy(&u, &f, sizeof(u));
-            return u;
-        };
 
         // Normalised here rather than in the shader, so the division happens
         // once per dispatch instead of once per pixel -- and so the two paths
         // share one expression of what the weights mean.
         const float sum = std::max(0.0001f, float(m_wr) + float(m_wg) + float(m_wb));
-        return {bits(float(m_wr) / sum), bits(float(m_wg) / sum), bits(float(m_wb) / sum)};
+        return {FloatBits(float(m_wr) / sum), FloatBits(float(m_wg) / sum), FloatBits(float(m_wb) / sum)};
     }
 
 private:
-    Param<float> m_wr{this, "r_weight", 0.299f, 0.0f, 1.0f};
-    Param<float> m_wg{this, "g_weight", 0.587f, 0.0f, 1.0f};
-    Param<float> m_wb{this, "b_weight", 0.114f, 0.0f, 1.0f};
+    // Rec. 709 by default, the luma everything else uses (color.h).
+    Param<float> m_wr{this, "r_weight", float(kLumaR), 0.0f, 1.0f};
+    Param<float> m_wg{this, "g_weight", float(kLumaG), 0.0f, 1.0f};
+    Param<float> m_wb{this, "b_weight", float(kLumaB), 0.0f, 1.0f};
 
 };
 

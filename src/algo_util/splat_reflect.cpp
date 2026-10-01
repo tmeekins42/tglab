@@ -126,7 +126,7 @@ void ReflPayload(const std::vector<SplatParam>& params, const std::vector<ReflPa
                  std::vector<SplatParam>* out) {
     *out = params;
     for (size_t i = 0; i < params.size(); ++i) {
-        const double r = 1.0 / (1.0 + std::exp(-refl[i].reflLogit));
+        const double r = Sigmoid(refl[i].reflLogit);
         for (double& c : (*out)[i].color) c = r;
     }
 }

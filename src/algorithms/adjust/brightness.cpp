@@ -105,11 +105,6 @@ void main(uint3 tid : SV_DispatchThreadID) {
     }
 
     std::vector<uint32_t> GpuConstants(int) const override {
-        auto bits = [](float f) {
-            uint32_t u;
-            std::memcpy(&u, &f, sizeof(u));
-            return u;
-        };
 
         // NOT scaled by 255 the way the CPU path scales it.
         //
@@ -118,7 +113,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
         // whatever the storage format, so scaling here would apply the offset
         // 255 times over. The two paths therefore look different and agree,
         // which is exactly what the CPU/GPU agreement test exists to confirm.
-        return {bits(float(m_brightness)), bits(float(m_gain))};
+        return {FloatBits(float(m_brightness)), FloatBits(float(m_gain))};
     }
 
 private:

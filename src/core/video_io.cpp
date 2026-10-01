@@ -51,6 +51,399 @@ std::string HrText(HRESULT hr) {
     return buf;
 }
 
+// --- motion: a small sparse tracker ---------------------------------------------
+//
+// Only as much as picking frames needs: how far the view has moved since the
+// last kept frame, and how much of it is still the same view. Grey frames a
+// couple of hundred pixels across, Shi-Tomasi corners, pyramidal
+// Lucas-Kanade -- the classic KLT tracker, a millisecond or so a frame.
+
+struct Grey {
+    int w = 0, h = 0;
+    std::vector<float> px;
+    float At(int x, int y) const { return px[size_t(y) * size_t(w) + size_t(x)]; }
+    // Bilinear, clamped to the edge.
+    float Sample(float x, float y) const {
+        x = std::clamp(x, 0.0f, float(w - 1));
+        y = std::clamp(y, 0.0f, float(h - 1));
+        const int x0 = std::min(int(x), w - 2 < 0 ? 0 : w - 2);
+        const int y0 = std::min(int(y), h - 2 < 0 ? 0 : h - 2);
+        const int x1 = std::min(x0 + 1, w - 1), y1 = std::min(y0 + 1, h - 1);
+        const float fx = x - float(x0), fy = y - float(y0);
+        return (1 - fy) * ((1 - fx) * At(x0, y0) + fx * At(x1, y0)) +
+               fy * ((1 - fx) * At(x0, y1) + fx * At(x1, y1));
+    }
+};
+
+// Luma 0..1 of a BGRX/RGBX frame, box-downscaled by k: (r + 2g + b) / 4,
+// symmetric in r and b so the channel order does not matter.
+Grey GreyOf(const uint8_t* px, int w, int h, int pitch, int k) {
+    Grey g;
+    g.w = std::max(1, w / k);
+    g.h = std::max(1, h / k);
+    g.px.assign(size_t(g.w) * size_t(g.h), 0.0f);
+    const float inv = 1.0f / (1020.0f * float(k * k));
+    for (int y = 0; y < g.h; ++y)
+        for (int x = 0; x < g.w; ++x) {
+            int s = 0;
+            for (int yy = 0; yy < k; ++yy) {
+                const uint8_t* row = px + ptrdiff_t(y * k + yy) * pitch + ptrdiff_t(x * k) * 4;
+                for (int xx = 0; xx < k; ++xx, row += 4) s += row[0] + 2 * row[1] + row[2];
+            }
+            g.px[size_t(y) * size_t(g.w) + size_t(x)] = float(s) * inv;
+        }
+    return g;
+}
+
+// Three levels, each with its central-difference gradients.
+struct Pyramid {
+    Grey lv[3], gx[3], gy[3];
+    int levels = 0;
+};
+
+Pyramid PyramidOf(Grey base) {
+    Pyramid p;
+    p.lv[0] = std::move(base);
+    p.levels = 1;
+    for (int l = 1; l < 3; ++l) {
+        const Grey& a = p.lv[l - 1];
+        if (a.w < 16 || a.h < 16) break;
+        Grey b;
+        b.w = a.w / 2;
+        b.h = a.h / 2;
+        b.px.resize(size_t(b.w) * size_t(b.h));
+        for (int y = 0; y < b.h; ++y)
+            for (int x = 0; x < b.w; ++x)
+                b.px[size_t(y) * size_t(b.w) + size_t(x)] =
+                    0.25f * (a.At(2 * x, 2 * y) + a.At(2 * x + 1, 2 * y) +
+                             a.At(2 * x, 2 * y + 1) + a.At(2 * x + 1, 2 * y + 1));
+        p.lv[l] = std::move(b);
+        p.levels = l + 1;
+    }
+    for (int l = 0; l < p.levels; ++l) {
+        const Grey& a = p.lv[l];
+        Grey& gx = p.gx[l];
+        Grey& gy = p.gy[l];
+        gx.w = gy.w = a.w;
+        gx.h = gy.h = a.h;
+        gx.px.assign(a.px.size(), 0.0f);
+        gy.px.assign(a.px.size(), 0.0f);
+        for (int y = 1; y + 1 < a.h; ++y)
+            for (int x = 1; x + 1 < a.w; ++x) {
+                gx.px[size_t(y) * size_t(a.w) + size_t(x)] = 0.5f * (a.At(x + 1, y) - a.At(x - 1, y));
+                gy.px[size_t(y) * size_t(a.w) + size_t(x)] = 0.5f * (a.At(x, y + 1) - a.At(x, y - 1));
+            }
+    }
+    return p;
+}
+
+struct Pt { float x = 0, y = 0; };
+
+// Shi-Tomasi corners: the structure tensor's smaller eigenvalue over a 7x7
+// window, the best one per cell of a 16 x 12 grid so they spread over the
+// frame -- a view "still seen" should mean all of it, not one textured
+// corner. Weak ones (under 5% of the strongest) are dropped: a blank wall
+// gives none, and the caller notices.
+std::vector<Pt> Corners(const Pyramid& p) {
+    const Grey& gx = p.gx[0];
+    const Grey& gy = p.gy[0];
+    const int w = gx.w, h = gx.h, r = 3, margin = 8;
+    const int cx = 16, cy = 12;
+    std::vector<float> best(size_t(cx * cy), 0.0f);
+    std::vector<Pt> at(size_t(cx * cy));
+    float top = 0.0f;
+    for (int y = margin; y < h - margin; y += 2)
+        for (int x = margin; x < w - margin; x += 2) {
+            float a = 0, b = 0, c = 0;
+            for (int j = -r; j <= r; ++j)
+                for (int i = -r; i <= r; ++i) {
+                    const float ix = gx.At(x + i, y + j), iy = gy.At(x + i, y + j);
+                    a += ix * ix;
+                    b += ix * iy;
+                    c += iy * iy;
+                }
+            const float mid = 0.5f * (a + c);
+            const float lmin = mid - std::sqrt(std::max(0.0f, mid * mid - (a * c - b * b)));
+            const size_t cell = size_t(std::min(cy - 1, y * cy / h) * cx + std::min(cx - 1, x * cx / w));
+            if (lmin > best[cell]) { best[cell] = lmin; at[cell] = Pt{float(x), float(y)}; }
+            top = std::max(top, lmin);
+        }
+    std::vector<Pt> out;
+    for (size_t i = 0; i < best.size(); ++i)
+        if (best[i] > 0.05f * top && best[i] > 1e-5f) out.push_back(at[i]);
+    return out;
+}
+
+// Lucas-Kanade from A at `a` into B, coarse to fine; `b` is the guess in and
+// the answer out. False when the window has no texture to lock onto or the
+// point leaves the frame.
+bool TrackPoint(const Pyramid& A, const Pyramid& B, Pt a, Pt* b) {
+    const int r = 4;
+    const int levels = std::min(A.levels, B.levels);
+    float dx = (b->x - a.x) / float(1 << (levels - 1));
+    float dy = (b->y - a.y) / float(1 << (levels - 1));
+    for (int l = levels - 1; l >= 0; --l) {
+        const float s = 1.0f / float(1 << l);
+        const float ax = a.x * s, ay = a.y * s;
+        const Grey& IA = A.lv[l];
+        const Grey& IX = A.gx[l];
+        const Grey& IY = A.gy[l];
+        const Grey& IB = B.lv[l];
+        float g11 = 0, g12 = 0, g22 = 0;
+        float va[81], vx[81], vy[81];
+        int n = 0;
+        for (int j = -r; j <= r; ++j)
+            for (int i = -r; i <= r; ++i, ++n) {
+                va[n] = IA.Sample(ax + float(i), ay + float(j));
+                vx[n] = IX.Sample(ax + float(i), ay + float(j));
+                vy[n] = IY.Sample(ax + float(i), ay + float(j));
+                g11 += vx[n] * vx[n];
+                g12 += vx[n] * vy[n];
+                g22 += vy[n] * vy[n];
+            }
+        const float det = g11 * g22 - g12 * g12;
+        if (det < 1e-9f) return false;
+        for (int it = 0; it < 12; ++it) {
+            float b1 = 0, b2 = 0;
+            n = 0;
+            for (int j = -r; j <= r; ++j)
+                for (int i = -r; i <= r; ++i, ++n) {
+                    const float e = va[n] - IB.Sample(ax + dx + float(i), ay + dy + float(j));
+                    b1 += e * vx[n];
+                    b2 += e * vy[n];
+                }
+            const float ux = (g22 * b1 - g12 * b2) / det;
+            const float uy = (g11 * b2 - g12 * b1) / det;
+            dx += ux;
+            dy += uy;
+            if (ux * ux + uy * uy < 1e-4f) break;
+        }
+        if (l > 0) { dx *= 2.0f; dy *= 2.0f; }
+    }
+    b->x = a.x + dx;
+    b->y = a.y + dy;
+    const float w = float(A.lv[0].w), h = float(A.lv[0].h);
+    return b->x >= 0 && b->y >= 0 && b->x < w && b->y < h;
+}
+
+// Tracked forward and back: kept only if it comes home to within a pixel.
+// A point that drifted onto something else rarely finds its way back, so
+// this is what makes "still tracked" mean the same view.
+bool TrackChecked(const Pyramid& A, const Pyramid& B, Pt a, Pt* b) {
+    if (!TrackPoint(A, B, a, b)) return false;
+    Pt back = a;
+    if (!TrackPoint(B, A, *b, &back)) return false;
+    const float ex = back.x - a.x, ey = back.y - a.y;
+    return ex * ex + ey * ey < 1.0f;
+}
+
+// --- picking frames by motion -----------------------------------------------------
+//
+// Points found in the last KEPT frame are followed frame to frame. When their
+// median displacement reaches `step` (a fraction of the frame's shorter
+// side), or too few are still tracked, a frame is kept -- not the frame that
+// crossed the line but the SHARPEST since the view moved half a step, since
+// motion blur arrives exactly when the camera speeds up. Tracking then
+// restarts from the frame kept, so no two kept frames are more than a step
+// apart, however the camera moved between them.
+class MotionPicker {
+public:
+    MotionPicker(const VideoOptions& o, int w, int h, int rotation, double seconds,
+                 std::vector<Image>* frames, VideoInfo* info)
+        : m_o(o), m_w(w), m_h(h), m_rot(rotation), m_frames(frames), m_info(info) {
+        const int longSide = std::max(w, h);
+        m_k = (o.maxDim > 0 && longSide > o.maxDim) ? (longSide + o.maxDim - 1) / o.maxDim : 1;
+        m_kt = std::max(1, (longSide + 239) / 240);   // tracking: ~240 px across
+        m_step = o.step;
+        // The floor in time: at least `floorFrames` over the clip.
+        m_every = (o.floorFrames > 0 && seconds > 0.0) ? seconds / double(o.floorFrames) : 0.0;
+    }
+
+    void Frame(const uint8_t* px, int pitch, double t, double score) {
+        Pyramid p = PyramidOf(GreyOf(px, m_w, m_h, pitch, m_kt));
+        if (!m_started) {
+            m_started = true;
+            m_first = true;
+            Seed(p, p);
+            m_refTime = t;
+            Offer(px, pitch, t, score, p, 0.0);
+            m_prev = std::move(p);
+            return;
+        }
+        int alive = 0;
+        std::vector<double> dist;
+        for (size_t i = 0; i < m_cur.size(); ++i) {
+            if (!m_alive[i]) continue;
+            Pt b = m_cur[i];
+            if (TrackChecked(m_prev, p, m_cur[i], &b)) {
+                m_cur[i] = b;
+                ++alive;
+                dist.push_back(std::hypot(double(b.x - m_ref[i].x), double(b.y - m_ref[i].y)));
+            } else {
+                m_alive[i] = 0;
+            }
+        }
+        const double shortSide = double(std::min(p.lv[0].w, p.lv[0].h));
+        double d = 0.0;
+        if (!dist.empty()) {
+            std::nth_element(dist.begin(), dist.begin() + long(dist.size() / 2), dist.end());
+            d = dist[dist.size() / 2] / shortSide;
+        }
+        const double kept = m_seeded ? double(alive) / double(m_seeded) : 0.0;
+        // Nothing to track -- a blank wall, darkness -- so time decides: the
+        // sharpest frame of each second.
+        const bool blind = m_seeded < 12;
+        // Candidates lie between half a step and a step. The frame that
+        // crosses the step is past it by up to a frame's motion, so it is
+        // kept only when nothing inside qualified -- which is what makes a
+        // step the most two kept frames can be apart.
+        // THE FLOOR IN TIME works the same way: candidates from half the
+        // interval, a frame kept by the whole of it. A slow or short clip
+        // keeps its density this way; motion adds frames where it moves.
+        const double lo = m_first ? 0.0 : 0.5 * m_step;
+        const double hi = m_first ? 0.5 * m_step : m_step;
+        const double every = blind ? 1.0 : m_every;
+        const double since = t - m_refTime;
+
+        // UNLESS THE WINDOW IS BLURRED. A fast stretch of the clip is a
+        // blurred one, and there the window can hold only a frame or two,
+        // all soft: kept anyway, they starve the matcher. On IMG_1535 a
+        // second of turn kept frames of sharpness 22-37 where time slots
+        // found 58-98 nearby; fewer than five tracks crossed it, and the walk
+        // came out as two copies of the subject. So when the best candidate
+        // is blurred -- under kSharpFrac of the clip's sharpness over the
+        // last second -- the search runs on past the step, up to two steps,
+        // and keeps the first sharp frame (or, failing one, the sharpest).
+        // Sharp windows are unaffected: a step remains the most two kept
+        // frames are apart wherever the clip is in focus.
+        m_recent.push_back(score);
+        if (m_recent.size() > 31) m_recent.erase(m_recent.begin());
+        std::vector<double> rs = m_recent;
+        std::nth_element(rs.begin(), rs.begin() + long(rs.size() / 2), rs.end());
+        const double sharpEnough = kSharpFrac * rs[rs.size() / 2];
+        auto candSharp = [&] { return m_haveCand && m_candScore >= sharpEnough; };
+
+        // Nothing past either limit is a candidate -- the frame that crosses
+        // one is kept only when nothing inside qualified -- unless the
+        // window is blurred, as above.
+        const bool reach = !candSharp();   // may look past the limits
+        // Lost views -- a fast turn, something passing in front, a cut, and
+        // blur itself, which defeats the tracker. Not faster than five a
+        // second, or a stretch where nothing tracks would keep every frame.
+        const bool lost = !blind && kept < m_o.minTracked && since >= 0.2;
+        const bool inStep = d <= hi || (reach && d <= 2.0 * hi);
+        const bool inTime = every <= 0.0 || since <= every || (reach && since <= 2.0 * every);
+        const bool timeWindow = every > 0.0 && since >= 0.5 * every;
+        // Lost and the best so far blurred: the measured motion means
+        // little, so any frame is a candidate until a sharp one turns up.
+        if ((inStep && inTime && (blind || d >= lo || timeWindow)) || (lost && reach))
+            Offer(px, pitch, t, score, p, d);
+        int why = 0;   // 1 motion, 2 tracking lost, 3 time
+        if (blind) {
+            if (since >= every) why = 3;
+        } else if (d >= hi && (candSharp() || d >= 2.0 * hi)) {
+            why = 1;
+        } else if (lost && (candSharp() || since >= 1.0)) {
+            // ...and if every frame since is blurred, the sharpest of a
+            // second -- a fast turn's blur lasts less -- rather than waiting on.
+            why = 2;
+        } else if (m_every > 0.0 && since >= m_every &&
+                   (candSharp() || since >= 2.0 * m_every)) {
+            why = 3;
+        }
+        if (why) {
+            if (!m_haveCand) Offer(px, pitch, t, score, p, d);
+            Emit(p, why);
+        }
+        m_prev = std::move(p);
+    }
+
+    // The tail: a view half a step past the last kept frame is kept too, and
+    // a clip too short to trigger anything still gives its sharpest frame.
+    void Finish() {
+        if (m_haveCand && (m_frames->empty() || m_candD >= 0.5 * m_step || m_first))
+            Emit(m_prev, 1);
+        m_info->step = m_step;
+    }
+
+private:
+    // Corners of `from`, followed into `to` (the same frame when kept now).
+    void Seed(const Pyramid& from, const Pyramid& to) {
+        m_ref = Corners(from);
+        m_cur = m_ref;
+        m_alive.assign(m_ref.size(), 1);
+        if (&from != &to)
+            for (size_t i = 0; i < m_ref.size(); ++i) {
+                Pt b = m_ref[i];
+                if (TrackChecked(from, to, m_ref[i], &b)) m_cur[i] = b;
+                else m_alive[i] = 0;
+            }
+        m_seeded = int(m_ref.size());
+    }
+
+    void Offer(const uint8_t* px, int pitch, double t, double score, const Pyramid& p, double d) {
+        if (m_haveCand && score <= m_candScore) return;
+        m_cand.resize(size_t(m_w) * size_t(m_h) * 4);
+        for (int y = 0; y < m_h; ++y)
+            std::memcpy(m_cand.data() + size_t(y) * size_t(m_w) * 4, px + ptrdiff_t(y) * pitch,
+                        size_t(m_w) * 4);
+        m_candPyr = p;
+        m_candScore = score;
+        m_candTime = t;
+        m_candD = d;
+        m_haveCand = true;
+    }
+
+    void Emit(const Pyramid& now, int why) {
+        m_frames->push_back(FrameToImage(m_cand.data(), m_w, m_h, m_w * 4, m_k, m_rot, true));
+        m_info->times.push_back(m_candTime);
+        m_info->sharpness.push_back(m_candScore);
+        m_info->motion.push_back(m_candD);
+        if (why == 1) ++m_info->byMotion;
+        else if (why == 2) ++m_info->byTracking;
+        else ++m_info->byTime;
+        Seed(m_candPyr, now);
+        m_refTime = m_candTime;
+        m_haveCand = false;
+        m_candScore = -1.0;
+        m_first = false;
+        // TOO MANY: every other frame goes and the step doubles, so spacing
+        // still follows the motion, only coarser.
+        if (m_o.maxFrames > 0 && int(m_frames->size()) > m_o.maxFrames) {
+            auto thin = [](auto& v) {
+                size_t o = 0;
+                for (size_t i = 0; i < v.size(); i += 2) v[o++] = std::move(v[i]);
+                v.resize(o);
+            };
+            thin(*m_frames);
+            thin(m_info->times);
+            thin(m_info->sharpness);
+            thin(m_info->motion);
+            m_step *= 2.0;
+            m_every *= 2.0;
+            ++m_info->thinned;
+        }
+    }
+
+    const VideoOptions& m_o;
+    int m_w, m_h, m_rot, m_k = 1, m_kt = 1;
+    double m_step = 0.1;
+    double m_every = 0.0;   // the floor in time, seconds; 0 for none
+    std::vector<double> m_recent;   // sharpness of the last ~second of frames
+    static constexpr double kSharpFrac = 0.6;   // under this of it is blurred
+    std::vector<Image>* m_frames;
+    VideoInfo* m_info;
+    bool m_started = false, m_first = true;
+    Pyramid m_prev, m_candPyr;
+    std::vector<Pt> m_ref, m_cur;
+    std::vector<char> m_alive;
+    int m_seeded = 0;
+    double m_refTime = 0.0;
+    std::vector<uint8_t> m_cand;
+    bool m_haveCand = false;
+    double m_candScore = -1.0, m_candTime = 0.0, m_candD = 0.0;
+};
+
 }  // namespace
 
 bool IsVideoPath(const std::string& path) {
@@ -224,6 +617,13 @@ bool LoadVideoFrames(const std::string& path, const VideoOptions& opt,
     info->decoded = 0;
     info->times.clear();
     info->sharpness.clear();
+    info->motion.clear();
+    info->byMotion = info->byTracking = info->byTime = info->thinned = 0;
+    info->step = 0.0;
+    info->byTimeSlots = opt.pick == VideoPick::Time;
+    frames->clear();
+    MotionPicker picker(opt, int(w), int(h), info->rotation, info->seconds, frames, info);
+    const bool byMotion = opt.pick == VideoPick::Motion;
 
     const int slots = std::max(1, opt.frames);
     const int longSide = int(std::max(w, h));
@@ -236,7 +636,6 @@ bool LoadVideoFrames(const std::string& path, const VideoOptions& opt,
     std::vector<uint8_t> cand;
     double candScore = -1.0, candTime = 0.0;
     int candSlot = -1;
-    frames->clear();
     auto flush = [&] {
         if (candSlot < 0) return;
         frames->push_back(FrameToImage(cand.data(), int(w), int(h), int(w) * 4, k,
@@ -281,7 +680,12 @@ bool LoadVideoFrames(const std::string& path, const VideoOptions& opt,
                 pitch = BufferPitch(len, w, h);
                 if (len < DWORD(pitch) * h) scan0 = nullptr;   // truncated frame
             }
-            if (scan0) {
+            if (scan0 && byMotion) {
+                const double t = double(ts) * 1e-7;
+                picker.Frame(scan0, int(pitch), t,
+                             FrameSharpness(scan0, int(w), int(h), int(pitch)));
+                ++info->decoded;
+            } else if (scan0) {
                 const double t = double(ts) * 1e-7;
                 const int slot = duration > 0
                     ? std::min(slots - 1, int(double(ts) / double(duration) * slots))
@@ -309,14 +713,44 @@ bool LoadVideoFrames(const std::string& path, const VideoOptions& opt,
         SafeRelease(&buf);
         SafeRelease(&sample);
     }
-    flush();
+    if (byMotion) picker.Finish();
+    else flush();
     cleanup();
 
     if (frames->empty()) {
         *err = "'" + path + "' decoded no frames";
         return false;
     }
+    // A clip that barely moves -- a tripod shot, a slow drift -- has too
+    // little parallax for a reconstruction either way, but equal time slots
+    // at least give the rest of the chain something to try.
+    if (byMotion && int(frames->size()) < opt.minFrames && info->decoded > opt.minFrames) {
+        VideoOptions t = opt;
+        t.pick = VideoPick::Time;
+        t.frames = std::max(opt.minFrames, 30);
+        return LoadVideoFrames(path, t, frames, info, err);
+    }
     return true;
+}
+
+std::string VideoNote(const VideoInfo& vi, int kept) {
+    char buf[240];
+    int n = std::snprintf(buf, sizeof(buf), "%d frames kept of %d (%.1f s at %.0f fps, %dx%d%s)",
+                          kept, vi.decoded, vi.seconds, vi.fps, vi.width, vi.height,
+                          vi.rotation ? (", rotated " + std::to_string(vi.rotation) + "\xC2\xB0").c_str()
+                                      : "");
+    if (n > 0 && size_t(n) < sizeof(buf)) {
+        if (vi.byTimeSlots)
+            std::snprintf(buf + n, sizeof(buf) - size_t(n), "; by time");
+        else
+            std::snprintf(buf + n, sizeof(buf) - size_t(n),
+                          "; by motion, a step of %.0f%%%s%s", 100.0 * vi.step,
+                          vi.byTracking ? (", " + std::to_string(vi.byTracking) +
+                                           " where the view was lost").c_str() : "",
+                          vi.byTime ? (", " + std::to_string(vi.byTime) +
+                                       " by the time floor").c_str() : "");
+    }
+    return buf;
 }
 
 bool WriteTestVideo(const std::string& path, const std::vector<Image>& frames,

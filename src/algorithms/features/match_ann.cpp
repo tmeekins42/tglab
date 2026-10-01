@@ -743,6 +743,7 @@ private:
         // Each frame writes only its own row of votes.
         ParallelFor(size_t(n), [&](size_t fi) {
             const int f = int(fi);
+            if (GroupCancelled()) return;   // superseded: see SetGroupCancel
             std::vector<Candidate> c;
             for (size_t row : mine[size_t(f)]) {
                 if (isFloat) forest.Search(pool.FloatAt(row), checks, &c);

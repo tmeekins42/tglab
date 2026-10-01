@@ -27,6 +27,7 @@
 
 #include "../../algo_util/pixel_buffer.h"
 #include "../../algo_util/tone_curve.h"
+#include "../../algo_util/color.h"
 #include "../../core/algorithm.h"
 
 namespace tglab {
@@ -58,7 +59,7 @@ Levels Measure(const PixelBuffer& pb) {
         for (int x = 0; x < w; x += stride) {
             const float* p = pb.At(x, y);
             const float l = (ch >= 3)
-                ? 0.2126f * p[0] + 0.7152f * p[1] + 0.0722f * p[2]
+                ? Luma(p)
                 : p[0];
             // Negatives are real -- the demosaic undershoots on near-black
             // pixels and the merge amplifies that -- but they carry no

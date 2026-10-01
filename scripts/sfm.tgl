@@ -4,8 +4,9 @@
 # several -- then right-click the group and "Sort by filename" so the order is
 # the capture order. The matchers chain against neighbours, so order matters.
 #
-# Or drop a VIDEO on the "group" row: it replaces the photographs with the
-# clip's sharpest frame from each of 100 even time slots. Walk slowly around
+# Or drop a VIDEO on the "group" row: it replaces the photographs with frames
+# kept each time the view has moved far enough -- more where the camera moves
+# fast, fewer where it is slow, the sharpest near each point. Walk slowly around
 # the subject with exposure locked; see README for capture tips. A phone's
 # field of view differs from fountain-P11's -- about 33 degrees against 58.
 #

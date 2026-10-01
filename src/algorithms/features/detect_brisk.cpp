@@ -44,6 +44,8 @@
 
 #include "../../algo_util/features.h"
 #include "../../algo_util/pixel_buffer.h"
+#include "../../algo_util/color.h"
+#include "../../algo_util/fast.h"
 #include "../../core/algorithm.h"
 #include "gpu_pyramid.h"
 
@@ -72,35 +74,6 @@ struct Layer {
         return a + (b - a) * fy;
     }
 };
-
-constexpr int kCircleX[16] = { 0,  1,  2,  3,  3,  3,  2,  1,
-                               0, -1, -2, -3, -3, -3, -2, -1};
-constexpr int kCircleY[16] = {-3, -3, -2, -1,  0,  1,  2,  3,
-                              3,  3,  2,  1,  0, -1, -2, -3};
-
-// AGAST/FAST-9 corner test, with the same four-point early rejection as ORB's.
-bool FastCorner(const Layer& L, int x, int y, float t) {
-    const float c = L.At(x, y);
-    const float hi = c + t, lo = c - t;
-
-    int brightAxis = 0, darkAxis = 0;
-    for (int i = 0; i < 16; i += 4) {
-        const float p = L.At(x + kCircleX[i], y + kCircleY[i]);
-        if (p > hi) ++brightAxis;
-        else if (p < lo) ++darkAxis;
-    }
-    if (brightAxis < 3 && darkAxis < 3) return false;
-
-    int runBright = 0, runDark = 0;
-    for (int i = 0; i < 32; ++i) {
-        const int k = i & 15;
-        const float p = L.At(x + kCircleX[k], y + kCircleY[k]);
-        if (p > hi) { runDark = 0; if (++runBright >= 9) return true; }
-        else if (p < lo) { runBright = 0; if (++runDark >= 9) return true; }
-        else { runBright = runDark = 0; }
-    }
-    return false;
-}
 
 // FAST score: the largest threshold at which this pixel is still a corner.
 //
@@ -268,7 +241,7 @@ public:
             for (int x = 0; x < w; ++x) {
                 const float* p = in.At(x, y);
                 base.v[size_t(y) * size_t(w) + size_t(x)] = (ch >= 3)
-                    ? (0.2126f * p[0] + 0.7152f * p[1] + 0.0722f * p[2]) / scale
+                    ? Luma(p) / scale
                     : p[0] / scale;
             }
 

@@ -44,6 +44,7 @@
 
 #include "../../algo_util/features.h"
 #include "../../algo_util/view_graph.h"
+#include "../../algo_util/linalg.h"
 #include "../../core/algorithm.h"
 #include "../../core/parallel.h"
 
@@ -58,68 +59,6 @@ struct Corr {
     double ax, ay;   // in frame i
     double bx, by;   // in frame j
 };
-
-// Solves the smallest singular vector of an m x 9 system by Jacobi eigen
-// decomposition of A^T A.
-//
-// A 9x9 symmetric eigenproblem rather than a full SVD of A: the matrix is tiny
-// and fixed-size, cyclic Jacobi is thirty lines and unconditionally convergent
-// for a symmetric matrix, and the answer wanted is one eigenvector. Squaring
-// A costs condition number -- the standard objection -- but the eight-point
-// algorithm normalises its input first (Hartley), which is precisely the step
-// that makes the squared system well behaved.
-bool SmallestEigenvector9(const double A[81], double out[9]) {
-    double M[81];
-    std::copy(A, A + 81, M);
-
-    // V accumulates the rotations, so its columns end as the eigenvectors.
-    double V[81] = {};
-    for (int i = 0; i < 9; ++i) V[i * 9 + i] = 1.0;
-
-    for (int sweep = 0; sweep < 60; ++sweep) {
-        double off = 0.0;
-        for (int p = 0; p < 9; ++p)
-            for (int q = p + 1; q < 9; ++q) off += M[p * 9 + q] * M[p * 9 + q];
-        if (off < 1e-24) break;
-
-        for (int p = 0; p < 9; ++p) {
-            for (int q = p + 1; q < 9; ++q) {
-                const double apq = M[p * 9 + q];
-                if (std::fabs(apq) < 1e-18) continue;
-                const double app = M[p * 9 + p], aqq = M[q * 9 + q];
-                const double theta = 0.5 * (aqq - app) / apq;
-                const double t = (theta >= 0.0 ? 1.0 : -1.0) /
-                                 (std::fabs(theta) + std::sqrt(theta * theta + 1.0));
-                const double c = 1.0 / std::sqrt(t * t + 1.0);
-                const double s = t * c;
-
-                for (int k = 0; k < 9; ++k) {
-                    const double mkp = M[k * 9 + p], mkq = M[k * 9 + q];
-                    M[k * 9 + p] = c * mkp - s * mkq;
-                    M[k * 9 + q] = s * mkp + c * mkq;
-                }
-                for (int k = 0; k < 9; ++k) {
-                    const double mpk = M[p * 9 + k], mqk = M[q * 9 + k];
-                    M[p * 9 + k] = c * mpk - s * mqk;
-                    M[q * 9 + k] = s * mpk + c * mqk;
-                }
-                for (int k = 0; k < 9; ++k) {
-                    const double vkp = V[k * 9 + p], vkq = V[k * 9 + q];
-                    V[k * 9 + p] = c * vkp - s * vkq;
-                    V[k * 9 + q] = s * vkp + c * vkq;
-                }
-            }
-        }
-    }
-
-    int best = 0;
-    double bestVal = M[0];
-    for (int i = 1; i < 9; ++i)
-        if (M[i * 9 + i] < bestVal) { bestVal = M[i * 9 + i]; best = i; }
-
-    for (int i = 0; i < 9; ++i) out[i] = V[i * 9 + best];
-    return true;
-}
 
 // The eight-point algorithm on normalised coordinates, with Hartley's
 // isotropic conditioning.
@@ -162,8 +101,13 @@ bool EssentialEightPoint(const std::vector<Corr>& pts,
             for (int q = 0; q < 9; ++q) A[p * 9 + q] += r[p] * r[q];
     }
 
+    // The smallest singular vector of the m x 9 system, as the least
+    // eigenvector of A^T A: tiny and fixed-size, so a symmetric
+    // eigenproblem rather than an SVD. Squaring A costs condition number --
+    // the standard objection -- but the conditioning above is precisely
+    // what makes the squared system well behaved.
     double e[9];
-    if (!SmallestEigenvector9(A, e)) return false;
+    linalg::SmallestEigenvector<9>(A, e);
 
     // Undo the conditioning: E = Tb^T * E' * Ta.
     Mat3 Ta, Tb;
@@ -246,60 +190,11 @@ bool FivePointNullspace(const std::vector<Corr>& pts,
             for (int q = 0; q < 9; ++q) A[p * 9 + q] += r[p] * r[q];
     }
 
-    // Jacobi eigendecomposition, keeping all nine eigenvectors so the four
-    // smallest can be taken. Same sweep structure as SmallestEigenvector9.
-    double M[81];
-    std::copy(A, A + 81, M);
-    double V[81] = {};
-    for (int i = 0; i < 9; ++i) V[i * 9 + i] = 1.0;
-
-    for (int sweep = 0; sweep < 60; ++sweep) {
-        double off = 0.0;
-        for (int p = 0; p < 9; ++p)
-            for (int q = p + 1; q < 9; ++q) off += M[p * 9 + q] * M[p * 9 + q];
-        if (off < 1e-24) break;
-        for (int p = 0; p < 9; ++p) {
-            for (int q = p + 1; q < 9; ++q) {
-                const double apq = M[p * 9 + q];
-                if (std::fabs(apq) < 1e-18) continue;
-                const double app = M[p * 9 + p], aqq = M[q * 9 + q];
-                const double theta = 0.5 * (aqq - app) / apq;
-                const double t = (theta >= 0.0 ? 1.0 : -1.0) /
-                                 (std::fabs(theta) + std::sqrt(theta * theta + 1.0));
-                const double c = 1.0 / std::sqrt(t * t + 1.0);
-                const double s = t * c;
-                for (int k = 0; k < 9; ++k) {
-                    const double mkp = M[k * 9 + p], mkq = M[k * 9 + q];
-                    M[k * 9 + p] = c * mkp - s * mkq;
-                    M[k * 9 + q] = s * mkp + c * mkq;
-                }
-                for (int k = 0; k < 9; ++k) {
-                    const double mpk = M[p * 9 + k], mqk = M[q * 9 + k];
-                    M[p * 9 + k] = c * mpk - s * mqk;
-                    M[q * 9 + k] = s * mpk + c * mqk;
-                }
-                for (int k = 0; k < 9; ++k) {
-                    const double vkp = V[k * 9 + p], vkq = V[k * 9 + q];
-                    V[k * 9 + p] = c * vkp - s * vkq;
-                    V[k * 9 + q] = s * vkp + c * vkq;
-                }
-            }
-        }
-    }
-
-    // The four smallest eigenvalues, by selection: nine entries, so sorting
-    // would cost more to read than it saves to run.
-    int order[9];
-    for (int i = 0; i < 9; ++i) order[i] = i;
-    for (int i = 0; i < 4; ++i) {
-        int bestI = i;
-        for (int j = i + 1; j < 9; ++j)
-            if (M[order[j] * 9 + order[j]] < M[order[bestI] * 9 + order[bestI]])
-                bestI = j;
-        std::swap(order[i], order[bestI]);
-    }
+    // Eigenvalues ascending, so the first four columns span the nullspace.
+    double values[9], V[81];
+    linalg::SymmetricEigen<9>(A, values, V);
     for (int b = 0; b < 4; ++b)
-        for (int i = 0; i < 9; ++i) basis[b][i] = V[i * 9 + order[b]];
+        for (int i = 0; i < 9; ++i) basis[b][i] = V[i * 9 + b];
     return true;
 }
 
@@ -692,8 +587,7 @@ bool RecoverXY(const double rows[10][kNMono], double z, double* x, double* y) {
     double M[100];
     BuildMatrixAtZ(rows, z, M);
 
-    // Smallest singular vector via the same Jacobi routine, on M^T M.
-    double A[81] = {};   // only the 9x9 leading block is used by the helper,
+    // The smallest singular vector of M, as the least eigenvector of M^T M.
     double ATA[100] = {};
     for (int i = 0; i < 10; ++i)
         for (int j = 0; j < 10; ++j) {
@@ -701,51 +595,8 @@ bool RecoverXY(const double rows[10][kNMono], double z, double* x, double* y) {
             for (int k = 0; k < 10; ++k) s += M[k * 10 + i] * M[k * 10 + j];
             ATA[i * 10 + j] = s;
         }
-    (void)A;
-
-    // Jacobi on the 10x10.
-    double V[100] = {};
-    for (int i = 0; i < 10; ++i) V[i * 10 + i] = 1.0;
-    for (int sweep = 0; sweep < 60; ++sweep) {
-        double off = 0.0;
-        for (int p = 0; p < 10; ++p)
-            for (int q = p + 1; q < 10; ++q) off += ATA[p * 10 + q] * ATA[p * 10 + q];
-        if (off < 1e-26) break;
-        for (int p = 0; p < 10; ++p) {
-            for (int q = p + 1; q < 10; ++q) {
-                const double apq = ATA[p * 10 + q];
-                if (std::fabs(apq) < 1e-20) continue;
-                const double app = ATA[p * 10 + p], aqq = ATA[q * 10 + q];
-                const double theta = 0.5 * (aqq - app) / apq;
-                const double t = (theta >= 0.0 ? 1.0 : -1.0) /
-                                 (std::fabs(theta) + std::sqrt(theta * theta + 1.0));
-                const double c = 1.0 / std::sqrt(t * t + 1.0);
-                const double s = t * c;
-                for (int k = 0; k < 10; ++k) {
-                    const double mkp = ATA[k * 10 + p], mkq = ATA[k * 10 + q];
-                    ATA[k * 10 + p] = c * mkp - s * mkq;
-                    ATA[k * 10 + q] = s * mkp + c * mkq;
-                }
-                for (int k = 0; k < 10; ++k) {
-                    const double mpk = ATA[p * 10 + k], mqk = ATA[q * 10 + k];
-                    ATA[p * 10 + k] = c * mpk - s * mqk;
-                    ATA[q * 10 + k] = s * mpk + c * mqk;
-                }
-                for (int k = 0; k < 10; ++k) {
-                    const double vkp = V[k * 10 + p], vkq = V[k * 10 + q];
-                    V[k * 10 + p] = c * vkp - s * vkq;
-                    V[k * 10 + q] = s * vkp + c * vkq;
-                }
-            }
-        }
-    }
-
-    int best = 0;
-    for (int i = 1; i < 10; ++i)
-        if (ATA[i * 10 + i] < ATA[best * 10 + best]) best = i;
-
     double v[10];
-    for (int i = 0; i < 10; ++i) v[i] = V[i * 10 + best];
+    linalg::SmallestEigenvector<10>(ATA, v);
 
     // v[9] is the constant term; dividing by it makes v[7] = x and v[8] = y.
     if (std::fabs(v[9]) < 1e-12) return false;
@@ -966,7 +817,7 @@ double HomographyInlierFraction(const std::vector<Corr>& pts,
                 AtA[p * 9 + q] += A[i * 9 + size_t(p)] * A[i * 9 + size_t(q)];
 
     double h[9];
-    if (!SmallestEigenvector9(AtA, h)) return 0.0;
+    linalg::SmallestEigenvector<9>(AtA, h);
 
     Mat3 Hn;
     for (int i = 0; i < 9; ++i) Hn.m[i] = h[i];
@@ -1008,58 +859,17 @@ bool DecomposeEssential(const Mat3& E, const std::vector<Corr>& pts,
     // E = U diag(1,1,0) V^T. Recovered here via the symmetric eigenproblems of
     // E^T E and E E^T, which is enough for the two candidate rotations without
     // a general SVD routine.
-    Mat3 EtE = E.Transpose() * E;
-    double A[81] = {};
-    for (int i = 0; i < 3; ++i)
-        for (int j = 0; j < 3; ++j) A[i * 9 + j] = EtE.At(i, j);
+    const Mat3 EtE = E.Transpose() * E;
+    double values[3];
+    Mat3 V;
+    linalg::SymmetricEigen<3>(EtE.m, values, V.m);
 
-    // Jacobi on the 3x3, reusing the 9x9 routine's structure would be wasteful;
-    // do it directly.
-    double M[9], V[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
-    for (int i = 0; i < 9; ++i) M[i] = EtE.m[i];
-    for (int sweep = 0; sweep < 40; ++sweep) {
-        double off = M[1] * M[1] + M[2] * M[2] + M[5] * M[5];
-        if (off < 1e-26) break;
-        for (int p = 0; p < 3; ++p) {
-            for (int q = p + 1; q < 3; ++q) {
-                const double apq = M[p * 3 + q];
-                if (std::fabs(apq) < 1e-20) continue;
-                const double theta = 0.5 * (M[q * 3 + q] - M[p * 3 + p]) / apq;
-                const double tt = (theta >= 0.0 ? 1.0 : -1.0) /
-                                  (std::fabs(theta) + std::sqrt(theta * theta + 1.0));
-                const double c = 1.0 / std::sqrt(tt * tt + 1.0), s = tt * c;
-                for (int k = 0; k < 3; ++k) {
-                    const double mkp = M[k * 3 + p], mkq = M[k * 3 + q];
-                    M[k * 3 + p] = c * mkp - s * mkq;
-                    M[k * 3 + q] = s * mkp + c * mkq;
-                }
-                for (int k = 0; k < 3; ++k) {
-                    const double mpk = M[p * 3 + k], mqk = M[q * 3 + k];
-                    M[p * 3 + k] = c * mpk - s * mqk;
-                    M[q * 3 + k] = s * mpk + c * mqk;
-                }
-                for (int k = 0; k < 3; ++k) {
-                    const double vkp = V[k * 3 + p], vkq = V[k * 3 + q];
-                    V[k * 3 + p] = c * vkp - s * vkq;
-                    V[k * 3 + q] = s * vkp + c * vkq;
-                }
-            }
-        }
-    }
-
-    // Order the columns of V by descending eigenvalue; the null direction is
-    // last, and that is the epipole in frame i.
-    int order[3] = {0, 1, 2};
-    std::sort(order, order + 3, [&](int a, int b) {
-        return M[a * 3 + a] > M[b * 3 + b];
-    });
-
+    // The columns of V by DESCENDING eigenvalue; the null direction is last,
+    // and that is the epipole in frame i. Turned right-handed if need be.
     Mat3 Vm;
     for (int r = 0; r < 3; ++r)
-        for (int c = 0; c < 3; ++c) Vm.At(r, c) = V[r * 3 + order[c]];
-    if (Vm.m[0] * (Vm.m[4] * Vm.m[8] - Vm.m[5] * Vm.m[7]) -
-        Vm.m[1] * (Vm.m[3] * Vm.m[8] - Vm.m[5] * Vm.m[6]) +
-        Vm.m[2] * (Vm.m[3] * Vm.m[7] - Vm.m[4] * Vm.m[6]) < 0.0)
+        for (int c = 0; c < 3; ++c) Vm.At(r, c) = V.At(r, 2 - c);
+    if (Vm.Det() < 0.0)
         for (int r = 0; r < 3; ++r) Vm.At(r, 2) = -Vm.At(r, 2);
 
     // U from E * V, normalised. The third column is the left null vector.
@@ -1393,6 +1203,7 @@ bool RelativePose::RunAlign(std::vector<Image>* images, std::string* err) {
 
     ParallelFor(size_t(n), [&](size_t fi) {
         const int f = int(fi);
+        if (GroupCancelled()) return;   // superseded: see SetGroupCancel
         Tally& tl = tallies[fi];
         int& solved = tl.solved;
         int& attempted = tl.attempted;
@@ -1567,17 +1378,21 @@ bool RelativePose::RunAlign(std::vector<Image>* images, std::string* err) {
             // B's centre at -R^T t. Storing it unconverted put frame B's
             // epipole in a slot every consumer reads as frame A's.
             //
-            // The direction from A to B, in A's coordinates, is R^T t: rotate
-            // out of B and the sign already points the right way because the
-            // cheirality test picked the candidate that puts points in front
-            // of both cameras.
+            // The direction from A to B, in A's coordinates, is B's centre
+            // there: -R^T t, with the sign the cheirality test fixed.
             //
             // Measured on an exact synthetic pair: the stored direction was
             // 17 degrees from the truth on noise-free data. Small enough to
             // look like noise, large enough that translation averaging could
             // never converge -- and invisible to the rotation checks, which
             // were exactly right.
-            edge.direction = (R.Transpose() * t).Normalized();
+            //
+            // And then it was stored as +R^T t, pointing from B to A, which
+            // went unseen for longer: translation averaging cannot tell, since
+            // the mirrored layout satisfies every reversed direction equally,
+            // and the test compared |cos|. What it broke was global_position's
+            // chained start, built mirrored and so never chosen -- see there.
+            edge.direction = (R.Transpose() * t * -1.0).Normalized();
             edge.inliers = int(best.size());
             edge.revisit = set.revisit;
             out->edges.push_back(edge);

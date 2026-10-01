@@ -66,6 +66,7 @@
 #include <vector>
 
 #include "../../algo_util/pixel_buffer.h"
+#include "../../algo_util/color.h"
 #include "../../core/algorithm.h"
 
 namespace tglab {
@@ -376,7 +377,7 @@ public:
         {
             std::vector<float> guide(sn);
             for (size_t i = 0; i < sn; ++i)
-                guide[i] = 0.2126f * sr[i] + 0.7152f * sg[i] + 0.0722f * sb[i];
+                guide[i] = Luma(sr[i], sg[i], sb[i]);
             std::vector<float> refined;
             GuidedFilter(guide, t, sw, sh, refine, 1e-4f, &refined);
             t.swap(refined);
@@ -703,9 +704,6 @@ public:
 
     std::vector<uint32_t> SaveMeasurement() const override {
         if (!m_gpuValid) return {};   // nothing worth caching yet
-        auto bits = [](float f) {
-            uint32_t u; std::memcpy(&u, &f, sizeof(u)); return u;
-        };
         // ONLY THE AIRLIGHT, plus the patch radius it was measured with.
         //
         // Deliberately NOT the two working radii. Both are trivial to
@@ -719,8 +717,8 @@ public:
         // measured over a different window -- the exact failure this cache has
         // to be careful about, because a slightly wrong airlight is a
         // plausible-looking picture rather than an obvious error.
-        return {bits(m_gpuA[0]), bits(m_gpuA[1]), bits(m_gpuA[2]),
-                bits(m_gpuScale), uint32_t(int(m_patch))};
+        return {FloatBits(m_gpuA[0]), FloatBits(m_gpuA[1]), FloatBits(m_gpuA[2]),
+                FloatBits(m_gpuScale), uint32_t(int(m_patch))};
     }
 
     bool RestoreMeasurement(const std::vector<uint32_t>& b) override {
@@ -764,9 +762,6 @@ public:
     }
 
     std::vector<uint32_t> GpuPassConstants(int pass) const override {
-        auto bits = [](float f) {
-            uint32_t u; std::memcpy(&u, &f, sizeof(u)); return u;
-        };
         const float omega   = std::clamp(float(m_strength), 0.0f, 1.0f);
         const float t0      = std::max(0.01f, float(m_floor));
         const float protect = std::clamp(float(m_skyProtect), 0.0f, 1.0f);
@@ -777,8 +772,8 @@ public:
         if (pass == 1 || pass == 2) radius = m_gpuPatch;
         else if (pass == 3)         radius = m_gpuRefine;
 
-        return {bits(m_gpuA[0]), bits(m_gpuA[1]), bits(m_gpuA[2]),
-                bits(omega), bits(t0), bits(protect),
+        return {FloatBits(m_gpuA[0]), FloatBits(m_gpuA[1]), FloatBits(m_gpuA[2]),
+                FloatBits(omega), FloatBits(t0), FloatBits(protect),
                 uint32_t(std::max(0, radius))};
     }
 

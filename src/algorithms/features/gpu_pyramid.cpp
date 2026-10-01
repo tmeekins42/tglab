@@ -6,6 +6,7 @@
 #include <memory>
 
 #include "../../core/image.h"
+#include "../../core/math_util.h"
 #include "../../gpu/compute.h"
 
 namespace tglab {
@@ -410,12 +411,6 @@ bool CornerReady(ComputeContext* gpu, const GpuPlane& src, std::string* err) {
     return true;
 }
 
-uint32_t Bits(float f) {
-    uint32_t b = 0;
-    std::memcpy(&b, &f, sizeof b);
-    return b;
-}
-
 Kernels& TheKernels() {
     static Kernels k;
     return k;
@@ -492,7 +487,7 @@ bool GpuFastHarris(ComputeContext* gpu, const GpuPlane& src, GpuPlane* dst,
 
     return RunCornerKernel(
         gpu, ck, src, dst,
-        {Bits(threshold), uint32_t(harrisRadius), uint32_t(border)}, err);
+        {FloatBits(threshold), uint32_t(harrisRadius), uint32_t(border)}, err);
 }
 
 bool GpuFastScore(ComputeContext* gpu, const GpuPlane& src, GpuPlane* dst,
@@ -505,7 +500,7 @@ bool GpuFastScore(ComputeContext* gpu, const GpuPlane& src, GpuPlane* dst,
     // HarrisRadius is unused here but still occupies its slot: the two kernels
     // share one cbuffer layout, so Border must land where the shader expects it.
     return RunCornerKernel(gpu, ck, src, dst,
-                           {Bits(threshold), 0u, uint32_t(border)}, err);
+                           {FloatBits(threshold), 0u, uint32_t(border)}, err);
 }
 
 bool GpuDiffuse(ComputeContext* gpu, const GpuPlane& src, const GpuPlane& cond,
@@ -542,7 +537,7 @@ bool GpuDiffuse(ComputeContext* gpu, const GpuPlane& src, const GpuPlane& cond,
     GpuImage* cur = &a;
     GpuImage* nxt = &b;
     for (int i = 0; i < steps; ++i) {
-        if (!gpu->Dispatch(dk.k, {cur, &cmap}, {nxt}, {Bits(dt)}, err))
+        if (!gpu->Dispatch(dk.k, {cur, &cmap}, {nxt}, {FloatBits(dt)}, err))
             return false;
         std::swap(cur, nxt);
     }

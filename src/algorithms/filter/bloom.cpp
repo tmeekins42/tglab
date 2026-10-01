@@ -40,6 +40,7 @@
 #include <vector>
 
 #include "../../algo_util/pixel_buffer.h"
+#include "../../algo_util/color.h"
 #include "../../core/algorithm.h"
 
 namespace tglab {
@@ -86,7 +87,7 @@ float Gain() {
 float3 Highlight(float3 c) {
     float t = T();
     float k = max(Knee(), 1e-4);
-    float lum = dot(c, float3(0.2126, 0.7152, 0.0722));
+    float lum = Luma(c);
     float soft = clamp(lum - t + k, 0.0, 2.0 * k);
     soft = soft * soft / (4.0 * k);
     float contrib = max(max(soft, lum - t), 0.0) / max(lum, 1e-5);
@@ -219,7 +220,6 @@ public:
     }
 
     std::vector<uint32_t> GpuPassConstants(int pass) const override {
-        auto bits = [](float f) { uint32_t u; std::memcpy(&u, &f, sizeof u); return u; };
         // Pass 1 blurs horizontally and pass 2 vertically; the rest ignore it.
         const float dir = (pass == 2) ? 1.0f : 0.0f;
         // THE SPREAD SCALES; THE GAIN MUST NOT.
@@ -247,13 +247,13 @@ public:
                                    GpuScaledPx(float(m_spreadB))) / 3.0f, 1.0f);
         const float gainFix = (s1 > 1e-6f) ? (s0 * s0) / (s1 * s1) : 1.0f;
 
-        return {bits(float(m_threshold)),
-                bits(std::max(0.01f, float(m_knee))),
-                bits(std::max(0.05f, GpuScaledPx(float(m_spreadR)))),
-                bits(std::max(0.05f, GpuScaledPx(float(m_spreadG)))),
-                bits(std::max(0.05f, GpuScaledPx(float(m_spreadB)))),
-                bits(float(m_intensity) * gainFix),
-                bits(dir)};
+        return {FloatBits(float(m_threshold)),
+                FloatBits(std::max(0.01f, float(m_knee))),
+                FloatBits(std::max(0.05f, GpuScaledPx(float(m_spreadR)))),
+                FloatBits(std::max(0.05f, GpuScaledPx(float(m_spreadG)))),
+                FloatBits(std::max(0.05f, GpuScaledPx(float(m_spreadB)))),
+                FloatBits(float(m_intensity) * gainFix),
+                FloatBits(dir)};
     }
 
     // The widest channel, at the 2.5-sigma cutoff the blur pass uses. Bloom
@@ -347,7 +347,7 @@ void Bloom::RunCPU(RunCtx& ctx) {
             const float r = p[0];
             const float g = (ch >= 3) ? p[1] : p[0];
             const float b = (ch >= 3) ? p[2] : p[0];
-            const float lum = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+            const float lum = Luma(r, g, b);
             float soft = std::clamp(lum - thr + knee, 0.0f, 2.0f * knee);
             soft = soft * soft / (4.0f * knee);
             const float c = std::max(std::max(soft, lum - thr), 0.0f) /

@@ -7,6 +7,7 @@
 #include <cmath>
 
 #include "../../algo_util/pixel_buffer.h"
+#include "../../algo_util/color.h"
 #include "../../core/algorithm.h"
 
 namespace tglab {
@@ -22,7 +23,7 @@ namespace {
 inline float Sample(const PixelBuffer& b, int x, int y, float unitScale) {
     const float* p = b.AtClamped(x, y);   // clamp-to-edge
     if (b.Channels() == 1) return p[0] / unitScale;
-    return (0.299f * p[0] + 0.587f * p[1] + 0.114f * p[2]) / unitScale;
+    return Luma(p) / unitScale;
 }
 
 } // namespace

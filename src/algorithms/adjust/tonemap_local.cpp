@@ -60,6 +60,7 @@
 
 #include "../../algo_util/pixel_buffer.h"
 #include "../../algo_util/tone_curve.h"
+#include "../../algo_util/color.h"
 #include "../../core/algorithm.h"
 
 namespace tglab {
@@ -147,7 +148,7 @@ const char* const kTlLogHlsl = R"(
 void main(uint3 tid : SV_DispatchThreadID) {
     if (tid.x >= Width || tid.y >= Height) return;
     float4 c = T0[int2(tid.xy)];
-    float lum = dot(c.rgb, float3(0.2126, 0.7152, 0.0722));
+    float lum = Luma(c.rgb);
     float l = log2(max(lum, kFloor));
     U0[tid.xy] = float4(l, l * l, 0, 1);
 }
@@ -290,7 +291,7 @@ public:
         const std::vector<float>& sp = m_in.Data();
         for (size_t i = 0; i < n; ++i) {
             const float* p = &sp[i * size_t(ch)];
-            const float lum = (ch >= 3) ? 0.2126f * p[0] + 0.7152f * p[1] + 0.0722f * p[2]
+            const float lum = (ch >= 3) ? Luma(p)
                                         : p[0];
             // Floored rather than clamped away. A merged bracket contains real
             // negatives -- the demosaic undershoots near black and the merge
@@ -473,7 +474,7 @@ public:
             for (int x = 0; x < w; x += stride) {
                 const float* p = &sp[(size_t(y) * size_t(w) + size_t(x)) * size_t(ch)];
                 const float lum = (ch >= 3)
-                    ? 0.2126f * p[0] + 0.7152f * p[1] + 0.0722f * p[2] : p[0];
+                    ? Luma(p) : p[0];
                 s.push_back(std::log2(std::max(lum, kFloor)));
             }
         if (s.size() < 1000) return;
@@ -523,12 +524,11 @@ public:
     }
 
     std::vector<uint32_t> GpuPassConstants(int) const override {
-        auto bits = [](float f) { uint32_t u; std::memcpy(&u, &f, sizeof u); return u; };
         return {uint32_t(m_gpuRadius),
-                bits(m_gpuValid ? m_compression : 1.0f),
-                bits(m_gpuValid ? m_gpuOffset   : 0.0f),
-                bits(float(m_detail) * float(m_detail)),   // eps, a variance
-                bits(float(m_saturation)),
+                FloatBits(m_gpuValid ? m_compression : 1.0f),
+                FloatBits(m_gpuValid ? m_gpuOffset   : 0.0f),
+                FloatBits(float(m_detail) * float(m_detail)),   // eps, a variance
+                FloatBits(float(m_saturation)),
                 uint32_t(m_gpuValid ? 1u : 0u)};
     }
 

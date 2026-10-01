@@ -130,7 +130,6 @@ cbuffer Params : register(b0) {
     uint Pass;      // 0 = horizontal, 1 = vertical + threshold
 };
 
-float Luma(float4 c) { return dot(c.rgb, float3(0.299, 0.587, 0.114)); }
 
 [numthreads(8, 8, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
@@ -145,7 +144,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
         int x1 = min(int(tid.x) + r, int(Width) - 1);
         float s = 0.0, s2 = 0.0;
         for (int x = x0; x <= x1; ++x) {
-            float v = Luma(Src[int2(x, int(tid.y))]);
+            float v = Luma(Src[int2(x, int(tid.y))].rgb);
             s  += v;
             s2 += v * v;
         }
@@ -180,7 +179,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
         t = mean - a;                                // adaptive mean
     }
 
-    float v = Luma(Orig[int2(tid.xy)]);
+    float v = Luma(Orig[int2(tid.xy)].rgb);
     bool above = v > t;
     if (Invert != 0) above = !above;
     Dst[tid.xy] = above ? 1.0 : 0.0;
@@ -189,15 +188,10 @@ void main(uint3 tid : SV_DispatchThreadID) {
     }
 
     std::vector<uint32_t> GpuConstants(int iteration) const override {
-        auto bits = [](float f) {
-            uint32_t u;
-            std::memcpy(&u, &f, sizeof(u));
-            return u;
-        };
         return {uint32_t(GpuScaledRadius(RadiusFromWindow(int(m_window)))),
                 uint32_t(GpuMode()),
-                bits(GpuParamA()),
-                bits(GpuParamB()),
+                FloatBits(GpuParamA()),
+                FloatBits(GpuParamB()),
                 uint32_t(bool(m_invert) ? 1 : 0),
                 uint32_t(iteration)};
     }
@@ -355,7 +349,6 @@ cbuffer Params : register(b0) {
     uint Pass;              // 0 = horizontal min/max, 1 = vertical + threshold
 };
 
-float Luma(float4 c) { return dot(c.rgb, float3(0.299, 0.587, 0.114)); }
 
 [numthreads(8, 8, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
@@ -371,7 +364,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
         p = clamp(p, int2(0, 0), hi);
         if (Pass == 0) {
             // Colour in, luma out.
-            float v = Luma(Src[p]);
+            float v = Luma(Src[p].rgb);
             lo  = min(lo,  v);
             hiV = max(hiV, v);
         } else {
@@ -388,7 +381,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     }
 
     float contrast = hiV - lo;
-    float v = Luma(Orig[int2(tid.xy)]);
+    float v = Luma(Orig[int2(tid.xy)].rgb);
 
     bool above;
     if (contrast < asfloat(ContrastMinBits)) {
@@ -405,17 +398,12 @@ void main(uint3 tid : SV_DispatchThreadID) {
     }
 
     std::vector<uint32_t> GpuConstants(int iteration) const override {
-        auto bits = [](float f) {
-            uint32_t u;
-            std::memcpy(&u, &f, sizeof(u));
-            return u;
-        };
         // Both thresholds are declared in 0..255 but a UNORM SRV hands the
         // shader 0..1, so they are scaled here -- the same units trap as
         // brightness's offset.
         return {uint32_t(RadiusFromWindow(int(m_window))),
-                bits(float(m_contrastMin) / 255.0f),
-                bits(float(m_globalLevel) / 255.0f),
+                FloatBits(float(m_contrastMin) / 255.0f),
+                FloatBits(float(m_globalLevel) / 255.0f),
                 uint32_t(bool(m_invert) ? 1 : 0),
                 uint32_t(iteration)};
     }
@@ -558,7 +546,6 @@ cbuffer Params : register(b0) {
     uint Pass;         // 0 = horizontal, 1 = vertical + threshold
 };
 
-float Luma(float4 c) { return dot(c.rgb, float3(0.299, 0.587, 0.114)); }
 
 [numthreads(8, 8, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
@@ -579,7 +566,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
         p = clamp(p, int2(0, 0), hi);
         // Pass 0 reads colour and takes luma; pass 1 reads the pass-0 result,
         // which is already a scalar in .r.
-        acc  += ((Pass == 0) ? Luma(Src[p]) : Src[p].r) * wgt;
+        acc  += ((Pass == 0) ? Luma(Src[p].rgb) : Src[p].r) * wgt;
         wsum += wgt;
     }
     acc /= max(wsum, 1e-6);
@@ -590,7 +577,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     }
 
     // The original pixel, which the ping-pong buffer no longer holds.
-    float v = Luma(Orig[int2(tid.xy)]);
+    float v = Luma(Orig[int2(tid.xy)].rgb);
     bool above = v > (acc - asfloat(CBits));
     if (Invert != 0) above = !above;
     Dst[tid.xy] = above ? 1.0 : 0.0;
@@ -599,17 +586,12 @@ void main(uint3 tid : SV_DispatchThreadID) {
     }
 
     std::vector<uint32_t> GpuConstants(int iteration) const override {
-        auto bits = [](float f) {
-            uint32_t u;
-            std::memcpy(&u, &f, sizeof(u));
-            return u;
-        };
         // `c` is declared in 0..255 but a UNORM SRV hands the shader 0..1, so it
         // is scaled here -- the same units trap as brightness's offset, and the
         // CPU/GPU agreement test is what catches getting it wrong.
         return {uint32_t(RadiusFromWindow(int(m_window))),
-                bits(float(m_sigma)),
-                bits(float(m_c) / 255.0f),
+                FloatBits(float(m_sigma)),
+                FloatBits(float(m_c) / 255.0f),
                 uint32_t(bool(m_invert) ? 1 : 0),
                 uint32_t(iteration)};
     }

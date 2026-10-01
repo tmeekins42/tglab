@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "../../algo_util/pixel_buffer.h"
+#include "../../algo_util/color.h"
 #include "../../core/algorithm.h"
 
 namespace tglab {
@@ -130,7 +131,6 @@ cbuffer Params : register(b0) {
     uint Radius;
 };
 
-static const float3 kLuma = float3(0.299, 0.587, 0.114);
 
 [numthreads(8, 8, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
@@ -161,7 +161,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
                 sum   += c;
                 // Variance measured on luma, so the colour channels cannot
                 // disagree about which quadrant is flattest.
-                float l = dot(c, kLuma);
+                float l = Luma(c);
                 sumSq += l * l;
                 n     += 1.0;
             }
@@ -169,7 +169,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
 
         float  inv     = 1.0 / max(n, 1.0);
         float3 mean    = sum * inv;
-        float  lumMean = dot(mean, kLuma);
+        float  lumMean = Luma(mean);
         float  variance = max(0.0, sumSq * inv - lumMean * lumMean);
 
         if (!haveBest || variance < bestVar) {
@@ -189,14 +189,14 @@ void main(uint3 tid : SV_DispatchThreadID) {
     }
 
 private:
-    // Rec. 601 luma, matching the default weights in the grayscale algorithm.
+    // Luma (color.h), or the one channel there is.
     static float Luma(const float* p, int channels) {
         if (channels == 1) return p[0];
-        return 0.299f * p[0] + 0.587f * p[1] + 0.114f * p[2];
+        return tglab::Luma(p);
     }
     static float LumaFromSums(const float* sum, int channels) {
         if (channels == 1) return sum[0];
-        return 0.299f * sum[0] + 0.587f * sum[1] + 0.114f * sum[2];
+        return tglab::Luma(sum);
     }
 
     Param<int> m_radius{

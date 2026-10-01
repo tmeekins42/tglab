@@ -84,17 +84,7 @@ void ImageLoader::Run() {
             res.ok = LoadVideoFrames(req.path, VideoOptions{}, &res.frames, &vi,
                                      &res.error);
             res.frameTimes = vi.times;
-            if (res.ok) {
-                char buf[200];
-                std::snprintf(buf, sizeof(buf),
-                              "%d frames kept of %d (%.1f s at %.0f fps, %dx%d%s)",
-                              int(res.frames.size()), vi.decoded, vi.seconds,
-                              vi.fps, vi.width, vi.height,
-                              vi.rotation ? (", rotated " + std::to_string(vi.rotation) +
-                                             "°").c_str()
-                                          : "");
-                res.note = buf;
-            }
+            if (res.ok) res.note = VideoNote(vi, int(res.frames.size()));
         } else {
             res.ok = LoadImageFile(req.path, &res.image, &res.error);
         }

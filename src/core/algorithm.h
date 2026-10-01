@@ -16,6 +16,7 @@
 #include "data.h"
 #include "reduction.h"
 #include "image.h"
+#include "math_util.h"
 #include "param.h"
 
 namespace tglab {
@@ -459,6 +460,19 @@ public:
     void SetGroupGpu(ComputeContext* gpu) { m_groupGpu = gpu; }
     ComputeContext* GroupGpu() const { return m_groupGpu; }
 
+    // CANCELLATION, for the same reason and set the same way: RunCtx carries
+    // it for a per-image stage, and a group stage has no RunCtx. True once
+    // this run has been superseded -- a slider moved, a script edited, a load
+    // landed. A long group stage checks it every iteration or item and
+    // returns early (false, with any message); the pipeline then discards
+    // the stage whatever it returned, so a partial result is never shown or
+    // cached. Without it, a change made during a splat solve waited out the
+    // whole solve before it could run.
+    void SetGroupCancel(const CancelToken* cancel) { m_groupCancel = cancel; }
+    bool GroupCancelled() const { return m_groupCancel && m_groupCancel->Cancelled(); }
+    // The token itself, for a stage that runs a pipeline of its own.
+    const CancelToken* GroupCancelToken() const { return m_groupCancel; }
+
     // A reconstruct stage's THIRD input, when it declares one and the script
     // supplied it: a second group of images beside the frames on input 1 --
     // train_splats(splats, frames, depth) reads plane_sweep's maps here.
@@ -801,6 +815,7 @@ private:
     // The device for a whole-group stage. Borrowed from the run, never owned:
     // see SetGroupGpu. Null whenever there is no device or the run is CPU-only.
     ComputeContext* m_groupGpu = nullptr;
+    const CancelToken* m_groupCancel = nullptr;   // see SetGroupCancel
     // See SetReconstructExtra.
     const std::vector<Image>* m_reconExtra = nullptr;
 };

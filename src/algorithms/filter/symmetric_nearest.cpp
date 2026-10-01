@@ -18,6 +18,7 @@
 #include <cmath>
 
 #include "../../algo_util/pixel_buffer.h"
+#include "../../algo_util/color.h"
 #include "../../core/algorithm.h"
 
 namespace tglab {
@@ -111,7 +112,6 @@ cbuffer Params : register(b0) {
     uint Radius;
 };
 
-static const float3 kLuma = float3(0.299, 0.587, 0.114);
 
 [numthreads(8, 8, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
@@ -122,7 +122,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     int2 me = int2(tid.xy);
 
     float4 centre = Src[me];
-    float  cl     = dot(centre.rgb, kLuma);
+    float  cl     = Luma(centre.rgb);
 
     // The centre pixel is always included, so a flat window returns itself.
     float3 acc = centre.rgb;
@@ -139,8 +139,8 @@ void main(uint3 tid : SV_DispatchThreadID) {
 
             // Whichever of the pair is closer to the centre in luma wins, so
             // the one across an edge is always the one discarded.
-            float da = abs(dot(a, kLuma) - cl);
-            float db = abs(dot(b, kLuma) - cl);
+            float da = abs(Luma(a) - cl);
+            float db = abs(Luma(b) - cl);
             acc += (da <= db) ? a : b;
             n   += 1.0;
         }
@@ -158,7 +158,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
 private:
     static float Luma(const float* p, int channels) {
         if (channels == 1) return p[0];
-        return 0.299f * p[0] + 0.587f * p[1] + 0.114f * p[2];
+        return tglab::Luma(p);
     }
 
     Param<int> m_radius{

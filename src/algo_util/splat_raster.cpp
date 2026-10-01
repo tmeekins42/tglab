@@ -14,7 +14,6 @@ inline double MsSince(Clock::time_point t) {
     return std::chrono::duration<double, std::milli>(Clock::now() - t).count();
 }
 
-inline double Sigmoid(double x) { return 1.0 / (1.0 + std::exp(-x)); }
 
 // Row-major 3x3 helpers. Small enough to write out rather than pull in a
 // matrix type the rest of the file would have to convert to and from.
@@ -41,7 +40,7 @@ SplatParam ToParam(const Splat& s) {
     p.logScale[2] = std::log(std::max(1e-12, s.scale.z));
     for (int i = 0; i < 4; ++i) p.quat[i] = s.rot[i];
     const double o = std::clamp(s.opacity, 1e-4, 1.0 - 1e-4);
-    p.opacity = std::log(o / (1.0 - o));
+    p.opacity = Logit(o);
     p.color[0] = s.color.x; p.color[1] = s.color.y; p.color[2] = s.color.z;
     return p;
 }

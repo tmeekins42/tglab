@@ -215,13 +215,8 @@ void main(uint3 tid : SV_DispatchThreadID) {
     }
 
     std::vector<uint32_t> GpuConstants(int) const override {
-        auto bits = [](float f) {
-            uint32_t u;
-            std::memcpy(&u, &f, sizeof(u));
-            return u;
-        };
-        return {bits(float(m_amount)), bits(float(m_midpoint)),
-                bits(float(m_feather)), bits(float(m_roundness)),
+        return {FloatBits(float(m_amount)), FloatBits(float(m_midpoint)),
+                FloatBits(float(m_feather)), FloatBits(float(m_roundness)),
                 uint32_t(m_fullW), uint32_t(m_fullH),
                 uint32_t(m_offX),  uint32_t(m_offY)};
     }

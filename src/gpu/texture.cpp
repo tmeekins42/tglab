@@ -11,6 +11,7 @@
 #include "shader.h"
 
 #include "../algo_util/tone_curve.h"
+#include "../core/math_util.h"
 
 namespace tglab {
 
@@ -808,7 +809,6 @@ bool GpuTexture::UpdateFromGpu(Device& dev, const SharedGpuTexture& src,
     cl->SetComputeRootSignature(g_display.root);
     cl->SetPipelineState(g_display.pso);
 
-    auto bits = [](float f) { uint32_t u; std::memcpy(&u, &f, sizeof(u)); return u; };
     uint32_t roots[8] = {};
     roots[0] = uint32_t(src.desc.width);
     roots[1] = uint32_t(src.desc.height);
@@ -816,8 +816,8 @@ bool GpuTexture::UpdateFromGpu(Device& dev, const SharedGpuTexture& src,
     // A single-channel result is normalised over 0..1 here rather than over its
     // own min/max: finding the true range would need a reduction pass, and the
     // CPU path only had one because it already held every pixel.
-    roots[3] = bits(0.0f);
-    roots[4] = bits(1.0f);
+    roots[3] = FloatBits(0.0f);
+    roots[4] = FloatBits(1.0f);
     // Scene-linear results go through the tone curve; anything already
     // gamma-encoded is passed straight through.
     roots[5] = src.desc.linear ? 1u : 0u;
