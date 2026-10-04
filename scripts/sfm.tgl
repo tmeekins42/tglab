@@ -217,13 +217,22 @@ feat  = params( describe_dedode )( params( detect_dad, max_features = 10000 )( s
 # repetitive structure frames look alike without being the same view: castle-
 # P19's window bays produced revisits that took its ray residual from 0.8
 # degrees to 4.3 before the check, and 0.97 after it (23 of 35 dropped).
-# Measured with it on, nothing else set:
 #
-#   capture        ray residual   revisits kept / dropped
-#   fountain-P11       0.17 deg          8 / 6
-#   castle-P19         0.97               12 / 23
-#   cat video          0.32              113 / 24     one closed ring
-#   rose video         0.29              112 / 33
+# A revisit is a RETURN: a frame outside the stretch of the walk that still
+# looks like this one, with a stretch that does not between them. Revisits
+# used to be simply the best-scoring frames outside the window, and in a
+# video those are frames 3 to 10 away -- so on a 1576-frame room scan none of
+# them closed a loop. Measured with it on, nothing else set:
+#
+#   capture        revisits kept / dropped   points    reprojection
+#   fountain-P11        0 / 0  (11 photos)    10789       0.45 px
+#   castle-P19          4 / 4                 15106       0.44
+#   cat video          68 / 0, ~150 apart     49245       0.76     one closed ring
+#   face video         10 / 10                20303       0.90
+#
+# Against the old choice: 39% more points on the cat and 52% on the face, the
+# worst rotation edge 1.8 degrees where it was 5.7 on the cat, and 9.4 where
+# it was 14.5 on castle-P19.
 pairs = params( match_ann, chain = 1, window = 2, revisit = 3 )( feat )
 
 # LoMa's LEARNED MATCHER instead of nearest neighbour: a transformer that

@@ -547,9 +547,15 @@ public:
         std::snprintf(buf, sizeof buf, "matched %d pair%s %s: %d of %d candidates kept", m_pairs,
                       m_pairs == 1 ? "" : "s", how, m_kept, m_total);
         std::string s = buf;
-        if (m_revisits > 0)
+        if (m_revisits > 0) {
             s += "; " + std::to_string(m_revisits) + " of them revisits -- far apart "
                  "in the sequence, alike in view";
+            if (!m_revisitGaps.empty()) {
+                std::vector<int> g = m_revisitGaps;
+                std::nth_element(g.begin(), g.begin() + long(g.size() / 2), g.end());
+                s += " (typically " + std::to_string(g[g.size() / 2]) + " frames apart)";
+            }
+        }
         return s;
     }
 
@@ -795,9 +801,26 @@ private:
             const DescriptorSet& d = fs->descriptors;
             if (pool.kind == DescriptorKind::None) { pool.kind = d.kind; pool.dim = d.dim; }
             if (d.kind != pool.kind || d.dim != pool.dim) return 0;
+            // The STRONGEST responses, not every n-th keypoint: a stride picks
+            // a different 3% of a 10000-keypoint frame from each frame, so two
+            // frames of the same view rarely sampled the same corner -- a
+            // frame and its neighbour shared about 5 votes of 600. The
+            // strongest corners are the ones every view of a place detects.
             const size_t cnt = d.Count();
-            const size_t stride = std::max<size_t>(1, cnt / kSample);
-            for (size_t k = 0; k < cnt && mine[size_t(f)].size() < kSample; k += stride) {
+            std::vector<size_t> order(cnt);
+            for (size_t k = 0; k < cnt; ++k) order[k] = k;
+            if (fs->keypoints.size() == cnt && cnt > kSample) {
+                std::partial_sort(order.begin(), order.begin() + long(kSample), order.end(),
+                                  [&](size_t a, size_t b) {
+                                      return fs->keypoints[a].response > fs->keypoints[b].response;
+                                  });
+            } else {
+                const size_t stride = std::max<size_t>(1, cnt / kSample);
+                order.clear();
+                for (size_t k = 0; k < cnt; k += stride) order.push_back(k);
+            }
+            for (size_t j = 0; j < order.size() && mine[size_t(f)].size() < kSample; ++j) {
+                const size_t k = order[j];
                 mine[size_t(f)].push_back(owner.size());
                 owner.push_back(f);
                 if (d.kind == DescriptorKind::Float)
@@ -814,28 +837,72 @@ private:
         if (isFloat) forest.Build(pool, std::max(1, int(m_trees)), 8, 777u);
         else         lsh.Build(pool, std::max(1, int(m_trees)), int(m_keyBits), 777u);
 
+        // THE RUNNER-UP COMES FROM ANOTHER PLACE. A video's consecutive frames
+        // carry nearly the same descriptor for the same corner, so the best
+        // and second-best matches of a sample are usually two adjacent frames
+        // at almost the same distance, and a plain ratio test rejects nearly
+        // every vote: measured on a 1576-frame room scan, a frame and its
+        // neighbour shared about 5 votes of 600, and the revisits chosen from
+        // scores that small were noise. The runner-up is taken from frames
+        // outside the winner's own stretch (and the asking frame's), so the
+        // test asks what it should -- is this place clearly the one -- rather
+        // than which of two near-identical frames is closer.
         std::vector<float> votes(size_t(n) * size_t(n), 0.0f);
+        const float kStretchShare = 0.25f;   // of a frame's score with its neighbour
         const float ratio = float(m_ratio);
         const int checks = std::max(1, int(m_checks));
-        // Each frame writes only its own row of votes.
-        ParallelFor(size_t(n), [&](size_t fi) {
-            const int f = int(fi);
-            if (GroupCancelled()) return;   // superseded: see SetGroupCancel
-            std::vector<Candidate> c;
-            for (size_t row : mine[size_t(f)]) {
-                if (isFloat) forest.Search(pool.FloatAt(row), checks, &c);
-                else         lsh.Search(pool.BinaryAt(row), checks, &c);
-                // Best and runner-up among OTHER frames' samples.
-                float b1 = std::numeric_limits<float>::max(), b2 = b1;
-                int who = -1;
-                for (const Candidate& cd : c) {
-                    if (cd.index < 0 || owner[size_t(cd.index)] == f) continue;
-                    if (cd.dist < b1) { b2 = b1; b1 = cd.dist; who = owner[size_t(cd.index)]; }
-                    else if (cd.dist < b2) b2 = cd.dist;
+        const int place = 2 * window + 4;   // before the stretches are known
+        auto vote = [&](std::vector<float>* into, std::vector<float>* soft, auto&& excluded,
+                        auto&& samePlace) {
+            std::fill(into->begin(), into->end(), 0.0f);
+            // Each frame writes only its own row of votes.
+            ParallelFor(size_t(n), [&](size_t fi) {
+                const int f = int(fi);
+                if (GroupCancelled()) return;   // superseded: see SetGroupCancel
+                std::vector<Candidate> c;
+                std::vector<int> hit;
+                for (size_t row : mine[size_t(f)]) {
+                    if (isFloat) forest.Search(pool.FloatAt(row), checks, &c);
+                    else         lsh.Search(pool.BinaryAt(row), checks, &c);
+                    float b1 = std::numeric_limits<float>::max();
+                    int who = -1;
+                    for (const Candidate& cd : c) {
+                        if (cd.index < 0) continue;
+                        const int g = owner[size_t(cd.index)];
+                        if (g == f || excluded(f, g)) continue;
+                        if (cd.dist < b1) { b1 = cd.dist; who = g; }
+                    }
+                    if (who < 0) continue;
+                    // SOFT: every frame whose copy of the corner is about as
+                    // close as the best -- no competition between frames, so
+                    // it falls off with time only as the view changes.
+                    if (soft) {
+                        const float aboutAsClose = b1 / ratio;
+                        hit.clear();
+                        for (const Candidate& cd : c) {
+                            if (cd.index < 0 || cd.dist > aboutAsClose) continue;
+                            const int g = owner[size_t(cd.index)];
+                            if (g == f || std::find(hit.begin(), hit.end(), g) != hit.end()) continue;
+                            hit.push_back(g);
+                            (*soft)[size_t(f) * size_t(n) + size_t(g)] += 1.0f;
+                        }
+                    }
+                    float b2 = std::numeric_limits<float>::max();
+                    for (const Candidate& cd : c) {
+                        if (cd.index < 0) continue;
+                        const int g = owner[size_t(cd.index)];
+                        if (g == f || excluded(f, g) || samePlace(f, who, g)) continue;
+                        b2 = std::min(b2, cd.dist);
+                    }
+                    if (b1 < ratio * b2) (*into)[size_t(f) * size_t(n) + size_t(who)] += 1.0f;
                 }
-                if (who >= 0 && b1 < ratio * b2) votes[size_t(f) * size_t(n) + size_t(who)] += 1.0f;
-            }
-        });
+            });
+        };
+        // First over every frame, for the neighbour scale and each frame's
+        // own stretch.
+        std::vector<float> soft(size_t(n) * size_t(n), 0.0f);
+        vote(&votes, &soft, [](int, int) { return false; },
+             [&](int f, int w, int g) { return std::abs(g - w) <= place || std::abs(g - f) <= place; });
         auto score = [&](int a, int b) {
             return votes[size_t(a) * size_t(n) + size_t(b)] + votes[size_t(b) * size_t(n) + size_t(a)];
         };
@@ -847,24 +914,95 @@ private:
         std::nth_element(nb.begin(), nb.begin() + long(nb.size() / 2), nb.end());
         const float bar = 0.25f * nb[nb.size() / 2];
 
+        // A frame's OWN STRETCH of the walk: the frames either side of it,
+        // contiguously, that still look like it. A revisit is outside that
+        // stretch, not merely outside the matching window -- otherwise the
+        // best "revisits" are frames 3 or 4 steps away, which the chain
+        // already joins, and every slot goes to them. Measured on a 1576-frame
+        // room scan with window 2: the revisits joined no two blocks of 100
+        // frames that the chain did not, and frames 600-1300 were one long
+        // unclosed chain that came out at twice the scale of the rest, a
+        // second copy of the walls beside the first.
+        auto softScore = [&](int a, int b) {
+            return soft[size_t(a) * size_t(n) + size_t(b)] + soft[size_t(b) * size_t(n) + size_t(a)];
+        };
+        auto stretch = [&](int f) {
+            const float self = std::max(f > 0 ? softScore(f, f - 1) : 0.0f,
+                                        f < n - 1 ? softScore(f, f + 1) : 0.0f);
+            const float keep = kStretchShare * self;
+            int lo = f, hi = f;
+            while (lo > 0 && softScore(f, lo - 1) >= keep && softScore(f, lo - 1) > 0.0f) --lo;
+            while (hi < n - 1 && softScore(f, hi + 1) >= keep && softScore(f, hi + 1) > 0.0f) ++hi;
+            return std::pair<int, int>(std::min(lo, f - window), std::max(hi, f + window));
+        };
+        std::vector<std::pair<int, int>> own(static_cast<size_t>(n));
+        ParallelFor(size_t(n), [&](size_t f) { own[f] = stretch(int(f)); });
+        // ...and then twice as wide again: what the soft count measures is
+        // where a corner still looks almost the same, and a frame a little
+        // beyond that is still the same visit, not a return to it.
+        for (int f = 0; f < n; ++f) {
+            auto& [lo, hi] = own[size_t(f)];
+            lo = std::max(0, f - 2 * (f - lo));
+            hi = std::min(n - 1, f + 2 * (hi - f));
+        }
+        auto inside = [&](int g, int f) { return g >= own[size_t(f)].first && g <= own[size_t(f)].second; };
+
+        // Then again, the asking frame's own stretch left out altogether and
+        // the runner-up from outside both stretches: what is left are votes
+        // for OTHER visits to the place, which the first pass hands to the
+        // neighbours that look most like it.
+        std::vector<float> farVotes(size_t(n) * size_t(n), 0.0f);
+        vote(&farVotes, nullptr, [&](int f, int g) { return std::abs(g - f) <= window || inside(g, f); },
+             [&](int f, int w, int g) { return std::abs(g - w) <= window || inside(g, w) || inside(g, f); });
+        auto farScore = [&](int a, int b) {
+            return farVotes[size_t(a) * size_t(n) + size_t(b)] + farVotes[size_t(b) * size_t(n) + size_t(a)];
+        };
+
         // Each unordered pair once, stored on the later frame with the earlier
-        // as its reference -- the chain's own convention.
+        // as its reference -- the chain's own convention. A frame's revisits
+        // go to DIFFERENT places: once a candidate is taken, the rest of its
+        // stretch is passed over, so three revisits are three loop closures
+        // rather than three adjacent frames of one.
+        //
+        // A RETURN, NOT THE NEXT STRETCH: the score must DIP between the
+        // frame's stretch and the candidate -- the camera left the place and
+        // came back. Without that, a frame just past the stretch, which the
+        // far vote naturally favours, would still win every slot.
+        const float revisitBar = std::max(3.0f, 0.4f * bar);
         std::vector<char> taken(size_t(n) * size_t(n), 0);
         int added = 0;
+        m_revisitGaps.clear();
+        std::vector<float> dip(static_cast<size_t>(n));
         for (int f = 0; f < n; ++f) {
+            const auto [lo, hi] = own[size_t(f)];
+            // dip[g]: the lowest score strictly between the stretch and g.
+            float m = std::numeric_limits<float>::max();
+            for (int g = hi + 1; g < n; ++g) { dip[size_t(g)] = m; m = std::min(m, farScore(f, g)); }
+            m = std::numeric_limits<float>::max();
+            for (int g = lo - 1; g >= 0; --g) { dip[size_t(g)] = m; m = std::min(m, farScore(f, g)); }
             std::vector<std::pair<float, int>> cand;
             for (int g = 0; g < n; ++g) {
-                if (std::abs(g - f) <= window) continue;
-                const float s = score(f, g);
-                if (s >= bar && s > 0.0f) cand.emplace_back(s, g);
+                if (std::abs(g - f) <= window || (g >= lo && g <= hi)) continue;
+                const float s = farScore(f, g);
+                if (s >= revisitBar && dip[size_t(g)] <= 0.25f * s) cand.emplace_back(s, g);
             }
             std::sort(cand.begin(), cand.end(), std::greater<>());
-            for (size_t k = 0; k < cand.size() && int(k) < perFrame; ++k) {
-                const int a = std::min(f, cand[k].second), b = std::max(f, cand[k].second);
+            std::vector<std::pair<int, int>> used;
+            int kept = 0;
+            for (size_t k = 0; k < cand.size() && kept < perFrame; ++k) {
+                const int g = cand[k].second;
+                bool sameStretch = false;
+                for (const auto& [ulo, uhi] : used) sameStretch = sameStretch || (g >= ulo && g <= uhi);
+                if (sameStretch) continue;
+                used.push_back({std::min(own[size_t(g)].first, g - window),
+                                std::max(own[size_t(g)].second, g + window)});
+                ++kept;
+                const int a = std::min(f, g), b = std::max(f, g);
                 char& t = taken[size_t(a) * size_t(n) + size_t(b)];
                 if (t) continue;
                 t = 1;
                 (*out)[size_t(b)].push_back(a);
+                m_revisitGaps.push_back(b - a);
                 ++added;
             }
         }
@@ -883,6 +1021,7 @@ private:
     int         m_total = 0;
     int         m_kept  = 0;
     int         m_revisits = 0;
+    mutable std::vector<int> m_revisitGaps;   // frames apart, per revisit
     bool        m_exact = false;   // the last run searched exhaustively on the GPU
     bool        m_loma = false;    // ...or ran LoMa's matcher
     bool        m_lomaOnGpu = false;
