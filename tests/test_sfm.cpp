@@ -4507,6 +4507,9 @@ int main() {
                 a->FindParam("holdout")->SetFromScript(Value(4.0), &e);
                 a->FindParam("sh_degree")->SetFromScript(Value(3.0), &e);
                 a->FindParam("sh_every")->SetFromScript(Value(50.0), &e);
+                // What the colour CAN fit in 400 iterations, not when the
+                // loss stops falling fast: stop_below off.
+                a->FindParam("stop_below")->SetFromScript(Value(0.0), &e);
                 a->FindParam("reflect")->SetFromScript(Value(withReflect ? 1.0 : 0.0), &e);
                 a->FindParam("reflect_from")->SetFromScript(Value(50.0), &e);
                 a->FindParam("env_res")->SetFromScript(Value(16.0), &e);
@@ -4751,6 +4754,9 @@ int main() {
                 a->FindParam("densify")->SetFromScript(Value(0.0), &e);
                 a->FindParam("sh_degree")->SetFromScript(Value(double(degree)), &e);
                 a->FindParam("sh_every")->SetFromScript(Value(50.0), &e);
+                // What the colour CAN fit in 400 iterations, not when the
+                // loss stops falling fast: stop_below off.
+                a->FindParam("stop_below")->SetFromScript(Value(0.0), &e);
                 a->SetGroupGpu(device);
                 PointCloud trained = ringStart;
                 std::string err;

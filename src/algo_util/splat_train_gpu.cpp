@@ -2092,15 +2092,18 @@ bool SplatTrainerGpu::StepImpl(const SplatCam& cam, const RasterOptions& opt,
         usedPx = used / 3;
         const float invN = float(1.0 / double(std::max<size_t>(1, used)));
         std::vector<float> d(np * 4);
+        double absSum = 0.0;
         for (size_t i = 0; i < np; ++i) {
             for (int ch = 0; ch < 3; ++ch) {
                 if (target[i * 3 + size_t(ch)] < 0.0) { d[i * 4 + size_t(ch)] = 0.0f; continue; }
                 const double diff = double(s.stage[i * 4 + size_t(ch)]) - target[i * 3 + size_t(ch)];
+                absSum += std::fabs(diff);
                 d[i * 4 + size_t(ch)] = diff > 0.0 ? invN : (diff < 0.0 ? -invN : 0.0f);
             }
             d[i * 4 + 3] = s.stage[i * 4 + 3];   // final T
         }
         s.stage.swap(d);
+        m_lastL1 = absSum / double(std::max<size_t>(1, used));
         // With reflections this is the gradient of the SHADED image, which
         // the shading's backward turns into the composite's.
         GpuImage& dUp = reflNow ? s.dshade : s.drgbt;

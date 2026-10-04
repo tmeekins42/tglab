@@ -638,8 +638,15 @@ public:
         // at worst. Cameras and splats only: the cloud's millions of dense
         // points are not what is being looked at.
         auto lastSnap = std::chrono::steady_clock::now();
+        // NOT RIGHT AFTER AN OPACITY RESET: every Gaussian is nearly
+        // transparent then, until the ones the photographs need climb back,
+        // and a snapshot taken in between showed the viewer a sparse ghost
+        // of the model for a moment. One densify interval is the recovery.
+        int lastReset = -1000000000;
+        const int recover = std::max(100, every);
         auto snapshot = [&](int it) {
             if (!SnapshotWanted() || (it + 1) % 100 != 0) return;
+            if (it - lastReset < recover) return;
             const auto now = std::chrono::steady_clock::now();
             if (std::chrono::duration<double>(now - lastSnap).count() < 1.5) return;
             lastSnap = now;
@@ -661,8 +668,14 @@ public:
             GroupSnapshot(std::move(snap));
         };
 
+        double passSum = 0.0, lastGain = 0.0;
+        std::vector<double> afterPasses;   // each pass's mean loss, after densification
+        int passCount = 0;
+        int ran = iters;   // fewer when the run converged early
+        const double stopBelow = double(m_stopBelow);
         for (int it = 0; it < iters; ++it) {
             GroupProgress(double(it) / double(std::max(1, iters)));
+            double stepL1 = -1.0;
             snapshot(it - 1);
             // Superseded -- a parameter moved, a load landed: stop now rather
             // than finishing a solve nobody will see (see SetGroupCancel).
@@ -728,6 +741,7 @@ public:
                                      reflGpu ? &ra : nullptr)) {
                     if (reflGpu) stepEnv(c1, c2);
                     visibleSum += gpuTrainer->Visible();
+                    stepL1 = gpuTrainer->LastL1();
                     ++gpuIters;
                     stepped = true;
                 } else {
@@ -779,11 +793,14 @@ public:
             size_t used = 0;
             for (double v : *target) if (v >= 0.0) ++used;
             const double invN = 1.0 / double(std::max<size_t>(1, used));
+            double absSum = 0.0;
             for (size_t i = 0; i < img.size(); ++i) {
                 if ((*target)[i] < 0.0) { dImg[i] = 0.0; continue; }
                 const double d = img[i] - (*target)[i];
+                absSum += std::fabs(d);
                 dImg[i] = (d > 0.0 ? invN : (d < 0.0 ? -invN : 0.0));
             }
+            stepL1 = absSum * invN;
 
             std::fill(grad.begin(), grad.end(), SplatParam::Zero());
             if (!vw.depth.empty())
@@ -1184,6 +1201,31 @@ public:
                     }
                 }
                 ++resets;
+                lastReset = it;
+            }
+
+            // CONVERGED? The loss averaged over each full pass of the views,
+            // once densification is over and the set has stopped changing
+            // shape. One pass against the next is too noisy to judge -- on
+            // the face video a pass came out 0.5% WORSE between two that
+            // improved 2% -- so the rate is taken over two passes: when it
+            // falls below `stop_below` per pass, the run ends.
+            if (stepL1 >= 0.0) { passSum += stepL1; ++passCount; }
+            if (passCount >= int(views.size())) {
+                const double mean = passSum / double(passCount);
+                passSum = 0.0;
+                passCount = 0;
+                if (it + 1 > until) afterPasses.push_back(mean);
+                const size_t k = afterPasses.size();
+                if (stopBelow > 0.0 && k >= 3) {
+                    const double gain =
+                        0.5 * (afterPasses[k - 3] - afterPasses[k - 1]) / afterPasses[k - 3];
+                    if (gain < stopBelow) {
+                        lastGain = gain;
+                        ran = it + 1;
+                        break;
+                    }
+                }
             }
         }
 
@@ -1259,10 +1301,10 @@ public:
                           "backward %.0f, update %.0f, densify %.0f ms",
                           gpuIters, iters, tm.project * k, tm.bin * k,
                           tm.composite * k, tm.loss * k, tm.backward * k,
-                          tm.update * k, msDensify / double(iters));
+                          tm.update * k, msDensify / double(std::max(1, ran)));
         } else if (iters > 0) {
             const SplatRaster::Timings& tm = raster.Time();
-            const double k = 1.0 / double(iters);
+            const double k = 1.0 / double(std::max(1, ran));
             // Which path ran, stated every time: a GPU fallback that happens
             // silently reads as "the GPU is slow".
             std::snprintf(timing, sizeof(timing),
@@ -1282,8 +1324,8 @@ public:
                       "train_splats: %d iterations over %d views at %dx%d, %d "
                       "Gaussians (%.0f in view on average); L1 %.4f -> %.4f, "
                       "PSNR %.2f -> %.2f dB; %.1f s (%.1f preparing the views)%s%s",
-                      iters, int(views.size()), views[0].cam.w, views[0].cam.h,
-                      int(n), double(visibleSum) / double(std::max(1, iters)),
+                      ran, int(views.size()), views[0].cam.w, views[0].cam.h,
+                      int(n), double(visibleSum) / double(std::max(1, ran)),
                       l1Before, l1After, psnrBefore, psnrAfter, secs, msViews * 1e-3, dens,
                       timing);
         m_note = buf;
@@ -1291,6 +1333,13 @@ public:
             m_note += "; " + std::to_string(iters) + " iterations from passes = " +
                       std::to_string(double(m_passes)).substr(0, 4) +
                       (bool(m_reflect) ? " (x1.5 for reflections)" : "");
+        if (ran < iters) {
+            char sb[160];
+            std::snprintf(sb, sizeof sb, "; STOPPED EARLY at %d of %d iterations: the last "
+                          "two passes improved the loss by %.2f%% each (stop_below %.2f%%)",
+                          ran, iters, 100.0 * lastGain, 100.0 * stopBelow);
+            m_note += sb;
+        }
         if (stretch > 1.0) {
             char sb[160];
             std::snprintf(sb, sizeof sb, ", schedule stretched x%.2f (densify every %d, "
@@ -1468,6 +1517,16 @@ private:
         const int iters = Iterations(nViews);
         return double(m_passes) > 0.0 && iters > floor ? double(iters) / double(floor) : 1.0;
     }
+
+    // MEASURED with every 8th view held out, at sfm.tgl's 16 passes: the
+    // face video stopped at 848 of 1000 iterations, 32 s of training instead
+    // of 41, at a held-out PSNR of 25.00 dB against 25.24; the cat, still
+    // improving 2.5% a pass at the end, ran its full 2600 unchanged.
+    Param<float> m_stopBelow{this, "stop_below", 0.015f, 0.0f, 0.1f,
+        {.help = "Stop once densification is over and a full pass over the "
+                 "views improves the training loss by less than this fraction "
+                 "of the pass before. 0 always runs the full count.",
+         .step = 0.001}};
 
     Param<float> m_passes{this, "passes", 0.0f, 0.0f, 500.0f,
         {.help = "Training length as looks at each view: passes x views "

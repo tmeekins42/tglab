@@ -206,6 +206,10 @@ public:
 
     int Visible() const { return m_visible; }
 
+    // The last Step's L1 against its photograph, over the pixels it trained
+    // -- of the image the loss is taken on, shaded when reflections are on.
+    double LastL1() const { return m_lastL1; }
+
     // Milliseconds per phase, accumulated over every Step.
     struct Timings {
         double project = 0, bin = 0, composite = 0, loss = 0, backward = 0,
@@ -225,6 +229,7 @@ private:
     int     m_visible = 0;
     bool    m_clampColour = true;
     double  m_maxElong = 0.0;
+    double  m_lastL1 = 0.0;
     // Render's optional depth and coverage outputs, for the call in flight.
     std::vector<double>* m_renderDepth = nullptr;
     std::vector<double>* m_renderT = nullptr;
