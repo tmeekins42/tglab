@@ -30,6 +30,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -125,6 +126,27 @@ public:
             pts.push_back(t.point);
             const bool has = t.color.x != 0.0 || t.color.y != 0.0 || t.color.z != 0.0;
             cols.push_back(has ? t.color : Vec3{0.72, 0.72, 0.74});
+        }
+        // NO MORE THAN TRAINING CAN KEEP. A fused room scan is sixteen million
+        // points; training holds at most max_gaussians (a million by
+        // default) and spent its first densify steps pruning the rest, at a
+        // quarter of a second an iteration while they lasted -- and fitting
+        // a disc to each one here took 49 s. A random draw, fixed seed so a
+        // rerun gives the same splats, keeps the cloud's coverage; the
+        // spacing below is then measured on what was kept, so each Gaussian
+        // grows to cover the gap the dropped ones leave.
+        const size_t total = pts.size();
+        const size_t cap = size_t(std::max(4, int(m_maxSplats)));
+        if (pts.size() > cap) {
+            std::mt19937 rng(12345u);
+            for (size_t i = 0; i < cap; ++i) {
+                std::uniform_int_distribution<size_t> pick(i, pts.size() - 1);
+                const size_t j = pick(rng);
+                std::swap(pts[i], pts[j]);
+                std::swap(cols[i], cols[j]);
+            }
+            pts.resize(cap);
+            cols.resize(cap);
         }
         const int n = int(pts.size());
         if (n < 4) {
@@ -269,6 +291,8 @@ public:
                       "%d isolated points dropped",
                       nOut, n, nPlanar, nOut - nPlanar, dropped);
         m_note = buf;
+        if (total > size_t(n))
+            m_note += "; drawn at random from " + std::to_string(total) + " (max_splats)";
         return true;
     }
 
@@ -292,6 +316,13 @@ private:
         const double ez = pct([](const Vec3& p) { return p.z; });
         return std::max(1e-9, std::sqrt(ex * ex + ey * ey + ez * ez));
     }
+
+    // See the draw in RunReconstruct. Matches train_splats' max_gaussians.
+    Param<int> m_maxSplats{this, "max_splats", 1000000, 4, 100000000,
+        {.help = "At most this many Gaussians, drawn at random from the points "
+                 "when there are more. Training keeps no more than its "
+                 "max_gaussians anyway, so making more only costs time.",
+         .softMax = 10000000.0}};
 
     Param<float> m_isolated{this, "isolated", 3.0f, 0.0f, 20.0f,
         {.help = "Drop a point whose nearest neighbours are more than this "
