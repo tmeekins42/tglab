@@ -394,7 +394,14 @@ splats = params( init_splats, enabled = 0 )( fused )
 # surfaces the cameras measured instead of wherever paints the right colour.
 # Leave `dense` out to train on colour alone. Where the sweep measured nothing
 # -- the blank wall on the right -- colour decides as before.
-trained = params( train_splats, iterations = 1000 )( splats, small, dense )
+#
+# `passes` SCALES IT WITH THE CLIP: each iteration looks at one view, so a
+# fixed count trains a 1576-frame walk around a room at two thirds of a look
+# per view -- which made its splats worse than untrained. With passes = 16 the
+# count is 16 x the views (x1.5 with reflections) and `iterations` is the
+# floor: 1000 for fountain and a 60-frame face, about 2900 for a 179-frame
+# orbit, 25000 for the room.
+trained = params( train_splats, iterations = 1000, passes = 16 )( splats, small, dense )
 
 # FLOATERS, removed by free-space carving against the sweep's depth maps. A
 # Gaussian is dropped when more than `max_seen_through` cameras measured a

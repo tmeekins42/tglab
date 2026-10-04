@@ -418,7 +418,8 @@ public:
         // init_splats fitted each disc to its neighbours' surface, so that is
         // already the surface normal. Reflectivity starts near zero, so the
         // model begins as plain colour and reflects only where it pays.
-        const bool reflect = bool(m_reflect) && int(m_iterations) > 0;
+        const int iters = Iterations(int(views.size()));
+        const bool reflect = bool(m_reflect) && iters > 0;
         const int  reflFrom = std::max(0, int(m_reflectFrom));
         std::vector<ReflParam> refl;
         std::vector<double> rM1, rM2;
@@ -494,8 +495,7 @@ public:
 
         // Zero is allowed and means "measure only": the report then says how
         // well the untrained splats fit, which is the baseline every run of
-        // training should be compared with.
-        const int iters = std::max(0, int(m_iterations));
+        // training should be compared with. See Iterations() for `passes`.
 
         // --- Adam ---------------------------------------------------------------
         // Learning rates from the paper, per parameter group. Positions decay
@@ -1225,6 +1225,10 @@ public:
                       l1Before, l1After, psnrBefore, psnrAfter, secs, dens,
                       timing);
         m_note = buf;
+        if (double(m_passes) > 0.0)
+            m_note += "; " + std::to_string(iters) + " iterations from passes = " +
+                      std::to_string(double(m_passes)).substr(0, 4) +
+                      (bool(m_reflect) ? " (x1.5 for reflections)" : "");
         if (thinnedFrom > 0)
             m_note += "; started from " + std::to_string(thinnedFrom) +
                       " Gaussians, thinned evenly to max_gaussians";
@@ -1362,6 +1366,34 @@ private:
         *psnr = sp / double(views.size());
         if (depthErr) *depthErr = dn > 0 ? de / double(dn) : -1.0;
     }
+
+    // HOW LONG TO TRAIN, BY HOW OFTEN EACH VIEW IS SEEN. An iteration renders
+    // one camera, so a fixed count means very different training for a
+    // 61-frame face (sixteen looks at each view in 1000 iterations) and a
+    // 1576-frame room (two thirds of a look each) -- which trained the room's
+    // splats to WORSE than they started, 12.6 -> 11.3 dB. `passes` sets the
+    // count from the views instead; reflections, fitted on top of colour
+    // and from part-way in, get half as long again.
+    //
+    // `iterations` stays as a FLOOR: eleven photographs of fountain-P11 want
+    // about a thousand iterations (see sfm.tgl), ninety passes each, and
+    // sixteen passes would give them 176.
+    int Iterations(int nViews) const {
+        const int floor = std::max(0, int(m_iterations));
+        const double passes = double(m_passes);
+        if (passes <= 0.0) return floor;
+        const double mult = bool(m_reflect) ? 1.5 : 1.0;
+        const double fromViews = passes * double(std::max(1, nViews)) * mult;
+        return std::clamp(std::max(floor, int(std::lround(fromViews))), 1, 500000);
+    }
+
+    Param<float> m_passes{this, "passes", 0.0f, 0.0f, 500.0f,
+        {.help = "Training length as looks at each view: passes x views "
+                 "iterations (x1.5 with reflections), and never fewer than "
+                 "`iterations`. 0 uses `iterations` alone. 16 is about 1000 "
+                 "iterations for a 60-frame clip; a long walk around a room "
+                 "needs the same passes, and so many more iterations.",
+         .step = 1.0, .softMax = 100.0}};
 
     Param<int> m_iterations{this, "iterations", 300, 0, 100000,
         {.help = "Optimisation steps, each rendering one camera and updating "
