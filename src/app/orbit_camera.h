@@ -14,6 +14,14 @@
 //     right / middle / shift+drag  pan         the scene follows the mouse
 //     wheel                        dolly       toward the point under the cursor
 //     double-click                 re-centre   orbit about the point clicked
+//     W A S D, Q E                 move        forward, left, back, right, down, up
+//
+// ROTATION IS SCREEN-RELATIVE, like the pan: a sideways drag turns the scene
+// about the screen's vertical axis and an up-and-down drag about its
+// horizontal one, however the view happens to be tilted. It used to turn about
+// the WORLD's up axis -- yaw and pitch -- and since a reconstruction's "up" is
+// only whatever the first camera's was, dragging sideways on a tilted view
+// spun it about an axis that appeared nowhere on screen. See Turn().
 //
 // ORBIT RATHER THAN FREE-FLY. A reconstruction is an object to be inspected,
 // not a space to be walked through: the useful motion is "turn it over and look
@@ -53,22 +61,72 @@ struct OrbitCamera {
     double yaw   = 0.0;
     double pitch = 0.3;
 
+    // The orientation Turn() keeps, once it has been used: the unit direction
+    // from the target to the eye, and the screen's up. Until then the angles
+    // above decide both, which is what Frame() and the tests set.
+    bool   freeOrient = false;
+    Vec3   back{0, 0, 1};
+    Vec3   upv{0, -1, 0};
+
     double fovY = 50.0 * 3.14159265358979 / 180.0;
     double nearZ = 0.01;
     double farZ  = 1000.0;
 
     // Where the camera actually is, from the angles and distance.
     Vec3 Eye() const {
+        if (freeOrient) return target + back * distance;
         const double cp = std::cos(pitch), sp = std::sin(pitch);
         return target + Vec3{distance * cp * std::sin(yaw), distance * sp,
                              distance * cp * std::cos(yaw)};
     }
 
     void Rotate(double dYaw, double dPitch) {
+        freeOrient = false;
         yaw += dYaw;
         // Just short of +-90 degrees: see the note above.
         const double lim = 1.5533;   // 89 degrees
         pitch = std::clamp(pitch + dPitch, -lim, lim);
+    }
+
+    // SCREEN-RELATIVE rotation about the target: `about_up` radians about the
+    // screen's vertical axis, `about_right` about its horizontal one -- the
+    // same amounts and senses as Rotate() gives yaw and pitch on an untilted
+    // view, so the mouse feels the same until the view is tilted, and then
+    // keeps meaning "this way on screen". No clamp: with no world axis there
+    // is no pole to flip at, and the view can go over the top.
+    void Turn(double about_up, double about_right) {
+        if (!freeOrient) {
+            Vec3 r, u, f;
+            Basis(&r, &u, &f);
+            back = f * -1.0;
+            upv = u;
+            freeOrient = true;
+        }
+        Vec3 r, u, f;
+        Basis(&r, &u, &f);
+        // Rotate() turns about world +Y, which on an untilted view is the
+        // screen's DOWN (the reconstruction is +Y down; see ViewProj), hence
+        // the minus.
+        back = RotateAbout(back, u, -about_up);
+        Basis(&r, &u, &f);
+        back = RotateAbout(back, r, about_right);
+        upv = RotateAbout(u, r, about_right);
+        back = back.Normalized();
+    }
+
+    // Moves the camera and its target together, along the screen's right, up
+    // and forward axes, in units of the distance to the target -- so a key
+    // held for a second covers the same share of the view at any scale.
+    void Move(double right_, double up_, double forward_) {
+        Vec3 r, u, f;
+        Basis(&r, &u, &f);
+        target = target + (r * right_ + u * up_ + f * forward_) * distance;
+    }
+
+    static Vec3 RotateAbout(const Vec3& v, const Vec3& axis, double angle) {
+        const Vec3 k = axis.Normalized();
+        const double c = std::cos(angle), sn = std::sin(angle);
+        return v * c + k.Cross(v) * sn + k * (k.Dot(v) * (1.0 - c));
     }
 
     // Dolly, multiplicatively. A fixed step would crawl when far out and
@@ -157,6 +215,14 @@ struct OrbitCamera {
     // would be three chances to get the handedness wrong independently, and
     // the handedness has already been wrong once -- see ViewProj.
     void Basis(Vec3* right, Vec3* up, Vec3* fwd) const {
+        if (freeOrient) {
+            // right = fwd x up is the same right-handed basis the angles give:
+            // there, up = right x fwd with right = worldUp x fwd.
+            *fwd = back * -1.0;
+            *up = (upv - *fwd * upv.Dot(*fwd)).Normalized();
+            *right = fwd->Cross(*up).Normalized();
+            return;
+        }
         *fwd = (target - Eye()).Normalized();
         // right = worldUp x fwd, NOT fwd x worldUp: see ViewProj.
         *right = WorldUp().Cross(*fwd).Normalized();

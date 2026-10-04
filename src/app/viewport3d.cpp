@@ -1064,7 +1064,25 @@ void Viewport3D::Draw(Device& dev, Image*) {
             if (panning)
                 cam.Pan(double(d.x), double(d.y), double(h));
             else if (ImGui::IsMouseDragging(ImGuiMouseButton_Left))
-                cam.Rotate(double(d.x) * 0.008, double(-d.y) * 0.008);
+                cam.Turn(double(d.x) * 0.008, double(-d.y) * 0.008);
+        }
+
+        // WASD while the pointer is over the view, unless a text field has the
+        // keyboard: forward/back, left/right, and Q/E for down/up. Shift moves
+        // faster. Half the distance to the target per second -- at any scene
+        // scale -- so walking up to something slows down as it gets close.
+        if (ImGui::IsItemHovered() && !io.WantTextInput) {
+            double mr = 0.0, mu = 0.0, mf = 0.0;
+            if (ImGui::IsKeyDown(ImGuiKey_W)) mf += 1.0;
+            if (ImGui::IsKeyDown(ImGuiKey_S)) mf -= 1.0;
+            if (ImGui::IsKeyDown(ImGuiKey_D)) mr += 1.0;
+            if (ImGui::IsKeyDown(ImGuiKey_A)) mr -= 1.0;
+            if (ImGui::IsKeyDown(ImGuiKey_E)) mu += 1.0;
+            if (ImGui::IsKeyDown(ImGuiKey_Q)) mu -= 1.0;
+            if (mr != 0.0 || mu != 0.0 || mf != 0.0) {
+                const double step = 0.5 * double(io.DeltaTime) * (io.KeyShift ? 4.0 : 1.0);
+                cam.Move(mr * step, mu * step, mf * step);
+            }
         }
 
         // The controls, said where they are used, faint enough to ignore.
@@ -1072,7 +1090,7 @@ void Viewport3D::Draw(Device& dev, Image*) {
             ImVec2(origin.x + 6.0f, origin.y + float(h) - ImGui::GetTextLineHeight() - 4.0f),
             IM_COL32(200, 200, 200, 110),
             "drag: orbit   right/middle/shift-drag: pan   wheel: zoom to cursor   "
-            "double-click: orbit about that point");
+            "double-click: orbit about that point   WASD/QE: move");
     }
 
     ImGui::End();

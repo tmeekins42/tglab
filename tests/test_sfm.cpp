@@ -1829,6 +1829,47 @@ int main() {
                   "ratio " + std::to_string(ratio) + ")");
         }
 
+        // SCREEN-RELATIVE ROTATION. On an untilted view Turn() must do what
+        // Rotate() does -- the mouse feels the same until the view tilts --
+        // and on a tilted one a sideways turn must be about the SCREEN's up:
+        // the screen's up stays put and the target stays in the middle.
+        {
+            OrbitCamera a, b;
+            a.yaw = b.yaw = 0.4;
+            a.pitch = b.pitch = 0.0;
+            a.Rotate(0.05, 0.03);
+            b.Turn(0.05, 0.03);
+            const double d = (a.Eye() - b.Eye()).Norm();
+            Check(d < 1e-3 * a.distance,
+                  "Turn matches Rotate on an untilted view (eyes " + std::to_string(d) + " apart)");
+
+            OrbitCamera t;
+            t.Turn(0.0, 1.2);   // tilt well over
+            Vec3 r0, u0, f0;
+            t.Basis(&r0, &u0, &f0);
+            t.Turn(0.7, 0.0);   // then sideways
+            Vec3 r1, u1, f1;
+            t.Basis(&r1, &u1, &f1);
+            Check(u0.Dot(u1) > 0.9999,
+                  "a sideways turn keeps the screen's up on a tilted view (" +
+                      std::to_string(u0.Dot(u1)) + ")");
+            Check(std::fabs((t.Eye() - t.target).Norm() - t.distance) < 1e-9,
+                  "...and the distance to the target");
+            for (int i = 0; i < 40; ++i) t.Turn(0.0, 0.2);   // over the top, no pole
+            double sx, sy, sz;
+            Check(project(t, t.target, &sx, &sy, &sz) && std::fabs(sx) < 1e-4 && std::fabs(sy) < 1e-4,
+                  "...and the view stays valid right over the top");
+
+            OrbitCamera m;
+            const Vec3 e0 = m.Eye(), g0 = m.target;
+            m.Move(0.0, 0.0, 0.5);
+            Vec3 r, u, f;
+            m.Basis(&r, &u, &f);
+            Check(((m.target - g0) - f * (0.5 * m.distance)).Norm() < 1e-9 &&
+                      ((m.Eye() - e0) - (m.target - g0)).Norm() < 1e-9,
+                  "Move carries eye and target together along the view");
+        }
+
         // Pitch must not reach vertical: there the up vector and the view
         // direction are parallel, the basis collapses, and the view flips.
         {
