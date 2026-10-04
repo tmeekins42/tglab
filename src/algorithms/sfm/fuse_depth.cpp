@@ -37,6 +37,7 @@
 // contradicting it -- an occluded pixel simply fails to find support and is
 // dropped, which is conservative but loses real geometry at depth edges.
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cmath>
 #include <cstdio>
@@ -130,8 +131,10 @@ public:
         const int    maxSeen = int(m_maxSeenThrough);
         const double seeTol  = double(m_seeTolerance);
 
+        std::atomic<int> camsDone{0};
         ParallelFor(nCam, [&](int c) {
             if (GroupCancelled()) return;   // superseded: see SetGroupCancel
+            GroupProgress(double(camsDone++) / double(nCam));
             FuseCamera(c, *cloud, views, minViews, relTol, step, minConf,
                        maxSeen, seeTol, double(m_seenFraction), double(m_colourTolerance),
                        perHist[size_t(c)].data(), &perCam[size_t(c)], &perDropped[size_t(c)],

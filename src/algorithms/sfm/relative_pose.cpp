@@ -35,6 +35,7 @@
 // A wrong focal biases the recovered rotation, which is the main reason the
 // literature calibrates the view graph before averaging.
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -1201,9 +1202,11 @@ bool RelativePose::RunAlign(std::vector<Image>* images, std::string* err) {
     std::vector<Tally> tallies;
     tallies.resize(size_t(n));
 
+    std::atomic<int> framesDone{0};
     ParallelFor(size_t(n), [&](size_t fi) {
         const int f = int(fi);
         if (GroupCancelled()) return;   // superseded: see SetGroupCancel
+        GroupProgress(double(framesDone++) / double(n));
         Tally& tl = tallies[fi];
         int& solved = tl.solved;
         int& attempted = tl.attempted;

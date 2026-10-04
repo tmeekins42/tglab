@@ -704,6 +704,7 @@ int main(int argc, char** argv) {
     std::string detector = "detect_akaze";
     int window = 3, maxDim = 1600, rotMethod = 1, posMethod = 0;
     int videoFrames = 0;     // --video-frames N: N time slots; default picks by motion
+    bool showProgress = false;   // --progress: print the progress bar's changes
     double videoStep = 0.0;  // --video-step F: motion step, a fraction of the short side
     int    videoMax = -1;    // --video-max N: cap on frames kept by motion (0 = none)
     bool printCameras = false;   // --cameras: the camera path, per camera
@@ -752,6 +753,7 @@ int main(int argc, char** argv) {
         else if (a == "--dump" && i + 1 < argc)     dumpDir = argv[++i];
         else if (a == "--gpu")                         useGpu = true;
         else if (a == "--cameras")                     printCameras = true;
+        else if (a == "--progress")                    showProgress = true;
         else if (a == "--video-frames" && i + 1 < argc) videoFrames = std::atoi(argv[++i]);
         else if (a == "--video-step" && i + 1 < argc) videoStep = std::atof(argv[++i]);
         else if (a == "--video-max" && i + 1 < argc)  videoMax = std::atoi(argv[++i]);
@@ -936,9 +938,38 @@ int main(int argc, char** argv) {
             }
         }
 
+        // --progress: the bar as the app would show it, one line per new
+        // label and per tenth within a stage.
+        struct PrintProgress : Progress {
+            std::string last;
+            int lastTenth = -1;
+            std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+            void Set(int done, int total, const char* what) override {
+                Progress::Set(done, total, what);
+                const std::string w = what ? what : "";
+                const int tenth = total > 0 ? done * 10 / total : 0;
+                if (w == last && tenth == lastTenth) return;
+                last = w;
+                lastTenth = tenth;
+                std::printf("  [progress %7.1f s] %3d%%  %s\n",
+                            Ms(t0, std::chrono::steady_clock::now()) / 1000.0,
+                            total > 0 ? done * 100 / total : 0, w.c_str());
+            }
+            // What the app's viewers would receive during the run.
+            void StageFinished(int stage) override {
+                std::printf("  [progress %7.1f s] stage %d finished\n",
+                            Ms(t0, std::chrono::steady_clock::now()) / 1000.0, stage);
+            }
+            void Snapshot(int stage, std::shared_ptr<const PointCloud> pc) override {
+                std::printf("  [progress %7.1f s] stage %d snapshot: %zu splats\n",
+                            Ms(t0, std::chrono::steady_clock::now()) / 1000.0, stage,
+                            pc ? pc->splats.size() : size_t(0));
+            }
+        } printProgress;
         const auto ts = std::chrono::steady_clock::now();
         std::string serr;
-        const bool sok = sp.Execute(&s, nullptr, &serr, gpuPtr);
+        const bool sok = sp.Execute(&s, nullptr, &serr, gpuPtr, ExecMode::Auto, nullptr, nullptr,
+                                    showProgress ? &printProgress : nullptr);
         const double sms = Ms(ts, std::chrono::steady_clock::now());
 
         // The script's save() lines, which the app runs on request; here
@@ -1022,6 +1053,40 @@ int main(int argc, char** argv) {
                     std::filesystem::create_directories(dumpDir);
                     DumpOrbit(*pc, dumpDir + "/" + vd.name);
                     DumpTop(*pc, dumpDir + "/" + vd.name);
+                    // The cloud itself, for analysis outside: cameras (R row-
+                    // major, t, focal, cx, cy, w, h, solved) and tracks (point,
+                    // has-point, then each observation's frame, x, y).
+                    // Little-endian doubles and int32s; only for clouds of
+                    // under four million tracks -- the sparse kind.
+                    if (pc->tracks.size() < 4000000) {
+                        const std::string cp = dumpDir + "/" + vd.name + ".cloud";
+                        if (FILE* f = std::fopen(cp.c_str(), "wb")) {
+                            const int32_t nc = int32_t(pc->cameras.size());
+                            std::fwrite(&nc, 4, 1, f);
+                            for (const Camera& c : pc->cameras) {
+                                std::fwrite(c.R.m, 8, 9, f);
+                                const double v[6] = {c.t.x, c.t.y, c.t.z, c.focal, c.cx, c.cy};
+                                std::fwrite(v, 8, 6, f);
+                                const int32_t iv[3] = {c.width, c.height, c.solved ? 1 : 0};
+                                std::fwrite(iv, 4, 3, f);
+                            }
+                            const int32_t nt = int32_t(pc->tracks.size());
+                            std::fwrite(&nt, 4, 1, f);
+                            for (const Track& t : pc->tracks) {
+                                const double pt[3] = {t.point.x, t.point.y, t.point.z};
+                                std::fwrite(pt, 8, 3, f);
+                                const int32_t hdr[2] = {t.hasPoint ? 1 : 0, int32_t(t.obs.size())};
+                                std::fwrite(hdr, 4, 2, f);
+                                for (const Observation& o : t.obs) {
+                                    const int32_t fr = o.frame;
+                                    const float xy[2] = {o.x, o.y};
+                                    std::fwrite(&fr, 4, 1, f);
+                                    std::fwrite(xy, 4, 2, f);
+                                }
+                            }
+                            std::fclose(f);
+                        }
+                    }
                 }
             }
             const char* kind = "nothing";

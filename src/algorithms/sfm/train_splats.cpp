@@ -608,7 +608,38 @@ public:
             Evaluate(params, sh, shMax, {}, EnvMap{}, heldOut, opt, GroupGpu(), &heldL1,
                      &heldBefore, nullptr, gpuTrainer.get());
 
+        // SNAPSHOTS for the viewer while training runs (AlgorithmBase::
+        // GroupSnapshot): every hundred iterations, and no more than every
+        // second and a half, the Gaussians as they stand -- read back from
+        // the device without the optimiser's state, a few percent of the time
+        // at worst. Cameras and splats only: the cloud's millions of dense
+        // points are not what is being looked at.
+        auto lastSnap = std::chrono::steady_clock::now();
+        auto snapshot = [&](int it) {
+            if (!SnapshotWanted() || (it + 1) % 100 != 0) return;
+            const auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration<double>(now - lastSnap).count() < 1.5) return;
+            lastSnap = now;
+            std::vector<SplatParam> ps;
+            std::vector<double> shNow;
+            std::string e;
+            const bool onDev = gpuTrainer && gpuTrainer->DownloadParams(&ps, &shNow, &e);
+            const std::vector<SplatParam>& use = onDev ? ps : params;
+            const std::vector<double>& shUse = onDev ? shNow : sh;
+            auto snap = std::make_shared<PointCloud>();
+            snap->cameras = cloud->cameras;
+            snap->splats.resize(use.size());
+            for (size_t i = 0; i < use.size(); ++i) snap->splats[i] = FromParam(use[i]);
+            if (!shUse.empty() && shUse.size() == use.size() * size_t(kShRest)) {
+                snap->shDegree = shMax;
+                snap->splatSh.assign(shUse.begin(), shUse.end());
+            }
+            GroupSnapshot(std::move(snap));
+        };
+
         for (int it = 0; it < iters; ++it) {
+            GroupProgress(double(it) / double(std::max(1, iters)));
+            snapshot(it - 1);
             // Superseded -- a parameter moved, a load landed: stop now rather
             // than finishing a solve nobody will see (see SetGroupCancel).
             if (GroupCancelled()) { *err = "cancelled"; return false; }

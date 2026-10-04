@@ -7,6 +7,9 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <set>
+#include <algorithm>
+#include <map>
 #include <string>
 #include <thread>
 #include <vector>
@@ -65,6 +68,28 @@ static bool BuildPipeline(const char* script, int dim, UiState* ui,
 
 // ---------------------------------------------------------------------------
 
+// Takes outcomes the way the app does: a run's partial outcomes (viewers
+// published as their stages finish) merged by name into what was already
+// shown, and true only once the run's own outcome -- the one carrying its
+// statistics -- has arrived, with every viewer of the run in it.
+static bool FetchFinal(PipelineWorker& w, PipelineOutcome* out) {
+    static std::map<uint64_t, std::vector<ViewerImage>> shown;
+    PipelineOutcome o;
+    if (!w.TryFetch(&o)) return false;
+    std::vector<ViewerImage>& acc = shown[o.seq];
+    for (ViewerImage& v : o.viewers) {
+        auto it = std::find_if(acc.begin(), acc.end(),
+                               [&](const ViewerImage& a) { return a.name == v.name; });
+        if (it == acc.end()) acc.push_back(std::move(v));
+        else *it = std::move(v);
+    }
+    if (o.partial) return false;
+    o.viewers = std::move(acc);
+    shown.erase(o.seq);
+    *out = std::move(o);
+    return true;
+}
+
 static void TestWorker() {
     Section("worker thread");
 
@@ -91,7 +116,7 @@ static void TestWorker() {
             std::chrono::duration<double, std::milli>(clockt::now() - t0).count();
 
         PipelineOutcome out;
-        while (!worker.TryFetch(&out)) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        while (!FetchFinal(worker, &out)) std::this_thread::sleep_for(std::chrono::milliseconds(2));
         const double totalMs =
             std::chrono::duration<double, std::milli>(clockt::now() - t0).count();
 
@@ -100,6 +125,40 @@ static void TestWorker() {
         Check(totalMs > submitMs * 2, "the work really was the slow part");
         Check(out.ok && out.viewers.size() == 1 && out.viewers[0].image.Valid(),
               "result carries a valid viewer image");
+    }
+
+    // RESULTS AS THEY COME: a finished stage's viewer is published while the
+    // rest still run (a partial outcome), and between the partials and the
+    // run's own outcome every viewer arrives -- none dropped because it went
+    // early, whether or not the UI fetched the partial in time.
+    {
+        const char* kTwo =
+            "src = image(\"test\")\n"
+            "a = gaussian_blur(src, sigma = 2)\n"
+            "b = gaussian_blur(a, sigma = 12)\n"
+            "display(a, \"early\")\n"
+            "display(b, \"late\")\n";
+        UiState ui; Pipeline pipe; std::vector<Data> src; std::string err;
+        if (BuildPipeline(kTwo, dim, &ui, &pipe, &src, &err)) {
+            const uint64_t seq = worker.Submit(std::move(pipe), std::move(src));
+            std::set<std::string> seen;
+            bool sawPartial = false, sawFinal = false;
+            const auto deadline = clockt::now() + std::chrono::seconds(30);
+            while (clockt::now() < deadline && !sawFinal) {
+                PipelineOutcome out;
+                if (worker.TryFetch(&out) && out.seq == seq) {
+                    sawPartial = sawPartial || out.partial;
+                    sawFinal = !out.partial;
+                    for (const ViewerImage& v : out.viewers) seen.insert(v.name);
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            Check(sawFinal && seen.count("early") && seen.count("late"),
+                  "every viewer arrives, early ones as partials or carried into the result");
+            Check(sawPartial, "a finished stage's viewer is sent before the run ends");
+        } else {
+            Check(false, "build two-stage pipeline: " + err);
+        }
     }
 
     // A burst coalesces to far fewer runs, and the newest wins.
@@ -115,7 +174,7 @@ static void TestWorker() {
         const auto deadline = clockt::now() + std::chrono::seconds(30);
         while (clockt::now() < deadline) {
             PipelineOutcome out;
-            if (worker.TryFetch(&out)) {
+            if (FetchFinal(worker, &out)) {
                 ++delivered;
                 newest = out.seq;
                 if (newest == lastSeq) break;
@@ -160,7 +219,7 @@ static void TestWorker() {
                 worker.Submit(std::move(pipe), std::move(src));
                 PipelineOutcome out;
                 const auto dl = clockt::now() + std::chrono::seconds(30);
-                while (clockt::now() < dl && !worker.TryFetch(&out))
+                while (clockt::now() < dl && !FetchFinal(worker, &out))
                     std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
         }
@@ -179,7 +238,7 @@ static void TestWorker() {
         bool got = false;
         const auto deadline = clockt::now() + std::chrono::seconds(30);
         while (clockt::now() < deadline) {
-            if (worker.TryFetch(&out) && out.seq == lastSeq) { got = true; break; }
+            if (FetchFinal(worker, &out) && out.seq == lastSeq) { got = true; break; }
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
 
@@ -447,7 +506,7 @@ static void TestCancellation() {
         const auto t0 = clockt::now();
         worker.Submit(std::move(pipe), std::move(src));
         PipelineOutcome out;
-        while (!worker.TryFetch(&out)) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        while (!FetchFinal(worker, &out)) std::this_thread::sleep_for(std::chrono::milliseconds(2));
         baselineMs = std::chrono::duration<double, std::milli>(clockt::now() - t0).count();
     }
     Check(baselineMs > 300.0,
@@ -484,7 +543,7 @@ static void TestCancellation() {
         uint64_t got = 0;
         const auto deadline = clockt::now() + std::chrono::seconds(60);
         while (clockt::now() < deadline) {
-            if (worker.TryFetch(&out)) {
+            if (FetchFinal(worker, &out)) {
                 got = out.seq;
                 if (got == secondSeq) break;
             }

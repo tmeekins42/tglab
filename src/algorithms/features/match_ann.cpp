@@ -1041,6 +1041,7 @@ private:
         constexpr size_t kBatch = 64;
         std::vector<GpuKnn::Job> jobs;
         for (size_t b0 = 0; b0 < pairs.size(); b0 += kBatch) {
+            GroupProgress(double(b0) / double(pairs.size()));
             if (GroupCancelled()) return false;
             const size_t b1 = std::min(pairs.size(), b0 + kBatch);
             jobs.clear();

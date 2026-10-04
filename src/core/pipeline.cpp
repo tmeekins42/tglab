@@ -1408,6 +1408,21 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
             }
         } stageTimer(s);
 
+        // Tells the worker the stage is done, so its result can be shown while
+        // the rest run (Progress::StageFinished). On every exit path that
+        // leaves the stage valid; not for a cancelled run.
+        struct StageDone {
+            Progress* p;
+            const std::vector<Stage>& stages;
+            size_t index;
+            const CancelToken* c;
+            ~StageDone() {
+                if (!p || index >= stages.size() || !stages[index].valid) return;
+                if (c && c->Cancelled()) return;
+                p->StageFinished(int(index));
+            }
+        } stageDone{progress, m_stages, i, cancel};
+
         // Already consumed frame by frame by a fused reduction below.
         if (fused.count(int(i))) continue;
 
@@ -1811,6 +1826,20 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
             // reconstruct stage reaching past it would defeat that.
             s.algo->SetGroupGpu(mode == ExecMode::ForceCPU ? nullptr : gpu);
             s.algo->SetGroupCancel(cancel);
+            s.algo->SetGroupProgress(progress);
+            if (progress) {
+                const int stageIndex = int(i);
+                s.algo->SetGroupSnapshot([progress, stageIndex](std::shared_ptr<const PointCloud> pc) {
+                    progress->Snapshot(stageIndex, std::move(pc));
+                });
+            }
+            struct ClearProgress {
+                AlgorithmBase* a;
+                ~ClearProgress() {
+                    a->SetGroupProgress(nullptr);
+                    a->SetGroupSnapshot(nullptr);
+                }
+            } clearProgress{s.algo.get()};
 
             // A THIRD INPUT, a second group beside the frames, for a stage
             // that declares one: train_splats(splats, frames, depth). Null
@@ -1888,6 +1917,11 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
 
             s.algo->SetGroupGpu(mode == ExecMode::ForceCPU ? nullptr : gpu);
             s.algo->SetGroupCancel(cancel);
+            s.algo->SetGroupProgress(progress);
+            struct ClearProgress {
+                AlgorithmBase* a;
+                ~ClearProgress() { a->SetGroupProgress(nullptr); }
+            } clearProgress{s.algo.get()};
 
             std::string aerr;
             const bool ok = s.algo->RunAlign(&out.images, &aerr);

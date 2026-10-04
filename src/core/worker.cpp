@@ -180,6 +180,124 @@ bool PipelineWorker::TryFetch(PipelineOutcome* out) {
     return true;
 }
 
+bool PipelineWorker::BuildViewer(const ViewerDecl& vd, const Data* d, bool changed,
+                                 ViewerImage* out) {
+    // A RECONSTRUCTION takes its own path: there are no pixels to read back,
+    // convert or upload, so none of the machinery below applies. Handed over
+    // as a shared pointer and drawn by a 3D viewport.
+    if (const PointCloud* pc = std::get_if<PointCloud>(d)) {
+        uint64_t& cver = m_viewerVersions[vd.name];
+        if (changed || cver == 0) ++cver;
+        out->name    = vd.name;
+        out->version = cver;
+        out->cloud   = std::make_shared<const PointCloud>(*pc);
+        return true;
+    }
+
+    // A GROUP shows the frame its panel asks for (a frame selector), not
+    // every frame: a hundred-frame video would otherwise be a hundred
+    // readbacks per run. It used to show nothing at all, which left the
+    // panel on "computing..." forever after the run had finished.
+    const Data* shown = d;
+    Data oneFrame;
+    int frameIdx = 0, frameCount = 0;
+    if (const ImageSet* set = std::get_if<ImageSet>(d)) {
+        if (set->images.empty()) return false;
+        frameCount = int(set->images.size());
+        {
+            std::lock_guard<std::mutex> lock(m_mtx);
+            auto it = m_viewerFrames.find(vd.name);
+            if (it != m_viewerFrames.end()) frameIdx = it->second;
+        }
+        frameIdx = std::clamp(frameIdx, 0, frameCount - 1);
+        oneFrame = Data{const_cast<Image&>(set->images[size_t(frameIdx)]).Clone()};
+        shown = &oneFrame;
+    }
+
+    if (!std::holds_alternative<Image>(*shown)) return false;
+
+    uint64_t& ver = m_viewerVersions[vd.name];
+    // A different frame of an unchanged group is new pixels too.
+    auto sent = m_sentFrames.find(vd.name);
+    const bool frameMoved = sent == m_sentFrames.end() || sent->second != frameIdx;
+    m_sentFrames[vd.name] = frameIdx;
+    if (changed || frameMoved || ver == 0) ++ver;
+
+    const Image& result = std::get<Image>(*shown);
+
+    // Still on the GPU: hand over a reference and do NOT read it back.
+    // Clone() would map the pixels, which is the 86 ms this whole path exists
+    // to avoid. A CPU-only result has no shared texture, so it takes the
+    // clone -- both cases have to work, since a script can mix the two.
+    std::shared_ptr<SharedGpuTexture> shared = ShareGpuTexture(result);
+
+    out->name       = vd.name;
+    out->version    = ver;
+    out->frame      = frameIdx;
+    out->frameCount = frameCount;
+    out->gpu        = shared;
+    if (shared) {
+        // Descriptor only -- deliberately NOT Image(desc), which allocates and
+        // zero-fills a full CPU buffer and reports itself CPU-resident.
+        out->image.AdoptDesc(result.Desc());
+    } else {
+        out->image = const_cast<Image&>(result).Clone();
+    }
+    return true;
+}
+
+// RESULTS AS THEY COME. A finished stage's viewers go out at once, and so
+// does a long stage's snapshot -- to the viewers of that stage and of any
+// later stage it feeds through first inputs, since sfm.tgl shows
+// carve_splats(train_splats(...)), not train_splats itself. Published as a
+// partial outcome the UI merges by name, exactly as it merges a run's.
+void PipelineWorker::PublishPartial(int stage, std::shared_ptr<const PointCloud> snapshot) {
+    if (!m_curJob) return;
+    PipelineJob& job = *m_curJob;
+    const auto& stages = job.pipe.Stages();
+    std::vector<ViewerImage> vis;
+    for (const ViewerDecl& vd : job.pipe.Viewers()) {
+        if (vd.source.stage < 0) continue;
+        if (!snapshot) {
+            if (vd.source.stage != stage || job.pipe.IsOff(vd.source)) continue;
+            const Data* d = job.pipe.Resolve(vd.source, job.sources.get());
+            if (!d) continue;
+            ViewerImage vi;
+            if (!BuildViewer(vd, d, true, &vi)) continue;
+            m_partialSent[vd.name] = true;
+            vis.push_back(std::move(vi));
+        } else {
+            int k = vd.source.stage;
+            while (k > stage && k < int(stages.size())) {
+                const Stage& st = stages[size_t(k)];
+                if (st.inputs.empty() || st.inputs[0].stage < 0) break;
+                k = st.inputs[0].stage;
+            }
+            if (k != stage) continue;
+            ViewerImage vi;
+            vi.name    = vd.name;
+            vi.version = ++m_viewerVersions[vd.name];
+            vi.cloud   = snapshot;
+            vis.push_back(std::move(vi));
+        }
+    }
+    if (vis.empty()) return;
+
+    std::lock_guard<std::mutex> lock(m_mtx);
+    if (!m_result || m_result->seq != job.seq) {
+        m_result = std::make_unique<PipelineOutcome>();
+        m_result->seq     = job.seq;
+        m_result->ok      = true;
+        m_result->partial = true;
+    }
+    for (ViewerImage& v : vis) {
+        auto it = std::find_if(m_result->viewers.begin(), m_result->viewers.end(),
+                               [&](const ViewerImage& o) { return o.name == v.name; });
+        if (it == m_result->viewers.end()) m_result->viewers.push_back(std::move(v));
+        else *it = std::move(v);
+    }
+}
+
 void PipelineWorker::Run() {
     // The worker owns the previous pipeline: Execute() *moves* cached outputs
     // out of it, so it must not be reachable from the UI thread while a job is
@@ -249,10 +367,14 @@ void PipelineWorker::Run() {
         const auto t0 = std::chrono::steady_clock::now();
         std::string err;
         m_progress.Set(0, 0, "starting");
+        m_progress.worker = this;
+        m_curJob = job.get();
+        m_partialSent.clear();
         const bool ok = job->pipe.Execute(job->sources.get(), havePrev ? &prev : nullptr, &err,
                                           haveGpu ? &gpu : nullptr,
                                           m_mode.load(std::memory_order_relaxed),
                                           &job->sourceVersions, token.get(), &m_progress);
+        m_curJob = nullptr;
         const double elapsedMs =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 
@@ -377,6 +499,8 @@ void PipelineWorker::Run() {
             // the version check skips both.
             const size_t firstDirty = job->pipe.FirstDirtyStage();
             for (const ViewerDecl& vd : job->pipe.Viewers()) {
+                // Sent while the run went: see PublishPartial.
+                if (m_partialSent.count(vd.name)) continue;
                 if (job->pipe.IsOff(vd.source)) {
                     ViewerImage vi;
                     vi.name = vd.name;
@@ -386,99 +510,12 @@ void PipelineWorker::Run() {
                 }
                 const Data* d = job->pipe.Resolve(vd.source, job->sources.get());
                 if (!d) continue;
-
-                // A RECONSTRUCTION takes its own path: there are no pixels to
-                // read back, convert or upload, so none of the machinery below
-                // applies. Handed over as a shared pointer and drawn by a 3D
-                // viewport.
-                if (const PointCloud* pc = std::get_if<PointCloud>(d)) {
-                    const bool moved = (vd.source.stage < 0)
-                                           ? sourcesChanged
-                                           : size_t(vd.source.stage) >= firstDirty;
-                    uint64_t& cver = m_viewerVersions[vd.name];
-                    if (moved || cver == 0) ++cver;
-
-                    ViewerImage vi;
-                    vi.name    = vd.name;
-                    vi.version = cver;
-                    vi.cloud   = std::make_shared<const PointCloud>(*pc);
-                    outcome->viewers.push_back(std::move(vi));
-                    continue;
-                }
-
-                // A GROUP shows its FIRST frame rather than nothing.
-                //
-                // This used to `continue`, so `display(group, "frames")` --
-                // which is the obvious thing to write, and what sfm.tgl does
-                // -- produced a panel stuck on "computing..." forever. The
-                // pipeline had finished; the viewer was simply never handed
-                // anything, and there was no way to tell those apart from
-                // outside.
-                //
-                // The first frame is a placeholder for a frame SELECTOR, which
-                // is what this panel eventually wants: a group of nineteen
-                // photographs has nineteen things worth looking at. Showing
-                // one is a poor answer and showing none is a bug report.
-                // NOW A FRAME SELECTOR: the panel asks for a frame, and that
-                // one is sent. Only one frame travels -- a hundred-frame video
-                // would otherwise be a hundred readbacks per run.
-                const Data* shown = d;
-                Data oneFrame;
-                int frameIdx = 0, frameCount = 0;
-                if (const ImageSet* set = std::get_if<ImageSet>(d)) {
-                    if (set->images.empty()) continue;
-                    frameCount = int(set->images.size());
-                    {
-                        std::lock_guard<std::mutex> lock(m_mtx);
-                        auto it = m_viewerFrames.find(vd.name);
-                        if (it != m_viewerFrames.end()) frameIdx = it->second;
-                    }
-                    frameIdx = std::clamp(frameIdx, 0, frameCount - 1);
-                    oneFrame = Data{const_cast<Image&>(set->images[size_t(frameIdx)]).Clone()};
-                    shown = &oneFrame;
-                }
-
-                if (!std::holds_alternative<Image>(*shown)) continue;
-
                 // A palette source (stage < 0) changes only when the file
                 // behind it is replaced, which arrives as a new source version.
-                const bool changed = (vd.source.stage < 0)
-                                         ? sourcesChanged
-                                         : size_t(vd.source.stage) >= firstDirty;
-                uint64_t& ver = m_viewerVersions[vd.name];
-                // A different frame of an unchanged group is new pixels too.
-                auto sent = m_sentFrames.find(vd.name);
-                const bool frameMoved = sent == m_sentFrames.end() || sent->second != frameIdx;
-                m_sentFrames[vd.name] = frameIdx;
-                if (changed || frameMoved || ver == 0) ++ver;
-
-                const Image& result = std::get<Image>(*shown);
-
-                // Still on the GPU: hand over a reference and do NOT read it
-                // back. Clone() would map the pixels, which is the 86 ms this
-                // whole path exists to avoid.
-                //
-                // A CPU-only result (a stage with no GPU kernel) has no shared
-                // texture, so it takes the clone as before -- both cases have
-                // to work, since a script can mix the two.
-                std::shared_ptr<SharedGpuTexture> shared = ShareGpuTexture(result);
-
+                const bool changed = (vd.source.stage < 0) ? sourcesChanged
+                                                           : size_t(vd.source.stage) >= firstDirty;
                 ViewerImage vi;
-                vi.name    = vd.name;
-                vi.version = ver;
-                vi.frame = frameIdx;
-                vi.frameCount = frameCount;
-                vi.gpu     = shared;
-                if (shared) {
-                    // Descriptor only -- deliberately NOT Image(desc), which
-                    // allocates and zero-fills a full CPU buffer and reports
-                    // itself CPU-resident. That would spend the 84 MB this path
-                    // exists to save and hand every reader an image of zeros.
-                    vi.image.AdoptDesc(result.Desc());
-                } else {
-                    vi.image = const_cast<Image&>(result).Clone();
-                }
-                outcome->viewers.push_back(std::move(vi));
+                if (BuildViewer(vd, d, changed, &vi)) outcome->viewers.push_back(std::move(vi));
             }
 
             // The info panel's histogram, measured here while the pixels are
@@ -516,6 +553,15 @@ void PipelineWorker::Run() {
         const uint64_t finishedSeq = outcome->seq;
         {
             std::lock_guard<std::mutex> lock(m_mtx);
+            // A partial of this run the UI has not fetched yet holds viewers
+            // this outcome skipped as already sent: carry them over.
+            if (m_result && m_result->partial && m_result->seq == outcome->seq) {
+                for (ViewerImage& v : m_result->viewers) {
+                    const bool have = std::any_of(outcome->viewers.begin(), outcome->viewers.end(),
+                                                  [&](const ViewerImage& o) { return o.name == v.name; });
+                    if (!have) outcome->viewers.push_back(std::move(v));
+                }
+            }
             m_result = std::move(outcome);
             m_running.reset();
             // Only idle when nothing newer arrived while we were working.

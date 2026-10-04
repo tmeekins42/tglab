@@ -4,15 +4,20 @@
 // so the script, the UI, and the stage cache all discover them the same way.
 #pragma once
 
+#include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "cancel.h"
+#include "progress.h"
 #include "data.h"
 #include "reduction.h"
 #include "image.h"
@@ -473,6 +478,41 @@ public:
     // The token itself, for a stage that runs a pipeline of its own.
     const CancelToken* GroupCancelToken() const { return m_groupCancel; }
 
+    // A RESULT SO FAR, for the viewer while a long stage is still going:
+    // see Progress::Snapshot. SnapshotWanted is false when nobody is
+    // watching -- a bench, a test -- so the stage need not build one.
+    void SetGroupSnapshot(std::function<void(std::shared_ptr<const PointCloud>)> f) {
+        m_snapshot = std::move(f);
+    }
+    bool SnapshotWanted() const { return bool(m_snapshot); }
+    void GroupSnapshot(std::shared_ptr<const PointCloud> pc) const {
+        if (m_snapshot) m_snapshot(std::move(pc));
+    }
+
+    // PROGRESS, set the same way: where a long group stage says how far it has
+    // got, 0..1, and optionally what it is doing ("bundle adjustment"). The
+    // pipeline sets it before RunReconstruct / RunAlign and clears it after.
+    // Cheap to call every iteration, and from any thread: repeated values
+    // are dropped here, and the rest serialised (the label is a copy).
+    void SetGroupProgress(Progress* p) { m_groupProgress = p; m_lastPermille.store(-1); }
+    Progress* GroupProgressSink() const { return m_groupProgress; }
+    void GroupProgress(double fraction, const char* phase = nullptr) const {
+        if (!m_groupProgress) return;
+        const int pm = int(std::clamp(fraction, 0.0, 1.0) * 1000.0);
+        if (pm == m_lastPermille.load(std::memory_order_relaxed) &&
+            phase == m_lastPhase.load(std::memory_order_relaxed))
+            return;
+        // Recursive: a stage running a pipeline of its own (solve_cameras)
+        // forwards its inner stages through here, from inside this lock.
+        static std::recursive_mutex mtx;
+        std::lock_guard<std::recursive_mutex> lock(mtx);
+        m_lastPermille.store(pm, std::memory_order_relaxed);
+        m_lastPhase.store(phase, std::memory_order_relaxed);
+        std::string label = Name();
+        if (phase && *phase) label += std::string(": ") + phase;
+        m_groupProgress->SetWithin(fraction, label.c_str());
+    }
+
     // A reconstruct stage's THIRD input, when it declares one and the script
     // supplied it: a second group of images beside the frames on input 1 --
     // train_splats(splats, frames, depth) reads plane_sweep's maps here.
@@ -830,6 +870,10 @@ private:
     // see SetGroupGpu. Null whenever there is no device or the run is CPU-only.
     ComputeContext* m_groupGpu = nullptr;
     const CancelToken* m_groupCancel = nullptr;   // see SetGroupCancel
+    Progress* m_groupProgress = nullptr;          // see SetGroupProgress
+    std::function<void(std::shared_ptr<const PointCloud>)> m_snapshot;   // see SetGroupSnapshot
+    mutable std::atomic<int> m_lastPermille{-1};
+    mutable std::atomic<const char*> m_lastPhase{nullptr};
     // See SetReconstructExtra.
     const std::vector<Image>* m_reconExtra = nullptr;
 };

@@ -75,6 +75,41 @@ long long GoodObservations(const PointCloud& pc, double px) {
     return good;
 }
 
+// THE INNER CHAIN'S PROGRESS, mapped into this stage's: the inner pipeline
+// says which of its eight steps is running (Set) and the step how far it has
+// got (SetWithin), and this turns both into one fraction of the whole solve.
+// Steps are weighted by their share of the time, measured on a 1576-frame room
+// scan, so the bar moves at an even pace rather than racing through relative
+// pose and then sitting on global positioning. Each round runs the bar from
+// the start again (the round count is a maximum, usually not reached), with
+// the round in the label.
+struct InnerProgress : Progress {
+    const AlgorithmBase* owner = nullptr;
+    int round = 0, rounds = 1;
+    int step = 0;
+    std::string stepName, label;
+    static constexpr double kWeight[8] = {2.1, 9.7, 0.1, 51.0, 0.9, 25.0, 0.9, 25.0};
+
+    void Set(int done, int total, const char* what) override {
+        if (total != 8) return;   // not the step count: ignore
+        step = std::clamp(done, 0, 7);
+        if (what) stepName = what;
+        Report(0.0, stepName.c_str());
+    }
+    void SetWithin(double f, const char* what) override { Report(f, what); }
+
+    void Report(double f, const char* what) {
+        double before = 0.0, all = 0.0;
+        for (int i = 0; i < 8; ++i) {
+            if (i < step) before += kWeight[i];
+            all += kWeight[i];
+        }
+        const double inRound = (before + kWeight[step] * std::clamp(f, 0.0, 1.0)) / all;
+        label = std::string(what ? what : "") + " (round " + std::to_string(round + 1) + ")";
+        owner->GroupProgress(inRound, label.c_str());
+    }
+};
+
 class SolveCameras : public AlgorithmBase {
 public:
     const char* Name()     const override { return "solve_cameras"; }
@@ -143,10 +178,15 @@ public:
             s = add("bundle_adjust_sfm", s, {{"max_distance", dist}});
             if (s < 0) { *err = "solve_cameras: a stage it runs is not registered"; return false; }
 
-            // The inner chain is cancelled with this run (SetGroupCancel).
+            // The inner chain is cancelled with this run (SetGroupCancel), and
+            // reports its progress through this stage's (InnerProgress).
+            InnerProgress inner;
+            inner.owner = this;
+            inner.round = r;
+            inner.rounds = 1;   // the bar runs per round; the label names it
             std::string e;
             if (!p.Execute(&src, nullptr, &e, nullptr, ExecMode::Auto, nullptr,
-                           GroupCancelToken())) {
+                           GroupCancelToken(), GroupProgressSink() ? &inner : nullptr)) {
                 if (GroupCancelled()) { *err = "cancelled"; return false; }
                 lastErr = e;
                 break;

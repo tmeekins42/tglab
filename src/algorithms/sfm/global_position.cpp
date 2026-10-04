@@ -55,6 +55,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <functional>
 #include <cstdlib>
 #include <random>
 #include <string>
@@ -107,7 +108,8 @@ struct Ray {
 // around it (frame 0 of a video walk-around, 1.5 radii from frame 1).
 double RefineAngular(const std::vector<Ray>& rays, const std::vector<bool>& solved,
                    int iterations, double huber, std::vector<Vec3>* camPos,
-                   std::vector<Vec3>* pts) {
+                   std::vector<Vec3>* pts,
+                   const std::function<void(double)>& onStep = {}) {
     const int nCam = int(camPos->size()), nTrk = int(pts->size());
     std::vector<int> var(size_t(nCam), -1);
     int nv = 0;
@@ -188,6 +190,7 @@ double RefineAngular(const std::vector<Ray>& rays, const std::vector<bool>& solv
     }
     std::vector<double> Hinv(size_t(nTrk) * 9, 0.0);
     for (int it = 0; it < iterations; ++it) {
+        if (onStep) onStep(double(it) / double(std::max(1, iterations)));
         if (!baseValid) {
         // Each track's own block and couplings, in parallel: every write here
         // is to this track's slots.
@@ -612,6 +615,7 @@ bool GlobalPosition::SolveJoint(PointCloud* cloud, std::string* err) {
 
     const int iters = int(m_iterations);
     for (int it = 0; it < iters; ++it) {
+        GroupProgress(0.1 * double(it) / double(std::max(1, iters)), "alternating start");
         // --- points, given cameras ---
         std::vector<double> A(size_t(nTrk) * 9, 0.0);
         std::vector<Vec3>   b;
@@ -812,27 +816,36 @@ bool GlobalPosition::SolveJoint(PointCloud* cloud, std::string* err) {
         // the time. The winner is refined from its OWN start, not continued
         // from the trial, so where the trial and the full run agree the
         // answer is exactly what it was.
+        // This stage's progress across a refinement: [lo, hi] of the bar.
+        auto span = [this](double lo, double hi, const char* what) {
+            return std::function<void(double)>(
+                [this, lo, hi, what](double f) { GroupProgress(lo + (hi - lo) * f, what); });
+        };
         int skip = 0;   // 1: the alternating start lost the trial, 2: the chained
         double ta = 0.0, tc = 0.0;
         const int trial = std::min(10, int(m_refine));
         if (chainOk && trial < int(m_refine)) {
             std::vector<Vec3> aCam = camPos, aPt = pt, cCam = chainCam, cPt = chainPt;
-            ta = RefineAngular(rays, isSolved, trial, 0.035, &aCam, &aPt);
-            tc = RefineAngular(rays, isSolved, trial, 0.035, &cCam, &cPt);
+            ta = RefineAngular(rays, isSolved, trial, 0.035, &aCam, &aPt, span(0.10, 0.15, "trial"));
+            tc = RefineAngular(rays, isSolved, trial, 0.035, &cCam, &cPt, span(0.15, 0.20, "trial"));
             skip = tc < ta ? 1 : 2;
         }
         if (skip == 1) {
-            RefineAngular(rays, isSolved, int(m_refine), 0.035, &chainCam, &chainPt);
+            RefineAngular(rays, isSolved, int(m_refine), 0.035, &chainCam, &chainPt,
+                          span(0.20, 1.0, "refine"));
             camPos.swap(chainCam);
             pt.swap(chainPt);
             m_start = "chained directions";
         }
         const double costAlt =
-            skip == 1 ? 0.0 : RefineAngular(rays, isSolved, int(m_refine), 0.035, &camPos, &pt);
+            skip == 1 ? 0.0
+                      : RefineAngular(rays, isSolved, int(m_refine), 0.035, &camPos, &pt,
+                                      span(0.20, skip == 0 && chainOk ? 0.6 : 1.0, "refine"));
         if (skip != 1) m_start = "alternating";
         double costChain = 0.0;
         if (chainOk && skip == 0) {
-            costChain = RefineAngular(rays, isSolved, int(m_refine), 0.035, &chainCam, &chainPt);
+            costChain = RefineAngular(rays, isSolved, int(m_refine), 0.035, &chainCam, &chainPt,
+                                      span(0.6, 1.0, "refine"));
             if (costChain < costAlt) {
                 camPos.swap(chainCam);
                 pt.swap(chainPt);

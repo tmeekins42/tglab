@@ -504,6 +504,8 @@ bool BundleAdjustSfm::RunReconstruct(const std::vector<Image>*, PointCloud* clou
 
     for (int iter = 0; iter < int(m_iterations); ++iter) {
         if (GroupCancelled()) { *err = "cancelled"; return false; }   // see SetGroupCancel
+        // Of the step budget; a solve that converges stops short of the end.
+        GroupProgress(double(iter) / double(std::max(1, int(m_iterations))));
         // --- accumulate the blocks ------------------------------------------
         //
         // B: camera-camera, dense per camera but block diagonal across them.

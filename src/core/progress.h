@@ -15,9 +15,12 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <string>
 
 namespace tglab {
+
+struct PointCloud;
 
 class Progress {
 public:
@@ -35,6 +38,26 @@ public:
             m_labelVersion.fetch_add(1, std::memory_order_release);
         }
     }
+
+    // How far the CURRENT stage has got, 0..1, with what it is doing: a long
+    // group stage -- a camera solve, splat training -- reports from inside
+    // (AlgorithmBase::GroupProgress) so the bar moves instead of sitting at
+    // the stage's start for minutes. Shown as the stage's own fraction; the
+    // next stage's Set() replaces it. Virtual so a stage running a pipeline
+    // of its own can map its inner stages into its range (solve_cameras).
+    virtual void SetWithin(double fraction, const char* what) {
+        const double f = fraction < 0.0 ? 0.0 : fraction > 1.0 ? 1.0 : fraction;
+        Set(int(f * 1000.0 + 0.5), 1000, what);
+    }
+
+    // RESULTS DURING THE RUN. The pipeline calls StageFinished as each stage
+    // completes, and a long stage may hand over a Snapshot of what it has so
+    // far (train_splats, every hundred iterations). The worker overrides
+    // these to put them on screen at once: a solve used to show nothing --
+    // not even the sparse points -- until the splats at the end had trained.
+    // Both run on the pipeline's thread, between or inside stages.
+    virtual void StageFinished(int /*stage*/) {}
+    virtual void Snapshot(int /*stage*/, std::shared_ptr<const PointCloud> /*cloud*/) {}
 
     // Running tallies, published as each stage finishes rather than at the end
     // of the run.

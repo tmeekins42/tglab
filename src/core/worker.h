@@ -110,6 +110,9 @@ struct ViewerImage {
 struct PipelineOutcome {
     uint64_t                 seq = 0;
     bool                     ok  = false;
+    // Sent while the run is still going: the viewers of the stages finished
+    // so far, or a stage's snapshot. The run's own outcome follows.
+    bool                     partial = false;
     std::string              error;
     std::vector<ViewerImage> viewers;
 
@@ -251,6 +254,36 @@ public:
 private:
     void Run();
 
+    // The viewer for one declared display(), from the data its source holds.
+    // False when there is nothing to show (an empty group, an unknown kind).
+    // `changed` bumps its version, so the UI re-uploads.
+    bool BuildViewer(const ViewerDecl& vd, const Data* d, bool changed, ViewerImage* out);
+
+    // Sends what a finished stage -- or a stage's snapshot -- means for the
+    // viewers, without waiting for the run. Worker thread; see LiveProgress.
+    void PublishPartial(int stage, std::shared_ptr<const PointCloud> snapshot);
+
+    // The pipeline's progress, which also carries its intermediate results
+    // out: a finished stage, or a long one's snapshot, goes straight to the
+    // viewers that show it (Progress::StageFinished / Snapshot).
+    class LiveProgress : public Progress {
+    public:
+        PipelineWorker* worker = nullptr;
+        void StageFinished(int stage) override {
+            if (worker) worker->PublishPartial(stage, nullptr);
+        }
+        void Snapshot(int stage, std::shared_ptr<const PointCloud> pc) override {
+            if (worker) worker->PublishPartial(stage, std::move(pc));
+        }
+    };
+
+    // The job running, for PublishPartial; worker thread only.
+    PipelineJob* m_curJob = nullptr;
+    // Viewers already sent this run from a finished stage: their data cannot
+    // change before the run ends, so the run's outcome does not copy and
+    // send them again (a dense cloud is millions of points).
+    std::map<std::string, bool> m_partialSent;
+
     std::thread             m_thread;
     // mutable so const accessors (LastReports) can lock it -- the lock protects
     // the data, not the logical constness of reading it.
@@ -272,7 +305,7 @@ private:
     std::atomic<ExecMode> m_mode{ExecMode::Auto};
     // What the current run is doing, for the status bar. Written by the worker,
     // read by the UI without a lock -- see core/progress.h.
-    Progress              m_progress;
+    LiveProgress          m_progress;
 
     std::atomic<int>      m_lastGpuStages{0};
     std::atomic<int>      m_lastHybridStages{0};

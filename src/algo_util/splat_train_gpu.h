@@ -110,6 +110,12 @@ public:
                   std::vector<int>* gradCount, std::vector<double>* maxScreen,
                   std::string* err);
 
+    // Just the Gaussians -- and their view-dependent colour when `sh` is
+    // given and there is any -- for a look at training as it goes, without
+    // unpacking Adam's moments or the densification counters.
+    bool DownloadParams(std::vector<SplatParam>* params, std::vector<double>* sh,
+                        std::string* err);
+
     // One iteration against one photograph. `target` is w*h*3, as
     // train_splats holds it. `lrMean` is this iteration's position rate and
     // c1, c2 Adam's bias corrections; the other groups' rates are the

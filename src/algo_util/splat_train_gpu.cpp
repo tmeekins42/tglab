@@ -1528,6 +1528,34 @@ bool SplatTrainerGpu::Download(std::vector<SplatParam>* params,
     return true;
 }
 
+bool SplatTrainerGpu::DownloadParams(std::vector<SplatParam>* params,
+                                     std::vector<double>* sh, std::string* err) {
+    Impl& s = *m;
+    std::lock_guard<std::mutex> lock(s.ctx->SubmitMutex());
+    const ImageDesc& d = s.stateA.desc;
+    if (!s.Get(s.stateA, size_t(d.width) * size_t(d.height) * 4)) {
+        *err = "could not read back the training state";
+        return false;
+    }
+    params->assign(s.n, SplatParam::Zero());
+    for (size_t i = 0; i < s.n; ++i) {
+        const float* t = &s.stage[i * kStateTexels * 4];
+        double* p = (*params)[i].Data();
+        for (int q = 0; q < 14; ++q) p[q] = double(t[q]);
+    }
+    if (sh) {
+        sh->clear();
+        if (s.haveSh &&
+            s.Get(s.shTex, size_t(s.shTex.desc.width) * size_t(s.shTex.desc.height) * 4)) {
+            sh->assign(s.n * size_t(kShRest), 0.0);
+            for (size_t i = 0; i < s.n; ++i)
+                for (int q = 0; q < kShRest; ++q)
+                    (*sh)[i * size_t(kShRest) + size_t(q)] = double(s.stage[i * 48 + size_t(q)]);
+        }
+    }
+    return true;
+}
+
 // The view-dependent colour, beside the state Upload sends: kShRest
 // coefficients per Gaussian and Adam's two moments for each, in the same
 // order as the parameters. Called after Upload, since that decides n.

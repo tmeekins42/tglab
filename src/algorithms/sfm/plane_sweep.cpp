@@ -76,6 +76,7 @@
 // prior. Adding it here would stop this being the naive method, which is the
 // thing it is for. So the grid stays, and PMVS is where it gets solved.
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <string>
@@ -449,6 +450,7 @@ public:
         if (gpuAvail) {
             for (int f = 0; f < nFrames; ++f) {
                 if (GroupCancelled()) { *err = "cancelled"; return false; }   // see SetGroupCancel
+                GroupProgress(double(f) / double(nFrames));
                 if (SweepFrame(f, cloud, images, planes, nPlanes, radius,
                                maxNb, minCorr, zNear, zFar, out,
                                &perMeasured[size_t(f)], &perTotal[size_t(f)],
@@ -463,8 +465,10 @@ public:
         std::vector<int> rest;
         for (int f = 0; f < nFrames; ++f)
             if (!done[size_t(f)]) rest.push_back(f);
+        std::atomic<int> restDone{0};
         ParallelFor(int(rest.size()), [&](int i) {
             if (GroupCancelled()) return;   // superseded: see SetGroupCancel
+            GroupProgress(double(nFrames - int(rest.size()) + restDone++) / double(nFrames));
             const int f = rest[size_t(i)];
             SweepFrame(f, cloud, images, planes, nPlanes, radius, maxNb,
                        minCorr, zNear, zFar, out, &perMeasured[size_t(f)],
