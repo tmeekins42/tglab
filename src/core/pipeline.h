@@ -284,6 +284,9 @@ public:
     // falling back and recovering, for months, with nothing said.
     const std::vector<std::string>& GpuFallbacks() const { return m_gpuFallbacks; }
     int CpuStageCount()    const { return m_cpuStages; }
+    // Of those, the ones whose RunCPU did its work on the device itself (see
+    // AlgorithmBase::UsesGpuInRunCPU) -- a learned network, a GPU search.
+    int HybridStageCount() const { return m_hybridStages; }
     int CachedStageCount() const { return m_cachedStages; }
 
     // Stages skipped because their settings would change nothing. Reported so a
@@ -391,6 +394,7 @@ private:
     int                     m_gpuStages = 0;
     std::vector<std::string> m_gpuFallbacks;
     int                     m_cpuStages = 0;
+    int                     m_hybridStages = 0;
     int                     m_cachedStages = 0;
     int                     m_bypassedStages = 0;
     size_t                  m_firstDirty = 0;

@@ -8,8 +8,10 @@
 
 #include <d3d12.h>
 
+#include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "../core/image.h"
@@ -68,6 +70,46 @@ struct GpuImage {
     void Release() { if (res) { res->Release(); res = nullptr; } }
 };
 
+// A GPU-resident flat array of bytes, bound as a raw buffer
+// (ByteAddressBuffer / RWByteAddressBuffer).
+//
+// WHY BUFFERS AS WELL AS IMAGES. Everything else here is an image, and an
+// image is the right shape for pixels. A neural network's tensors are not: a
+// 64-channel feature map at 1024x1024 is 64 planes, and a texture side is
+// capped at 16384, so stacking them overflows; its weights are a 512x512x3x3
+// block with no 2D meaning at all. A flat array indexes both without packing
+// tricks, and the same descriptor tables bind it -- an SRV range takes a
+// buffer view as readily as a texture view, so kernels and the root signature
+// are unchanged.
+//
+// Owned and move-only for GpuImage's reasons.
+struct GpuBuffer {
+    ID3D12Resource*       res   = nullptr;
+    uint64_t              bytes = 0;
+    D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
+
+    ~GpuBuffer() { Release(); }
+
+    GpuBuffer() = default;
+    GpuBuffer(const GpuBuffer&)            = delete;
+    GpuBuffer& operator=(const GpuBuffer&) = delete;
+
+    GpuBuffer(GpuBuffer&& o) noexcept : res(o.res), bytes(o.bytes), state(o.state) {
+        o.res = nullptr;
+    }
+    GpuBuffer& operator=(GpuBuffer&& o) noexcept {
+        if (this != &o) {
+            Release();
+            res = o.res; bytes = o.bytes; state = o.state;
+            o.res = nullptr;
+        }
+        return *this;
+    }
+
+    bool Valid() const { return res != nullptr; }
+    void Release() { if (res) { res->Release(); res = nullptr; } }
+};
+
 // One compiled kernel plus its root signature and PSO.
 // Owns its D3D12 objects: stages hold these in a shared_ptr, so the destructor
 // is what actually frees them when the last pipeline referencing it goes away.
@@ -114,6 +156,17 @@ public:
                       const std::string& debugName,
                       ComputeKernel* out, std::string* errors);
 
+    // A kernel compiled once per context and kept until Shutdown, under
+    // `key` -- which must name the source exactly, variants included.
+    //
+    // WHY. A helper that owns its kernels (the network engine, the k-NN
+    // search) is naturally created per call, and each creation recompiled
+    // every kernel through DXC: measured, ten kernels at tens of milliseconds
+    // each turned an 85 ms network into a 550 ms one inside the pipeline,
+    // where a fresh engine serves every frame. Thread-safe; null on failure.
+    const ComputeKernel* SharedKernel(const std::string& key, const std::string& hlsl,
+                                      std::string* err);
+
     bool CreateImage(const ImageDesc& d, GpuImage* out);
     bool Upload(const ImageView& src, GpuImage* dst);
     bool Readback(const GpuImage& src, ImageView* dst);
@@ -132,6 +185,44 @@ public:
                   const std::vector<uint32_t>& constants,
                   std::string* err, uint32_t groupsX = 0,
                   uint32_t groupsY = 0);
+
+    // --- raw buffers --------------------------------------------------------
+    //
+    // `bytes` is rounded up to a multiple of 4, the unit of a raw view.
+    bool CreateBuffer(uint64_t bytes, GpuBuffer* out);
+    // Copies `bytes` from `src` into `dst` at byte `offset`, and waits.
+    bool UploadBuffer(const void* src, uint64_t bytes, GpuBuffer* dst, uint64_t offset = 0);
+    // Copies the first `bytes` of `src` back to `dst`, and waits.
+    bool ReadbackBuffer(const GpuBuffer& src, void* dst, uint64_t bytes);
+
+    // A scratch buffer of at least `bytes`, reused when one of a suitable size
+    // has been handed back -- see RecycleBuffer. Contents are unspecified.
+    //
+    // WHY A POOL. A network allocates every intermediate fresh: about a
+    // gigabyte per frame for the DeDoDe descriptor at 784 pixels, dozens of
+    // committed resources, each paid for in the OS zeroing its pages. The
+    // shapes are identical frame to frame, so after the first frame every
+    // request can be met from what the previous one gave back.
+    //
+    // Reuse while a recorded batch still references the buffer is safe: the
+    // work is on one queue, recorded in order, and every bind records the
+    // state transition (or UAV barrier) that orders the new use after the
+    // old one. Thread-safe.
+    bool AcquireBuffer(uint64_t bytes, GpuBuffer* out);
+    // Hands a buffer back for reuse; past the pool's budget the largest
+    // pooled ones are freed instead.
+    void RecycleBuffer(GpuBuffer&& b);
+
+    // Dispatch with buffers bound instead of images: inputs at t0.., outputs
+    // at u0.., as raw views. Unlike Dispatch there is no image to size the
+    // grid from, so the caller gives it, and ALL 32 root constants are the
+    // caller's -- there is no width/height pair at the front.
+    bool DispatchBuffers(const ComputeKernel& k,
+                         const std::vector<const GpuBuffer*>& inputs,
+                         const std::vector<GpuBuffer*>& outputs,
+                         const std::vector<uint32_t>& constants,
+                         uint32_t groupsX, uint32_t groupsY, uint32_t groupsZ,
+                         std::string* err);
 
     ShaderCompiler& Compiler() { return m_compiler; }
 
@@ -208,6 +299,10 @@ private:
     // discarding it. See the definition for why this matters.
     bool BeginRecording();
 
+    // Reserves this dispatch's slice of the descriptor heap, flushing first
+    // when the batch has used it up. See Dispatch.
+    bool TakeHeapSlice(UINT* base, std::string* err);
+
     // Histogram scratch, created on first use and reused. The bins live in a
     // 256x4 R32_UINT texture (rows R, G, B, luma) and the luma range in a 2x1
     // one; integer textures because HLSL atomics need them, and textures rather
@@ -253,6 +348,29 @@ private:
     UINT                  m_heapCursor = 0;
 
     std::vector<ID3D12Resource*> m_staging;   // upload buffers in flight, pooled on flush
+
+    // A reference to every buffer a recorded DispatchBuffers binds, dropped
+    // once its batch has run. A dispatch is only RECORDED until the flush, so
+    // a caller freeing a scratch buffer right after recording -- a network's
+    // temporaries going out of scope -- would otherwise free memory the GPU
+    // has yet to touch.
+    std::vector<ID3D12Resource*> m_inflight;
+
+    // Buffers handed back by RecycleBuffer, for AcquireBuffer. Own lock: a
+    // tensor can be freed by a thread not holding the submit mutex.
+    std::mutex                               m_poolMtx;
+    struct PooledBuffer {
+        uint64_t              bytes;
+        ID3D12Resource*       res;
+        D3D12_RESOURCE_STATES state;   // where it was left: its next bind transitions from here
+    };
+    std::vector<PooledBuffer>                m_bufferPool;
+
+    // SharedKernel's cache. unique_ptr so a returned pointer stays valid as
+    // the map grows.
+    std::mutex                                                     m_kernelMtx;
+    std::unordered_map<std::string, std::unique_ptr<ComputeKernel>> m_kernels;
+    uint64_t                                 m_poolBytes = 0;
 
     // Idle staging buffers for reuse; see TakeStaging().
     struct PooledStaging {

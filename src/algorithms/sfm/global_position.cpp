@@ -55,13 +55,16 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <random>
 #include <string>
 #include <vector>
 
 #include "../../algo_util/least_squares.h"
 #include "../../algo_util/linalg.h"
+#include "../../algo_util/sparse_cholesky.h"
 #include "../../core/algorithm.h"
+#include "../../core/parallel.h"
 
 namespace tglab {
 namespace {
@@ -136,25 +139,68 @@ double RefineAngular(const std::vector<Ray>& rays, const std::vector<bool>& solv
 
     LmDamping damp{1e-3, 5.0, 1.0 / 3.0, 1e-6, 1e8};
     double cur = cost(*camPos, *pts);
-    std::vector<double> S, rhs;
-    S.resize(size_t(n3) * size_t(n3));
-    rhs.resize(size_t(n3));
-    for (int it = 0; it < iterations; ++it) {
-        std::fill(S.begin(), S.end(), 0.0);
-        std::fill(rhs.begin(), rhs.end(), 0.0);
-        // Per point: its block, its gradient, and each ray's camera coupling.
-        struct PointSys { double H[9]; Vec3 g; };
-        std::vector<PointSys> psys;
-        psys.resize(size_t(nTrk));
-        std::vector<double> rayA(rays.size() * 9, 0.0);   // w A A per ray
-        std::vector<Vec3>   rayG(rays.size());            // w A r per ray
 
-        for (int t = 0; t < nTrk; ++t) {
+    // THE CAMERA SYSTEM IS SPARSE, as bundle adjustment's is: two cameras
+    // couple only through a point both saw. Stored and factored densely it
+    // was 365 s of a 1577-camera room scan, and 113 s sparse, to the same
+    // answer; see sparse_cholesky.h.
+    linalg::BlockSparseCholesky sys;
+    {
+        std::vector<std::pair<int, int>> pairs;
+        std::vector<int> cs;
+        for (const auto& rs : byTrack) {
+            cs.clear();
+            for (int ri : rs) cs.push_back(var[size_t(rays[size_t(ri)].camera)]);
+            std::sort(cs.begin(), cs.end());
+            cs.erase(std::unique(cs.begin(), cs.end()), cs.end());
+            for (size_t a = 0; a < cs.size(); ++a)
+                for (size_t b = a + 1; b < cs.size(); ++b) pairs.push_back({cs[b], cs[a]});
+        }
+        if (!sys.Analyse(std::vector<int>(static_cast<size_t>(nv), 3), pairs)) return cur;
+    }
+    auto diagAt = [&](int a) {
+        const int c = a / 3, k = a % 3;
+        return size_t(sys.Offset(c, c)) + size_t(k * 3 + k);
+    };
+    std::vector<double> S, rhs;
+    S.resize(sys.NumValues());
+    rhs.resize(size_t(n3));
+
+    // Per point: its block, its gradient, and each ray's camera coupling --
+    // and the camera diagonal blocks and gradient before damping and
+    // elimination. Kept across a REJECTED step, which leaves the state where
+    // it was: the damping enters only after them.
+    struct PointSys { double H[9]; Vec3 g; };
+    std::vector<PointSys> psys(static_cast<size_t>(nTrk));
+    std::vector<double> rayA(rays.size() * 9, 0.0);   // w A A per ray
+    std::vector<Vec3>   rayG(rays.size());            // w A r per ray
+    std::vector<double> Sbase(sys.NumValues()), rhsBase(static_cast<size_t>(n3));
+    bool baseValid = false;
+
+    // The elimination's workers, each with its own S and rhs: every point
+    // updates the camera blocks of every pair of cameras that saw it, so
+    // threads cannot share one. Allocated once.
+    std::vector<std::vector<double>> workerS(ParallelThreads(size_t(nTrk)));
+    std::vector<std::vector<double>> workerR(workerS.size());
+    for (size_t w = 0; w < workerS.size(); ++w) {
+        workerS[w].assign(sys.NumValues(), 0.0);
+        workerR[w].assign(size_t(n3), 0.0);
+    }
+    std::vector<double> Hinv(size_t(nTrk) * 9, 0.0);
+    for (int it = 0; it < iterations; ++it) {
+        if (!baseValid) {
+        // Each track's own block and couplings, in parallel: every write here
+        // is to this track's slots.
+        ParallelFor(size_t(nTrk), [&](size_t ti) {
+            const int t = int(ti);
             PointSys& P = psys[size_t(t)];
             std::fill(P.H, P.H + 9, 0.0);
             P.g = Vec3{0, 0, 0};
             for (int ri : byTrack[size_t(t)]) {
                 const Ray& r = rays[size_t(ri)];
+                double* AA = &rayA[size_t(ri) * 9];
+                std::fill(AA, AA + 9, 0.0);
+                rayG[size_t(ri)] = Vec3{0, 0, 0};
                 const Vec3 d = (*pts)[size_t(t)] - (*camPos)[size_t(r.camera)];
                 const double L = d.Norm();
                 if (L < 1e-12) continue;
@@ -168,7 +214,6 @@ double RefineAngular(const std::vector<Ray>& rays, const std::vector<bool>& solv
                 for (int a = 0; a < 3; ++a)
                     for (int b = 0; b < 3; ++b)
                         A[a * 3 + b] = ((a == b ? 1.0 : 0.0) - uu[a] * uu[b]) / L;
-                double* AA = &rayA[size_t(ri) * 9];
                 for (int a = 0; a < 3; ++a)
                     for (int b = 0; b < 3; ++b) {
                         double v = 0.0;
@@ -182,22 +227,29 @@ double RefineAngular(const std::vector<Ray>& rays, const std::vector<bool>& solv
                     Ar[a] = w * (A[a * 3 + 0] * rr[0] + A[a * 3 + 1] * rr[1] + A[a * 3 + 2] * rr[2]);
                 rayG[size_t(ri)] = Vec3{Ar[0], Ar[1], Ar[2]};
                 P.g = P.g + Vec3{Ar[0], Ar[1], Ar[2]};
-                // Camera diagonal block and gradient (d/dc = -A).
-                const int vc = var[size_t(r.camera)];
-                if (vc >= 0) {
-                    for (int a = 0; a < 3; ++a)
-                        for (int b = 0; b < 3; ++b)
-                            S[size_t(vc * 3 + a) * size_t(n3) + size_t(vc * 3 + b)] +=
-                                AA[a * 3 + b];
-                    rhs[size_t(vc * 3 + 0)] += Ar[0];   // -g_c = +A r
-                    rhs[size_t(vc * 3 + 1)] += Ar[1];
-                    rhs[size_t(vc * 3 + 2)] += Ar[2];
-                }
             }
+        });
+        // Camera diagonal blocks and gradient (d/dc = -A), serially and in
+        // the same order as ever. A skipped ray contributes zeros.
+        std::fill(Sbase.begin(), Sbase.end(), 0.0);
+        std::fill(rhsBase.begin(), rhsBase.end(), 0.0);
+        for (int t = 0; t < nTrk; ++t)
+            for (int ri : byTrack[size_t(t)]) {
+                const int vc = var[size_t(rays[size_t(ri)].camera)];
+                if (vc < 0) continue;
+                const double* AA = &rayA[size_t(ri) * 9];
+                sys.Add(Sbase.data(), vc, vc, AA);
+                const Vec3& Ar = rayG[size_t(ri)];
+                rhsBase[size_t(vc * 3 + 0)] += Ar.x;   // -g_c = +A r
+                rhsBase[size_t(vc * 3 + 1)] += Ar.y;
+                rhsBase[size_t(vc * 3 + 2)] += Ar.z;
+            }
+        baseValid = true;
         }
+        S = Sbase;
+        rhs = rhsBase;
 
         // Damped point blocks, inverted; Schur-eliminated into S and rhs.
-        std::vector<double> Hinv(size_t(nTrk) * 9, 0.0);
         auto inv3 = [](const double M[9], double* out) {
             const double det = M[0] * (M[4] * M[8] - M[5] * M[7]) -
                                M[1] * (M[3] * M[8] - M[5] * M[6]) +
@@ -210,10 +262,19 @@ double RefineAngular(const std::vector<Ray>& rays, const std::vector<bool>& solv
             out[8] = (M[0] * M[4] - M[1] * M[3]) / det;
             return true;
         };
-        for (int a = 0; a < n3; ++a)
-            S[size_t(a) * size_t(n3) + size_t(a)] *= (1.0 + damp.lambda);
-        for (int a = 0; a < n3; ++a) S[size_t(a) * size_t(n3) + size_t(a)] += 1e-12;
-        for (int t = 0; t < nTrk; ++t) {
+        for (int a = 0; a < n3; ++a) S[diagAt(a)] *= (1.0 + damp.lambda);
+        for (int a = 0; a < n3; ++a) S[diagAt(a)] += 1e-12;
+        // Tracks dealt round-robin to the workers; see workerS.
+        ParallelFor(workerS.size(), [&](size_t wk) {
+        std::vector<double>& Sw = workerS[wk];   // this worker's share of S and rhs,
+        std::vector<double>& rw = workerR[wk];   // added in below
+        std::fill(Sw.begin(), Sw.end(), 0.0);
+        std::fill(rw.begin(), rw.end(), 0.0);
+        std::vector<std::pair<int, int>> sorted;   // (camera var, ray), per track
+        std::vector<int> vs;
+        std::vector<double> AH;
+        std::vector<long long> offs;
+        for (int t = int(wk); t < nTrk; t += int(workerS.size())) {
             PointSys& P = psys[size_t(t)];
             double Hd[9];
             std::copy(P.H, P.H + 9, Hd);
@@ -228,39 +289,81 @@ double RefineAngular(const std::vector<Ray>& rays, const std::vector<bool>& solv
             double hg[3];
             for (int a = 0; a < 3; ++a)
                 hg[a] = Hi[a * 3 + 0] * gx[0] + Hi[a * 3 + 1] * gx[1] + Hi[a * 3 + 2] * gx[2];
+            // This track's rays by camera, ascending: the order the sparse
+            // system's columns hold their rows in.
+            sorted.clear();
             for (int ri : rs) {
                 const int vi = var[size_t(rays[size_t(ri)].camera)];
-                if (vi < 0) continue;
-                const double* Ai = &rayA[size_t(ri) * 9];   // H_{c_i t} = -Ai
+                if (vi >= 0) sorted.push_back({vi, ri});
+            }
+            std::sort(sorted.begin(), sorted.end());
+            const size_t L = sorted.size();
+            AH.resize(L * 9);
+            vs.resize(L);
+            for (size_t q = 0; q < L; ++q) {
+                const int vi = sorted[q].first;
+                vs[q] = vi;
+                const double* Ai = &rayA[size_t(sorted[q].second) * 9];   // H_{c_i t} = -Ai
                 // rhs_i -= H_ct Hi (-g_X) = -(-Ai) hg = +Ai hg
                 for (int a = 0; a < 3; ++a)
-                    rhs[size_t(vi * 3 + a)] +=
+                    rw[size_t(vi * 3 + a)] +=
                         Ai[a * 3 + 0] * hg[0] + Ai[a * 3 + 1] * hg[1] + Ai[a * 3 + 2] * hg[2];
                 // (Ai Hi) once, then times each Aj: S_ij -= (-Ai) Hi (-Aj) = Ai Hi Aj
-                double AiHi[9];
+                double* AiHi = &AH[q * 9];
                 for (int a = 0; a < 3; ++a)
                     for (int b = 0; b < 3; ++b) {
                         double v = 0.0;
                         for (int k = 0; k < 3; ++k) v += Ai[a * 3 + k] * Hi[k * 3 + b];
                         AiHi[a * 3 + b] = v;
                     }
-                for (int rj : rs) {
-                    const int vj = var[size_t(rays[size_t(rj)].camera)];
-                    if (vj < 0) continue;
-                    const double* Aj = &rayA[size_t(rj) * 9];
+            }
+            // Only the blocks the sparse system stores, its lower half:
+            // column vj takes rows vi >= vj, all found in one merge walk.
+            // Two rays from the same camera give a diagonal block, which is
+            // stored in full, so it takes both orders of the pair.
+            offs.resize(L);
+            for (size_t q2 = 0; q2 < L; ++q2) {
+                const int vj = vs[q2];
+                sys.Offsets(vj, &vs[q2], int(L - q2), offs.data());
+                const double* Aj = &rayA[size_t(sorted[q2].second) * 9];
+                for (size_t q1 = q2; q1 < L; ++q1) {
+                    const long long off = offs[q1 - q2];
+                    if (off < 0) continue;
+                    const double* AiHi = &AH[q1 * 9];
+                    double M[9];
                     for (int a = 0; a < 3; ++a)
                         for (int b = 0; b < 3; ++b) {
                             double v = 0.0;
                             for (int k = 0; k < 3; ++k) v += AiHi[a * 3 + k] * Aj[k * 3 + b];
-                            S[size_t(vi * 3 + a) * size_t(n3) + size_t(vj * 3 + b)] -= v;
+                            M[a * 3 + b] = v;
                         }
+                    double* dst = Sw.data() + off;
+                    for (int e = 0; e < 9; ++e) dst[e] -= M[e];
+                    if (vs[q1] == vj && q1 != q2)
+                        for (int a = 0; a < 3; ++a)
+                            for (int b = 0; b < 3; ++b) dst[a * 3 + b] -= M[b * 3 + a];
                 }
             }
         }
+        });
+        {
+            constexpr size_t kSlice = 1 << 16;
+            const size_t nvals = S.size();
+            ParallelFor((nvals + kSlice - 1) / kSlice, [&](size_t si) {
+                const size_t b0 = si * kSlice, b1 = std::min(nvals, b0 + kSlice);
+                for (size_t wk = 0; wk < workerS.size(); ++wk) {
+                    const double* Sw = workerS[wk].data();
+                    for (size_t i = b0; i < b1; ++i) S[i] += Sw[i];
+                }
+            });
+            for (size_t wk = 0; wk < workerS.size(); ++wk)
+                for (size_t i = 0; i < rhs.size(); ++i) rhs[i] += workerR[wk][i];
+        }
 
-        // The reduced camera system is SPD once damped: Cholesky, on copies.
-        std::vector<double> Lm = S, dc = rhs;
-        if (!linalg::CholeskySolve(Lm.data(), dc.data(), n3)) { damp.FailSingular(); continue; }
+        // The reduced camera system is SPD once damped: Cholesky, sparse.
+        std::vector<double> dc = rhs;
+        if (!sys.Factor(S.data())) { damp.FailSingular(); continue; }
+        sys.Solve(dc.data());
 
         // Candidate: cameras moved, then each point from its own block:
         // dX = Hi (-g_X - H_tc dc) = Hi (-g_X + sum Ai dc_i).
@@ -289,6 +392,7 @@ double RefineAngular(const std::vector<Ray>& rays, const std::vector<bool>& solv
         if (next < cur) {
             *camPos = std::move(nc);
             *pts = std::move(np);
+            baseValid = false;
             const bool tiny = cur - next < 1e-9 * cur;
             cur = next;
             damp.Succeed();
@@ -694,16 +798,57 @@ bool GlobalPosition::SolveJoint(PointCloud* cloud, std::string* err) {
             }
         }
 
-        const double costAlt = RefineAngular(rays, isSolved, int(m_refine), 0.035, &camPos, &pt);
-        m_start = "alternating";
-        if (chainOk) {
-            const double costChain =
-                RefineAngular(rays, isSolved, int(m_refine), 0.035, &chainCam, &chainPt);
+        // A SHORT TRIAL, when there are two starts, and only the leader is
+        // refined in full. Both used to get the full budget and the better
+        // was kept, but that is twice the work for little: on a 179-frame
+        // video the two stood at 551 and 5.9 after ten steps and ended at 97
+        // and 0.79, and on a 1577-frame room scan they ended within 1% of
+        // each other (64.0 and 63.4) -- the same answer reached twice.
+        // Refining only the trial's leader cut positioning on the room from
+        // 132 s to 76 s, and bundle adjustment then took 50 s, not 84. The
+        // price was the room's final reprojection error at 0.993 px against
+        // 0.973, because there the trial's leader was the slightly worse of
+        // the two in the end: a fiftieth of a pixel, judged not worth twice
+        // the time. The winner is refined from its OWN start, not continued
+        // from the trial, so where the trial and the full run agree the
+        // answer is exactly what it was.
+        int skip = 0;   // 1: the alternating start lost the trial, 2: the chained
+        double ta = 0.0, tc = 0.0;
+        const int trial = std::min(10, int(m_refine));
+        if (chainOk && trial < int(m_refine)) {
+            std::vector<Vec3> aCam = camPos, aPt = pt, cCam = chainCam, cPt = chainPt;
+            ta = RefineAngular(rays, isSolved, trial, 0.035, &aCam, &aPt);
+            tc = RefineAngular(rays, isSolved, trial, 0.035, &cCam, &cPt);
+            skip = tc < ta ? 1 : 2;
+        }
+        if (skip == 1) {
+            RefineAngular(rays, isSolved, int(m_refine), 0.035, &chainCam, &chainPt);
+            camPos.swap(chainCam);
+            pt.swap(chainPt);
+            m_start = "chained directions";
+        }
+        const double costAlt =
+            skip == 1 ? 0.0 : RefineAngular(rays, isSolved, int(m_refine), 0.035, &camPos, &pt);
+        if (skip != 1) m_start = "alternating";
+        double costChain = 0.0;
+        if (chainOk && skip == 0) {
+            costChain = RefineAngular(rays, isSolved, int(m_refine), 0.035, &chainCam, &chainPt);
             if (costChain < costAlt) {
                 camPos.swap(chainCam);
                 pt.swap(chainPt);
                 m_start = "chained directions";
             }
+        }
+        // What decided it, for the report.
+        if (chainOk) {
+            char buf[160];
+            if (skip != 0)
+                std::snprintf(buf, sizeof(buf), " (after %d trial steps, alternating %.4g against chained %.4g)",
+                              trial, ta, tc);
+            else
+                std::snprintf(buf, sizeof(buf), " (trial %.4g against %.4g; refined in full, %.4g against %.4g)",
+                              ta, tc, costAlt, costChain);
+            m_start += buf;
         }
     }
 

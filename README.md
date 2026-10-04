@@ -437,14 +437,14 @@ defaults.
 
 ## Algorithms
 
-77 registered. `choose("x", "category")` offers every algorithm in a category,
+79 registered. `choose("x", "category")` offers every algorithm in a category,
 so these names are the ones that matter in a script.
 
 | Category | Algorithms |
 |---|---|
 | **adjust** | `basic_adjust` (exposure, contrast, highlights, shadows, whites, blacks, vibrance, saturation, white balance), `brightness`, `crop` (trim and straighten, with a preview), `vignette`, `film_grain`, `dehaze` (dark channel prior), `resize` (area-average on minify, bilinear on magnify) |
 | **tonemap** | `tonemap` (global), `tonemap_local` (illumination/detail split) |
-| **features** | `detect_sift`, `detect_surf`, `detect_akaze`, `detect_orb`, `detect_brisk`, `draw_features`, `draw_matches`, `match_guided` (a second pass along epipolar lines) |
+| **features** | `detect_sift`, `detect_surf`, `detect_akaze`, `detect_orb`, `detect_brisk`, `detect_dad` and `describe_dedode` (learned; see below), `draw_features`, `draw_matches`, `match_guided` (a second pass along epipolar lines) |
 | **match** | `match_brute` (exact), `match_ann` (k-d forest / LSH) |
 | **merge** | `merge_hdr`, `merge_mean`, `align`, `align_features`, `bundle_adjust`, `stitch_panorama`, `reshape` |
 | **demosaic** | `demosaic_ahd` (default), `demosaic_consistent`, `demosaic_malvar`, `demosaic_ppg`, `demosaic_vng`, `demosaic_bilinear`, `demosaic_passthrough`, `demosaic_stages` (every intermediate as its own image, for debugging), `hot_pixel_repair` |
@@ -633,6 +633,90 @@ railed with the same sign on all fifteen frames — which tilts the whole panora
 and corrects no seam. The remaining residual is within-frame variation (lens
 falloff plus the scene's own gradient), and fixing it needs either a measured
 flat field or a seam-aware blend, not a better global fit.
+
+### Learned features
+
+**`sfm.tgl` uses learned features by default.** tglab is building up LoMa
+(Edstedt, Nordström et al., *LoMa: Local Feature Matching Revisited*, 2026),
+the matcher behind several recent splat solvers: a learned detector, a learned
+descriptor and a transformer matcher. Each arrives as its own stage, so it can
+be compared with the designed one it replaces. The networks run on tglab's own
+compute kernels (`src/algo_util/nn.h`): no inference runtime and no extra DLLs.
+Each is checked layer by layer against the published PyTorch model
+(`bench_nn`), and agrees to about one part in a million.
+
+- **`detect_dad`** — DaD, LoMa's keypoint detector, trained to pick points that
+  are found again in other views. It has no notion of a corner or a blob, and
+  it spreads its points far more evenly than AKAZE, which crowds onto the few
+  high-contrast spots.
+- **`describe_dedode`** — LoMa-B128's DeDoDe descriptor, 128 floats a point.
+  It describes *any* detector's keypoints, so `detect_akaze => describe_dedode`
+  is a fair comparison of a designed descriptor against a learned one on the
+  same points. Unit length by default, for `match_ann`.
+- **`match_ann`** searches float descriptors *exactly* on the GPU when there is
+  one — every pair compared, the eight nearest kept, then the same ratio test,
+  separation rule and cross check as the k-d forest. Exhaustive is faster than
+  approximate there, and finds about twice the matches.
+- **`match_ann(method = 1)`** — LoMa's learned matcher, a nine-layer
+  transformer (LightGlue's design): every point's description is rewritten by
+  attention to the rest of its own image, positions included, then to the
+  other image, before all are compared at once through a dual softmax. Needs
+  `describe_dedode(normalise = 0)`. Matches PyTorch's output exactly on a
+  2048-point pair (1561 of 1561), about 55 ms a pair at that size.
+
+```
+feat = small => detect_dad(max_features = 10000) => describe_dedode()
+```
+
+Measured in `sfm.tgl`'s sparse chain (images at 0.4 scale), AKAZE against the
+learned pair:
+
+| | fountain-P11, AKAZE | fountain-P11, learned | castle-P19, AKAZE | castle-P19, learned |
+|---|---|---|---|---|
+| inliers per pair | 437 | **3998** | 299 | **2044** |
+| pairs rejected | 6 of 39 | **0 of 30** | 1 of 70 | **0 of 61** |
+| points | 1,998 | **10,131** | 2,175 | **14,450** |
+| mean ray residual | 0.171° | **0.035°** | 0.982° | **0.130°** |
+| reprojection RMS | 0.80 px | **0.45 px** | 0.78 px | **0.45 px** |
+| focal (calibrated 58.2°) | 57.9° | **58.1°** | 57.9° | **58.2°** |
+
+On a hand-held video of a chrome tape measure, the weakest link in the
+sequence went from 39 triangulated tracks to 389.
+
+On an RTX 4070 Ti the two networks take about 0.2 s a frame (DaD 55 ms at
+1024 px, the descriptor 130 ms at 784), and matching a 169-frame video's 638
+pairs takes 20 s. Without a device they run on the CPU, at several seconds a
+frame.
+
+**The learned matcher against nearest neighbour**, on the same 4096 DaD
+points a frame:
+
+| | points | reprojection | worst rotation edge | matching |
+|---|---|---|---|---|
+| castle-P19, nearest neighbour | 7,967 | 0.38 px | — | 1.2 s |
+| castle-P19, LoMa | **8,765** | 0.44 px | — | 10.9 s |
+| IMG_1535 (169 frames), nearest neighbour | **26,297** | 0.83 px | 10.8° | 17 s |
+| IMG_1535, LoMa | 25,385 | 0.88 px | **4.8°** | 91 s |
+
+Better pairwise geometry, about as many points, five to ten times the
+matching time — so `sfm.tgl` keeps nearest neighbour (at 10,000 points, which
+reconstructs more still) and shows LoMa as a one-line swap. Two settings
+matter. `threshold` defaults to 0.9 rather than LoMa's own 0.1: SfM chains
+matches into tracks, and a low-confidence match breaks one (castle-P19 goes
+from 6,227 points at 0.1 to 8,765 at 0.9). `layers = 3` keeps 95% of the
+points at half the cost.
+
+The weights are files beside the executable rather than part of it. The
+release archive includes them; from source, make them from the published
+checkpoints (see [third_party/models](third_party/models/) for licences):
+
+```sh
+python tools/nn_convert.py dad models/dad.tgw                                        # 13 MB
+python tools/nn_convert.py loma_b128 models/dedode_b128.tgw --prefix _descriptor.    # 27 MB
+python tools/nn_convert.py loma_b128 models/loma_b128.tgw --exclude _detector. --exclude _descriptor.   # 24 MB
+```
+
+Python and PyTorch are needed for that step only.
 
 ### Structure from Motion
 
@@ -1052,10 +1136,11 @@ other tools, which `scripts/view_ply.tgl` opens in the 3D viewer.
 ./build/Release/tglab_runtime_tests.exe  # worker thread, shaders, GPU
 ./build/Release/tglab_sfm_tests.exe      # SfM, depth, splat gradients, GPU == CPU
 ./build/Release/tglab_pyramid_tests.exe  # detector GPU paths == CPU, same keypoints
+./build/Release/tglab_nn_tests.exe       # network ops: CPU vs PyTorch, GPU vs CPU
 ```
 
-`tglab_pyramid_tests` needs a device but *skips* rather than fails without one,
-so it stays in the gating suite on a machine with no GPU.
+`tglab_pyramid_tests` and `tglab_nn_tests` need a device but *skip* rather than
+fail without one, so they stay in the gating suite on a machine with no GPU.
 
 **Measurement tools**, none of them gating tests — they report a number and
 leave the judgement to you:
@@ -1067,6 +1152,7 @@ leave the judgement to you:
 | `bench_dehaze <image>` | Dehaze on a real image. `BENCH_ALGO=brightness` times a trivial algorithm instead, which gives the framework's own unpack/pack floor — worth knowing before optimising anything. |
 | `bench_stitch <raw>...` | The whole panorama chain headlessly, printing every stage's report. `--gain`, `--wta`. |
 | `bench_sfm <dir> --script s.tgl` | A 3D script headlessly, printing every stage's report. `--gpu` gives it a device; `--dump DIR` saves every image viewer as PNG and renders splats from orbit viewpoints beside the middle camera — where floaters show. |
+| `bench_nn dad\|dedode\|loma <weights> <reference>` | A learned network against PyTorch, layer by layer, on the CPU and the GPU, and timed. The reference comes from `tools/nn_reference.py`. |
 | `frame_exposure <raw>...` | What actually differs across a sweep: EXIF settings, measured brightness, centre vs surround. Says whether seams want a per-frame gain or something spatial. |
 | `vignette_profile <raw>...` | Lens falloff measured by averaging frames in sensor coordinates. **Reads its own verdict**: it refuses to call a result a lens profile when the variation is not radial. |
 
@@ -1165,6 +1251,9 @@ src/
 ## Licence
 
 MIT — see [LICENSE](LICENSE). Dear ImGui is MIT; `stb` is public domain / MIT.
+The network weights the release ships in `models/` are MIT (DaD, and LoMa's
+DeDoDe descriptor) and Apache-2.0 (LoMa's matcher, from LightGlue); their
+notices are in [third_party/models](third_party/models/).
 
 **LibRaw is LGPL-2.1 or CDDL-1.0** and is linked statically, so it carries
 obligations the permissive licences do not: the notice must be reproduced, and

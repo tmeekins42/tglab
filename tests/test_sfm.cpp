@@ -30,6 +30,8 @@
 #include <vector>
 
 #include "../src/algo_util/features.h"
+#include "../src/algo_util/linalg.h"
+#include "../src/algo_util/sparse_cholesky.h"
 #include "../src/algo_util/view_graph.h"
 #include "../src/core/algorithm.h"
 #include "../src/app/orbit_camera.h"
@@ -80,6 +82,93 @@ static Vec3 UnprojectForTest(const Camera& c, double px, double py,
 int main() {
     // Unbuffered, so a crash does not swallow the output that would say where.
     setvbuf(stdout, nullptr, _IONBF, 0);
+
+    // --- block-sparse Cholesky ------------------------------------------------
+    //
+    // Against the dense Cholesky on the same matrix, shaped like a video's
+    // reduced camera system: each node coupled to its next few, a handful of
+    // long-range revisits -- what makes the ordering matter -- and one size-1
+    // node coupled to everything, as a shared focal is. Built as a sum of
+    // rank-3 "points" over two or three nodes each, plus a little diagonal,
+    // so it is positive definite and its pattern is exactly the pairs used.
+    {
+        std::printf("\n--- block-sparse Cholesky ---\n");
+        std::mt19937 rng(7);
+        std::uniform_real_distribution<double> U(-1.0, 1.0);
+        const int nCam = 60;
+        std::vector<int> sizes(size_t(nCam), 6);
+        sizes.push_back(1);   // the shared node, last
+        const int nNode = nCam + 1;
+        linalg::BlockSparseCholesky sp;
+        std::vector<int> scalar(size_t(nNode) + 1, 0);
+        for (int i = 0; i < nNode; ++i) scalar[size_t(i) + 1] = scalar[size_t(i)] + sizes[size_t(i)];
+        const int dim = scalar[size_t(nNode)];
+
+        std::vector<std::vector<int>> groups;
+        for (int c = 0; c < nCam; ++c)
+            for (int d = 1; d <= 3 && c + d < nCam; ++d) groups.push_back({c, c + d, nCam});
+        for (int r = 0; r < 8; ++r) groups.push_back({r * 3, nCam - 1 - r * 4, nCam});   // revisits
+        std::vector<std::pair<int, int>> pairs;
+        for (const auto& g : groups)
+            for (int a : g)
+                for (int b : g) pairs.push_back({a, b});
+        Check(sp.Analyse(sizes, pairs), "analyses a video-shaped pattern");
+
+        std::vector<double> A(size_t(dim) * size_t(dim), 0.0);
+        for (const auto& g : groups) {
+            std::vector<int> cols;
+            for (int node : g)
+                for (int a = 0; a < sizes[size_t(node)]; ++a) cols.push_back(scalar[size_t(node)] + a);
+            for (int row = 0; row < 3; ++row) {
+                std::vector<double> gv(cols.size());
+                for (auto& v : gv) v = U(rng);
+                for (size_t p = 0; p < cols.size(); ++p)
+                    for (size_t q = 0; q < cols.size(); ++q)
+                        A[size_t(cols[p]) * size_t(dim) + size_t(cols[q])] += gv[p] * gv[q];
+            }
+        }
+        for (int i = 0; i < dim; ++i) A[size_t(i) * size_t(dim) + size_t(i)] += 0.1;
+
+        // The sparse values, block by block out of the dense matrix.
+        std::vector<double> vals(sp.NumValues(), 0.0);
+        for (int i = 0; i < nNode; ++i)
+            for (int j = 0; j <= i; ++j) {
+                if (sp.Offset(i, j) < 0) continue;
+                std::vector<double> blk(size_t(sizes[size_t(i)]) * size_t(sizes[size_t(j)]));
+                for (int a = 0; a < sizes[size_t(i)]; ++a)
+                    for (int b = 0; b < sizes[size_t(j)]; ++b)
+                        blk[size_t(a * sizes[size_t(j)] + b)] =
+                            A[size_t(scalar[size_t(i)] + a) * size_t(dim) + size_t(scalar[size_t(j)] + b)];
+                sp.Add(vals.data(), i, j, blk.data());
+            }
+
+        std::vector<double> rhs(static_cast<size_t>(dim));
+        for (auto& v : rhs) v = U(rng);
+        std::vector<double> xd = rhs, Ad = A;
+        const bool denseOk = linalg::CholeskySolve(Ad.data(), xd.data(), dim);
+        std::vector<double> xs = rhs;
+        const bool sparseOk = sp.Factor(vals.data());
+        if (sparseOk) sp.Solve(xs.data());
+        double worst = 0.0, scale = 0.0;
+        for (int i = 0; i < dim; ++i) {
+            worst = std::max(worst, std::fabs(xs[size_t(i)] - xd[size_t(i)]));
+            scale = std::max(scale, std::fabs(xd[size_t(i)]));
+        }
+        Check(denseOk && sparseOk && worst <= 1e-9 * std::max(1.0, scale),
+              "solves as the dense Cholesky does (worst difference " + std::to_string(worst) +
+                  ", fill " + std::to_string(sp.FactorValues()) + " of dense " +
+                  std::to_string(size_t(dim) * size_t(dim + 1) / 2) + ")");
+
+        // Not positive definite: one diagonal entry driven negative.
+        std::vector<double> bad = vals;
+        bad[size_t(sp.Offset(5, 5))] = -1.0;
+        Check(!sp.Factor(bad.data()), "refuses a matrix that is not positive definite");
+        // And recovers on the next good one: the pattern is reused.
+        std::vector<double> xs2 = rhs;
+        const bool again = sp.Factor(vals.data());
+        if (again) sp.Solve(xs2.data());
+        Check(again && xs2 == xs, "refactors on the same pattern to the same answer");
+    }
 
     // --- build_tracks -------------------------------------------------------
     //
@@ -3696,11 +3785,35 @@ int main() {
                         std::printf("       GPU note: %s\n", r.GpuNote().c_str());
                 };
 
+                // Twice: without the colour gate, and with one that the
+                // random depths straddle -- so some entries are gated and
+                // some are not, on both paths.
+                std::vector<SplatParam> ungated;
+                for (double gate : {0.0, 0.15}) {
+                opt.colourGate = gate;
+                if (gate > 0.0) std::printf("    with colour_gate %.2f:\n", gate);
                 std::vector<double> imgC, imgG;
                 std::vector<SplatParam> gradC, gradG;
                 bool usedC = false, usedG = false;
                 run(nullptr, &imgC, &gradC, &usedC, &depC);
                 run(&gpu, &imgG, &gradG, &usedG, &depG);
+                if (gate == 0.0) {
+                    ungated = gradC;
+                } else {
+                    // The gate removes colour gradient and touches nothing
+                    // else: shape and opacity still learn from every pixel.
+                    double colOff = 0.0, colOn = 0.0, otherDiff = 0.0;
+                    for (size_t i = 0; i < sp.size(); ++i)
+                        for (int q = 0; q < 14; ++q) {
+                            const double a = ungated[i].Data()[q], b = gradC[i].Data()[q];
+                            if (q >= 11) { colOff += std::fabs(a); colOn += std::fabs(b); }
+                            else otherDiff += std::fabs(a - b);
+                        }
+                    Check(colOn < colOff * 0.95 && colOn > 0.0 && otherDiff == 0.0,
+                          "the colour gate removes colour gradient (" +
+                              std::to_string(int(100.0 * colOn / std::max(1e-30, colOff))) +
+                              "% left) and nothing else");
+                }
                 Check(usedG, "the GPU path actually ran");
                 if (usedG) {
                     double worstD = 0.0;
@@ -3743,6 +3856,7 @@ int main() {
                         Check(rel < 1e-3 && mag[gi] > 0.0, m2);
                     }
                 }
+                }   // gate
             }
             dev->Release();
         }
@@ -4887,6 +5001,63 @@ int main() {
                         // was silently dropped would pass the comparison.
                         Check(meanShift > 0.0,
                               "...and depth changes where the Gaussians move");
+                    }
+
+                    // THE COLOUR GATE, with no depth loss: the same maps, 10%
+                    // beyond the Gaussians, against a 5% gate -- so most
+                    // pixels are gated. The device must still match the CPU
+                    // (its target reaches the kernel by a path the depth
+                    // loss does not take), and colour must move less than
+                    // ungated.
+                    auto trainG = [&](ComputeContext* device, PointCloud* out,
+                                      std::string* note) {
+                        auto a = Registry::Get().Create("train_splats");
+                        std::string e;
+                        a->FindParam("iterations")->SetFromScript(Value(1.0), &e);
+                        a->FindParam("downscale")->SetFromScript(Value(1.0), &e);
+                        a->FindParam("densify")->SetFromScript(Value(0.0), &e);
+                        a->FindParam("depth_weight")->SetFromScript(Value(0.0), &e);
+                        a->FindParam("colour_gate")->SetFromScript(Value(0.05), &e);
+                        a->SetGroupGpu(device);
+                        a->SetReconstructExtra(&depthSet);
+                        *out = start;
+                        std::string err;
+                        const bool ok = a->RunReconstruct(&frames, out, &err);
+                        *note = ok ? a->RunReport() : err;
+                        return ok;
+                    };
+                    PointCloud cg, gg;
+                    std::string ncg, ngg;
+                    const bool okg = trainG(nullptr, &cg, &ncg) && trainG(&gpu, &gg, &ngg);
+                    Check(okg, "a colour-gated step runs on both paths" +
+                                   (okg ? std::string() : ": " + ncg + " / " + ngg));
+                    if (okg) {
+                        double diff = 0.0, moved = 0.0, colGated = 0.0, colFree = 0.0;
+                        for (size_t i = 0; i < start.splats.size(); ++i) {
+                            const SplatParam s0 = ToParam(start.splats[i]);
+                            const SplatParam sc = ToParam(cg.splats[i]);
+                            const SplatParam sg = ToParam(gg.splats[i]);
+                            const SplatParam sn = ToParam(c1.splats[i]);   // ungated
+                            for (int q = 0; q < SplatParam::kCount; ++q) {
+                                const double dc = sc.Data()[q] - s0.Data()[q];
+                                diff += std::fabs(dc - (sg.Data()[q] - s0.Data()[q]));
+                                moved += std::fabs(dc);
+                                if (q >= 11) {
+                                    colGated += std::fabs(dc);
+                                    colFree += std::fabs(sn.Data()[q] - s0.Data()[q]);
+                                }
+                            }
+                        }
+                        char m3[200];
+                        std::snprintf(m3, sizeof(m3),
+                                      "...and the GPU step matches the CPU one (aggregate "
+                                      "difference %.1e of the movement)",
+                                      diff / std::max(1e-30, moved));
+                        Check(moved > 0.0 && diff / moved < 0.05, m3);
+                        Check(colGated < colFree,
+                              "...and colour moves less than ungated (" +
+                                  std::to_string(colGated) + " against " +
+                                  std::to_string(colFree) + ")");
                     }
                 }
 

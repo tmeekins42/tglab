@@ -2088,6 +2088,17 @@ bool SplatTrainerGpu::StepImpl(const SplatCam& cam, const RasterOptions& opt,
                 return false;
             }
             s.ddepthZero = false;
+        } else if (depthTarget && opt.colourGate > 0.0) {
+            // No depth loss, but the colour gate needs the target: zero
+            // depth gradient, the target as the shift. See colourGate.
+            s.ddStage.assign(np, 0.0f);
+            s.shiftStage.assign(depthTarget->begin(), depthTarget->end());
+            s.shiftStage.resize(np, 0.0f);
+            if (!s.Put(s.ddepth, lastD, s.ddStage) || !s.Put(s.dshift, lastD, s.shiftStage)) {
+                *err = "could not upload the depth target";
+                return false;
+            }
+            s.ddepthZero = false;
         } else if (!s.ddepthZero) {
             s.ddStage.assign(np, 0.0f);
             if (!s.Put(s.ddepth, lastD, s.ddStage) ||
@@ -2112,6 +2123,7 @@ bool SplatTrainerGpu::StepImpl(const SplatCam& cam, const RasterOptions& opt,
     std::vector<uint32_t> bc{uint32_t(cam.w), uint32_t(cam.h), uint32_t(tilesX),
                              uint32_t(kTexW)};
     bc.insert(bc.end(), bgC.begin(), bgC.end());
+    bc.push_back(FloatBits(float(opt.colourGate)));
     if (!reflNow) {
         if (!s.Run(s.bwd, {&s.proj, &s.list, &s.offs, &s.drgbt},
                    {&s.egrad, &s.last, &s.ddepth, &s.dshift},

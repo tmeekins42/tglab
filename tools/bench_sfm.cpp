@@ -705,6 +705,7 @@ int main(int argc, char** argv) {
     int window = 3, maxDim = 1600, rotMethod = 1, posMethod = 0;
     int videoFrames = 0;     // --video-frames N: N time slots; default picks by motion
     double videoStep = 0.0;  // --video-step F: motion step, a fraction of the short side
+    int    videoMax = -1;    // --video-max N: cap on frames kept by motion (0 = none)
     bool printCameras = false;   // --cameras: the camera path, per camera
     double fov = 50.0;
     std::string matcher = "match_ann";
@@ -753,6 +754,7 @@ int main(int argc, char** argv) {
         else if (a == "--cameras")                     printCameras = true;
         else if (a == "--video-frames" && i + 1 < argc) videoFrames = std::atoi(argv[++i]);
         else if (a == "--video-step" && i + 1 < argc) videoStep = std::atof(argv[++i]);
+        else if (a == "--video-max" && i + 1 < argc)  videoMax = std::atoi(argv[++i]);
         else files.push_back(a);
     }
 
@@ -782,6 +784,7 @@ int main(int argc, char** argv) {
             vo.frames = videoFrames;
         }
         if (videoStep > 0.0) vo.step = videoStep;
+        if (videoMax >= 0) vo.maxFrames = videoMax;
         VideoInfo vi;
         std::string verr;
         const auto tv = std::chrono::steady_clock::now();
@@ -829,7 +832,28 @@ int main(int argc, char** argv) {
     // --- load ---------------------------------------------------------------
     const auto tLoad = std::chrono::steady_clock::now();
     ImageSet set;
-    for (size_t fi = 0; fi < files.size(); ++fi) {
+    const bool fromVideo = !videoSet.empty();
+    // A video's frames are already decoded, so they downscale in parallel:
+    // one at a time was two minutes of a 1577-frame clip.
+    if (!videoSet.empty()) {
+        std::vector<Image> small(videoSet.size());
+        std::vector<char> ok(videoSet.size(), 0);
+        ParallelFor(videoSet.size(), [&](size_t fi) {
+            ok[fi] = Downscale(videoSet[fi], maxDim, &small[fi]) ? 1 : 0;
+        });
+        for (size_t fi = 0; fi < small.size(); ++fi) {
+            if (!ok[fi]) {
+                std::printf("  frame %zu: could not downscale\n", fi);
+                return 1;
+            }
+            if (fi == 0)
+                std::printf("  %dx%d -> %dx%d\n", videoSet[0].Desc().width, videoSet[0].Desc().height,
+                            small[0].Desc().width, small[0].Desc().height);
+            set.images.push_back(std::move(small[fi]));
+        }
+        videoSet.clear();
+    }
+    for (size_t fi = 0; fi < files.size() && !fromVideo; ++fi) {
         const std::string& f = files[fi];
         Image full;
         std::string err;

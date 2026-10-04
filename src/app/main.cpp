@@ -3401,6 +3401,13 @@ static double g_worstFrameMs = 0.0;
 //
 // Drawn only when there is GPU time to report: on a CPU-only run the split
 // would be "100% CPU", which the existing line already implies.
+// " (N using the GPU)" after the CPU stage count, when any did: stages whose
+// CPU path sends its heavy work to the device itself. Without it a run that
+// spent half its time on the GPU reports "0 GPU".
+static std::string HybridNote(int n) {
+    return n > 0 ? " (" + std::to_string(n) + " using the GPU)" : std::string();
+}
+
 static void SplitLine(double totalMs, double gpuMs) {
     if (gpuMs <= 0.0 || totalMs <= 0.0) return;
 
@@ -3691,17 +3698,20 @@ void App::Frame() {
         // flickers between the real timing and a near-zero one.
         if (m_worker.Busy()) {
             const Progress& p = m_worker.GetProgress();
-            ImGui::TextDisabled("running  %.1f ms   %d CPU / %d GPU so far   [%s]",
-                                p.ElapsedMs(), p.CpuStages(), p.GpuStages(), modeName);
+            ImGui::TextDisabled("running  %.1f ms   %d CPU%s / %d GPU so far   [%s]",
+                                p.ElapsedMs(), p.CpuStages(), HybridNote(p.HybridStages()).c_str(),
+                                p.GpuStages(), modeName);
             SplitLine(p.ElapsedMs(), p.GpuMs());
         } else if (const int cached = m_worker.LastCachedStages(); cached > 0) {
-            ImGui::TextDisabled("last run %.1f ms   %d CPU / %d GPU / %d cached   [%s]",
+            ImGui::TextDisabled("last run %.1f ms   %d CPU%s / %d GPU / %d cached   [%s]",
                                 m_worker.LastRunMs(), m_worker.LastCpuStages(),
+                                HybridNote(m_worker.LastHybridStages()).c_str(),
                                 m_worker.LastGpuStages(), cached, modeName);
             SplitLine(m_worker.LastRunMs(), m_worker.LastGpuMs());
         } else {
-            ImGui::TextDisabled("last run %.1f ms   %d CPU / %d GPU stage(s)   [%s]",
+            ImGui::TextDisabled("last run %.1f ms   %d CPU%s / %d GPU stage(s)   [%s]",
                                 m_worker.LastRunMs(), m_worker.LastCpuStages(),
+                                HybridNote(m_worker.LastHybridStages()).c_str(),
                                 m_worker.LastGpuStages(), modeName);
             SplitLine(m_worker.LastRunMs(), m_worker.LastGpuMs());
         }

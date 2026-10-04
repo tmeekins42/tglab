@@ -49,6 +49,13 @@ bool IsVideoPath(const std::string& path);
 // `maxFrames` caps the total: past it every other frame goes and the step
 // and the floor's interval double.
 //
+// THE CAP IS A MEMORY GUARD, NOT A QUALITY SETTING: every halving doubles
+// the step, and the step is what decides whether a clip reconstructs. It
+// was 250, and a 219 s walk around a room (IMG_1537) wanted 1577 frames at
+// 4%: halved three times to a 32% step, neighbouring frames 22 degrees
+// apart, and only 70 of 218 cameras reconstructed. Uncapped, all 1577 did.
+// At 1080x1920 a kept frame is 8 MB of RAM, so 2000 is about 16 GB.
+//
 // BY TIME: `frames` equal time slots, each keeping its sharpest frame -- the
 // original scheme, kept for comparison and for the tests of slotting.
 //
@@ -60,6 +67,7 @@ bool IsVideoPath(const std::string& path);
 //   IMG_1534    39 s      45/100         179/179
 //   IMG_1525    57 s      40/100         101/101
 //   IMG_1526    59 s      34/100         107/141     178/178
+//   IMG_1537   219 s                                1577/1577   (a room)
 //
 // Equal slots fail every clip over half a minute. The step is the coarsest
 // that reconstructed all of them; the floor is for the short clips, which
@@ -73,7 +81,7 @@ struct VideoOptions {
     double step = 0.04;
     double minTracked = 0.6;
     int    floorFrames = 60;
-    int    maxFrames = 250;
+    int    maxFrames = 2000;
     // A clip that moves too little for this many falls back to time slots.
     int    minFrames = 8;
     int frames = 100;     // by time: slots, so at most this many frames out

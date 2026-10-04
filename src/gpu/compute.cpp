@@ -1,5 +1,6 @@
 #include "compute.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -28,7 +29,13 @@ namespace {
 constexpr UINT kMaxSrv       = 8;
 constexpr UINT kMaxUav       = 8;
 constexpr UINT kNumConstants = 32;   // b0: width, height, then parameters
-constexpr UINT kHeapSize     = 256;  // (kMaxSrv + kMaxUav) * a few dispatches
+// (kMaxSrv + kMaxUav) per dispatch, so 4096 dispatches before a full heap
+// forces a batch to be submitted and waited on. It was 256: sixteen
+// dispatches, where a network records hundreds. For the convolutional
+// networks it measured no difference on its own -- their large dispatches
+// reach the pixel budget (see BatchPixelBudget) first -- but a batch of many
+// small dispatches is no longer cut every sixteen. A few MB of descriptors.
+constexpr UINT kHeapSize     = 65536;
 
 DXGI_FORMAT ToDxgi(Format f) {
     switch (f) {
@@ -101,6 +108,12 @@ void ComputeContext::Shutdown() {
     }
     for (ID3D12Resource* r : m_staging) if (r) r->Release();
     m_staging.clear();
+    for (ID3D12Resource* r : m_inflight) r->Release();   // the queue is idle now
+    m_inflight.clear();
+    for (const PooledBuffer& p : m_bufferPool) p.res->Release();
+    m_bufferPool.clear();
+    m_poolBytes = 0;
+    m_kernels.clear();   // their PSOs belong to this device
     for (const PooledStaging& p : m_stagingPool) p.res->Release();
     m_stagingPool.clear();
 
@@ -209,6 +222,21 @@ bool ComputeContext::CreateKernel(const std::string& hlsl, const std::string& en
     out->root = root;
     out->pso  = pso;
     return true;
+}
+
+const ComputeKernel* ComputeContext::SharedKernel(const std::string& key, const std::string& hlsl,
+                                                  std::string* err) {
+    std::lock_guard<std::mutex> lock(m_kernelMtx);
+    auto& slot = m_kernels[key];
+    if (!slot) {
+        auto k = std::make_unique<ComputeKernel>();
+        if (!CreateKernel(hlsl, "main", key, k.get(), err)) {
+            m_kernels.erase(key);   // retried next time, not cached as failed
+            return nullptr;
+        }
+        slot = std::move(k);
+    }
+    return slot.get();
 }
 
 bool ComputeContext::CreateImage(const ImageDesc& d, GpuImage* out) {
@@ -481,24 +509,9 @@ bool ComputeContext::Dispatch(const ComputeKernel& k,
         return false;
     }
 
-    if (!BeginRecording()) return false;
-
     // Build the descriptor table: SRVs first, then UAVs at a fixed offset.
-    //
-    // Each dispatch takes its OWN slice of the heap. The GPU reads these
-    // descriptors when the list executes, which -- with batching -- is long
-    // after every dispatch in the batch has been recorded. Writing them all to
-    // slot 0 would leave every dispatch seeing the last one's bindings.
-    constexpr UINT kSlotsPerDispatch = kMaxSrv + kMaxUav;
-    if (m_heapCursor + kSlotsPerDispatch > kHeapSize) {
-        // Out of heap for this batch: submit what is recorded so the slots are
-        // free again. Correctness over batching -- the alternative is silently
-        // aliasing another dispatch's descriptors.
-        if (!Flush(err)) return false;
-        if (!BeginRecording()) return false;
-    }
-    const UINT base = m_heapCursor;
-    m_heapCursor += kSlotsPerDispatch;
+    UINT base = 0;
+    if (!TakeHeapSlice(&base, err)) return false;
 
     D3D12_CPU_DESCRIPTOR_HANDLE heapCpu = m_srvHeap->GetCPUDescriptorHandleForHeapStart();
     D3D12_GPU_DESCRIPTOR_HANDLE heapGpu = m_srvHeap->GetGPUDescriptorHandleForHeapStart();
@@ -638,6 +651,276 @@ bool ComputeContext::Dispatch(const ComputeKernel& k,
     return true;
 }
 
+// Each dispatch takes its OWN slice of the heap. The GPU reads these
+// descriptors when the list executes, which -- with batching -- is long after
+// every dispatch in the batch has been recorded. Writing them all to slot 0
+// would leave every dispatch seeing the last one's bindings.
+bool ComputeContext::TakeHeapSlice(UINT* base, std::string* err) {
+    if (!BeginRecording()) { *err = "could not open the command list"; return false; }
+    constexpr UINT kSlotsPerDispatch = kMaxSrv + kMaxUav;
+    if (m_heapCursor + kSlotsPerDispatch > kHeapSize) {
+        // Out of heap for this batch: submit what is recorded so the slots are
+        // free again. Correctness over batching -- the alternative is silently
+        // aliasing another dispatch's descriptors.
+        if (!Flush(err)) return false;
+        if (!BeginRecording()) { *err = "could not open the command list"; return false; }
+    }
+    *base = m_heapCursor;
+    m_heapCursor += kSlotsPerDispatch;
+    return true;
+}
+
+// --- raw buffers ---------------------------------------------------------------
+
+bool ComputeContext::CreateBuffer(uint64_t bytes, GpuBuffer* out) {
+    bytes = (std::max<uint64_t>(bytes, 4) + 3) & ~uint64_t(3);
+
+    D3D12_HEAP_PROPERTIES hp = {};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    D3D12_RESOURCE_DESC bd = {};
+    bd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width            = bytes;
+    bd.Height           = 1;
+    bd.DepthOrArraySize = 1;
+    bd.MipLevels        = 1;
+    bd.Format           = DXGI_FORMAT_UNKNOWN;
+    bd.SampleDesc.Count = 1;
+    bd.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    bd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
+    ID3D12Resource* res = nullptr;
+    const HRESULT hr = m_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd,
+                                                        D3D12_RESOURCE_STATE_COMMON,
+                                                        nullptr, IID_PPV_ARGS(&res));
+    if (FAILED(hr)) {
+        // Always reported, as CreateImage does: see there.
+        std::fprintf(stderr, "[gpu] could not allocate a %.1f MB buffer: 0x%08X\n",
+                     double(bytes) / (1024.0 * 1024.0), unsigned(hr));
+        return false;
+    }
+    out->Release();
+    out->res   = res;
+    out->bytes = bytes;
+    out->state = D3D12_RESOURCE_STATE_COMMON;
+    return true;
+}
+
+bool ComputeContext::AcquireBuffer(uint64_t bytes, GpuBuffer* out) {
+    bytes = (std::max<uint64_t>(bytes, 4) + 3) & ~uint64_t(3);
+    {
+        // The smallest pooled buffer that fits and wastes at most half of
+        // itself: a 1 MB request must not pin a 300 MB buffer.
+        std::lock_guard<std::mutex> lock(m_poolMtx);
+        size_t best = m_bufferPool.size();
+        for (size_t i = 0; i < m_bufferPool.size(); ++i) {
+            const uint64_t b = m_bufferPool[i].bytes;
+            if (b >= bytes && b <= 2 * bytes &&
+                (best == m_bufferPool.size() || b < m_bufferPool[best].bytes))
+                best = i;
+        }
+        if (best < m_bufferPool.size()) {
+            out->Release();
+            out->bytes = m_bufferPool[best].bytes;
+            out->res   = m_bufferPool[best].res;
+            out->state = m_bufferPool[best].state;
+            m_poolBytes -= out->bytes;
+            m_bufferPool.erase(m_bufferPool.begin() + long(best));
+            return true;
+        }
+    }
+    return CreateBuffer(bytes, out);
+}
+
+void ComputeContext::RecycleBuffer(GpuBuffer&& b) {
+    if (!b.Valid()) return;
+    // Budgeted: enough for a large network's whole working set to cycle, not
+    // so much that it starves the rest of the application's video memory.
+    //
+    // 3 GB. The DeDoDe descriptor at 784 x 784 works in 2.7 GB, and at 2 GB
+    // its two largest buffers -- 602 MB between them -- were freed after
+    // every frame and created, and zeroed by the OS, again for the next.
+    constexpr uint64_t kPoolBudget = uint64_t(3) << 30;
+    std::lock_guard<std::mutex> lock(m_poolMtx);
+    m_bufferPool.push_back({b.bytes, b.res, b.state});
+    m_poolBytes += b.bytes;
+    b.res = nullptr;
+    while (m_poolBytes > kPoolBudget && !m_bufferPool.empty()) {
+        size_t big = 0;
+        for (size_t i = 1; i < m_bufferPool.size(); ++i)
+            if (m_bufferPool[i].bytes > m_bufferPool[big].bytes) big = i;
+        m_poolBytes -= m_bufferPool[big].bytes;
+        m_bufferPool[big].res->Release();   // in-flight work holds its own reference
+        m_bufferPool.erase(m_bufferPool.begin() + long(big));
+    }
+}
+
+namespace {
+// Moves a buffer to `to`, recording the barrier when it is not already there.
+void TransitionBuffer(ID3D12GraphicsCommandList* list, GpuBuffer* b,
+                      D3D12_RESOURCE_STATES to) {
+    if (b->state == to) return;
+    D3D12_RESOURCE_BARRIER bar = {};
+    bar.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    bar.Transition.pResource   = b->res;
+    bar.Transition.StateBefore = b->state;
+    bar.Transition.StateAfter  = to;
+    bar.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    list->ResourceBarrier(1, &bar);
+    b->state = to;
+}
+} // namespace
+
+bool ComputeContext::UploadBuffer(const void* src, uint64_t bytes, GpuBuffer* dst,
+                                  uint64_t offset) {
+    if (!dst->Valid() || offset + bytes > dst->bytes) return false;
+    if (bytes == 0) return true;
+
+    ID3D12Resource* staging = TakeStaging(D3D12_HEAP_TYPE_UPLOAD, bytes);
+    if (!staging) return false;
+    void* mapped = nullptr;
+    D3D12_RANGE noRead = {0, 0};
+    if (FAILED(staging->Map(0, &noRead, &mapped))) { staging->Release(); return false; }
+    std::memcpy(mapped, src, size_t(bytes));
+    staging->Unmap(0, nullptr);
+
+    if (!BeginRecording()) { staging->Release(); return false; }
+    TransitionBuffer(m_list, dst, D3D12_RESOURCE_STATE_COPY_DEST);
+    m_list->CopyBufferRegion(dst->res, offset, staging, 0, bytes);
+
+    m_staging.push_back(staging);
+    m_pendingWork = true;
+    std::string err;
+    return Flush(&err);
+}
+
+bool ComputeContext::ReadbackBuffer(const GpuBuffer& src, void* dst, uint64_t bytes) {
+    if (!src.Valid() || bytes > src.bytes) return false;
+    if (bytes == 0) return true;
+
+    ID3D12Resource* staging = TakeStaging(D3D12_HEAP_TYPE_READBACK, bytes);
+    if (!staging) return false;
+    if (!BeginRecording()) { staging->Release(); return false; }
+    // const_cast as in Readback: the state belongs to the resource.
+    TransitionBuffer(m_list, const_cast<GpuBuffer*>(&src), D3D12_RESOURCE_STATE_COPY_SOURCE);
+    m_list->CopyBufferRegion(staging, 0, src.res, 0, bytes);
+
+    m_pendingWork = true;
+    std::string err;
+    if (!Flush(&err)) { staging->Release(); return false; }
+
+    void* mapped = nullptr;
+    D3D12_RANGE range = {0, SIZE_T(bytes)};
+    if (FAILED(staging->Map(0, &range, &mapped))) { staging->Release(); return false; }
+    std::memcpy(dst, mapped, size_t(bytes));
+    staging->Unmap(0, nullptr);
+    RecycleStaging(staging);
+    return true;
+}
+
+bool ComputeContext::DispatchBuffers(const ComputeKernel& k,
+                                     const std::vector<const GpuBuffer*>& inputs,
+                                     const std::vector<GpuBuffer*>& outputs,
+                                     const std::vector<uint32_t>& constants,
+                                     uint32_t groupsX, uint32_t groupsY, uint32_t groupsZ,
+                                     std::string* err) {
+    if (!k.Valid())      { *err = "kernel is not valid"; return false; }
+    if (outputs.empty()) { *err = "dispatch needs at least one output"; return false; }
+    if (inputs.size() > kMaxSrv || outputs.size() > kMaxUav ||
+        constants.size() > kNumConstants) {
+        *err = "too many bindings or constants for this root signature";
+        return false;
+    }
+    if (groupsX == 0 || groupsY == 0 || groupsZ == 0) return true;   // nothing to do
+
+    UINT base = 0;
+    if (!TakeHeapSlice(&base, err)) return false;
+
+    D3D12_CPU_DESCRIPTOR_HANDLE heapCpu = m_srvHeap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_GPU_DESCRIPTOR_HANDLE heapGpu = m_srvHeap->GetGPUDescriptorHandleForHeapStart();
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = {heapCpu.ptr + SIZE_T(base) * m_srvStride};
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu = {heapGpu.ptr + SIZE_T(base) * m_srvStride};
+
+    for (UINT i = 0; i < kMaxSrv; ++i) {
+        D3D12_CPU_DESCRIPTOR_HANDLE h = {cpu.ptr + SIZE_T(i) * m_srvStride};
+        D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sd.Format                  = DXGI_FORMAT_R32_TYPELESS;
+        sd.ViewDimension           = D3D12_SRV_DIMENSION_BUFFER;
+        sd.Buffer.Flags            = D3D12_BUFFER_SRV_FLAG_RAW;
+        const GpuBuffer* b = i < inputs.size() ? inputs[i] : nullptr;
+        if (b && b->Valid()) {
+            sd.Buffer.NumElements = UINT(b->bytes / 4);
+            m_device->CreateShaderResourceView(b->res, &sd, h);
+        } else {
+            sd.Buffer.NumElements = 1;
+            m_device->CreateShaderResourceView(nullptr, &sd, h);
+        }
+    }
+    for (UINT i = 0; i < kMaxUav; ++i) {
+        D3D12_CPU_DESCRIPTOR_HANDLE h = {cpu.ptr + SIZE_T(kMaxSrv + i) * m_srvStride};
+        D3D12_UNORDERED_ACCESS_VIEW_DESC ud = {};
+        ud.Format        = DXGI_FORMAT_R32_TYPELESS;
+        ud.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        ud.Buffer.Flags  = D3D12_BUFFER_UAV_FLAG_RAW;
+        GpuBuffer* b = i < outputs.size() ? outputs[i] : nullptr;
+        if (b && b->Valid()) {
+            ud.Buffer.NumElements = UINT(b->bytes / 4);
+            m_device->CreateUnorderedAccessView(b->res, nullptr, &ud, h);
+        } else {
+            ud.Buffer.NumElements = 1;
+            m_device->CreateUnorderedAccessView(nullptr, nullptr, &ud, h);
+        }
+    }
+
+    // Outputs first, so a buffer bound both ways ends up a UAV (see Dispatch).
+    for (GpuBuffer* o : outputs)
+        if (o && o->Valid()) TransitionBuffer(m_list, o, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    for (const GpuBuffer* i : inputs) {
+        if (!i || !i->Valid()) continue;
+        bool alsoOut = false;
+        for (GpuBuffer* o : outputs) alsoOut |= (o == i);
+        if (!alsoOut)
+            TransitionBuffer(m_list, const_cast<GpuBuffer*>(i),
+                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+
+    ID3D12DescriptorHeap* heaps[] = {m_srvHeap};
+    m_list->SetDescriptorHeaps(1, heaps);
+    m_list->SetComputeRootSignature(k.root);
+    m_list->SetPipelineState(k.pso);
+    uint32_t roots[kNumConstants] = {};
+    for (size_t i = 0; i < constants.size(); ++i) roots[i] = constants[i];
+    m_list->SetComputeRoot32BitConstants(0, kNumConstants, roots, 0);
+    m_list->SetComputeRootDescriptorTable(1, gpu);
+    m_list->Dispatch(groupsX, groupsY, groupsZ);
+
+    // Held until the batch has run: see m_inflight.
+    for (const GpuBuffer* b : inputs)
+        if (b && b->Valid()) { b->res->AddRef(); m_inflight.push_back(b->res); }
+    for (const GpuBuffer* b : outputs)
+        if (b && b->Valid()) { b->res->AddRef(); m_inflight.push_back(b->res); }
+
+    for (GpuBuffer* o : outputs) {
+        if (!o || !o->Valid()) continue;
+        D3D12_RESOURCE_BARRIER b = {};
+        b.Type          = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        b.UAV.pResource = o->res;
+        m_list->ResourceBarrier(1, &b);
+    }
+    m_pendingWork = true;
+
+    // Counted against the same budget as images, a thread standing for a
+    // pixel (64 a group, the size every buffer kernel here uses): the hang
+    // that budget bounds follows the size of the batched work, whatever is
+    // bound. See Dispatch.
+    m_batchPixels += uint64_t(groupsX) * groupsY * groupsZ * 64u;
+    if (m_batchPixels >= BatchPixelBudget()) {
+        if (!Flush(err)) return false;
+    }
+    return true;
+}
+
 // Pixels a batch may accumulate before it is submitted.
 //
 // 16 MP, chosen by bisection rather than by argument. 24 MP was tried first --
@@ -685,7 +968,19 @@ bool ComputeContext::Flush(std::string* err) {
     // here attributes it to the submit instead of to an arbitrary stage.
     const auto tSubmit = std::chrono::steady_clock::now();
 
-    if (FAILED(m_list->Close())) { *err = "could not close command list"; return false; }
+    // Buffers held for the batch (see m_inflight), released once it can no
+    // longer touch them. NOT on a timed-out wait: the device may still be
+    // running it, and a leak beats freeing memory under a live kernel.
+    auto releaseInflight = [this] {
+        for (ID3D12Resource* r : m_inflight) r->Release();
+        m_inflight.clear();
+    };
+
+    if (FAILED(m_list->Close())) {
+        releaseInflight();
+        *err = "could not close command list";
+        return false;
+    }
 
     ID3D12CommandList* lists[] = {m_list};
     m_queue->ExecuteCommandLists(1, lists);
@@ -710,11 +1005,14 @@ bool ComputeContext::Flush(std::string* err) {
     // A hang shows up here even when the wait succeeds.
     if (m_device->GetDeviceRemovedReason() != S_OK) {
         m_deviceLost = true;
+        releaseInflight();
         ReportDeviceRemoval(m_device, "compute flush");
         *err = "GPU device was removed (a kernel most likely ran too long); "
                "falling back to the CPU";
         return false;
     }
+
+    releaseInflight();
 
     // Staging buffers are only safe to reuse once the GPU is done with them.
     for (ID3D12Resource* r : m_staging) if (r) RecycleStaging(r);

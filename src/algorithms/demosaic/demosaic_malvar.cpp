@@ -82,32 +82,36 @@ public:
         ImageView       dst = ctx.Out(0);
         if (!src.Valid() || !dst.Valid()) return;
 
-        m_in.Unpack(src);
-        if (!m_in.Valid()) return;
+        // Locals, not members: frames of a group demosaic concurrently on one
+        // instance, and member scratch was shared between them.
+        PixelBuffer in;
+        in.Unpack(src);
+        if (!in.Valid()) return;
 
-        const int w = m_in.Width(), h = m_in.Height();
+        const int w = in.Width(), h = in.Height();
         const CfaPattern cfa = src.desc.cfa;
 
         // Not a mosaic: pass through rather than inventing a pattern, matching
         // the other demosaicers so an unconditional call is harmless.
         if (cfa == CfaPattern::None || cfa == CfaPattern::XTrans) {
-            PassThrough(dst, w, h);
+            PassThrough(in, dst, w, h);
             return;
         }
 
         const float black = src.desc.blackLevel;
         const float range = std::max(src.desc.whiteLevel - black, 1e-6f);
 
-        m_s.assign(size_t(w) * size_t(h), 0.0f);
+        std::vector<float> s;
+        s.assign(size_t(w) * size_t(h), 0.0f);
         for (int y = 0; y < h; ++y)
             for (int x = 0; x < w; ++x)
-                m_s[size_t(y) * size_t(w) + size_t(x)] =
-                    std::clamp((m_in.Get(x, y, 0) - black) / range, 0.0f, 4.0f);
+                s[size_t(y) * size_t(w) + size_t(x)] =
+                    std::clamp((in.Get(x, y, 0) - black) / range, 0.0f, 4.0f);
 
         auto at = [&](int x, int y) {
             x = std::clamp(x, 0, w - 1);
             y = std::clamp(y, 0, h - 1);
-            return m_s[size_t(y) * size_t(w) + size_t(x)];
+            return s[size_t(y) * size_t(w) + size_t(x)];
         };
 
         const float alpha = float(m_alpha);
@@ -352,15 +356,15 @@ private:
     // reads 16596 against a declared white of 16383.
     static constexpr float kClip = 0.99f;
 
-    void PassThrough(ImageView& dst, int w, int h) {
-        const int ch = m_in.Channels();
-        const float scale = m_in.ValueScale();
+    static void PassThrough(const PixelBuffer& in, ImageView& dst, int w, int h) {
+        const int ch = in.Channels();
+        const float scale = in.ValueScale();
         for (int y = 0; y < h; ++y)
             for (int x = 0; x < w; ++x) {
                 uint16_t* p = dst.At<uint16_t>(x, y);
                 for (int c = 0; c < 3; ++c)
-                    p[c] = FloatToHalf(m_in.Get(x, y, ch == 1 ? 0 : c) / scale);
-                p[3] = FloatToHalf(ch == 4 ? m_in.Get(x, y, 3) / scale : 1.0f);
+                    p[c] = FloatToHalf(in.Get(x, y, ch == 1 ? 0 : c) / scale);
+                p[3] = FloatToHalf(ch == 4 ? in.Get(x, y, 3) / scale : 1.0f);
             }
     }
 
@@ -392,8 +396,6 @@ private:
     float m_camMul[3] = {1.0f, 1.0f, 1.0f};
     float m_rgbCam[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
 
-    PixelBuffer        m_in;
-    std::vector<float> m_s;
 };
 
 REGISTER_ALGORITHM(DemosaicMalvar);

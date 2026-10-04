@@ -39,8 +39,11 @@
 #include <vector>
 
 #include "../../algo_util/features.h"
+#include "../../algo_util/gpu_knn.h"
+#include "../../algo_util/loma.h"
 #include "../../core/algorithm.h"
 #include "../../core/parallel.h"
+#include "gpu_pyramid.h"
 
 namespace tglab {
 namespace {
@@ -248,12 +251,12 @@ private:
             }
 
             const float diff = q[n.dim] - n.value;
-            const int near = (diff < 0.0f) ? n.left : n.right;
-            const int far  = (diff < 0.0f) ? n.right : n.left;
+            const int nearSide = (diff < 0.0f) ? n.left : n.right;
+            const int farSide  = (diff < 0.0f) ? n.right : n.left;
             // The far branch cannot hold anything closer than |diff|, so that
             // is its priority when it is reconsidered.
-            queue->push_back({far, tree, diff * diff});
-            node = near;
+            queue->push_back({farSide, tree, diff * diff});
+            node = nearSide;
         }
     }
 
@@ -462,46 +465,60 @@ public:
             }
         }
 
-        // EACH FRAME'S INDEX BUILT ONCE, in parallel, rather than once per
-        // pair: a chain of window 2 with 3 revisits rebuilt every frame's
-        // index about five times, plus a reverse index per pair for the cross
-        // check. The forward and reverse indexes keep their own seeds, so the
-        // matches are exactly what the pair-by-pair loop produced -- in about
-        // a sixth of the time on a 100-frame video (49 s to 8 s).
-        std::vector<KdForest>  fwdF(nImg), revF(nImg);
-        std::vector<LshTables> fwdL(nImg), revL(nImg);
-        const bool cross = bool(m_crossCheck);
-        ParallelFor(nImg, [&](size_t i) {
-            const FeatureSidecar* fs = FeaturesOf((*images)[i]);
-            if (!fs) return;
-            const int trees = std::max(1, int(m_trees));
-            if (isRef[i]) {
-                if (isFloat) fwdF[i].Build(fs->descriptors, trees, 8, 12345u);
-                else         fwdL[i].Build(fs->descriptors, trees, int(m_keyBits), 12345u);
-            }
-            if (isQuery[i] && cross) {
-                if (isFloat) revF[i].Build(fs->descriptors, trees, 8, 54321u);
-                else         revL[i].Build(fs->descriptors, trees, int(m_keyBits), 54321u);
-            }
-        });
-
+        // EXACT, ON THE GPU, for float descriptors when there is a device:
+        // every candidate compared, the k nearest kept, then judged by the
+        // same rules as below. See GpuKnn for why brute force wins there.
         std::vector<std::shared_ptr<MatchSidecar>> made(nImg);
-        ParallelFor(nImg, [&](size_t i) {
-            if (refsOf[i].empty()) return;
-            const FeatureSidecar* fs = FeaturesOf((*images)[i]);
-            auto ms = std::make_shared<MatchSidecar>();
-            for (const auto& [refIdx, revisit] : refsOf[i]) {
-                const FeatureSidecar* ref = FeaturesOf((*images)[size_t(refIdx)]);
-                MatchSet set;
-                set.reference = refIdx;
-                set.revisit = revisit;
-                MatchPair(*ref, *fs, fwdF[size_t(refIdx)], fwdL[size_t(refIdx)],
-                          revF[i], revL[i], isFloat, &set);
-                ms->considered += set.considered;
-                ms->sets.push_back(std::move(set));
-            }
-            made[i] = std::move(ms);
-        });
+        m_loma = int(m_method) == 1;
+        if (m_loma) {
+            if (!MatchAllLoma(*images, refsOf, &made, err)) return false;
+            m_exact = false;
+        } else {
+            m_exact = isFloat && GroupGpu() && MatchAllOnGpu(*images, refsOf, &made);
+        }
+        if (!m_exact && !m_loma) {
+            for (auto& m : made) m.reset();
+
+            // EACH FRAME'S INDEX BUILT ONCE, in parallel, rather than once per
+            // pair: a chain of window 2 with 3 revisits rebuilt every frame's
+            // index about five times, plus a reverse index per pair for the cross
+            // check. The forward and reverse indexes keep their own seeds, so the
+            // matches are exactly what the pair-by-pair loop produced -- in about
+            // a sixth of the time on a 100-frame video (49 s to 8 s).
+            std::vector<KdForest>  fwdF(nImg), revF(nImg);
+            std::vector<LshTables> fwdL(nImg), revL(nImg);
+            const bool cross = bool(m_crossCheck);
+            ParallelFor(nImg, [&](size_t i) {
+                const FeatureSidecar* fs = FeaturesOf((*images)[i]);
+                if (!fs) return;
+                const int trees = std::max(1, int(m_trees));
+                if (isRef[i]) {
+                    if (isFloat) fwdF[i].Build(fs->descriptors, trees, 8, 12345u);
+                    else         fwdL[i].Build(fs->descriptors, trees, int(m_keyBits), 12345u);
+                }
+                if (isQuery[i] && cross) {
+                    if (isFloat) revF[i].Build(fs->descriptors, trees, 8, 54321u);
+                    else         revL[i].Build(fs->descriptors, trees, int(m_keyBits), 54321u);
+                }
+            });
+
+            ParallelFor(nImg, [&](size_t i) {
+                if (refsOf[i].empty()) return;
+                const FeatureSidecar* fs = FeaturesOf((*images)[i]);
+                auto ms = std::make_shared<MatchSidecar>();
+                for (const auto& [refIdx, revisit] : refsOf[i]) {
+                    const FeatureSidecar* ref = FeaturesOf((*images)[size_t(refIdx)]);
+                    MatchSet set;
+                    set.reference = refIdx;
+                    set.revisit = revisit;
+                    MatchPair(*ref, *fs, fwdF[size_t(refIdx)], fwdL[size_t(refIdx)],
+                              revF[i], revL[i], isFloat, &set);
+                    ms->considered += set.considered;
+                    ms->sets.push_back(std::move(set));
+                }
+                made[i] = std::move(ms);
+            });
+        }
 
         for (size_t i = 0; i < nImg; ++i) {
             if (!made[i] || made[i]->sets.empty()) continue;
@@ -510,7 +527,8 @@ public:
                 m_kept  += int(set.matches.size());
                 ++m_pairs;
             }
-            made[i]->matcher = isFloat ? "ann (kd-forest)" : "ann (lsh)";
+            made[i]->matcher = m_loma ? "loma" : m_exact ? "exact (GPU)"
+                             : isFloat ? "ann (kd-forest)" : "ann (lsh)";
             (*images)[i].Sidecars().Set(kMatchSidecar, made[i]);
         }
         return true;
@@ -519,10 +537,15 @@ public:
     std::string RunReport() const override {
         if (!m_note.empty()) return m_note;
         if (m_pairs == 0) return {};
+        char how[64];
+        if (m_loma)
+            std::snprintf(how, sizeof how, "with LoMa (%d layers%s)", m_lomaLayers,
+                          m_lomaOnGpu ? "" : ", on the CPU");
+        else
+            std::snprintf(how, sizeof how, "%s", m_exact ? "exactly, on the GPU" : "approximately");
         char buf[192];
-        std::snprintf(buf, sizeof buf,
-                      "matched %d pair%s approximately: %d of %d candidates kept",
-                      m_pairs, m_pairs == 1 ? "" : "s", m_kept, m_total);
+        std::snprintf(buf, sizeof buf, "matched %d pair%s %s: %d of %d candidates kept", m_pairs,
+                      m_pairs == 1 ? "" : "s", how, m_kept, m_total);
         std::string s = buf;
         if (m_revisits > 0)
             s += "; " + std::to_string(m_revisits) + " of them revisits -- far apart "
@@ -543,9 +566,7 @@ private:
                    const KdForest& forest, const LshTables& lsh,
                    const KdForest& revForest, const LshTables& revLsh, bool isFloat,
                    MatchSet* out) const {
-        const float maxRatio = float(m_ratio);
-        const int   checks   = std::max(1, int(m_checks));
-        const float sepSq    = float(m_minSeparation) * float(m_minSeparation);
+        const int checks = std::max(1, int(m_checks));
 
         // The reverse direction, for the cross check.
         //
@@ -575,12 +596,28 @@ private:
             }
         }
 
+        Judge(ref, other, isFloat, backBest, out, [&](size_t i, std::vector<Candidate>* cands) {
+            if (isFloat) forest.Search(other.descriptors.FloatAt(i), checks, cands);
+            else         lsh.Search(other.descriptors.BinaryAt(i), checks, cands);
+        });
+    }
+
+    // THE JUDGING, shared by every way of finding candidates -- the forest,
+    // LSH, or the exact GPU search -- so that how a match is accepted never
+    // depends on how its candidates were found. `candidatesFor(i, &c)` fills
+    // the candidates for query i; `backBest` is the reverse direction's best,
+    // for the cross check (empty for none).
+    template <class CandidatesFor>
+    void Judge(const FeatureSidecar& ref, const FeatureSidecar& other, bool isFloat,
+               const std::vector<int>& backBest, MatchSet* out,
+               CandidatesFor&& candidatesFor) const {
+        const float maxRatio = float(m_ratio);
+        const float sepSq    = float(m_minSeparation) * float(m_minSeparation);
         std::vector<Candidate> cands;
         const size_t n = other.descriptors.Count();
 
         for (size_t i = 0; i < n; ++i) {
-            if (isFloat) forest.Search(other.descriptors.FloatAt(i), checks, &cands);
-            else         lsh.Search(other.descriptors.BinaryAt(i), checks, &cands);
+            candidatesFor(i, &cands);
             if (cands.empty()) continue;
 
             const Best b = PickBest(cands, ref.keypoints, sepSq);
@@ -623,6 +660,46 @@ private:
             out->matches.push_back(m);
         }
     }
+
+    static constexpr const char* kMethodNames[] = {"nearest neighbour", "LoMa (learned)"};
+
+    Param<int> m_method{this, "method", 0, 0, 1,
+        {.help = "Nearest neighbour compares descriptors two at a time, with "
+                 "the ratio test and cross check below. LoMa is a transformer "
+                 "trained to match: each point's description is rewritten by "
+                 "attention to the rest of its own image and then to the "
+                 "other image before any comparison, so repeated structure "
+                 "-- a facade of identical windows -- is resolved by context "
+                 "rather than thrown away as ambiguous. Needs describe_dedode "
+                 "with normalise = 0, and is best with a few thousand "
+                 "keypoints a frame: its cost grows with their square.",
+         .choices = kMethodNames, .choiceCount = 2}};
+
+    Param<int> m_lomaLayersParam{this, "layers", 9, 1, 9,
+        {.help = "LoMa: how many of its nine transformer layers to run. Every "
+                 "layer has its own trained matching head, so fewer is a "
+                 "real, cheaper matcher rather than a broken one -- LoMa's "
+                 "paper reports 3 and 5 as useful speed/accuracy points."}};
+
+    // 0.9, NOT LoMa's own 0.1, and measured: LoMa's default maximises matches
+    // for one pair's pose, but SfM chains matches into multi-view TRACKS, and
+    // a low-confidence match -- a point paired with a neighbour of its true
+    // partner, which the network will do when the partner was not detected --
+    // conflicts with the same point's matches in other pairs and breaks the
+    // track. At 4096 DaD points a frame, sfm.tgl's sparse chain:
+    //
+    //   threshold     castle-P19 points   fountain-P11 points   IMG_1535 points
+    //     0.1               6227                3038                   --
+    //     0.5               7887                3809                 13555
+    //     0.8               8621                4479                 22685
+    //     0.9               8765                4742                 25385
+    //   (nearest neighbour  7967                4557                 26297)
+    Param<float> m_lomaThreshold{this, "threshold", 0.9f, 0.0f, 1.0f,
+        {.help = "LoMa: the dual-softmax probability a mutual best match "
+                 "must exceed to be kept. Higher than LoMa's own 0.1 because "
+                 "SfM chains matches into tracks across many pairs, and an "
+                 "unsure match breaks a track: measured, raising it from 0.1 "
+                 "to 0.9 took castle-P19 from 6227 points to 8765."}};
 
     Param<int> m_reference{this, "reference", 0, 0, 64,
         {.help = "Which frame the others are matched against. Ignored when "
@@ -806,7 +883,214 @@ private:
     int         m_total = 0;
     int         m_kept  = 0;
     int         m_revisits = 0;
+    bool        m_exact = false;   // the last run searched exhaustively on the GPU
+    bool        m_loma = false;    // ...or ran LoMa's matcher
+    bool        m_lomaOnGpu = false;
+    int         m_lomaLayers = 0;
     std::string m_note;
+
+    // Every pair through LoMa's matcher. Errors (missing weights, the wrong
+    // descriptors) fail the stage rather than falling back: a matcher
+    // quietly swapped for another would make every comparison meaningless.
+    bool MatchAllLoma(const std::vector<Image>& images,
+                      const std::vector<std::vector<std::pair<int, bool>>>& refsOf,
+                      std::vector<std::shared_ptr<MatchSidecar>>* made, std::string* err) {
+        const LomaMatcher* net = SharedNetwork<LomaMatcher>(
+            "loma_b128.tgw",
+            "python tools/nn_convert.py loma_b128 models/loma_b128.tgw "
+            "--exclude _detector. --exclude _descriptor.",
+            err);
+        if (!net) { *err = "match_ann: " + *err; return false; }
+        m_lomaLayers = std::clamp(int(m_lomaLayersParam), 1, net->Layers());
+
+        // Each frame's inputs once: positions normalised to -1..1 across the
+        // image (pixel centres at +0.5, as describe_dedode samples them) and
+        // the descriptors as they are.
+        const size_t nImg = images.size();
+        std::vector<std::vector<float>> kp(nImg);
+        for (size_t i = 0; i < nImg; ++i) {
+            const FeatureSidecar* fs = FeaturesOf(images[i]);
+            if (!fs) continue;
+            const DescriptorSet& d = fs->descriptors;
+            if (fs->keypoints.empty()) continue;
+            if (d.kind != DescriptorKind::Float || d.dim != net->InputDim()) {
+                *err = "match_ann: LoMa needs describe_dedode's " + std::to_string(net->InputDim()) +
+                       "-float descriptors, and frame " + std::to_string(i) + " has " + fs->detector + "'s";
+                return false;
+            }
+            // Unit-length descriptors are the default for match_ann's
+            // distances, and NOT what the network was trained on -- it would
+            // still return matches, quietly worse ones. Caught by their norms.
+            double mean = 0.0;
+            for (size_t k = 0; k < d.Count(); ++k) {
+                double s = 0.0;
+                for (int c = 0; c < d.dim; ++c) s += double(d.FloatAt(k)[c]) * d.FloatAt(k)[c];
+                mean += std::sqrt(s);
+            }
+            mean /= double(d.Count());
+            if (std::fabs(mean - 1.0) < 1e-3) {
+                *err = "match_ann: these descriptors are unit length -- LoMa needs them raw, "
+                       "so describe with describe_dedode(normalise = 0)";
+                return false;
+            }
+            const ImageDesc& im = images[i].Desc();
+            kp[i].resize(fs->keypoints.size() * 2);
+            for (size_t k = 0; k < fs->keypoints.size(); ++k) {
+                kp[i][2 * k]     = 2.0f * fs->keypoints[k].x / float(im.width) - 1.0f;
+                kp[i][2 * k + 1] = 2.0f * fs->keypoints[k].y / float(im.height) - 1.0f;
+            }
+        }
+
+        ComputeContext* dev = GroupGpu();
+        GpuLock lock(dev);
+        nn::Engine eng(dev);
+        m_lomaOnGpu = dev != nullptr;
+        const float threshold = float(m_lomaThreshold);
+        std::vector<LomaMatcher::Pair> pairs;
+        for (size_t i = 0; i < nImg; ++i) {
+            if (refsOf[i].empty()) continue;
+            if (GroupCancelled()) { *err = "cancelled"; return false; }
+            const FeatureSidecar* fs = FeaturesOf(images[i]);
+            auto ms = std::make_shared<MatchSidecar>();
+            for (const auto& [refIdx, revisit] : refsOf[i]) {
+                const FeatureSidecar* ref = FeaturesOf(images[size_t(refIdx)]);
+                if (!net->Match(eng, kp[size_t(refIdx)], ref->descriptors.f, kp[i],
+                                fs->descriptors.f, m_lomaLayers, threshold, &pairs, err)) {
+                    *err = "match_ann: " + *err;
+                    return false;
+                }
+                MatchSet set;
+                set.reference = refIdx;
+                set.revisit = revisit;
+                set.considered = int(fs->keypoints.size());
+                for (const auto& p : pairs) {
+                    Match m;
+                    m.a = p.i;   // the reference's keypoint
+                    m.b = p.j;   // this frame's
+                    // Lower is better in both, as for the distance matchers.
+                    m.distance = 1.0f - p.score;
+                    m.ratio = 1.0f - p.score;
+                    set.matches.push_back(m);
+                }
+                ms->considered += set.considered;
+                ms->sets.push_back(std::move(set));
+            }
+            (*made)[i] = std::move(ms);
+        }
+        return true;
+    }
+
+    // Every pair's matches by exact search on the device: each frame's
+    // descriptors uploaded once, each pair's k nearest found by GpuKnn, then
+    // the same Judge as the forest's. False -- and nothing in `made` to trust
+    // -- when the device cannot do it, so the caller falls back to the forest.
+    //
+    // k = kKnnMax rather than 2, because of min_separation: the runner-up
+    // must be a different place in the reference image, and the second
+    // nearest descriptor is often the same corner detected twice. The
+    // runner-up is the best of the k that is far enough; when none of the
+    // nearest eight is, Judge finds no runner-up and drops the match, which
+    // is the conservative direction.
+    bool MatchAllOnGpu(const std::vector<Image>& images,
+                       const std::vector<std::vector<std::pair<int, bool>>>& refsOf,
+                       std::vector<std::shared_ptr<MatchSidecar>>* made) const {
+        ComputeContext* dev = GroupGpu();
+        GpuLock lock(dev);
+        GpuKnn knn(dev);
+        std::string err;
+        const size_t nImg = images.size();
+
+        std::vector<char> used(nImg, 0);
+        for (size_t i = 0; i < nImg; ++i)
+            for (const auto& r : refsOf[i]) used[i] = used[size_t(r.first)] = 1;
+        std::vector<GpuBuffer> bufs(nImg);
+        int dim = 0;
+        for (size_t i = 0; i < nImg; ++i) {
+            if (!used[i]) continue;
+            const DescriptorSet& d = FeaturesOf(images[i])->descriptors;
+            dim = d.dim;
+            if (!GpuKnn::Supports(dim) ||
+                !knn.Upload(d.f.data(), int(d.Count()), dim, &bufs[i], &err))
+                return false;
+        }
+
+        // Every pair, in the order the sets are reported.
+        struct PairJob {
+            size_t i;
+            int refIdx;
+            bool revisit;
+            std::vector<int> idx, back;
+            std::vector<float> d2;
+            MatchSet set;
+        };
+        std::vector<PairJob> pairs;
+        for (size_t i = 0; i < nImg; ++i)
+            for (const auto& [refIdx, revisit] : refsOf[i]) {
+                PairJob pj;
+                pj.i = i;
+                pj.refIdx = refIdx;
+                pj.revisit = revisit;
+                pairs.push_back(std::move(pj));
+            }
+
+        // IN BATCHES: a batch's searches are recorded together, merged on
+        // the device and read back once, then its pairs are judged on every
+        // core. One pair at a time, the device waited on the CPU and the
+        // CPU on the device. A batch's output is ~0.4 MB a pair.
+        const bool cross = bool(m_crossCheck);
+        constexpr size_t kBatch = 64;
+        std::vector<GpuKnn::Job> jobs;
+        for (size_t b0 = 0; b0 < pairs.size(); b0 += kBatch) {
+            if (GroupCancelled()) return false;
+            const size_t b1 = std::min(pairs.size(), b0 + kBatch);
+            jobs.clear();
+            for (size_t p = b0; p < b1; ++p) {
+                PairJob& pj = pairs[p];
+                const int nq = int(FeaturesOf(images[pj.i])->descriptors.Count());
+                const int nr = int(FeaturesOf(images[size_t(pj.refIdx)])->descriptors.Count());
+                GpuKnn::Job fwd;
+                fwd.q = &bufs[pj.i];
+                fwd.nq = nq;
+                fwd.db = &bufs[size_t(pj.refIdx)];
+                fwd.nd = nr;
+                fwd.k = kKnnMax;
+                fwd.idx = &pj.idx;
+                fwd.d2 = &pj.d2;
+                // The cross check's search the other way round, from the
+                // same distances rather than a second pass: see GpuKnn::Job.
+                if (cross) fwd.back = &pj.back;
+                jobs.push_back(fwd);
+            }
+            if (!knn.SearchBatch(jobs, dim, &err)) return false;
+
+            ParallelFor(b1 - b0, [&](size_t o) {
+                PairJob& pj = pairs[b0 + o];
+                const FeatureSidecar* fs = FeaturesOf(images[pj.i]);
+                const FeatureSidecar* ref = FeaturesOf(images[size_t(pj.refIdx)]);
+                pj.set.reference = pj.refIdx;
+                pj.set.revisit = pj.revisit;
+                Judge(*ref, *fs, true, pj.back, &pj.set, [&](size_t q, std::vector<Candidate>* c) {
+                    c->clear();
+                    for (int j = 0; j < kKnnMax; ++j) {
+                        const size_t at = q * size_t(kKnnMax) + size_t(j);
+                        if (pj.idx[at] >= 0) c->push_back({pj.idx[at], pj.d2[at]});
+                    }
+                });
+                // The candidates are spent; free them as the batch goes.
+                std::vector<int>().swap(pj.idx);
+                std::vector<float>().swap(pj.d2);
+                std::vector<int>().swap(pj.back);
+            });
+        }
+
+        for (PairJob& pj : pairs) {
+            auto& ms = (*made)[pj.i];
+            if (!ms) ms = std::make_shared<MatchSidecar>();
+            ms->considered += pj.set.considered;
+            ms->sets.push_back(std::move(pj.set));
+        }
+        return true;
+    }
 };
 
 } // namespace

@@ -192,6 +192,21 @@ struct RasterOptions {
     // Added to the 2D covariance so every Gaussian covers about a pixel.
     double lowPass  = 0.3;
     Vec3   background;          // what a pixel shows where nothing covers it
+
+    // DEPTH-GATED COLOUR, for training (Backward only). Where a pixel has a
+    // measured depth -- the depth target passed to Backward as its shift --
+    // a Gaussian whose own depth differs from it by more than this fraction
+    // of it gets NO colour gradient from that pixel. Its opacity and shape
+    // gradients are untouched.
+    //
+    // Why: at an occluding edge a Gaussian on the near surface overlaps
+    // pixels that show the far one -- the frame of a pair of glasses over
+    // the skin behind it -- and the colour loss pulls its colour toward
+    // what those pixels show, which renders as a halo of the far surface's
+    // colour around the near one. Gated, it cannot become skin-coloured;
+    // the loss can still make it fade or shrink off those pixels, which is
+    // the right fix for an edge that overhangs. 0 is off.
+    double colourGate = 0.0;
 };
 
 class SplatRaster {

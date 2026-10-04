@@ -1,9 +1,15 @@
 #include "video_io.h"
+#include "parallel.h"
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
+#include <mutex>
+#include <thread>
 
 #include <windows.h>
 #include <mfapi.h>
@@ -259,8 +265,19 @@ public:
         m_every = (o.floorFrames > 0 && seconds > 0.0) ? seconds / double(o.floorFrames) : 0.0;
     }
 
+    // The tracking pyramid of a frame: a function of its pixels alone, so
+    // any number of frames can have theirs built at once.
+    Pyramid Prepare(const uint8_t* px, int pitch) const {
+        return PyramidOf(GreyOf(px, m_w, m_h, pitch, m_kt));
+    }
+
     void Frame(const uint8_t* px, int pitch, double t, double score) {
-        Pyramid p = PyramidOf(GreyOf(px, m_w, m_h, pitch, m_kt));
+        Frame(px, pitch, t, score, Prepare(px, pitch));
+    }
+
+    // ...and the rest, which follows points from frame to frame and so must
+    // see the frames one at a time, in order.
+    void Frame(const uint8_t* px, int pitch, double t, double score, Pyramid p) {
         if (!m_started) {
             m_started = true;
             m_first = true;
@@ -361,9 +378,15 @@ public:
     // The tail: a view half a step past the last kept frame is kept too, and
     // a clip too short to trigger anything still gives its sharpest frame.
     void Finish() {
-        if (m_haveCand && (m_frames->empty() || m_candD >= 0.5 * m_step || m_first))
+        if (m_haveCand && (m_pending.empty() || m_candD >= 0.5 * m_step || m_first))
             Emit(m_prev, 1);
         m_info->step = m_step;
+        m_frames->resize(m_pending.size());
+        ParallelFor(m_pending.size(), [&](size_t i) {
+            (*m_frames)[i] = FrameToImage(m_pending[i].data(), m_w, m_h, m_w * 4, m_k, m_rot, true);
+            std::vector<uint8_t>().swap(m_pending[i]);   // each frame's raw copy gone as it goes
+        });
+        m_pending.clear();
     }
 
 private:
@@ -395,7 +418,11 @@ private:
     }
 
     void Emit(const Pyramid& now, int why) {
-        m_frames->push_back(FrameToImage(m_cand.data(), m_w, m_h, m_w * 4, m_k, m_rot, true));
+        // The pixels as they are; turned into an image -- downscaled and
+        // rotated upright, 16 ms a frame -- in Finish, many at once. Done
+        // here, one at a time, it was 25 s of decoding a 219 s room scan.
+        m_pending.push_back(std::move(m_cand));
+        m_cand.clear();
         m_info->times.push_back(m_candTime);
         m_info->sharpness.push_back(m_candScore);
         m_info->motion.push_back(m_candD);
@@ -409,13 +436,13 @@ private:
         m_first = false;
         // TOO MANY: every other frame goes and the step doubles, so spacing
         // still follows the motion, only coarser.
-        if (m_o.maxFrames > 0 && int(m_frames->size()) > m_o.maxFrames) {
+        if (m_o.maxFrames > 0 && int(m_pending.size()) > m_o.maxFrames) {
             auto thin = [](auto& v) {
                 size_t o = 0;
                 for (size_t i = 0; i < v.size(); i += 2) v[o++] = std::move(v[i]);
                 v.resize(o);
             };
-            thin(*m_frames);
+            thin(m_pending);
             thin(m_info->times);
             thin(m_info->sharpness);
             thin(m_info->motion);
@@ -432,6 +459,7 @@ private:
     std::vector<double> m_recent;   // sharpness of the last ~second of frames
     static constexpr double kSharpFrac = 0.6;   // under this of it is blurred
     std::vector<Image>* m_frames;
+    std::vector<std::vector<uint8_t>> m_pending;   // kept frames' pixels, BGRX, until Finish
     VideoInfo* m_info;
     bool m_started = false, m_first = true;
     Pyramid m_prev, m_candPyr;
@@ -469,6 +497,40 @@ int BufferPitch(uint32_t bytes, uint32_t w, uint32_t h) {
         if (pitch >= tight && pitch - tight < 256 && pitch % 4 == 0) return int(pitch);
     }
     return int(tight);
+}
+
+// NV12 -- the decoder's own output, w x h luma then (w/2) x (h/2)
+// interleaved chroma, compact -- to top-down BGRX with X 0: BT.709, limited
+// range, chroma repeated over its 2 x 2 pixels. That is what Media
+// Foundation's own RGB32 conversion does for these clips, which declare no
+// colour metadata: fitted on a frame of IMG_1528 against it, this agrees to
+// within one level, on 3% of values and exactly on the rest (BT.601 was off
+// by 20 levels, interpolated chroma by 87 at edges). Doing it here instead
+// is the point: Media Foundation's conversion is single threaded and was
+// 67 s of decoding a 219 s clip, 11 ms a frame against 2.3 for the decode.
+void Nv12ToBgrx(const uint8_t* nv, int w, int h, uint8_t* out) {
+    const uint8_t* uvPlane = nv + size_t(w) * size_t(h);
+    // Serial: frames are converted many at once, a batch across the cores.
+    for (int y = 0; y < h; ++y) {
+        const uint8_t* yr = nv + size_t(y) * size_t(w);
+        const uint8_t* uv = uvPlane + size_t(y / 2) * size_t(w);
+        uint8_t* o = out + size_t(y) * size_t(w) * 4;
+        for (int x = 0; x < w; ++x) {
+            const double Y = (double(yr[x]) - 16.0) * (255.0 / 219.0);
+            const double cb = (double(uv[(x & ~1)]) - 128.0) * (255.0 / 224.0);
+            const double cr = (double(uv[(x & ~1) + 1]) - 128.0) * (255.0 / 224.0);
+            const double r = Y + 1.5748 * cr;
+            const double b = Y + 1.8556 * cb;
+            const double g = (Y - 0.2126 * r - 0.0722 * b) / 0.7152;
+            auto px8 = [](double v) {
+                return uint8_t(v <= 0.0 ? 0 : v >= 255.0 ? 255 : int(v + 0.5));
+            };
+            o[4 * x + 0] = px8(b);
+            o[4 * x + 1] = px8(g);
+            o[4 * x + 2] = px8(r);
+            o[4 * x + 3] = 0;
+        }
+    }
 }
 
 double FrameSharpness(const uint8_t* px, int w, int h, int pitch) {
@@ -578,10 +640,21 @@ bool LoadVideoFrames(const std::string& path, const VideoOptions& opt,
         native->GetUINT32(MF_MT_VIDEO_ROTATION, &rot);
     }
 
+    // NV12 by motion -- converted here, in parallel; see Nv12ToBgrx -- and
+    // RGB32 from the reader otherwise, or when NV12 is not on offer.
     MFCreateMediaType(&want);
     want->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-    want->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
-    hr = reader->SetCurrentMediaType(kStream, nullptr, want);
+    bool nv12 = opt.pick == VideoPick::Motion;
+    hr = E_FAIL;
+    if (nv12) {
+        want->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
+        hr = reader->SetCurrentMediaType(kStream, nullptr, want);
+        nv12 = SUCCEEDED(hr);
+    }
+    if (!nv12) {
+        want->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
+        hr = reader->SetCurrentMediaType(kStream, nullptr, want);
+    }
     if (FAILED(hr)) {
         *err = "could not decode '" + path + "' (" + HrText(hr) + ")";
         if (codec == MFVideoFormat_HEVC)
@@ -646,6 +719,108 @@ bool LoadVideoFrames(const std::string& path, const VideoOptions& opt,
         candScore = -1.0;
     };
 
+    // DECODING AND ANALYSIS OVERLAP, by motion, in batches. Measured on a
+    // 219 s room scan, 6183 frames: decoding with Media Foundation's RGB
+    // conversion 14.7 ms a frame, sharpness and motion tracking 11.6 ms, one
+    // after the other -- 168 s. Now this thread decodes, NV12 and no more,
+    // and hands over batches; the analyser converts, scores and builds the
+    // tracking pyramids of a whole batch at once on every core, and only the
+    // tracking itself goes frame by frame. The decisions are made on the
+    // same pixels, to a level, so the frames kept are the same ones.
+    struct Raw { std::vector<uint8_t> px; double t; };
+    constexpr size_t kBatch = 32, kBatchesInFlight = 2;
+    std::mutex qMtx;
+    std::condition_variable qCv;
+    std::deque<std::vector<Raw>> batches;
+    std::vector<std::vector<uint8_t>> spare;
+    bool decodeDone = false;
+    std::thread analyser;
+    if (byMotion) {
+        analyser = std::thread([&] {
+            // A batch prepared -- converted, scored, its pyramids built --
+            // while the one before it is tracked: the two overlap, the
+            // preparation on every core and the tracking on this thread.
+            struct Prepared {
+                std::vector<Raw> raw;
+                std::vector<std::vector<uint8_t>> bgrx;
+                std::vector<double> score;
+                std::vector<Pyramid> pyr;
+            };
+            auto nextBatch = [&](std::vector<Raw>* out) {
+                std::unique_lock<std::mutex> lk(qMtx);
+                qCv.wait(lk, [&] { return !batches.empty() || decodeDone; });
+                if (batches.empty()) return false;
+                *out = std::move(batches.front());
+                batches.pop_front();
+                lk.unlock();
+                qCv.notify_all();
+                return true;
+            };
+            const int stride = int(w) * 4;
+            auto prepare = [&](Prepared* batchIn) {
+                Prepared& pb = *batchIn;
+                const size_t n = pb.raw.size();
+                pb.bgrx.resize(n);
+                pb.score.assign(n, 0.0);
+                pb.pyr.clear();
+                pb.pyr.resize(n);
+                const int fw = int(w), fh = int(h);
+                ParallelFor(n, [&pb, &picker, fw, fh, stride, nv12](size_t i) {
+                    const uint8_t* px = pb.raw[i].px.data();
+                    if (nv12) {
+                        pb.bgrx[i].resize(size_t(fw) * size_t(fh) * 4);
+                        Nv12ToBgrx(px, fw, fh, pb.bgrx[i].data());
+                        px = pb.bgrx[i].data();
+                    }
+                    pb.score[i] = FrameSharpness(px, fw, fh, stride);
+                    pb.pyr[i] = picker.Prepare(px, stride);
+                });
+            };
+            auto track = [&](Prepared* p) {
+                for (size_t i = 0; i < p->raw.size(); ++i)
+                    picker.Frame(nv12 ? p->bgrx[i].data() : p->raw[i].px.data(), stride,
+                                 p->raw[i].t, p->score[i], std::move(p->pyr[i]));
+                std::lock_guard<std::mutex> lk(qMtx);
+                for (Raw& r : p->raw) spare.push_back(std::move(r.px));
+                p->raw.clear();
+            };
+
+            Prepared cur, next;
+            if (!nextBatch(&cur.raw)) return;
+            prepare(&cur);
+            for (;;) {
+                const bool more = nextBatch(&next.raw);
+                std::thread prep;
+                if (more) prep = std::thread([&] { prepare(&next); });
+                track(&cur);
+                if (!more) return;
+                prep.join();
+                std::swap(cur, next);
+            }
+        });
+    }
+    std::vector<Raw> filling;
+    auto handOver = [&] {
+        if (filling.empty()) return;
+        {
+            std::unique_lock<std::mutex> lk(qMtx);
+            qCv.wait(lk, [&] { return batches.size() < kBatchesInFlight; });
+            batches.push_back(std::move(filling));
+        }
+        qCv.notify_all();
+        filling.clear();
+    };
+    auto stopAnalyser = [&] {
+        if (!analyser.joinable()) return;
+        handOver();
+        {
+            std::lock_guard<std::mutex> lk(qMtx);
+            decodeDone = true;
+        }
+        qCv.notify_all();
+        analyser.join();
+    };
+
     for (;;) {
         DWORD flags = 0;
         LONGLONG ts = 0;
@@ -655,6 +830,7 @@ bool LoadVideoFrames(const std::string& path, const VideoOptions& opt,
             SafeRelease(&sample);
             *err = "decoding '" + path + "' failed after " +
                    std::to_string(info->decoded) + " frames (" + HrText(hr) + ")";
+            stopAnalyser();
             cleanup();
             return false;
         }
@@ -671,19 +847,54 @@ bool LoadVideoFrames(const std::string& path, const VideoOptions& opt,
             BYTE* raw = nullptr;
             DWORD len = 0;
             bool locked2d = false, locked = false;
+            // NV12's chroma plane follows the luma's rows, which a decoder
+            // pads (1088 for 1080): found from the buffer's whole length.
+            const uint8_t* uvPlane = nullptr;
             if (SUCCEEDED(buf->QueryInterface(IID_PPV_ARGS(&b2))) &&
                 SUCCEEDED(b2->Lock2D(&scan0, &pitch))) {
                 locked2d = true;
+                DWORD clen = 0;
+                if (nv12 && pitch > 0 && SUCCEEDED(b2->GetContiguousLength(&clen)))
+                    uvPlane = scan0 + size_t(pitch) * (size_t(clen) * 2 / 3 / size_t(pitch));
             } else if (SUCCEEDED(buf->Lock(&raw, nullptr, &len))) {
                 locked = true;
                 scan0 = raw;
-                pitch = BufferPitch(len, w, h);
-                if (len < DWORD(pitch) * h) scan0 = nullptr;   // truncated frame
+                if (nv12) {
+                    pitch = LONG(w);
+                    uvPlane = scan0 + size_t(w) * (size_t(len) * 2 / 3 / size_t(w));
+                    if (size_t(len) < size_t(w) * size_t(h) * 3 / 2) scan0 = nullptr;
+                } else {
+                    pitch = BufferPitch(len, w, h);
+                    if (len < DWORD(pitch) * h) scan0 = nullptr;   // truncated frame
+                }
             }
+            if (nv12 && !uvPlane) scan0 = nullptr;
             if (scan0 && byMotion) {
-                const double t = double(ts) * 1e-7;
-                picker.Frame(scan0, int(pitch), t,
-                             FrameSharpness(scan0, int(w), int(h), int(pitch)));
+                Raw r;
+                r.t = double(ts) * 1e-7;
+                {
+                    std::lock_guard<std::mutex> lk(qMtx);
+                    if (!spare.empty()) {
+                        r.px = std::move(spare.back());
+                        spare.pop_back();
+                    }
+                }
+                // Copied compact and top-down, whatever the stored layout.
+                if (nv12) {
+                    r.px.resize(size_t(w) * size_t(h) * 3 / 2);
+                    for (UINT32 y = 0; y < h; ++y)
+                        std::memcpy(r.px.data() + size_t(y) * w, scan0 + ptrdiff_t(y) * pitch, w);
+                    uint8_t* uvOut = r.px.data() + size_t(w) * h;
+                    for (UINT32 y = 0; y < h / 2; ++y)
+                        std::memcpy(uvOut + size_t(y) * w, uvPlane + ptrdiff_t(y) * pitch, w);
+                } else {
+                    r.px.resize(size_t(w) * size_t(h) * 4);
+                    for (UINT32 y = 0; y < h; ++y)
+                        std::memcpy(r.px.data() + size_t(y) * w * 4, scan0 + ptrdiff_t(y) * pitch,
+                                    size_t(w) * 4);
+                }
+                filling.push_back(std::move(r));
+                if (filling.size() >= kBatch) handOver();
                 ++info->decoded;
             } else if (scan0) {
                 const double t = double(ts) * 1e-7;
@@ -713,6 +924,7 @@ bool LoadVideoFrames(const std::string& path, const VideoOptions& opt,
         SafeRelease(&buf);
         SafeRelease(&sample);
     }
+    stopAnalyser();   // every queued frame analysed, in order
     if (byMotion) picker.Finish();
     else flush();
     cleanup();

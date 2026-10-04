@@ -510,6 +510,20 @@ public:
     // to make impossible. TestGpuUsersDeclareIt checks the two agree.
     virtual bool UsesGpuInRunCPU() const { return false; }
 
+    // ...and whether EVERY such use holds GpuLock for as long as it touches
+    // the device -- upload, dispatch and readback as one locked operation,
+    // nothing outside it. Then the frames may run concurrently after all:
+    // the lock serialises the device work, and each frame's CPU work around
+    // it overlaps the others'.
+    //
+    // Opt-in, because the default for a GPU user must stay the safe one. The
+    // learned feature stages declare it: frame by frame, their image
+    // preparation and keypoint sampling ran strictly between network runs,
+    // the device idle for all of it -- detect_dad spent 105 ms a frame on a
+    // 36 ms network, and every frame reported waiting 0 ms for the lock
+    // because no other frame was ever there.
+    virtual bool LocksGpuInRunCPU() const { return false; }
+
     // Compute shader source with a `main` entry point. Bindings by convention:
     //   t0..t3  inputs        u0..u3  outputs
     //   b0      uint Width, uint Height, then GpuConstants() below

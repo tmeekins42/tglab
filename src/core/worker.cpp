@@ -275,6 +275,7 @@ void PipelineWorker::Run() {
             m_lastGpuMs.store(m_progress.GpuMs(), std::memory_order_relaxed);
             m_lastGpuStages.store(job->pipe.GpuStageCount(), std::memory_order_relaxed);
             m_lastCpuStages.store(job->pipe.CpuStageCount(), std::memory_order_relaxed);
+            m_lastHybridStages.store(job->pipe.HybridStageCount(), std::memory_order_relaxed);
             m_lastCachedStages.store(job->pipe.CachedStageCount(), std::memory_order_relaxed);
             m_lastBypassed.store(job->pipe.BypassedStageCount(), std::memory_order_relaxed);
             m_lastScale.store(job->pipe.RanAtScale(), std::memory_order_relaxed);

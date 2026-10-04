@@ -47,8 +47,15 @@ add_library(tglab_core STATIC
     src/core/image_loader.cpp
     src/algo_util/auto_develop.cpp
     src/algo_util/depth_views.cpp
+    src/algo_util/gpu_knn.cpp
     src/algo_util/histogram.cpp
+    src/algo_util/loma.cpp
+    src/algo_util/dad.cpp
+    src/algo_util/dedode.cpp
+    src/algo_util/nn.cpp
+    src/algo_util/nn_gpu.cpp
     src/algo_util/pixel_buffer.cpp
+    src/algo_util/sparse_cholesky.cpp
     src/algo_util/splat_raster.cpp
     src/algo_util/splat_reflect.cpp
     src/algo_util/splat_raster_gpu.cpp
@@ -238,6 +245,16 @@ if(MSVC)
 endif()
 tglab_copy_dxc(tglab_pyramid_tests)
 
+# Neural-network operations (src/algo_util/nn.h): the CPU path against
+# PyTorch, and the GPU kernels against the CPU. Skips the GPU half without a
+# device.
+add_executable(tglab_nn_tests tests/test_nn.cpp)
+target_link_libraries(tglab_nn_tests PRIVATE tglab_core d3d12 dxgi)
+if(MSVC)
+    target_compile_definitions(tglab_nn_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+tglab_copy_dxc(tglab_nn_tests)
+
 enable_testing()
 add_test(NAME script_spine COMMAND tglab_tests)
 add_test(NAME filters      COMMAND tglab_filter_tests)
@@ -246,6 +263,7 @@ add_test(NAME demosaic     COMMAND tglab_demosaic_tests)
 add_test(NAME runtime      COMMAND tglab_runtime_tests)
 add_test(NAME denoise      COMMAND tglab_denoise_tests)
 add_test(NAME pyramid      COMMAND tglab_pyramid_tests)
+add_test(NAME nn           COMMAND tglab_nn_tests)
 
 # Manual reproduction harness, not an add_test().
 #
@@ -480,3 +498,21 @@ target_link_libraries(bench_dehaze PRIVATE tglab_core)
 if(MSVC)
     target_compile_definitions(bench_dehaze PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
+
+# The learned networks (src/algo_util/nn.h) against PyTorch, layer by layer,
+# from a reference that tools/nn_reference.py saves. See the tool's header.
+add_executable(bench_nn tools/bench_nn.cpp)
+target_link_libraries(bench_nn PRIVATE tglab_core d3d12 dxgi)
+if(MSVC)
+    target_compile_definitions(bench_nn PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+tglab_copy_dxc(bench_nn)
+
+# The block-sparse Cholesky (src/algo_util/sparse_cholesky.h) on a synthetic
+# reduced camera system the size of a long video's, timed.
+add_executable(bench_sparse tools/bench_sparse.cpp)
+target_link_libraries(bench_sparse PRIVATE tglab_core d3d12 dxgi)
+if(MSVC)
+    target_compile_definitions(bench_sparse PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+tglab_copy_dxc(bench_sparse)

@@ -158,6 +158,7 @@ public:
     // How the last completed job split across backends.
     int LastGpuStages()    const { return m_lastGpuStages.load(std::memory_order_relaxed); }
     int LastCpuStages()    const { return m_lastCpuStages.load(std::memory_order_relaxed); }
+    int LastHybridStages() const { return m_lastHybridStages.load(std::memory_order_relaxed); }
     int LastCachedStages() const { return m_lastCachedStages.load(std::memory_order_relaxed); }
 
     // Stages skipped because their settings would change nothing.
@@ -274,6 +275,7 @@ private:
     Progress              m_progress;
 
     std::atomic<int>      m_lastGpuStages{0};
+    std::atomic<int>      m_lastHybridStages{0};
     std::atomic<int>      m_lastCpuStages{0};
     std::atomic<int>      m_lastCachedStages{0};
     std::atomic<double>   m_lastMs{0.0};

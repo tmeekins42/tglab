@@ -18,18 +18,16 @@
 # WHAT EACH STAGE DOES, because the chain is long and every stage solves a
 # genuinely different problem:
 #
-#   detect_akaze     finds features. AKAZE because it measures the most
-#                    repeatable of the detectors here (96% on the stock
-#                    fixture against SIFT's 70%), and repeatability is the
-#                    whole game: a point that is not found again in the next
-#                    frame contributes nothing.
+#   detect_dad       finds features: a network trained to pick points that are
+#                    found again in other views, because repeatability is the
+#                    whole game -- a point that is not found again in the next
+#                    frame contributes nothing. detect_akaze is the designed
+#                    alternative; see the measurements at `feat` below.
 #
-#                    `max_dim` downscales what the DETECTOR sees without
-#                    touching the image, which is what lets the rest of the
-#                    pipeline work at full resolution -- see the note on
-#                    resize below.
+#   describe_dedode  describes them: a network's 128-float description of
+#                    each point, far more distinctive than a designed one.
 #
-#   match_ann        pairs them. `chain` matches each frame against its
+#   match_ann        pairs them, exactly on the GPU for float descriptors. `chain` matches each frame against its
 #                    neighbours rather than against frame 0, and `window` says
 #                    how many neighbours. More than one is what gives the view
 #                    graph loops, and loops are what let rotation averaging
@@ -138,48 +136,47 @@ frames = image("group")
 # final reconstruction. Both are correct; they differ in how long you wait.
 small = params( resize, scale = 0.4 )( frames )
 
+# LEARNED FEATURES BY DEFAULT: DaD finds the points and DeDoDe describes them
+# -- the detector and descriptor of LoMa (2026), run on tglab's own kernels.
+# Measured against the AKAZE line below, everything else as in this script:
+#
+#                          inliers/pair   points   ray residual   focal
+#   fountain-P11  AKAZE         437         1998      0.171 deg   57.9 deg
+#                 learned      3998        10131      0.035       58.1
+#   castle-P19    AKAZE         299         2175      0.982       57.9
+#                 learned      2044        14450      0.130       58.2
+#
+# (Both captures are calibrated at 58.2 degrees.) On a hand-held video of a
+# chrome tape measure the weakest link in the sequence went from 39
+# triangulated tracks to 389 -- the difference between one reconstruction
+# and two copies of the subject.
+#
+# The two networks take about a fifth of a second a frame on an RTX 4070 Ti
+# (and several seconds on the CPU, without a device). Their weights live in
+# models/ beside tglab; see third_party/models/README.md.
+#
+# DaD keeps the 10000 strongest points after non-maximum suppression. It
+# spreads them evenly by construction -- it was trained to pick points that
+# are found again -- so the cap does not starve flat regions the way a
+# designed detector's response ranking does (see the AKAZE notes below).
+feat  = params( describe_dedode )( params( detect_dad, max_features = 10000 )( small ) )
+
+# THE DESIGNED ALTERNATIVE: swap this in for the line above to compare.
+#
 # MORE FEATURES THAN THE DETECTOR'S DEFAULT, because 5000 is a cap tuned for
-# a single image and SfM is not that.
+# a single image and SfM is not that. A detector that hits its cap discards
+# candidates by response rank rather than by which points the NEXT frame will
+# also find. Measured on castle-P19: cap 5000 gave 359 inliers a pair and 987
+# points, 10000 gave 505 and 1669, 20000 no more -- at this resolution AKAZE
+# finds fewer than 10000.
 #
-# A detector that hits its cap is discarding candidates, and what it discards
-# is decided by response ranking rather than by which points the NEXT frame
-# will also find. Measured on castle-P19 with this script as it stands:
-#
-#    cap     inliers/pair  cameras  points  ray residual
-#    5000        359        19/19     987      0.99 deg
-#   10000        505        19/19    1669      0.80 deg
-#   20000        505        19/19    1669      0.80 deg
-#
-# At this resolution (resize 0.4, max_dim 1200) AKAZE finds fewer than 10000
-# features a frame, so the cap stops binding there and 20000 changes nothing.
-# At higher resolution it does bind, and more is not simply better: the extra
-# features are low-response texture that matches ambiguously.
-#
-# The cost is quadratic in the matcher, so this is the first control to lower
-# if a large set is slow.
 # colour = 1 APPENDS 84 BITS OF OPPONENT-COLOUR to each descriptor, which AKAZE
-# otherwise throws away entirely -- it describes a greyscale patch, so two
-# bricks of different colour with the same relief are indistinguishable to it.
-# On a scene of repetitive masonry that is exactly the ambiguity that matters.
+# otherwise throws away: it describes a greyscale patch, so two bricks of
+# different colour with the same relief are indistinguishable to it. On
+# fountain-P11 it took inliers a pair from 582 to 685 and halved the worst
+# rotation residual. Turn it off for a monochrome capture.
 #
-# MEASURED ON fountain-P11:
-#
-#   colour   inliers/pair   points   worst rotation residual
-#        0            582     1733                  1.61 deg
-#        1            685     2027                  0.78 deg
-#
-# More matches survive RANSAC, and the ones that do disagree with each other
-# half as much.
-#
-# (An earlier version of this table also claimed colour turned a phantom
-# second brick wall into one sheet. That was measured while camera
-# positioning was broken -- see global_position -- and does not reproduce:
-# with it fixed, the depth profile shows two peaks either way, which on this
-# scene are the fountain and the wall behind it.)
-#
-# Turn it off for a monochrome or near-monochrome capture, where the extra
-# bits carry no information and only cost matching time.
-feat  = params( detect_akaze, max_features = 10000, colour = 1 )( small )
+# feat = params( detect_akaze, max_features = 10000, colour = 1 )( small )
 
 # CHAIN IS NOT THE DEFAULT, and leaving it off is the single easiest way to
 # get nothing out of this script.
@@ -228,6 +225,28 @@ feat  = params( detect_akaze, max_features = 10000, colour = 1 )( small )
 #   cat video          0.32              113 / 24     one closed ring
 #   rose video         0.29              112 / 33
 pairs = params( match_ann, chain = 1, window = 2, revisit = 3 )( feat )
+
+# LoMa's LEARNED MATCHER instead of nearest neighbour: a transformer that
+# rewrites every point's description by attention -- to its own image, then
+# to the other -- before matching, so repeated structure is resolved by
+# context. It needs the descriptors raw, and few enough points that its
+# quadratic attention stays affordable:
+#
+# feat  = params( describe_dedode, normalise = 0 )( params( detect_dad, max_features = 4096 )( small ) )
+# pairs = params( match_ann, method = 1, chain = 1, window = 2, revisit = 3 )( feat )
+#
+# MEASURED against nearest neighbour on the same 4096 points a frame:
+#
+#                       points       reprojection   worst rotation   matching
+#   castle-P19   NN       7967          0.38 px           --            1.2 s
+#                LoMa     8765          0.44             --           10.9
+#   IMG_1535     NN      26297          0.83            10.8 deg       17 s
+#                LoMa    25385          0.88             4.8           91 s
+#
+# Better pairwise geometry -- the rotation graph's worst edge halves -- and
+# about as many points, for five to ten times the matching time. `layers = 3`
+# keeps 95% of the points at half the cost. Not the default, then: the
+# nearest-neighbour line above, with 10000 points, still reconstructs more.
 
 # NO align_features here, unlike the panorama script. It fits a homography,
 # which describes a pure camera ROTATION -- exactly what SfM does not have.

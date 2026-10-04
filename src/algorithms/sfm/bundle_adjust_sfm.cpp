@@ -60,7 +60,9 @@
 
 #include "../../algo_util/least_squares.h"
 #include "../../algo_util/linalg.h"
+#include "../../algo_util/sparse_cholesky.h"
 #include "../../core/algorithm.h"
+#include "../../core/parallel.h"
 
 namespace tglab {
 namespace {
@@ -397,17 +399,31 @@ bool BundleAdjustSfm::RunReconstruct(const std::vector<Image>*, PointCloud* clou
     // camera and a real reward for pulling it back.
     const double kBehindPenalty = 1e4;   // pixels squared, per observation
 
+    // Observations in fixed chunks, each summed on its own thread and the
+    // partial sums added in chunk order -- the same total whatever the
+    // thread count, which matters because accepting a step compares costs.
+    constexpr size_t kObsChunk = 4096;
+    const size_t nChunks = (obs.size() + kObsChunk - 1) / kObsChunk;
+
     auto evaluate = [&](const State& st, double* rms) {
-        double sum = 0.0;
-        for (const Obs& o : obs) {
-            double rx, ry, Jc[14], Jp[6], Jf[2];
-            if (!Residual(st, o, cx[size_t(o.cam)], cy[size_t(o.cam)], doFocal,
-                          &rx, &ry, Jc, Jp, Jf)) {
-                sum += kBehindPenalty;
-                continue;
+        std::vector<double> part(nChunks, 0.0);
+        ParallelFor(nChunks, [&](size_t ci) {
+            double sum = 0.0;
+            const size_t end = std::min(obs.size(), (ci + 1) * kObsChunk);
+            for (size_t i = ci * kObsChunk; i < end; ++i) {
+                const Obs& o = obs[i];
+                double rx, ry, Jc[14], Jp[6], Jf[2];
+                if (!Residual(st, o, cx[size_t(o.cam)], cy[size_t(o.cam)], doFocal,
+                              &rx, &ry, Jc, Jp, Jf)) {
+                    sum += kBehindPenalty;
+                    continue;
+                }
+                sum += rx * rx + ry * ry;
             }
-            sum += rx * rx + ry * ry;
-        }
+            part[ci] = sum;
+        });
+        double sum = 0.0;
+        for (double p : part) sum += p;
         // Divided by EVERY observation, not the ones that happened to project,
         // so the reported RMS is comparable across runs too.
         *rms = obs.empty() ? 0.0 : std::sqrt(sum / double(obs.size()));
@@ -416,6 +432,72 @@ bool BundleAdjustSfm::RunReconstruct(const std::vector<Image>*, PointCloud* clou
 
     double rms0 = 0.0;
     double cost = evaluate(s, &rms0);
+
+    // THE REDUCED CAMERA SYSTEM IS SPARSE, and is stored and factored so.
+    //
+    // A node per camera, plus one for the shared focal, which couples to
+    // every camera. Two cameras' block is non-zero only when some point is
+    // seen by both, so the pattern comes straight from the observations and
+    // does not change from one iteration to the next.
+    //
+    // It was dense: S, B and a copy per elimination worker, each nS x nS.
+    // Fine at 179 cameras (9 MB a copy); at a room scan's 1577 that was
+    // 720 MB a copy and a 9500-unknown Cholesky on every step -- 887 s of
+    // bundle adjustment, for a matrix that is nearly all zeros. Sparse, the
+    // same solve took 78 s to the same answer, step for step; at 179
+    // cameras, where the system is nearly dense anyway, it is level with the
+    // dense code (the factor is the same kernel, run on supernode panels).
+    const int focalNode = shareFocal ? nActiveCam : -1;
+    linalg::BlockSparseCholesky sys;
+    {
+        std::vector<int> sizes(static_cast<size_t>(nActiveCam), camParams);
+        if (shareFocal) sizes.push_back(1);
+        std::vector<std::vector<int>> camsOf(static_cast<size_t>(nActivePt));
+        for (const Obs& o : obs) camsOf[size_t(o.pt)].push_back(o.cam);
+        std::vector<std::pair<int, int>> pairs;
+        for (auto& cs : camsOf) {
+            std::sort(cs.begin(), cs.end());
+            cs.erase(std::unique(cs.begin(), cs.end()), cs.end());
+            for (size_t a = 0; a < cs.size(); ++a)
+                for (size_t b = a + 1; b < cs.size(); ++b) pairs.push_back({cs[b], cs[a]});
+        }
+        if (shareFocal)
+            for (int c = 0; c < nActiveCam; ++c) pairs.push_back({focalNode, c});
+        if (!sys.Analyse(sizes, pairs)) { *err = "bundle_adjust_sfm: bad system pattern"; return false; }
+    }
+    // A scalar's diagonal entry in the sparse values, for the damping.
+    auto diagAt = [&](int a) -> size_t {
+        const int node = (shareFocal && a == focalCol) ? focalNode : a / camParams;
+        const int within = a - sys.Scalar(node);
+        return size_t(sys.Offset(node, node)) + size_t(within * sys.Size(node) + within);
+    };
+
+    // Each elimination worker's own share of S and g_S (see the elimination
+    // below), allocated once for the whole solve.
+    std::vector<std::vector<double>> workerS(ParallelThreads(size_t(nActivePt)));
+    std::vector<std::vector<double>> workerG(workerS.size());
+    for (size_t w = 0; w < workerS.size(); ++w) {
+        workerS[w].assign(sys.NumValues(), 0.0);
+        workerG[w].assign(size_t(nS), 0.0);
+    }
+
+    // The accumulated blocks, kept across iterations: see "only when the state
+    // has moved" below.
+    std::vector<double> B(sys.NumValues(), 0.0);
+    std::vector<double> Cblk(size_t(nActivePt) * 9, 0.0);
+    std::vector<double> gCam(size_t(nS), 0.0);
+    std::vector<double> gPt(size_t(nActivePt) * 3, 0.0);
+    // E is stored per observation rather than as a matrix: it is the only
+    // genuinely sparse part, and materialising it would cost the memory the
+    // Schur complement exists to save.
+    struct EBlock { int cam, pt; double m[7 * 3]; };
+    std::vector<EBlock> E;
+    E.reserve(obs.size());
+    std::vector<std::vector<int>> byPoint;
+    byPoint.resize(size_t(nActivePt));
+    struct ObsJ { bool ok; double rx, ry, Jc[14], Jp[6], Jf[2]; };
+    std::vector<ObsJ> jac(obs.size());
+    bool blocksValid = false;
 
     LmDamping damp{1e-4, 10.0, 0.3, 1e-10, 1e12};
     int taken = 0;
@@ -428,23 +510,39 @@ bool BundleAdjustSfm::RunReconstruct(const std::vector<Image>*, PointCloud* clou
         // C: point-point, 3x3 per point and block diagonal -- the property the
         //    Schur complement exploits.
         // E: camera-point coupling, one block per observation.
-        std::vector<double> B(size_t(nS) * size_t(nS), 0.0);
-        std::vector<double> Cblk(size_t(nActivePt) * 9, 0.0);
-        std::vector<double> gCam(size_t(nS), 0.0);
-        std::vector<double> gPt(size_t(nActivePt) * 3, 0.0);
+        //
+        // ONLY WHEN THE STATE HAS MOVED. A rejected step leaves the cameras
+        // and points where they were, and these depend on nothing else -- the
+        // damping enters only below -- so they are kept. That is most
+        // iterations: Levenberg-Marquardt ends by raising the damping until no
+        // step helps, and measured on a 179-camera video a solve of 21
+        // iterations accepted 3.
+        if (!blocksValid) {
+        std::fill(B.begin(), B.end(), 0.0);
+        std::fill(Cblk.begin(), Cblk.end(), 0.0);
+        std::fill(gCam.begin(), gCam.end(), 0.0);
+        std::fill(gPt.begin(), gPt.end(), 0.0);
+        E.clear();
 
-        // E is stored per observation rather than as a matrix: it is the only
-        // genuinely sparse part, and materialising it would cost the memory
-        // the Schur complement exists to save.
-        struct EBlock { int cam, pt; double m[7 * 3]; };
-        std::vector<EBlock> E;
-        E.reserve(obs.size());
+        // Residuals and Jacobians in parallel, the summing below serially.
+        ParallelFor(nChunks, [&](size_t ci) {
+            const size_t end = std::min(obs.size(), (ci + 1) * kObsChunk);
+            for (size_t i = ci * kObsChunk; i < end; ++i) {
+                const Obs& o = obs[i];
+                ObsJ& j = jac[i];
+                j.ok = Residual(s, o, cx[size_t(o.cam)], cy[size_t(o.cam)], doFocal, &j.rx,
+                                &j.ry, j.Jc, j.Jp, j.Jf);
+            }
+        });
 
-        for (const Obs& o : obs) {
-            double rx, ry, Jc[14], Jp[6], Jf[2];
-            if (!Residual(s, o, cx[size_t(o.cam)], cy[size_t(o.cam)], doFocal,
-                          &rx, &ry, Jc, Jp, Jf))
-                continue;
+        for (size_t oi = 0; oi < obs.size(); ++oi) {
+            const Obs& o = obs[oi];
+            const ObsJ& j = jac[oi];
+            if (!j.ok) continue;
+            const double rx = j.rx, ry = j.ry;
+            const double* Jc = j.Jc;
+            const double* Jp = j.Jp;
+            const double* Jf = j.Jf;
 
             const double wgt = RobustWeight(RobustLoss(lossKind),
                                             std::sqrt(rx * rx + ry * ry), delta);
@@ -468,15 +566,21 @@ bool BundleAdjustSfm::RunReconstruct(const std::vector<Image>*, PointCloud* clou
                 A[1][camParams] = Jf[1];
             }
 
-            // B is no longer block diagonal when the focal is shared: the
-            // shared column couples every camera to every other. It was
-            // already stored densely, so this costs nothing but the honesty
-            // of saying so.
+            // B is this camera's own block, plus -- when the focal is shared --
+            // its coupling to the focal node and the focal's own entry.
+            double M[8 * 8];
             for (int a = 0; a < nA; ++a) {
                 for (int b = 0; b < nA; ++b)
-                    B[size_t(idx[a]) * size_t(nS) + size_t(idx[b])] +=
-                        wgt * (A[0][a] * A[0][b] + A[1][a] * A[1][b]);
+                    M[a * nA + b] = wgt * (A[0][a] * A[0][b] + A[1][a] * A[1][b]);
                 gCam[size_t(idx[a])] -= wgt * (A[0][a] * rx + A[1][a] * ry);
+            }
+            double own[7 * 7];
+            for (int a = 0; a < camParams; ++a)
+                for (int b = 0; b < camParams; ++b) own[a * camParams + b] = M[a * nA + b];
+            sys.Add(B.data(), o.cam, o.cam, own);
+            if (shareFocal) {
+                sys.Add(B.data(), focalNode, o.cam, &M[camParams * nA]);
+                sys.Add(B.data(), focalNode, focalNode, &M[camParams * nA + camParams]);
             }
 
             double* Cp = &Cblk[size_t(o.pt) * 9];
@@ -494,6 +598,14 @@ bool BundleAdjustSfm::RunReconstruct(const std::vector<Image>*, PointCloud* clou
                 for (int b = 0; b < 3; ++b)
                     eb.m[a * 3 + b] = wgt * (A[0][a] * Jp[b] + A[1][a] * Jp[3 + b]);
             E.push_back(eb);
+        }
+
+        // Group the E blocks by point, so each point's contribution to S is
+        // accumulated once over the cameras that saw it.
+        for (auto& v : byPoint) v.clear();
+        for (size_t i = 0; i < E.size(); ++i)
+            byPoint[size_t(E[i].pt)].push_back(int(i));
+        blocksValid = true;
         }
 
         // --- Schur complement -----------------------------------------------
@@ -558,7 +670,7 @@ bool BundleAdjustSfm::RunReconstruct(const std::vector<Image>*, PointCloud* clou
         };
         for (int a = 0; a < nS; ++a) {
             const int k = kindOf(a);
-            diagSum[k] += S[size_t(a) * size_t(nS) + size_t(a)];
+            diagSum[k] += S[diagAt(a)];
             ++diagN[k];
         }
         double diagMean[3];
@@ -568,7 +680,7 @@ bool BundleAdjustSfm::RunReconstruct(const std::vector<Image>*, PointCloud* clou
         }
 
         for (int a = 0; a < nS; ++a) {
-            double& d = S[size_t(a) * size_t(nS) + size_t(a)];
+            double& d = S[diagAt(a)];
             d = d * (1.0 + damp.lambda) + damp.lambda * diagMean[kindOf(a)];
         }
 
@@ -584,66 +696,131 @@ bool BundleAdjustSfm::RunReconstruct(const std::vector<Image>*, PointCloud* clou
             if (ptOk[size_t(p)]) std::copy(inv.m, inv.m + 9, &Cinv[size_t(p) * 9]);
         }
 
-        // Group the E blocks by point, so each point's contribution to S is
-        // accumulated once over the cameras that saw it.
-        std::vector<std::vector<int>> byPoint;
-        byPoint.resize(size_t(nActivePt));
-        for (size_t i = 0; i < E.size(); ++i)
-            byPoint[size_t(E[i].pt)].push_back(int(i));
+        // THE ELIMINATION, S -= E C^-1 E^T and g_S -= E C^-1 g_p, point by
+        // point. A point seen by L cameras couples every pair of them, so
+        // this is L^2 small products per point, and it was most of a bundle
+        // adjustment's time -- 480 ms of every iteration on a 179-camera
+        // video (36k points, tracks up to 100 frames long). Three things
+        // cut it down, none of which changes the arithmetic beyond the
+        // order of summation:
+        //
+        //   E C^-1 is formed ONCE per observation, rather than again for
+        //   every pair the observation is in;
+        //   only pairs ii <= jj are formed, the other half by symmetry;
+        //   points are dealt round-robin to a fixed set of workers, each
+        //   summing into its own copy of S and g_S, added together at the
+        //   end -- S is shared by every point, so threads cannot write it
+        //   directly.
+        //
+        // Slot `a` of camera `c`'s block, as an index into the reduced
+        // system. Slots 0..camParams-1 are that camera's own; the extra slot,
+        // present only when the focal is shared, is the one column every
+        // camera contributes to.
+        const int nE = shareFocal ? camParams + 1 : camParams;
+        auto slot = [&](int cam, int a) {
+            return (shareFocal && a == camParams) ? focalCol : cam * camParams + a;
+        };
+        ParallelFor(workerS.size(), [&](size_t w) {
+            std::vector<double>& Sl = workerS[w];
+            std::vector<double>& gl = workerG[w];
+            std::fill(Sl.begin(), Sl.end(), 0.0);
+            std::fill(gl.begin(), gl.end(), 0.0);
+            std::vector<double> EC;   // this point's E C^-1, nE x 3 per observation
+            for (size_t p = w; p < size_t(nActivePt); p += workerS.size()) {
+                if (!ptOk[p]) continue;
+                const double* Ci = &Cinv[p * 9];
+                const double* gp = &gPt[p * 3];
+                const std::vector<int>& seen = byPoint[p];
+                const size_t L = seen.size();
 
-        for (int p = 0; p < nActivePt; ++p) {
-            if (!ptOk[size_t(p)]) continue;
-            const double* Ci = &Cinv[size_t(p) * 9];
-            const double* gp = &gPt[size_t(p) * 3];
+                // C^-1 g_p, for the gradient.
+                double Cg[3] = {};
+                for (int a = 0; a < 3; ++a)
+                    for (int b = 0; b < 3; ++b) Cg[a] += Ci[a * 3 + b] * gp[b];
 
-            // C^-1 g_p, used by both the gradient and the back-substitution.
-            double Cg[3] = {};
-            for (int a = 0; a < 3; ++a)
-                for (int b = 0; b < 3; ++b) Cg[a] += Ci[a * 3 + b] * gp[b];
-
-            // Slot `a` of camera `c`'s block, as an index into the reduced
-            // system. Slots 0..camParams-1 are that camera's own; the extra
-            // slot, present only when the focal is shared, is the one column
-            // every camera contributes to.
-            const int nE = shareFocal ? camParams + 1 : camParams;
-            auto slot = [&](int cam, int a) {
-                return (shareFocal && a == camParams) ? focalCol
-                                                      : cam * camParams + a;
-            };
-
-            for (int ii : byPoint[size_t(p)]) {
-                const EBlock& ea = E[size_t(ii)];
-
-                for (int a = 0; a < nE; ++a) {
-                    double acc = 0.0;
-                    for (int b = 0; b < 3; ++b) acc += ea.m[a * 3 + b] * Cg[b];
-                    gS[size_t(slot(ea.cam, a))] -= acc;
+                EC.resize(L * size_t(nE) * 3);
+                for (size_t q = 0; q < L; ++q) {
+                    const EBlock& e = E[size_t(seen[q])];
+                    double* ec = &EC[q * size_t(nE) * 3];
+                    for (int a = 0; a < nE; ++a) {
+                        for (int k = 0; k < 3; ++k) {
+                            double v = 0.0;
+                            for (int b = 0; b < 3; ++b) v += e.m[a * 3 + b] * Ci[b * 3 + k];
+                            ec[a * 3 + k] = v;
+                        }
+                        double acc = 0.0;
+                        for (int b = 0; b < 3; ++b) acc += e.m[a * 3 + b] * Cg[b];
+                        gl[size_t(slot(e.cam, a))] -= acc;
+                    }
                 }
 
-                for (int jj : byPoint[size_t(p)]) {
-                    const EBlock& eb = E[size_t(jj)];
-                    for (int a = 0; a < nE; ++a) {
-                        // (E C^-1)_a, one row at a time.
-                        double row[3] = {};
-                        for (int k = 0; k < 3; ++k)
-                            for (int b = 0; b < 3; ++b)
-                                row[k] += ea.m[a * 3 + b] * Ci[b * 3 + k];
-                        for (int b = 0; b < nE; ++b) {
-                            double acc = 0.0;
-                            for (int k = 0; k < 3; ++k) acc += row[k] * eb.m[b * 3 + k];
-                            S[size_t(slot(ea.cam, a)) * size_t(nS) +
-                              size_t(slot(eb.cam, b))] -= acc;
+                // Each pair's nE x nE product, -E1 C^-1 E2^T, goes into the
+                // sparse blocks it belongs to. The matrix is symmetric and
+                // only its lower blocks are stored (diagonal blocks in full),
+                // so of the dense version's two writes per pair -- the block
+                // and its mirror -- whichever lands in stored space is kept:
+                // the camera-camera block once, in either orientation (Add
+                // transposes as needed), a camera's diagonal block both ways,
+                // and the focal row, which is below every camera.
+                for (size_t q1 = 0; q1 < L; ++q1) {
+                    const EBlock& e1 = E[size_t(seen[q1])];
+                    const double* ec = &EC[q1 * size_t(nE) * 3];
+                    for (size_t q2 = q1; q2 < L; ++q2) {
+                        const EBlock& e2 = E[size_t(seen[q2])];
+                        double V[8 * 8];
+                        for (int a = 0; a < nE; ++a)
+                            for (int b = 0; b < nE; ++b)
+                                V[a * nE + b] = -(ec[a * 3] * e2.m[b * 3] +
+                                                  ec[a * 3 + 1] * e2.m[b * 3 + 1] +
+                                                  ec[a * 3 + 2] * e2.m[b * 3 + 2]);
+                        double cc[7 * 7];
+                        for (int a = 0; a < camParams; ++a)
+                            for (int b = 0; b < camParams; ++b) cc[a * camParams + b] = V[a * nE + b];
+                        sys.Add(Sl.data(), e1.cam, e2.cam, cc);
+                        if (e1.cam == e2.cam && q1 != q2) {
+                            double ct[7 * 7];
+                            for (int a = 0; a < camParams; ++a)
+                                for (int b = 0; b < camParams; ++b)
+                                    ct[a * camParams + b] = cc[b * camParams + a];
+                            sys.Add(Sl.data(), e1.cam, e1.cam, ct);
+                        }
+                        if (shareFocal) {
+                            const int F = camParams;   // the focal slot
+                            sys.Add(Sl.data(), focalNode, e2.cam, &V[F * nE]);
+                            double ff = V[F * nE + F];
+                            if (q1 != q2) {
+                                double col[7];
+                                for (int a = 0; a < camParams; ++a) col[a] = V[a * nE + F];
+                                sys.Add(Sl.data(), focalNode, e1.cam, col);
+                                ff += V[F * nE + F];
+                            }
+                            sys.Add(Sl.data(), focalNode, focalNode, &ff);
                         }
                     }
                 }
             }
+        });
+        // The workers' shares added in, in fixed slices of the values so the
+        // sum is the same whatever the thread count.
+        {
+            constexpr size_t kSlice = 1 << 16;
+            const size_t nv = S.size();
+            ParallelFor((nv + kSlice - 1) / kSlice, [&](size_t si) {
+                const size_t b0 = si * kSlice, b1 = std::min(nv, b0 + kSlice);
+                for (size_t w = 0; w < workerS.size(); ++w) {
+                    const double* Sl = workerS[w].data();
+                    for (size_t i = b0; i < b1; ++i) S[i] += Sl[i];
+                }
+            });
+            for (size_t w = 0; w < workerS.size(); ++w)
+                for (size_t i = 0; i < gS.size(); ++i) gS[i] += workerG[w][i];
         }
 
         // --- solve and step ---------------------------------------------------
         std::vector<double> dCam = gS;
-        std::vector<double> Scopy = S;
-        // The reduced camera system is SPD once damped: Cholesky.
-        if (!linalg::CholeskySolve(Scopy.data(), dCam.data(), nS)) { damp.FailSingular(); continue; }
+        // The reduced camera system is SPD once damped: Cholesky, sparse.
+        if (!sys.Factor(S.data())) { damp.FailSingular(); continue; }
+        sys.Solve(dCam.data());
 
         // Back-substitution: dP = C^-1 (g_p - E^T dCam).
         std::vector<double> dPt(size_t(nActivePt) * 3, 0.0);
@@ -736,6 +913,7 @@ bool BundleAdjustSfm::RunReconstruct(const std::vector<Image>*, PointCloud* clou
             // than on the cost delta; until one is measured to help, running
             // to the cap is the honest default.
             s = std::move(trial);
+            blocksValid = false;
             cost = trialCost;
             damp.Succeed();
             ++taken;

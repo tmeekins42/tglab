@@ -61,8 +61,14 @@ public:
         m_gpuMs.store(gpuMs, std::memory_order_relaxed);
     }
 
+    // Of the CPU stages, those that used the device from inside: see
+    // Pipeline::HybridStageCount.
+    void SetHybridStages(int n) { m_hybridStages.store(n, std::memory_order_relaxed); }
+    int  HybridStages() const { return m_hybridStages.load(std::memory_order_relaxed); }
+
     void Clear() {
         m_done.store(0, std::memory_order_relaxed);
+        m_hybridStages.store(0, std::memory_order_relaxed);
         m_total.store(0, std::memory_order_relaxed);
         m_cpuStages.store(0, std::memory_order_relaxed);
         m_gpuStages.store(0, std::memory_order_relaxed);
@@ -97,6 +103,7 @@ private:
     std::atomic<int>      m_total{0};
     std::atomic<int>      m_cpuStages{0};
     std::atomic<int>      m_gpuStages{0};
+    std::atomic<int>    m_hybridStages{0};
     std::atomic<double>   m_elapsedMs{0.0};
     std::atomic<double>   m_gpuMs{0.0};
     std::atomic<unsigned> m_labelVersion{0};

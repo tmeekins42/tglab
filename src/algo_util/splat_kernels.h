@@ -214,6 +214,7 @@ cbuffer Params : register(b0) {
     uint TilesX; uint TexW;
     uint BgR; uint BgG; uint BgB;
     uint MinA; uint MaxA;
+    uint Gate;   // RasterOptions::colourGate; 0 is off
 };
 
 // Per-wave partial sums for a batch: [entry][wave][10]. Sized for the batch
@@ -254,6 +255,7 @@ void main(uint3 gid : SV_GroupID, uint3 gt : SV_GroupThreadID,
     float  dD  = inside ? DDepth[uint2(px, py)] : 0.0;
     float  shift = inside ? DShift[uint2(px, py)] : 0.0;
     float  accD = 0.0;
+    float  gate = asfloat(Gate);
 #ifdef REFL
     float4 dX   = inside ? DRN[uint2(px, py)] : float4(0, 0, 0, 0);
     float4 accX = float4(0, 0, 0, 0);
@@ -328,9 +330,15 @@ void main(uint3 gid : SV_GroupID, uint3 gt : SV_GroupThreadID,
                         hit = true;
                         float Ti = T / (1.0 - alpha);
                         float3 col = sCol[b].rgb;
-                        g[5] = alpha * Ti * dC.x;
-                        g[6] = alpha * Ti * dC.y;
-                        g[7] = alpha * Ti * dC.z;
+                        // Depth-gated colour: see RasterOptions::colourGate.
+                        // `shift` is the pixel's measured depth, 0 for none.
+                        bool gated = gate > 0.0 && shift > 0.0 &&
+                                     abs(sCol[b].w - shift) > gate * shift;
+                        if (!gated) {
+                            g[5] = alpha * Ti * dC.x;
+                            g[6] = alpha * Ti * dC.y;
+                            g[7] = alpha * Ti * dC.z;
+                        }
                         float dAlpha = Ti * dot(col - acc, dC);
                         if (dD != 0.0) {   // no depth loss: skip it exactly
                             float z = sCol[b].w - shift;   // the channel's value
@@ -342,10 +350,12 @@ void main(uint3 gid : SV_GroupID, uint3 gt : SV_GroupThreadID,
                         // Reflectivity and normal: four more channels, as
                         // colour's, over a background of 0.
                         float4 xv = sX[b];
-                        g[10] = alpha * Ti * dX.x;
-                        g[11] = alpha * Ti * dX.y;
-                        g[12] = alpha * Ti * dX.z;
-                        g[13] = alpha * Ti * dX.w;
+                        if (!gated) {   // appearance too, as colour
+                            g[10] = alpha * Ti * dX.x;
+                            g[11] = alpha * Ti * dX.y;
+                            g[12] = alpha * Ti * dX.z;
+                            g[13] = alpha * Ti * dX.w;
+                        }
                         dAlpha += Ti * dot(xv - accX, dX);
                         accX = alpha * xv + (1.0 - alpha) * accX;
 #endif

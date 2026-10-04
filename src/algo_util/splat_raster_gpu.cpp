@@ -225,7 +225,9 @@ bool SplatRaster::BackPixelGpu(const SplatCam& cam, const RasterOptions& opt,
         for (size_t i = 0; i < np; ++i) g.stage[i] = float((*dDepth)[i]);
     if (!g.Ensure(g.ddepth, ddD) || !g.Put(g.ddepth, ddD)) return false;
     g.stage.assign(np, 0.0f);
-    if (dDepth && depthShift)
+    // The target depth, whenever there is one: the depth loss subtracts it,
+    // and the colour gate compares against it.
+    if (depthShift)
         for (size_t i = 0; i < np; ++i) g.stage[i] = (*depthShift)[i];
     if (!g.Ensure(g.dshift, ddD) || !g.Put(g.dshift, ddD)) return false;
 
@@ -238,7 +240,7 @@ bool SplatRaster::BackPixelGpu(const SplatCam& cam, const RasterOptions& opt,
         uint32_t(cam.w), uint32_t(cam.h), uint32_t(g.tilesX), uint32_t(kTexW),
         FloatBits(float(opt.background.x)), FloatBits(float(opt.background.y)),
         FloatBits(float(opt.background.z)), FloatBits(float(opt.minAlpha)),
-        FloatBits(float(opt.maxAlpha))};
+        FloatBits(float(opt.maxAlpha)), FloatBits(float(opt.colourGate))};
     if (!g.ctx->Dispatch(g.bwd, {&g.proj, &g.list, &g.offs, &g.drgbt},
                          {&g.egrad, &g.last, &g.ddepth, &g.dshift}, c, &err,
                          uint32_t(m_tilesX),

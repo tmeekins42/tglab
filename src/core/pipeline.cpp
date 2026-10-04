@@ -67,6 +67,7 @@ static bool MatchesSpec(FormatSpec spec, Format f) {
 // number cannot come from timing individual stages.
 void Pipeline::PublishStats(Progress* progress, const ComputeContext* gpu) const {
     if (!progress) return;
+    progress->SetHybridStages(m_hybridStages);
     progress->SetStats(m_cpuStages, m_gpuStages,
                        std::chrono::duration<double, std::milli>(
                            std::chrono::steady_clock::now() - m_runStart).count(),
@@ -797,6 +798,11 @@ bool Pipeline::RunStageOnce(Stage& s, const std::vector<const Data*>& in,
                    report);
         s.algo->RunCPU(ctx);
         ++m_cpuStages;
+        // ...one that does its heavy work on the device itself: counted as a
+        // CPU stage, since the pipeline did not run it on the GPU, but said
+        // separately -- otherwise a run that spent half its time on the GPU
+        // reads "0 GPU".
+        if (gpu && mode != ExecMode::ForceCPU && s.algo->UsesGpuInRunCPU()) ++m_hybridStages;
 
         // An algorithm that honoured the token has written only part of its
         // output. Leaving the stage valid would cache that partial result and,
@@ -900,7 +906,7 @@ bool Pipeline::BroadcastStage(Stage& s, const std::vector<const Data*>& in,
     // ctx.Gpu() is null, the algorithm takes its own CPU fallback, and the
     // frames are independent after all.
     const bool cpuTouchesGpu = gpu && mode != ExecMode::ForceCPU &&
-                               s.algo->UsesGpuInRunCPU();
+                               s.algo->UsesGpuInRunCPU() && !s.algo->LocksGpuInRunCPU();
 
     const bool wantGpu = stageWantsGpu || cpuTouchesGpu;
 
@@ -1015,7 +1021,7 @@ bool Pipeline::BroadcastStage(Stage& s, const std::vector<const Data*>& in,
             if (!failed.load()) harvest(f, &ok);
         }
     } else {
-        ParallelFor(nFrames, runFrame);
+        ParallelFor(nFrames, runFrame, kMaxFramesInFlight);   // memory: see there
         // Gathered after the join, in frame order, so the output set is
         // identical whatever order the frames completed in. The peak here is
         // genuinely all of them, which is the cost of running them at once --
@@ -1065,6 +1071,7 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
     m_gpuStages = 0;
     m_gpuFallbacks.clear();
     m_cpuStages = 0;
+    m_hybridStages = 0;
     m_cachedStages = 0;
     m_bypassedStages = 0;
 

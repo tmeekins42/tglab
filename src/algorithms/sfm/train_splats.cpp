@@ -179,8 +179,17 @@ bool LoadView(const Image& img, int k, std::vector<double>* rgb, int* ow,
 // brick wall, a horizontal edge the camera moved along -- and those should
 // still be fitted. A few pixels closes them; a background region is far
 // wider and stays out.
-void MaskUncovered(const std::vector<Splat>& points, const SplatCam& cam, int grow,
-                   std::vector<double>* rgb) {
+//
+// AND SHRUNK BACK (mask_close, on by default): grown alone, the mask also
+// pushed the outline mask_grow pixels into the background all round the
+// subject, and training then made the Gaussians at the edge paint that ring
+// -- stretching them outward, which from any other viewpoint is a fuzzy,
+// spiky halo and floating blobs. Measured on a 179-frame video of a knitted
+// cat on a book (IMG_1528), rendered from 60 degrees off the capture path:
+// the halo and the floaters gone with the closing, and without the holes
+// along the book's edge that no growth at all leaves.
+// The pixels the cloud's points land on in this view: 1 where one does.
+std::vector<uint8_t> CloudFootprint(const std::vector<Splat>& points, const SplatCam& cam) {
     const int w = cam.w, h = cam.h;
     std::vector<uint8_t> in(size_t(w) * size_t(h), 0);
     for (const Splat& s : points) {
@@ -190,28 +199,48 @@ void MaskUncovered(const std::vector<Splat>& points, const SplatCam& cam, int gr
         const int y = int(cam.fy * q.y / q.z + cam.cy);
         if (x >= 0 && y >= 0 && x < w && y < h) in[size_t(y) * size_t(w) + size_t(x)] = 1;
     }
-    // Dilation by a square of side 2*grow+1, separably: rows, then columns.
-    std::vector<uint8_t> tmp(in.size(), 0);
+    return in;
+}
+
+// Grows (any covered pixel within r) or, with `erode`, shrinks (every pixel
+// within r covered) a mask by a square of side 2r+1, separably.
+void Morph(std::vector<uint8_t>* m, int w, int h, int r, bool erode) {
+    if (r <= 0) return;
+    std::vector<uint8_t> tmp(m->size(), 0);
+    const uint8_t want = erode ? 0 : 1;   // the value that decides early
     for (int y = 0; y < h; ++y)
         for (int x = 0; x < w; ++x) {
-            uint8_t v = 0;
-            for (int d = -grow; d <= grow && !v; ++d) {
-                const int xx = x + d;
-                if (xx >= 0 && xx < w) v = in[size_t(y) * size_t(w) + size_t(xx)];
+            uint8_t v = erode ? 1 : 0;
+            for (int d = -r; d <= r && v != want; ++d) {
+                const int xx = std::clamp(x + d, 0, w - 1);
+                if ((*m)[size_t(y) * size_t(w) + size_t(xx)] == want) v = want;
             }
             tmp[size_t(y) * size_t(w) + size_t(x)] = v;
         }
     for (int y = 0; y < h; ++y)
         for (int x = 0; x < w; ++x) {
-            uint8_t v = 0;
-            for (int d = -grow; d <= grow && !v; ++d) {
-                const int yy = y + d;
-                if (yy >= 0 && yy < h) v = tmp[size_t(yy) * size_t(w) + size_t(x)];
+            uint8_t v = erode ? 1 : 0;
+            for (int d = -r; d <= r && v != want; ++d) {
+                const int yy = std::clamp(y + d, 0, h - 1);
+                if (tmp[size_t(yy) * size_t(w) + size_t(x)] == want) v = want;
             }
-            if (!v)
-                for (int ch = 0; ch < 3; ++ch)
-                    (*rgb)[(size_t(y) * size_t(w) + size_t(x)) * 3 + size_t(ch)] = -1.0;
+            (*m)[size_t(y) * size_t(w) + size_t(x)] = v;
         }
+}
+
+void MaskUncovered(const std::vector<Splat>& points, const SplatCam& cam, int grow, bool close,
+                   std::vector<double>* rgb) {
+    const int w = cam.w, h = cam.h;
+    std::vector<uint8_t> in = CloudFootprint(points, cam);
+    Morph(&in, w, h, grow, false);
+    // CLOSING: grown, then shrunk back by as much. Gaps narrower than twice
+    // the growth stay filled, but the outline returns to where the cloud
+    // ends -- rather than a ring of background beyond it, which training
+    // then has to paint and which renders as a halo of stretched Gaussians.
+    if (close) Morph(&in, w, h, grow, true);
+    for (size_t i = 0; i < in.size(); ++i)
+        if (!in[i])
+            for (int ch = 0; ch < 3; ++ch) (*rgb)[i * 3 + size_t(ch)] = -1.0;
 }
 
 // L1 and PSNR over the pixels with a target (see MaskUnmeasured).
@@ -284,7 +313,10 @@ public:
         // The mask marks where the dense cloud is, so it needs the dense
         // path; the depth input is what says this is one.
         const bool useMask = ReconstructExtra() && bool(m_mask);
-        if (useDepth &&
+        // The maps are read for the depth loss, and for the colour gate,
+        // which compares each Gaussian's depth with them (colour_gate).
+        const bool needDepthMaps = ReconstructExtra() && (useDepth || double(m_colourGate) > 0.0);
+        if (needDepthMaps &&
             !ReadDepthViews(*ReconstructExtra(), int(cloud->cameras.size()),
                             "train_splats", &depthViews, &depthHolds, err))
             return false;
@@ -297,10 +329,11 @@ public:
             int w = 0, h = 0;
             if (!LoadView((*images)[i], k, &vw.rgb, &w, &h)) continue;
             vw.cam = SplatCamFrom(c, w, h);
-            if (useDepth)
+            if (needDepthMaps)
                 vw.depth = DepthTarget(depthViews[i], w, h, double(m_depthConfidence));
             if (useMask) {
-                MaskUncovered(cloud->splats, vw.cam, std::max(0, int(m_maskGrow)), &vw.rgb);
+                MaskUncovered(cloud->splats, vw.cam, std::max(0, int(m_maskGrow)), bool(m_maskClose),
+                              &vw.rgb);
                 for (double v : vw.rgb) if (v < 0.0) ++maskedPx;
                 totalPx += vw.rgb.size();
             }
@@ -435,6 +468,7 @@ public:
         RasterOptions opt;
         const double bg = double(m_background);
         opt.background = Vec3{bg, bg, bg};
+        opt.colourGate = double(m_colourGate);
 
         // --- how well it fits before -----------------------------------------
         double l1Before = 0.0, psnrBefore = 0.0;
@@ -722,8 +756,11 @@ public:
                                 vw.depth.empty() ? nullptr : &vw.depth);
                 gradR.assign(n, SplatParam::Zero());
                 gradN.assign(n, SplatParam::Zero());
-                rasterR.Backward(payR, vw.cam, black, dRm, &gradR);
-                rasterN.Backward(payN, vw.cam, black, dNm, &gradN);
+                // The target as shift: the colour gate applies to
+                // reflectivity and normal as on the device.
+                const std::vector<float>* gateDepth = vw.depth.empty() ? nullptr : &vw.depth;
+                rasterR.Backward(payR, vw.cam, black, dRm, &gradR, nullptr, gateDepth);
+                rasterN.Backward(payN, vw.cam, black, dNm, &gradN, nullptr, gateDepth);
                 ParallelFor(n, [&](size_t i) {
                     double* g = grad[i].Data();
                     const double* a = gradR[i].Data();
@@ -1440,6 +1477,11 @@ private:
                  "grown by before masking, so thin unmeasured gaps on the "
                  "subject -- mortar lines, edges along the camera's motion -- "
                  "are still fitted. Wide unmeasured regions stay out."}};
+    Param<bool> m_maskClose{this, "mask_close", true,
+        "Shrink the grown mask back by mask_grow afterwards (a morphological "
+        "closing): thin gaps stay filled, but the outline returns to where "
+        "the cloud ends, instead of a ring of background around the subject "
+        "that the Gaussians are then asked to paint."};
 
     Param<float> m_depthWeight{this, "depth_weight", 0.3f, 0.0f, 10.0f,
         {.help = "How strongly rendered depth is pulled toward the plane "
@@ -1448,6 +1490,16 @@ private:
                  "the same at any scene scale. Used only when the depth maps "
                  "are passed as the third input; 0 disables.",
          .step = 0.05, .softMax = 2.0}};
+
+    Param<float> m_colourGate{this, "colour_gate", 0.0f, 0.0f, 0.5f,
+        {.help = "Learn each Gaussian's colour only from pixels whose "
+                 "measured depth is within this fraction of its own. At an "
+                 "edge where a near surface overlaps a far one -- glasses "
+                 "over skin, a face against a wall -- the near Gaussians "
+                 "otherwise take on the far surface's colour and render "
+                 "as a halo. Shape and opacity still learn from every "
+                 "pixel, so an overhanging edge can still shrink back. Needs "
+                 "the depth input; 0 is off."}};
 
     Param<float> m_depthConfidence{this, "depth_confidence", 0.0f, 0.0f, 1.0f,
         {.help = "Lowest sweep confidence a depth may have to be used as a "

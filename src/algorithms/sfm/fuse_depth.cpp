@@ -119,6 +119,8 @@ public:
 
         std::vector<long long> perTested(size_t(nCam), 0);
         std::vector<long long> perKept(size_t(nCam), 0);
+        std::vector<long long> perDropped(size_t(nCam), 0);   // by the seen-through test
+        std::vector<long long> perColour(size_t(nCam), 0);    // by the colour test
 
         // Per camera, how many agreeing points each number of other cameras
         // saw through; the last bucket collects the rest.
@@ -131,8 +133,9 @@ public:
         ParallelFor(nCam, [&](int c) {
             if (GroupCancelled()) return;   // superseded: see SetGroupCancel
             FuseCamera(c, *cloud, views, minViews, relTol, step, minConf,
-                       maxSeen, seeTol, perHist[size_t(c)].data(),
-                       &perCam[size_t(c)], &perTested[size_t(c)],
+                       maxSeen, seeTol, double(m_seenFraction), double(m_colourTolerance),
+                       perHist[size_t(c)].data(), &perCam[size_t(c)], &perDropped[size_t(c)],
+                       &perColour[size_t(c)], &perTested[size_t(c)],
                        &perKept[size_t(c)]);
         });
 
@@ -182,9 +185,16 @@ public:
         m_note += buf;
         if (maxSeen < 16) {
             long long dropped = 0;
-            for (int k = maxSeen + 1; k < kHist; ++k) dropped += hist[size_t(k)];
-            std::snprintf(buf, sizeof(buf), " (more than %d dropped: %lld)",
-                          maxSeen, dropped);
+            for (long long d : perDropped) dropped += d;
+            std::snprintf(buf, sizeof(buf), " (more than %d and %.0f%% of those measuring there, dropped: %lld)",
+                          maxSeen, 100.0 * double(m_seenFraction), dropped);
+            m_note += buf;
+        }
+        if (double(m_colourTolerance) > 0.0) {
+            long long dropped = 0;
+            for (long long d : perColour) dropped += d;
+            std::snprintf(buf, sizeof(buf), "; colour outvoted by the agreeing views: %lld dropped",
+                          dropped);
             m_note += buf;
         }
         return true;
@@ -197,8 +207,9 @@ private:
     void FuseCamera(int ci, const PointCloud& cloud,
                     const std::vector<DepthView>& views, int minViews,
                     double relTol, int step, double minConf, int maxSeen,
-                    double seeTol, long long* hist,
-                    std::vector<Track>* out, long long* tested,
+                    double seeTol, double seenFrac, double colourTol, long long* hist,
+                    std::vector<Track>* out, long long* droppedSeen,
+                    long long* droppedColour, long long* tested,
                     long long* kept) const {
         const Camera& ref = cloud.cameras[size_t(ci)];
         const DepthView& rv = views[size_t(ci)];
@@ -224,8 +235,14 @@ private:
                 int agree = 0;
                 double sumD = double(d);
                 int    sumN = 1;
+                const Vec3 colour = rv.Colour(x, y);
+                // Agreeing views that see this pixel's colour there, and that
+                // see something else. The colour vote polls EVERY agreeing
+                // view, so the loop runs on past min_views when it is on.
+                int colourSame = 0, colourOther = 0;
+                const bool pollAll = colourTol > 0.0;
 
-                for (int cj = 0; cj < nCam && agree < minViews; ++cj) {
+                for (int cj = 0; cj < nCam && (pollAll || agree < minViews); ++cj) {
                     if (cj == ci) continue;
                     const Camera& oc = cloud.cameras[size_t(cj)];
                     const DepthView& ov = views[size_t(cj)];
@@ -252,14 +269,44 @@ private:
                     if (diff / local.z > relTol) continue;
 
                     ++agree;
-                    // Averaged over the agreeing views, which is the other
-                    // half of what fusion is for: several noisy measurements
-                    // of one surface make a better estimate than any of them.
-                    sumD += double(od) * (double(d) / local.z);
-                    ++sumN;
+                    if (pollAll) {
+                        if ((ov.Colour(ix, iy) - colour).Norm() <= colourTol) ++colourSame;
+                        else                                                  ++colourOther;
+                    }
+                    // Averaged over the first min_views agreeing views, which
+                    // is the other half of what fusion is for: several noisy
+                    // measurements of one surface make a better estimate than
+                    // any of them.
+                    if (agree <= minViews) {
+                        sumD += double(od) * (double(d) / local.z);
+                        ++sumN;
+                    }
                 }
 
                 if (agree < minViews) continue;
+
+                // THE SURFACE IS RIGHT BUT IS IT THIS PIXEL'S? A correlation
+                // window straddling a silhouette gives the foreground's depth
+                // to pixels that show the background -- edge fattening -- and
+                // every other camera agrees, because the depth is real. Only
+                // the colour gives it away: the others see the surface's own
+                // colour there, this pixel sees the room behind it. Measured
+                // on a face video (IMG_1529), that drew the silhouette from
+                // each end of the arc across the face as streaks of dark dots.
+                //
+                // A MAJORITY, not any one view: a frame's neighbours on the
+                // arc have their silhouette in nearly the same place, so they
+                // see the same background there and would vouch for the wrong
+                // colour. The cameras facing the surface outvote them.
+                //
+                // What is left is mostly REAL: rendered from a capture camera,
+                // the fused face and cat match the photos. Grey patches on
+                // the face from a novel angle are beard and sideburns -- dense,
+                // because stubble has texture, over sparsely measured skin.
+                if (pollAll && colourOther > colourSame) {
+                    ++*droppedColour;
+                    continue;
+                }
 
                 // HOW MANY CAMERAS SEE THROUGH IT. Agreement asks whether
                 // others measured a surface HERE; this asks the opposite
@@ -267,10 +314,20 @@ private:
                 // clearly BEHIND this point along its own ray. If so, that
                 // camera looked straight through the place this point claims
                 // is solid: free space, and the point is a floater.
+                int measured = 0;
                 const int seenThrough =
-                    CountSeenThrough(cloud, views, world, ci, minConf, seeTol);
+                    CountSeenThrough(cloud, views, world, ci, minConf, seeTol, &measured);
                 ++hist[std::min(seenThrough, kHist - 1)];
-                if (seenThrough > maxSeen) continue;
+                // Relative as well as absolute, as carve_splats judges: a
+                // surface measured by a hundred cameras can collect a few
+                // noisy see-throughs and still be real. 16 is off, as the
+                // help says -- it used to drop anything seen through by MORE
+                // than 16 cameras, which a long video easily reaches.
+                if (maxSeen < 16 && seenThrough > maxSeen &&
+                    double(seenThrough) >= seenFrac * double(measured)) {
+                    ++*droppedSeen;
+                    continue;
+                }
 
                 // Re-unproject at the averaged depth.
                 const double fused = sumD / double(sumN);
@@ -279,7 +336,7 @@ private:
                 Track t;
                 t.point = p;
                 t.hasPoint = true;
-                t.color = rv.Colour(x, y);
+                t.color = colour;
 
                 // One observation, naming where this point was measured. Not a
                 // real track -- nothing was matched to produce it -- but the
@@ -375,17 +432,46 @@ private:
     // same wrong, too-near depth. Every camera looking at the scene from
     // elsewhere then sees a real surface BEHIND that point, straight through
     // the place it claims is solid.
-    Param<int> m_maxSeenThrough{this, "max_seen_through", 16, 0, 16,
+    //
+    // On by default (1, with seen_fraction) because a video makes this the
+    // common case, not the rare one: a frame's nearest cameras are its own
+    // sweep neighbours and share its errors. Measured on a knitted cat
+    // (IMG_1528), the out-of-focus room behind it was measured at random
+    // depths that neighbouring frames "agreed" with -- a dome of floaters
+    // over the scene. This test removed the dome (about 100k of 3.9M points)
+    // while costing the photo sets almost nothing (fountain 4,298 of 481k,
+    // castle 7,609 of 538k). Requiring agreement from a minimum angle was
+    // tried first and only thinned the dome, while costing castle 20%.
+    Param<int> m_maxSeenThrough{this, "max_seen_through", 1, 0, 16,
         {.help = "Drop a point when more than this many other cameras "
                  "measured a surface clearly BEHIND it along their own line "
                  "of sight -- they looked through where the point claims to "
                  "be, so it is floating in free space. 16 disables the test."}};
+
+    Param<float> m_seenFraction{this, "seen_fraction", 0.2f, 0.0f, 1.0f,
+        {.help = "...and those cameras must be at least this fraction of the "
+                 "ones that measured anything there. A surface measured by a "
+                 "hundred cameras can collect a few noisy see-throughs and "
+                 "still be real; a floater is seen through by many of the "
+                 "cameras that look its way. As carve_splats judges.",
+         .step = 0.05}};
 
     Param<float> m_seeTolerance{this, "see_tolerance", 0.05f, 0.005f, 0.5f,
         {.help = "How far behind the point another camera's surface must be, "
                  "as a fraction of the distance, before that camera counts "
                  "as seeing through it. Looser than `tolerance` on purpose: "
                  "this removes points, so only a clear gap should count.",
+         .step = 0.01}};
+
+    // PHOTOMETRIC AGREEMENT: see the check in FuseCamera. The distance is
+    // plain RGB, 0-1 per channel: a video's frames share an exposure, and
+    // the mistake this catches is a different OBJECT's colour, not a shade.
+    Param<float> m_colourTolerance{this, "colour_tolerance", 0.25f, 0.0f, 1.0f,
+        {.help = "Drop a point when its pixel's colour differs by more than "
+                 "this from what MOST agreeing cameras see there. Catches "
+                 "background pixels next to a silhouette that the sweep's "
+                 "window gave the foreground's depth -- right place, wrong "
+                 "colour, showing as dark streaks. 0 disables the test.",
          .step = 0.01}};
 
     std::string m_note;

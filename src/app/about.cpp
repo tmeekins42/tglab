@@ -53,6 +53,21 @@ const Attribution kLibraries[] = {
     {"stb_image_write", "1.16", "https://github.com/nothings/stb",
      "MIT License or public domain",
      "Copyright (c) 2017 Sean Barrett"},
+
+    // Network WEIGHTS rather than code: tglab runs them on its own kernels,
+    // and ships them as models/*.tgw converted from the published checkpoints.
+    {"DaD keypoint detector (weights)", "v0.1.0", "https://github.com/Parskatt/dad",
+     "MIT License",
+     "Copyright (c) 2025 Johan Edstedt"},
+
+    {"LoMa / DeDoDe-B128 descriptor (weights)", "B128", "https://github.com/davnords/LoMa",
+     "MIT License",
+     "Copyright (c) 2026 Johan Edstedt"},
+
+    // LoMa's matcher is LightGlue's architecture and carries its licence.
+    {"LoMa-B128 matcher (weights)", "B128", "https://github.com/davnords/LoMa",
+     "Apache License 2.0 (from LightGlue)",
+     "LightGlue: Copyright 2023 ETH Zurich"},
 };
 
 // The LGPL's practical obligation for a statically linked library: say which

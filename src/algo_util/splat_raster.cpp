@@ -331,10 +331,14 @@ void SplatRaster::Backward(const std::vector<SplatParam>& splats,
                     const double* col = splats[size_t(j)].color;
                     Grad2& g = eg[k];
 
-                    // dC/dcolour = alpha T.
+                    // dC/dcolour = alpha T -- unless the pixel's measured
+                    // depth says it shows another surface: see
+                    // RasterOptions::colourGate.
+                    const bool gated = opt.colourGate > 0.0 && shift > 0.0 &&
+                                       std::fabs(P.depth - shift) > opt.colourGate * shift;
                     double dAlpha = 0.0;
                     for (int ch = 0; ch < 3; ++ch) {
-                        g.color[ch] += alpha * Ti * dC[ch];
+                        if (!gated) g.color[ch] += alpha * Ti * dC[ch];
                         dAlpha += Ti * (col[ch] - acc[ch]) * dC[ch];
                         acc[ch] = alpha * col[ch] + (1.0 - alpha) * acc[ch];
                     }

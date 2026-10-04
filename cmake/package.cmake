@@ -68,6 +68,17 @@ add_custom_target(package_release
     COMMAND ${CMAKE_COMMAND} -E copy_directory
             "${CMAKE_SOURCE_DIR}/assets"  "${TGLAB_DIST_DIR}/assets"
 
+    # The learned feature networks' weights. Not tracked in git -- made by
+    # tools/nn_convert.py, see third_party/models/README.md -- so a machine
+    # that has not made them FAILS here rather than shipping an sfm.tgl
+    # whose first stage cannot run.
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${TGLAB_DIST_DIR}/models"
+    COMMAND ${CMAKE_COMMAND} -E copy
+            "${CMAKE_SOURCE_DIR}/models/dad.tgw"
+            "${CMAKE_SOURCE_DIR}/models/dedode_b128.tgw"
+            "${CMAKE_SOURCE_DIR}/models/loma_b128.tgw"
+            "${TGLAB_DIST_DIR}/models/"
+
     COMMAND ${CMAKE_COMMAND} -E copy
             "${CMAKE_SOURCE_DIR}/LICENSE"   "${TGLAB_DIST_DIR}/"
     COMMAND ${CMAKE_COMMAND} -E copy
@@ -89,6 +100,11 @@ add_custom_target(package_release
     COMMAND ${CMAKE_COMMAND} -E copy
             "${CMAKE_SOURCE_DIR}/third_party/stb/LICENSE.txt"
             "${TGLAB_DIST_DIR}/licenses/stb-LICENSE.txt"
+    COMMAND ${CMAKE_COMMAND} -E copy
+            "${CMAKE_SOURCE_DIR}/third_party/models/DaD-LICENSE.txt"
+            "${CMAKE_SOURCE_DIR}/third_party/models/LoMa-LICENSE.txt"
+            "${CMAKE_SOURCE_DIR}/third_party/models/LightGlue-LICENSE.txt"
+            "${TGLAB_DIST_DIR}/licenses/"
 
     # Generated rather than checked in, so it cannot disagree with the archive
     # it describes.
