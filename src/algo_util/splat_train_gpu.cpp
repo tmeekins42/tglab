@@ -283,6 +283,7 @@ cbuffer Params : register(b0) {
     uint T0; uint T1; uint T2;
     uint Fx; uint Fy;
     uint LowPass; uint LrMean; uint C1; uint C2; uint ToNdc; uint ClampColour;
+    uint MaxElong;   // log of the largest axis's limit over the middle one; 0 = none
 };
 
 void Store14(uint base, float p[14]) {
@@ -464,6 +465,15 @@ void main(uint3 id : SV_DispatchThreadID) {
     // Colour kept displayable; see train_splats' clamp_colour.
     if (ClampColour != 0)
         [unroll] for (uint k = 11; k < 14; ++k) p[k] = saturate(p[k]);
+    // No needles; see train_splats' max_elongation. The largest axis held
+    // within a factor of the MIDDLE one, so a flat disc stays flat.
+    float lim = asfloat(MaxElong);
+    if (lim > 0.0) {
+        uint hi = (p[3] >= p[4] && p[3] >= p[5]) ? 3 : (p[4] >= p[5] ? 4 : 5);
+        uint o1 = hi == 3 ? 4 : 3, o2 = hi == 5 ? 4 : 5;
+        float mid = max(p[o1], p[o2]);
+        p[hi] = min(p[hi], mid + lim);
+    }
 
     Store14(base, p);
     Store14(base + 4, m1);
@@ -2222,6 +2232,7 @@ bool SplatTrainerGpu::StepImpl(const SplatCam& cam, const RasterOptions& opt,
         c.push_back(FloatBits(float(c2)));
         c.push_back(FloatBits(float(0.5 * double(cam.w))));
         c.push_back(m_clampColour ? 1u : 0u);
+        c.push_back(FloatBits(m_maxElong > 1.0 ? float(std::log(m_maxElong)) : 0.0f));
         if (!s.Run(s.update, {&s.stateA, &s.g2, &s.proj}, {&s.stateB}, c,
                    groupsN, 1, err))
             return false;

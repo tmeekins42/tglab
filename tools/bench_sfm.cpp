@@ -550,10 +550,20 @@ static void DumpOrbit(const PointCloud& pc, const std::string& prefix) {
     for (const Splat& s : pc.splats) params.push_back(ToParam(s));
 
     const int w = 768, h = int(std::lround(768.0 * mid.height / std::max(1, mid.width)));
-    for (int deg : {-60, -30, 0, 30, 60}) {
+    // Swung about the vertical, and TILTED off the camera path too: a
+    // viewer looks from where no frame was taken, and that is where splats
+    // fitted only to the path break up first.
+    const std::pair<int, int> views[] = {{-60, 0}, {-30, 0}, {0, 0}, {30, 0}, {60, 0},
+                                         {0, -30}, {0, 30}};
+    for (const auto& [deg, tilt] : views) {
         const double a = deg * 3.14159265358979 / 180.0;
-        const Vec3 p = p0 * std::cos(a) + up.Cross(p0) * std::sin(a) +
-                       up * (up.Dot(p0) * (1.0 - std::cos(a)));
+        Vec3 p = p0 * std::cos(a) + up.Cross(p0) * std::sin(a) +
+                 up * (up.Dot(p0) * (1.0 - std::cos(a)));
+        if (tilt != 0) {
+            const Vec3 ax = up.Cross(p).Normalized();
+            const double t = tilt * 3.14159265358979 / 180.0;
+            p = p * std::cos(t) + ax.Cross(p) * std::sin(t);
+        }
         const Vec3 pos = centre + p;
         const Vec3 z = (centre - pos).Normalized();
         const Vec3 x = up.Cross(z).Normalized();
@@ -609,7 +619,8 @@ static void DumpOrbit(const PointCloud& pc, const std::string& prefix) {
             }
         v = ImageView{};
         char name[64];
-        std::snprintf(name, sizeof(name), "_orbit%+03d.png", deg);
+        if (tilt == 0) std::snprintf(name, sizeof(name), "_orbit%+03d.png", deg);
+        else           std::snprintf(name, sizeof(name), "_tilt%+03d.png", tilt);
         std::string e;
         SavePng(prefix + name, im, &e);
     }

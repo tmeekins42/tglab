@@ -199,6 +199,11 @@ public:
     // clamp_colour does on the CPU. On by default.
     void SetClampColour(bool on) { m_clampColour = on; }
 
+    // Hold each Gaussian's largest axis within `ratio` times its middle one
+    // after every step, as train_splats' max_elongation does on the CPU.
+    // 0 (or anything up to 1) leaves them free.
+    void SetMaxElongation(double ratio) { m_maxElong = ratio; }
+
     int Visible() const { return m_visible; }
 
     // Milliseconds per phase, accumulated over every Step.
@@ -219,6 +224,7 @@ private:
     std::unique_ptr<Impl> m;
     int     m_visible = 0;
     bool    m_clampColour = true;
+    double  m_maxElong = 0.0;
     // Render's optional depth and coverage outputs, for the call in flight.
     std::vector<double>* m_renderDepth = nullptr;
     std::vector<double>* m_renderT = nullptr;

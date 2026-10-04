@@ -564,6 +564,7 @@ public:
         const size_t maxCount = size_t(std::max(1, int(m_maxGaussians)));
         const double pruneOpacity = double(m_pruneOpacity);
         const bool   clampColour  = bool(m_clampColour);
+        const double logElong = double(m_maxElongation) > 1.0 ? std::log(double(m_maxElongation)) : 0.0;
         long long cloned = 0, split = 0, pruned = 0;
         int densifySteps = 0;
         int pruneSteps   = 0;   // after densify_until: prune, never grow
@@ -618,6 +619,7 @@ public:
         if (ComputeContext* dev = GroupGpu()) {
             auto t = std::make_unique<SplatTrainerGpu>(dev);
             t->SetClampColour(clampColour);
+            t->SetMaxElongation(double(m_maxElongation));
             if (upGpu(*t, &gpuNote)) gpuTrainer = std::move(t);
         }
         int gpuIters = 0;
@@ -911,6 +913,11 @@ public:
                 }
                 if (clampColour)
                     for (int q = 11; q < 14; ++q) p[q] = std::clamp(p[q], 0.0, 1.0);
+                if (logElong > 0.0) {   // see max_elongation
+                    const int hi = (p[3] >= p[4] && p[3] >= p[5]) ? 3 : (p[4] >= p[5] ? 4 : 5);
+                    const double mid = std::max(p[hi == 3 ? 4 : 3], p[hi == 5 ? 4 : 5]);
+                    p[hi] = std::min(p[hi], mid + logElong);
+                }
             });
 
             msAdam += msSince(tAdam);
@@ -1567,10 +1574,16 @@ private:
     // test scene needing +-2 gained 0.08 dB from degree 1. So: colour's own
     // rate. That is still gentler on the picture than it sounds, since a
     // coefficient reaches the colour through Y_k, at most 0.49 at degree 1.
-    Param<float> m_shLr{this, "sh_lr", 2.5e-3f, 0.0f, 0.05f,
-        {.help = "Learning rate of the view-dependent colour terms. The "
-                 "paper's 1.25e-4 is for 30000 iterations; this default suits "
-                 "the hundreds to low thousands a run here takes.",
+    // MEASURED on the cat video (3222 iterations, every 8th view held out):
+    // at 2.5e-3, the rate a few-hundred-iteration run wanted, held-out PSNR
+    // 24.17 dB, and seen from 30 degrees off the camera ring the fur was
+    // speckled in random colours -- terms fitted to each photograph's noise,
+    // read back from directions no photograph took. At 5e-4: 24.09 dB and the
+    // speckle gone; at the paper's 1.25e-4, 23.44.
+    Param<float> m_shLr{this, "sh_lr", 5e-4f, 0.0f, 0.05f,
+        {.help = "Learning rate of the view-dependent colour terms. Higher "
+                 "fits the photographs a little better and colours views from "
+                 "off the camera path at random; the paper's is 1.25e-4.",
          .step = 1e-4}};
 
     // See MaskUnmeasured. Needs the depth input; without it every pixel trains.
@@ -1718,6 +1731,22 @@ private:
                  "photographs need climb back, and the rest fade and are "
                  "pruned. 0 disables.",
          .softMax = 3000.0}};
+
+    // NO NEEDLES. A Gaussian stretched long and thin along one axis fits the
+    // photographs from the camera path -- seen end-on, it is a dot -- and
+    // from anywhere else it is a streak: the "hair" on a cat and the streaks
+    // off a book's edge, seen from below the ring the video was shot on. The
+    // largest axis is held within this many times the MIDDLE one, so the flat
+    // discs init_splats makes, thin in one axis, are left as they are.
+    // Measured as sh_lr was: at 3, held-out PSNR 24.18 dB against 24.17
+    // free, and from off the ring the streaks off the book and the sparkles
+    // below it mostly gone.
+    Param<float> m_maxElongation{this, "max_elongation", 3.0f, 0.0f, 100.0f,
+        {.help = "Largest axis of a Gaussian at most this many times its middle "
+                 "one: no needles, which look right from the camera path and "
+                 "streak from anywhere else. Flat discs are not limited. 0 "
+                 "leaves them free.",
+         .step = 0.5, .softMax = 20.0}};
 
     Param<float> m_pruneOpacity{this, "prune_opacity", 0.005f, 0.0f, 0.5f,
         {.help = "Gaussians whose opacity has fallen below this are removed at "
