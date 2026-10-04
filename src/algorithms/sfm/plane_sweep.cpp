@@ -397,6 +397,8 @@ public:
             planes[size_t(f)] = ToLuma((*images)[size_t(f)]);
         });
 
+        m_frameDepths = FrameDepths(cloud);
+
         const int   nPlanes = std::max(2, int(m_planes));
         const int   radius  = std::max(1, int(m_window) / 2);
         // Capped at 16 to match the fixed array in the combine loop below.
@@ -512,7 +514,8 @@ public:
         // regions between them, which is where a sweep actually fails. But a
         // large disagreement here is conclusive evidence of a bug, and that
         // is what it is for.
-        const double agree = SparseAgreement(cloud, *out);
+        std::vector<double> perFrameAgree;
+        const double agree = SparseAgreement(cloud, *out, &perFrameAgree);
 
         // AND THE WORST SINGLE FRAME, because the median over all frames hides
         // exactly the failure that matters: one frame's depth map being wrong
@@ -520,8 +523,8 @@ public:
         // place, and the pooled figure barely moves.
         int    worstFrame = -1;
         double worstAgree = 0.0;
-        for (int f = 0; f < nFrames; ++f) {
-            const double a = SparseAgreement(cloud, *out, f);
+        for (int f = 0; f < nFrames && f < int(perFrameAgree.size()); ++f) {
+            const double a = perFrameAgree[size_t(f)];
             if (a >= 0.0 && a > worstAgree) { worstAgree = a; worstFrame = f; }
         }
 
@@ -570,11 +573,14 @@ private:
     // `cam` < 0 asks for the whole cloud, which is what the degenerate
     // fallback and the synthetic test want.
     bool DepthRange(const PointCloud& cloud, int cam, double* zNear,
-                    double* zFar, std::string* err) const {
+                    double* zFar, std::string* err,
+                    const std::vector<double>* seen = nullptr) const {
         std::vector<double> depths;
-        depths.reserve(cloud.tracks.size());
+        if (seen) depths = *seen;
+        else depths.reserve(cloud.tracks.size());
 
         for (const Track& t : cloud.tracks) {
+            if (seen) break;   // already gathered: see FrameDepths
             if (!t.hasPoint) continue;
 
             // Only the points THIS camera actually observed. A point the
@@ -649,6 +655,30 @@ private:
         *zNear = a;
         *zFar  = b;
         return true;
+    }
+
+    // Each frame's depths of the points it observed, as DepthRange gathers
+    // them for one camera -- for every frame in ONE pass over the tracks.
+    // Gathered per frame, inside the sweep, it scanned every track once per
+    // frame: on a 1576-frame room scan, 1576 passes over 270000 tracks.
+    std::vector<std::vector<double>> FrameDepths(const PointCloud& cloud) const {
+        std::vector<std::vector<double>> by(cloud.cameras.size());
+        std::vector<int> frames;
+        for (const Track& t : cloud.tracks) {
+            if (!t.hasPoint) continue;
+            frames.clear();
+            for (const Observation& o : t.obs)
+                if (o.frame >= 0 && o.frame < int(cloud.cameras.size()) &&
+                    std::find(frames.begin(), frames.end(), o.frame) == frames.end())
+                    frames.push_back(o.frame);
+            for (int f : frames) {
+                const Camera& c = cloud.cameras[size_t(f)];
+                if (!c.solved) continue;
+                const Vec3 p = c.R * t.point + c.t;
+                if (p.z > 1e-6) by[size_t(f)].push_back(p.z);
+            }
+        }
+        return by;
     }
 
     // Which frames to correlate the reference against.
@@ -733,7 +763,7 @@ private:
         {
             double a = 0.0, b = 0.0;
             std::string ignored;
-            if (DepthRange(cloud, f, &a, &b, &ignored)) {
+            if (DepthRange(cloud, f, &a, &b, &ignored, &m_frameDepths[size_t(f)])) {
                 zNear = a;
                 zFar  = b;
             }
@@ -1379,15 +1409,23 @@ private:
     // Median relative disagreement between the sweep and triangulation, at
     // the pixels where a sparse point was observed. See the call site for
     // what this can and cannot tell us.
+    //
+    // Each frame's own median as well, into `perFrame`, from the same pass:
+    // asked for frame by frame it was a pass over every observation per
+    // frame, quadratic in the length of a video.
     double SparseAgreement(const PointCloud& cloud, const ImageSet& maps,
-                           int onlyFrame = -1) const {
+                           std::vector<double>* perFrame) const {
         std::vector<double> rel;
+        std::vector<std::vector<double>> by(cloud.cameras.size());
+        // Each depth map mapped once, not once per observation.
+        std::vector<ImageView> mapped(cloud.cameras.size());
+        for (size_t f = 0; f < mapped.size() && f * 3 < maps.images.size(); ++f)
+            mapped[f] = const_cast<Image&>(maps.images[f * 3]).MapCpuRead();
 
         for (const Track& t : cloud.tracks) {
             if (!t.hasPoint) continue;
             for (const Observation& o : t.obs) {
                 if (o.frame < 0) continue;
-                if (onlyFrame >= 0 && o.frame != onlyFrame) continue;
                 const size_t di = size_t(o.frame) * 3;
                 if (di >= maps.images.size()) continue;
 
@@ -1397,8 +1435,7 @@ private:
                 const Vec3 p = c.R * t.point + c.t;
                 if (p.z <= 1e-6) continue;
 
-                ImageView dv =
-                    const_cast<Image&>(maps.images[di]).MapCpuRead();
+                const ImageView& dv = mapped[size_t(o.frame)];
                 if (!dv.Valid()) continue;
                 const int px = int(o.x + 0.5), py = int(o.y + 0.5);
                 if (px < 0 || py < 0 || px >= dv.desc.width ||
@@ -1408,7 +1445,14 @@ private:
                 if (z <= 0.0f) continue;          // unmeasured here
 
                 rel.push_back(std::fabs(double(z) - p.z) / p.z);
+                by[size_t(o.frame)].push_back(rel.back());
             }
+        }
+        perFrame->assign(by.size(), -1.0);
+        for (size_t f = 0; f < by.size(); ++f) {
+            if (by[f].empty()) continue;
+            std::sort(by[f].begin(), by[f].end());
+            (*perFrame)[f] = by[f][by[f].size() / 2];
         }
         if (rel.empty()) return -1.0;
         std::sort(rel.begin(), rel.end());
@@ -1621,6 +1665,7 @@ private:
     // Diagnostics for the report, set by RunDense; nothing reads them back.
     int  m_gpuFrames = 0;
     bool m_gpuAvail  = false;
+    std::vector<std::vector<double>> m_frameDepths;   // FrameDepths, for this run
 };
 
 REGISTER_ALGORITHM(PlaneSweep);

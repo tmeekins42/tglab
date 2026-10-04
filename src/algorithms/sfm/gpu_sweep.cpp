@@ -22,7 +22,7 @@ ImageDesc PlaneDesc(int w, int h) {
 //
 // One thread per reference pixel, one dispatch per plane. Bindings:
 //
-//   t0..t3  the neighbours, luma in .x
+//   t0..t3  the neighbours, R32F luma (read as .x)
 //   u0      running state: best, prev, next, rival
 //   u1      running state: bestPlane, rivalPlane, lastScore, firstScore
 //   u2      the reference: luma, sA, sAA, -     (read only; a UAV slot
@@ -63,66 +63,106 @@ float LoadNb(uint k, int2 p) {
     }
 }
 
-[numthreads(8, 8, 1)]
-void main(uint3 tid : SV_DispatchThreadID) {
-    if (tid.x >= Width || tid.y >= Height) return;
+// A 16x16 TILE PER GROUP, its warped samples shared. Each window position
+// is a sample every pixel whose window covers it would otherwise compute
+// again -- 49 homography divides and 196 texture loads per pixel per
+// neighbour at the default 7x7 window. Here each sample of the tile and its
+// apron is warped ONCE, by whichever thread draws it, into group-shared
+// memory; the windows are then summed from there. The arithmetic per sample
+// and the order of the sums are the old kernel's -- but the compiler rounds
+// the warp a little differently, so a pixel whose best two planes were all
+// but tied can now pick the other. Measured on fountain-P11 (sfm.tgl at 0.4):
+// 90.2% measured at a 0.2% median error either way, and fusion kept 475459
+// points either way. On a 179-frame video the planes took 6.3 s, from 8.2.
+#define TS 16
+#define MAXT 46          // TS + 2 * the largest radius, 15
+groupshared float gA[MAXT * MAXT];
+groupshared float gB[MAXT * MAXT];
+groupshared uint  gOk[MAXT * MAXT];
 
+[numthreads(TS, TS, 1)]
+void main(uint3 gid : SV_GroupID, uint3 gt : SV_GroupThreadID) {
     int r  = int(Radius);
-    int px = int(tid.x), py = int(tid.y);
+    int T  = TS + 2 * r;
+    int ox = int(gid.x) * TS - r, oy = int(gid.y) * TS - r;
+    int li = int(gt.y) * TS + int(gt.x);
+    int px = int(gid.x) * TS + int(gt.x), py = int(gid.y) * TS + int(gt.y);
+    bool live = px < int(Width) && py < int(Height);
+
+    // The reference's luma over the tile and its apron.
+    for (int i = li; i < T * T; i += TS * TS) {
+        int wx = ox + i % T, wy = oy + i / T;
+        gA[i] = (wx >= 0 && wy >= 0 && wx < int(Width) && wy < int(Height))
+                    ? U2[int2(wx, wy)].x : 0.0;
+    }
 
     // Only a complete window is scored, matching the CPU: a partially
     // sampled window compares different amounts of image at different depths
     // and biases one plane against another. Margin pixels still run the fold
     // below with a score of -2, so their lastScore stays correct.
     float combined = -2.0;
-    bool inside = px >= r && py >= r &&
+    bool inside = live && px >= r && py >= r &&
                   px < int(Width) - r && py < int(Height) - r;
-
+    float full = float((2 * r + 1) * (2 * r + 1));
+    float sA = 0.0, sAA = 0.0;
     if (inside) {
-        float full = float((2 * r + 1) * (2 * r + 1));
-        float4 rv = U2[tid.xy];
-        float sA = rv.y, sAA = rv.z;
+        float4 rv = U2[int2(px, py)];
+        sA = rv.y; sAA = rv.z;
+    }
 
-        float v[4];
-        int n = 0;
+    float v[4];
+    int n = 0;
 
-        for (uint k = 0; k < NumNb; ++k) {
-            uint row = PlaneIdx * 4 + k;
-            float4 ha = U3[int2(0, row)];
-            float4 hb = U3[int2(1, row)];
-            float4 hc = U3[int2(2, row)];
-            float h00 = ha.x, h01 = ha.y, h02 = ha.z;
-            float h10 = ha.w, h11 = hb.x, h12 = hb.y;
-            float h20 = hb.z, h21 = hb.w, h22 = hc.x;
-            uint nw = (k == 0) ? NbW0 : (k == 1) ? NbW1 : (k == 2) ? NbW2 : NbW3;
-            uint nh = (k == 0) ? NbH0 : (k == 1) ? NbH1 : (k == 2) ? NbH2 : NbH3;
+    for (uint k = 0; k < NumNb; ++k) {
+        uint row = PlaneIdx * 4 + k;
+        float4 ha = U3[int2(0, row)];
+        float4 hb = U3[int2(1, row)];
+        float4 hc = U3[int2(2, row)];
+        float h00 = ha.x, h01 = ha.y, h02 = ha.z;
+        float h10 = ha.w, h11 = hb.x, h12 = hb.y;
+        float h20 = hb.z, h21 = hb.w, h22 = hc.x;
+        uint nw = (k == 0) ? NbW0 : (k == 1) ? NbW1 : (k == 2) ? NbW2 : NbW3;
+        uint nh = (k == 0) ? NbH0 : (k == 1) ? NbH1 : (k == 2) ? NbH2 : NbH3;
 
-            float sB = 0, sBB = 0, sAB = 0;
-            bool ok = true;
-            for (int dy = -r; dy <= r && ok; ++dy) {
-                for (int dx = -r; dx <= r; ++dx) {
-                    int wx = px + dx, wy = py + dy;
-                    float fx = float(wx), fy = float(wy);
-                    float qx = h00 * fx + h01 * fy + h02;
-                    float qy = h10 * fx + h11 * fy + h12;
-                    float qz = h20 * fx + h21 * fy + h22;
-                    if (abs(qz) <= 1e-12) { ok = false; break; }
-                    float sx = qx / qz, sy = qy / qz;
-                    // Strictly inside, so x0+1 and y0+1 are in range and no
-                    // clamping is needed. A clamped edge sample would invent
-                    // an agreement with the border pixel.
-                    if (!(sx >= 0.0 && sy >= 0.0 &&
-                          sx < float(nw - 1) && sy < float(nh - 1))) {
-                        ok = false; break;
-                    }
+        GroupMemoryBarrierWithGroupSync();   // the last neighbour's samples are read
+        for (int i = li; i < T * T; i += TS * TS) {
+            float fx = float(ox + i % T), fy = float(oy + i / T);
+            float qx = h00 * fx + h01 * fy + h02;
+            float qy = h10 * fx + h11 * fy + h12;
+            float qz = h20 * fx + h21 * fy + h22;
+            uint ok = 0;
+            float b = 0.0;
+            if (abs(qz) > 1e-12) {
+                float sx = qx / qz, sy = qy / qz;
+                // Strictly inside, so x0+1 and y0+1 are in range and no
+                // clamping is needed. A clamped edge sample would invent
+                // an agreement with the border pixel.
+                if (sx >= 0.0 && sy >= 0.0 && sx < float(nw - 1) && sy < float(nh - 1)) {
                     int x0 = int(sx), y0 = int(sy);
                     float ax = sx - float(x0), ay = sy - float(y0);
                     float p00 = LoadNb(k, int2(x0,     y0));
                     float p10 = LoadNb(k, int2(x0 + 1, y0));
                     float p01 = LoadNb(k, int2(x0,     y0 + 1));
                     float p11 = LoadNb(k, int2(x0 + 1, y0 + 1));
-                    float b = lerp(lerp(p00, p10, ax), lerp(p01, p11, ax), ay);
-                    float a = U2[int2(wx, wy)].x;
+                    b = lerp(lerp(p00, p10, ax), lerp(p01, p11, ax), ay);
+                    ok = 1;
+                }
+            }
+            gB[i] = b;
+            gOk[i] = ok;
+        }
+        GroupMemoryBarrierWithGroupSync();
+
+        if (inside) {
+            float sB = 0, sBB = 0, sAB = 0;
+            bool ok = true;
+            int cx = px - ox, cy = py - oy;
+            for (int dy = -r; dy <= r && ok; ++dy) {
+                for (int dx = -r; dx <= r; ++dx) {
+                    int t = (cy + dy) * T + (cx + dx);
+                    if (gOk[t] == 0) { ok = false; break; }
+                    float b = gB[t];
+                    float a = gA[t];
                     sB += b; sBB += b * b; sAB += a * b;
                 }
             }
@@ -136,7 +176,10 @@ void main(uint3 tid : SV_DispatchThreadID) {
                 if (den > 1e-6) v[n++] = num / den;
             }
         }
+    }
+    if (!live) return;
 
+    if (inside) {
         // THE BEST HALF, NOT THE MEAN. On repeating texture a wrong depth
         // that shifts the pattern by one period correlates well in every
         // neighbour at once, so the mean does not penalise it; and a pixel
@@ -158,8 +201,8 @@ void main(uint3 tid : SV_DispatchThreadID) {
     }
 
     // --- fold into the running state, mirroring the CPU's PixState -----------
-    float4 s  = U0[tid.xy];
-    float4 pi = U1[tid.xy];
+    float4 s  = U0[uint2(px, py)];
+    float4 pi = U1[uint2(px, py)];
     int   bestP     = int(pi.x);
     int   rivalP    = int(pi.y);
     float lastScore = pi.z;
@@ -185,11 +228,11 @@ void main(uint3 tid : SV_DispatchThreadID) {
         rivalP = p;
     }
 
-    U0[tid.xy] = s;
+    U0[uint2(px, py)] = s;
     // w: the FIRST plane's score, kept so the winner can be checked for a
     // peak that falls away at both ends of the range; z ends up holding the
     // last plane's.
-    U1[tid.xy] = float4(float(bestP), float(rivalP), combined, p == 0 ? combined : pi.w);
+    U1[uint2(px, py)] = float4(float(bestP), float(rivalP), combined, p == 0 ? combined : pi.w);
 }
 )";
 
@@ -382,14 +425,18 @@ bool GpuSweepSession::Begin(ComputeContext* gpu, const SweepPlane& ref,
     for (size_t i = 0; i < neighbours.size(); ++i) {
         const SweepPlane& nb = neighbours[i];
         if (!nb.v || nb.w <= 0 || nb.h <= 0) { *err = "empty neighbour"; return false; }
-        if (!gpu->CreateImage(PlaneDesc(nb.w, nb.h), &m->nbs[i])) {
+        // ONE CHANNEL: the kernel reads only luma, and a four-channel copy
+        // was four times the upload -- most of what preparing a frame cost.
+        ImageDesc nd = PlaneDesc(nb.w, nb.h);
+        nd.format = Format::R32F;
+        if (!gpu->CreateImage(nd, &m->nbs[i])) {
             *err = "could not allocate a neighbour plane";
             return false;
         }
-        m->staging.assign(size_t(nb.w) * size_t(nb.h) * 4, 0.0f);
-        for (size_t j = 0, nn = size_t(nb.w) * size_t(nb.h); j < nn; ++j)
-            m->staging[j * 4] = nb.v[j];
-        if (!gpu->Upload(ViewOf(m->staging, nb.w, nb.h), &m->nbs[i])) {
+        ImageView nv;
+        nv.desc = nd;
+        nv.data = reinterpret_cast<uint8_t*>(const_cast<float*>(nb.v));
+        if (!gpu->Upload(nv, &m->nbs[i])) {
             *err = "could not upload a neighbour plane";
             return false;
         }
@@ -415,7 +462,7 @@ bool GpuSweepSession::Plane(int planeIndex, std::string* err) {
 
     if (!m->gpu->Dispatch(TheKernel().k, srv,
                           {&m->state, &m->planeIdx, &m->ref, &m->homog},
-                          c, err))
+                          c, err, uint32_t((m->w + 15) / 16), uint32_t((m->h + 15) / 16)))
         return false;
 
     // SUBMITTED ON ITS OWN, every time. ComputeContext batches dispatches
