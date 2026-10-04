@@ -189,11 +189,11 @@ bool LoadView(const Image& img, int k, std::vector<double>* rgb, int* ow,
 // the halo and the floaters gone with the closing, and without the holes
 // along the book's edge that no growth at all leaves.
 // The pixels the cloud's points land on in this view: 1 where one does.
-std::vector<uint8_t> CloudFootprint(const std::vector<Splat>& points, const SplatCam& cam) {
+std::vector<uint8_t> CloudFootprint(const std::vector<Vec3>& means, const SplatCam& cam) {
     const int w = cam.w, h = cam.h;
     std::vector<uint8_t> in(size_t(w) * size_t(h), 0);
-    for (const Splat& s : points) {
-        const Vec3 q = cam.R * s.mean + cam.t;
+    for (const Vec3& m : means) {
+        const Vec3 q = cam.R * m + cam.t;
         if (q.z <= 1e-9) continue;
         const int x = int(cam.fx * q.x / q.z + cam.cx);
         const int y = int(cam.fy * q.y / q.z + cam.cy);
@@ -228,10 +228,10 @@ void Morph(std::vector<uint8_t>* m, int w, int h, int r, bool erode) {
         }
 }
 
-void MaskUncovered(const std::vector<Splat>& points, const SplatCam& cam, int grow, bool close,
+void MaskUncovered(const std::vector<Vec3>& means, const SplatCam& cam, int grow, bool close,
                    std::vector<double>* rgb) {
     const int w = cam.w, h = cam.h;
-    std::vector<uint8_t> in = CloudFootprint(points, cam);
+    std::vector<uint8_t> in = CloudFootprint(means, cam);
     Morph(&in, w, h, grow, false);
     // CLOSING: grown, then shrunk back by as much. Gaps narrower than twice
     // the growth stay filled, but the outline returns to where the cloud
@@ -322,6 +322,13 @@ public:
             return false;
         std::vector<View> views, heldOut;
         size_t maskedPx = 0, totalPx = 0;   // for the report
+        // The frames read in order (a read may come back from the device),
+        // then each view's depth target and mask IN PARALLEL: the mask
+        // projects every splat into every view, which on a 1576-frame room
+        // with 15 million splats was most of a four-minute stage spent
+        // before the first iteration. The means alone are projected -- a
+        // twentieth of the bytes each view has to read.
+        std::vector<std::pair<size_t, View>> made;
         for (size_t i = 0; i < cloud->cameras.size(); ++i) {
             const Camera& c = cloud->cameras[i];
             if (!c.solved) continue;
@@ -329,11 +336,22 @@ public:
             int w = 0, h = 0;
             if (!LoadView((*images)[i], k, &vw.rgb, &w, &h)) continue;
             vw.cam = SplatCamFrom(c, w, h);
+            made.emplace_back(i, std::move(vw));
+        }
+        std::vector<Vec3> means;
+        if (useMask) {
+            means.resize(cloud->splats.size());
+            for (size_t q = 0; q < means.size(); ++q) means[q] = cloud->splats[q].mean;
+        }
+        ParallelFor(made.size(), [&](size_t q) {
+            auto& [i, vw] = made[q];
             if (needDepthMaps)
-                vw.depth = DepthTarget(depthViews[i], w, h, double(m_depthConfidence));
+                vw.depth = DepthTarget(depthViews[i], vw.cam.w, vw.cam.h, double(m_depthConfidence));
+            if (useMask)
+                MaskUncovered(means, vw.cam, std::max(0, int(m_maskGrow)), bool(m_maskClose), &vw.rgb);
+        });
+        for (auto& [i, vw] : made) {
             if (useMask) {
-                MaskUncovered(cloud->splats, vw.cam, std::max(0, int(m_maskGrow)), bool(m_maskClose),
-                              &vw.rgb);
                 for (double v : vw.rgb) if (v < 0.0) ++maskedPx;
                 totalPx += vw.rgb.size();
             }
@@ -344,6 +362,8 @@ public:
             const bool hold = holdEvery >= 2 && int(i) % holdEvery == holdEvery / 2;
             (hold ? heldOut : views).push_back(std::move(vw));
         }
+        const double msViews = std::chrono::duration<double, std::milli>(
+                                   std::chrono::steady_clock::now() - t0).count();
         if (views.empty()) {
             *err = "train_splats: no solved camera has a usable frame";
             return false;
@@ -407,7 +427,8 @@ public:
         // base colour settles before the finer view dependence is fitted to
         // what is left. Band d switches on at iteration d * sh_every.
         std::vector<double> shM1(sh.size(), 0.0), shM2(sh.size(), 0.0);
-        const int shEvery = std::max(1, int(m_shEvery));
+        const double stretch = Stretch(int(views.size()));
+        const int shEvery = std::max(1, int(std::lround(double(m_shEvery) * stretch)));
         auto degreeAt = [&](int it) { return std::min(shMax, it / shEvery); };
         const double lrSh = double(m_shLr);
         std::vector<SplatParam> viewParams;   // params coloured for this camera
@@ -420,7 +441,7 @@ public:
         // model begins as plain colour and reflects only where it pays.
         const int iters = Iterations(int(views.size()));
         const bool reflect = bool(m_reflect) && iters > 0;
-        const int  reflFrom = std::max(0, int(m_reflectFrom));
+        const int  reflFrom = std::max(0, int(std::lround(double(m_reflectFrom) * stretch)));
         std::vector<ReflParam> refl;
         std::vector<double> rM1, rM2;
         EnvMap env;
@@ -533,11 +554,11 @@ public:
         std::vector<double> maxScreen(n, 0.0);
         const double worldLimit  = double(m_maxWorldSize) * extent;
         const double screenLimit = double(m_maxScreenSize);
-        const int    resetEvery  = std::max(0, int(m_opacityResetEvery));
+        const int    resetEvery  = std::max(0, int(std::lround(double(m_opacityResetEvery) * stretch)));
         long long prunedFaint = 0, prunedBig = 0;
         int resets = 0;
         const bool densify = bool(m_densify) && iters > 0;
-        const int  every = std::max(1, int(m_densifyEvery));
+        const int  every = std::max(1, int(std::lround(double(m_densifyEvery) * stretch)));
         const int  until = int(double(iters) * double(m_densifyUntil));
         const double threshold = double(m_gradThreshold);
         const size_t maxCount = size_t(std::max(1, int(m_maxGaussians)));
@@ -632,7 +653,8 @@ public:
             for (size_t i = 0; i < use.size(); ++i) snap->splats[i] = FromParam(use[i]);
             if (!shUse.empty() && shUse.size() == use.size() * size_t(kShRest)) {
                 snap->shDegree = shMax;
-                snap->splatSh.assign(shUse.begin(), shUse.end());
+                snap->splatSh.resize(shUse.size());
+                for (size_t q = 0; q < shUse.size(); ++q) snap->splatSh[q] = float(shUse[q]);
             }
             GroupSnapshot(std::move(snap));
         };
@@ -1185,7 +1207,8 @@ public:
         cloud->splats.resize(n);
         for (size_t i = 0; i < n; ++i) cloud->splats[i] = FromParam(params[i]);
         cloud->shDegree = sh.empty() ? 0 : shMax;
-        cloud->splatSh.assign(sh.begin(), sh.end());
+        cloud->splatSh.resize(sh.size());
+        for (size_t q = 0; q < sh.size(); ++q) cloud->splatSh[q] = float(sh[q]);
         cloud->splatRefl.clear();
         cloud->envMap.clear();
         cloud->envRes = 0;
@@ -1199,7 +1222,8 @@ public:
                 cloud->splatRefl[i * 4 + 2] = float(nn.y);
                 cloud->splatRefl[i * 4 + 3] = float(nn.z);
             }
-            cloud->envMap.assign(env.texels.begin(), env.texels.end());
+            cloud->envMap.resize(env.texels.size());
+            for (size_t q = 0; q < env.texels.size(); ++q) cloud->envMap[q] = float(env.texels[q]);
             cloud->envRes = env.res;
         }
 
@@ -1250,16 +1274,22 @@ public:
         std::snprintf(buf, sizeof(buf),
                       "train_splats: %d iterations over %d views at %dx%d, %d "
                       "Gaussians (%.0f in view on average); L1 %.4f -> %.4f, "
-                      "PSNR %.2f -> %.2f dB; %.1f s%s%s",
+                      "PSNR %.2f -> %.2f dB; %.1f s (%.1f preparing the views)%s%s",
                       iters, int(views.size()), views[0].cam.w, views[0].cam.h,
                       int(n), double(visibleSum) / double(std::max(1, iters)),
-                      l1Before, l1After, psnrBefore, psnrAfter, secs, dens,
+                      l1Before, l1After, psnrBefore, psnrAfter, secs, msViews * 1e-3, dens,
                       timing);
         m_note = buf;
         if (double(m_passes) > 0.0)
             m_note += "; " + std::to_string(iters) + " iterations from passes = " +
                       std::to_string(double(m_passes)).substr(0, 4) +
                       (bool(m_reflect) ? " (x1.5 for reflections)" : "");
+        if (stretch > 1.0) {
+            char sb[160];
+            std::snprintf(sb, sizeof sb, ", schedule stretched x%.2f (densify every %d, "
+                          "opacity reset every %d)", stretch, every, resetEvery);
+            m_note += sb;
+        }
         if (thinnedFrom > 0)
             m_note += "; started from " + std::to_string(thinnedFrom) +
                       " Gaussians, thinned evenly to max_gaussians";
@@ -1416,6 +1446,20 @@ private:
         const double mult = bool(m_reflect) ? 1.5 : 1.0;
         const double fromViews = passes * double(std::max(1, nViews)) * mult;
         return std::clamp(std::max(floor, int(std::lround(fromViews))), 1, 500000);
+    }
+
+    // THE SCHEDULE STRETCHES WITH THE RUN. densify_every, opacity_reset_every,
+    // sh_every and reflect_from count iterations, and were tuned on runs of
+    // about `iterations`. When `passes` makes the run longer, they are
+    // stretched by the same factor, so the run keeps the shape they were
+    // tuned at. Left as counts, a 1576-frame room trained for 25216
+    // iterations reset every opacity each 100 -- while each Gaussian is seen
+    // a few times in a pass of 1576 views, so none could recover before the
+    // next prune, and 950470 Gaussians fell to 734 (12.8 -> 7.7 dB).
+    double Stretch(int nViews) const {
+        const int floor = std::max(1, int(m_iterations));
+        const int iters = Iterations(nViews);
+        return double(m_passes) > 0.0 && iters > floor ? double(iters) / double(floor) : 1.0;
     }
 
     Param<float> m_passes{this, "passes", 0.0f, 0.0f, 500.0f,
