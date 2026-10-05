@@ -106,7 +106,28 @@ struct Ray {
 // mattered -- a start that placed that camera badly left it stranded, its
 // rays written off as outliers by the robust loss while the rest solved
 // around it (frame 0 of a video walk-around, 1.5 radii from frame 1).
-double RefineAngular(const std::vector<Ray>& rays, const std::vector<bool>& solved,
+//
+// SMOOTHNESS, for a sequence, when `smooth` > 0: consecutive frames are
+// expected to move steadily. A ray ties a camera to a point, so where few
+// points cross from one stretch of a walk to the next -- a pan across a bare
+// wall -- the two sides are tied by almost nothing, and each can take its own
+// scale and offset at no cost to the rays. Measured on a 1576-frame room scan:
+// five places along the walk where 3 to 9 tracks crossed, one camera step 78
+// times the median, and the scale of the scene doubling from one side of it
+// to the other. The penalty is on each frame's second difference, divided by
+// the typical step so it cannot reward shrinking the scene, and Huber-robust
+// so a genuine change of pace costs only linearly; where the rays pin the
+// cameras it barely moves them. On the room, at 1: the largest step fell
+// from 78 to 21 times the median, and the median depth the frames saw, per
+// 100 frames from frame 500 on, stayed within 0.56..1.06 where it had ranged
+// 0.61..2.08 -- the same room, no longer at two sizes.
+//
+// Tried and dropped: the view graph's translation DIRECTIONS as extra rays
+// between cameras. Across a pan the camera mostly rotates, so those
+// directions are noise exactly where they were wanted -- at 10 rays per edge
+// the room lost every track across five frames, and at 1 nothing improved.
+double RefineAngular(const std::vector<Ray>& rays, double smooth,
+                   const std::vector<bool>& solved,
                    int iterations, double huber, std::vector<Vec3>* camPos,
                    std::vector<Vec3>* pts,
                    const std::function<void(double)>& onStep = {}) {
@@ -119,6 +140,24 @@ double RefineAngular(const std::vector<Ray>& rays, const std::vector<bool>& solv
     }
     if (nv == 0) return 0.0;
     const int n3 = nv * 3;
+
+    // SMOOTHNESS, for a sequence: consecutive solved frames (c-1, c, c+1)
+    // whose second difference is penalised, scale-free -- divided by the
+    // typical step, which is re-measured each iteration -- and Huber-robust,
+    // so a real change of pace costs only linearly.
+    std::vector<int> mids;
+    if (smooth > 0.0)
+        for (int c = 1; c + 1 < nCam; ++c)
+            if (var[size_t(c - 1)] >= 0 && var[size_t(c)] >= 0 && var[size_t(c + 1)] >= 0) mids.push_back(c);
+    constexpr double kSmoothHuber = 0.5;
+    auto typicalStep = [&](const std::vector<Vec3>& cp) {
+        std::vector<double> st;
+        for (int c : mids) st.push_back((cp[size_t(c + 1)] - cp[size_t(c)]).Norm());
+        if (st.empty()) return 1.0;
+        std::nth_element(st.begin(), st.begin() + long(st.size() / 2), st.end());
+        return std::max(1e-12, st[st.size() / 2]);
+    };
+    double stepScale = typicalStep(*camPos);
 
     // Rays grouped by track, for the per-point elimination.
     std::vector<std::vector<int>> byTrack;
@@ -135,6 +174,11 @@ double RefineAngular(const std::vector<Ray>& rays, const std::vector<bool>& solv
             if (L < 1e-12) continue;
             const double e = (d * (1.0 / L) - r.dir).Norm();
             s += e <= huber ? 0.5 * e * e : huber * (e - 0.5 * huber);
+        }
+        for (int c : mids) {
+            const Vec3 a = (cp[size_t(c - 1)] + cp[size_t(c + 1)] - cp[size_t(c)] * 2.0) * (1.0 / stepScale);
+            const double e = a.Norm();
+            s += smooth * (e <= kSmoothHuber ? 0.5 * e * e : kSmoothHuber * (e - 0.5 * kSmoothHuber));
         }
         return s;
     };
@@ -157,6 +201,12 @@ double RefineAngular(const std::vector<Ray>& rays, const std::vector<bool>& solv
             cs.erase(std::unique(cs.begin(), cs.end()), cs.end());
             for (size_t a = 0; a < cs.size(); ++a)
                 for (size_t b = a + 1; b < cs.size(); ++b) pairs.push_back({cs[b], cs[a]});
+        }
+        for (int c : mids) {
+            const int v0 = var[size_t(c - 1)], v1 = var[size_t(c)], v2 = var[size_t(c + 1)];
+            pairs.push_back({v1, v0});
+            pairs.push_back({v2, v1});
+            pairs.push_back({v2, v0});
         }
         if (!sys.Analyse(std::vector<int>(static_cast<size_t>(nv), 3), pairs)) return cur;
     }
@@ -247,6 +297,30 @@ double RefineAngular(const std::vector<Ray>& rays, const std::vector<bool>& solv
                 rhsBase[size_t(vc * 3 + 1)] += Ar.y;
                 rhsBase[size_t(vc * 3 + 2)] += Ar.z;
             }
+        // Smoothness: r = (c0 - 2 c1 + c2) / s, dr/dc_k = k_k I / s.
+        for (int c : mids) {
+            const int vv[3] = {var[size_t(c - 1)], var[size_t(c)], var[size_t(c + 1)]};
+            const double kk[3] = {1.0, -2.0, 1.0};
+            const Vec3 a = ((*camPos)[size_t(c - 1)] + (*camPos)[size_t(c + 1)] -
+                            (*camPos)[size_t(c)] * 2.0) * (1.0 / stepScale);
+            const double e = a.Norm();
+            const double w = smooth * (e <= kSmoothHuber ? 1.0 : kSmoothHuber / e) /
+                             (stepScale * stepScale);
+            for (int p = 0; p < 3; ++p)
+                for (int q = 0; q <= p; ++q) {
+                    const double m = w * kk[p] * kk[q];
+                    const double M[9] = {m, 0, 0, 0, m, 0, 0, 0, m};
+                    if (vv[p] == vv[q]) {
+                        if (p == q) sys.Add(Sbase.data(), vv[p], vv[p], M);
+                    } else {
+                        sys.Add(Sbase.data(), vv[p], vv[q], M);
+                    }
+                }
+            const double ar[3] = {a.x, a.y, a.z};
+            for (int p = 0; p < 3; ++p)
+                for (int k = 0; k < 3; ++k)
+                    rhsBase[size_t(vv[p] * 3 + k)] -= w * stepScale * kk[p] * ar[k];
+        }
         baseValid = true;
         }
         S = Sbase;
@@ -398,6 +472,10 @@ double RefineAngular(const std::vector<Ray>& rays, const std::vector<bool>& solv
             baseValid = false;
             const bool tiny = cur - next < 1e-9 * cur;
             cur = next;
+            if (!mids.empty()) {   // the scale moved: re-measured, and the cost with it
+                stepScale = typicalStep(*camPos);
+                cur = cost(*camPos, *pts);
+            }
             damp.Succeed();
             if (tiny) break;
         } else if (!damp.Fail()) {
@@ -458,6 +536,16 @@ private:
                  "reach a starting point: they minimise distance, which rewards "
                  "shrinking the scene, and converge one link of the chain at a "
                  "time. 0 skips it, for comparison."}};
+
+    Param<float> m_smooth{this, "smooth", 0.0f, 0.0f, 100.0f,
+        {.help = "For frames in sequence, a video: how strongly the camera is "
+                 "held to a steady path in the refinement. Where few points "
+                 "cross from one stretch of a walk to the next -- a pan across "
+                 "a bare wall -- the rays alone let each side take its own "
+                 "scale, and the reconstruction comes back as copies of the "
+                 "scene at different sizes. Robust, so a real turn or change "
+                 "of pace costs little. 0 for photographs in no particular "
+                 "order."}};
 
     Param<int> m_seed{this, "seed", 1, 0, 100000,
         {.help = "Random seed for the initial positions. The joint method "
@@ -710,6 +798,13 @@ bool GlobalPosition::SolveJoint(PointCloud* cloud, std::string* err) {
         std::vector<bool> isSolved(size_t(nCam), false);
         for (int c = 0; c < nCam; ++c) isSolved[size_t(c)] = cloud->cameras[size_t(c)].solved;
 
+        // The view graph's directions, beside the rays; see RefineAngular.
+        // Each edge stands for every match behind it, so it counts as
+        // `edge_weight` rays -- far fewer than the hundreds of rays a
+        // well-observed camera has, so where points tie the cameras the edges
+        // barely move them, and where they do not the edges are what is left.
+        const double smoothWeight = double(m_smooth);
+
         // A SECOND START, from the pairs' own translation DIRECTIONS chained
         // along the sequence at equal steps -- and the refinement run from
         // both, keeping whichever explains the rays better.
@@ -826,12 +921,12 @@ bool GlobalPosition::SolveJoint(PointCloud* cloud, std::string* err) {
         const int trial = std::min(10, int(m_refine));
         if (chainOk && trial < int(m_refine)) {
             std::vector<Vec3> aCam = camPos, aPt = pt, cCam = chainCam, cPt = chainPt;
-            ta = RefineAngular(rays, isSolved, trial, 0.035, &aCam, &aPt, span(0.10, 0.15, "trial"));
-            tc = RefineAngular(rays, isSolved, trial, 0.035, &cCam, &cPt, span(0.15, 0.20, "trial"));
+            ta = RefineAngular(rays, smoothWeight, isSolved, trial, 0.035, &aCam, &aPt, span(0.10, 0.15, "trial"));
+            tc = RefineAngular(rays, smoothWeight, isSolved, trial, 0.035, &cCam, &cPt, span(0.15, 0.20, "trial"));
             skip = tc < ta ? 1 : 2;
         }
         if (skip == 1) {
-            RefineAngular(rays, isSolved, int(m_refine), 0.035, &chainCam, &chainPt,
+            RefineAngular(rays, smoothWeight, isSolved, int(m_refine), 0.035, &chainCam, &chainPt,
                           span(0.20, 1.0, "refine"));
             camPos.swap(chainCam);
             pt.swap(chainPt);
@@ -839,12 +934,12 @@ bool GlobalPosition::SolveJoint(PointCloud* cloud, std::string* err) {
         }
         const double costAlt =
             skip == 1 ? 0.0
-                      : RefineAngular(rays, isSolved, int(m_refine), 0.035, &camPos, &pt,
+                      : RefineAngular(rays, smoothWeight, isSolved, int(m_refine), 0.035, &camPos, &pt,
                                       span(0.20, skip == 0 && chainOk ? 0.6 : 1.0, "refine"));
         if (skip != 1) m_start = "alternating";
         double costChain = 0.0;
         if (chainOk && skip == 0) {
-            costChain = RefineAngular(rays, isSolved, int(m_refine), 0.035, &chainCam, &chainPt,
+            costChain = RefineAngular(rays, smoothWeight, isSolved, int(m_refine), 0.035, &chainCam, &chainPt,
                                       span(0.6, 1.0, "refine"));
             if (costChain < costAlt) {
                 camPos.swap(chainCam);
@@ -918,6 +1013,10 @@ bool GlobalPosition::SolveJoint(PointCloud* cloud, std::string* err) {
                   resid * 180.0 / 3.14159265358979);
     m_note = buf;
     if (!m_start.empty()) m_note += "; refined from the " + m_start + " start";
+    if (float(m_smooth) > 0.0f && int(m_refine) > 0) {
+        std::snprintf(buf, sizeof buf, "; held to a steady path (smooth %.3g)", double(float(m_smooth)));
+        m_note += buf;
+    }
     return true;
 }
 
