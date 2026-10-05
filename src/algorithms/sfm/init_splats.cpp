@@ -27,6 +27,8 @@
 // Where a point has too few neighbours to fit a plane it stays a sphere,
 // which is the paper's choice and the honest one when the shape is unknown.
 #include <algorithm>
+#include <atomic>
+#include <limits>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -41,60 +43,93 @@
 namespace tglab {
 namespace {
 
-// A uniform grid over the points, for nearest-neighbour search.
+// An exact k-d tree over the points, for the k nearest within a radius.
 //
-// SORTED KEYS rather than a hash map: one sort of (cell, index) pairs and a
-// binary search per lookup. For a few million points that is both faster and
-// far lighter than a map of vectors.
-struct Grid {
-    double cell = 1.0;
-    Vec3   lo;
-    std::vector<std::pair<uint64_t, int>> keyed;
+// NOT A UNIFORM GRID, which this was: a grid's cell is sized for the
+// cloud's typical spacing, and a cloud whose density varies wildly defeats
+// it. After a camera solve collapsed (IMG_1533 with smooth = 100), 46558 of
+// a million points shared one 1 cm cell, every one of them sorted fifty
+// thousand candidates, and the stage ran for longer than anyone waited. A
+// tree's cost does not depend on how the points are spread.
+struct KdTree {
+    struct Node { int lo, hi, left, right, axis; double split; };
+    const std::vector<Vec3>* pts = nullptr;
+    std::vector<int>  idx;
+    std::vector<Node> nodes;
+    static constexpr int kLeaf = 16;
 
-    static uint64_t Key(int x, int y, int z) {
-        const uint64_t mask = (1ull << 21) - 1;
-        return (uint64_t(x) & mask) | ((uint64_t(y) & mask) << 21) |
-               ((uint64_t(z) & mask) << 42);
-    }
-    void CellOf(const Vec3& p, int* x, int* y, int* z) const {
-        *x = int(std::floor((p.x - lo.x) / cell));
-        *y = int(std::floor((p.y - lo.y) / cell));
-        *z = int(std::floor((p.z - lo.z) / cell));
+    static double Coord(const Vec3& p, int a) { return a == 0 ? p.x : a == 1 ? p.y : p.z; }
+
+    void Build(const std::vector<Vec3>& points, const std::vector<char>& in) {
+        pts = &points;
+        idx.clear();
+        for (int i = 0; i < int(points.size()); ++i)
+            if (in[size_t(i)]) idx.push_back(i);
+        nodes.clear();
+        if (!idx.empty()) BuildNode(0, int(idx.size()));
     }
 
-    void Build(const std::vector<Vec3>& pts, double cellSize) {
-        cell = cellSize;
-        lo = pts.empty() ? Vec3{0, 0, 0} : pts[0];
-        for (const Vec3& p : pts) {
-            lo.x = std::min(lo.x, p.x);
-            lo.y = std::min(lo.y, p.y);
-            lo.z = std::min(lo.z, p.z);
+    int BuildNode(int lo, int hi) {
+        const int id = int(nodes.size());
+        nodes.push_back(Node{lo, hi, -1, -1, -1, 0.0});
+        if (hi - lo <= kLeaf) return id;
+        Vec3 mn = (*pts)[size_t(idx[size_t(lo)])], mx = mn;
+        for (int q = lo; q < hi; ++q) {
+            const Vec3& p = (*pts)[size_t(idx[size_t(q)])];
+            mn = Vec3{std::min(mn.x, p.x), std::min(mn.y, p.y), std::min(mn.z, p.z)};
+            mx = Vec3{std::max(mx.x, p.x), std::max(mx.y, p.y), std::max(mx.z, p.z)};
         }
-        keyed.resize(pts.size());
-        for (size_t i = 0; i < pts.size(); ++i) {
-            int x, y, z;
-            CellOf(pts[i], &x, &y, &z);
-            keyed[i] = {Key(x, y, z), int(i)};
-        }
-        std::sort(keyed.begin(), keyed.end());
+        const Vec3 d = mx - mn;
+        const int axis = (d.x >= d.y && d.x >= d.z) ? 0 : (d.y >= d.z ? 1 : 2);
+        const int mid = (lo + hi) / 2;
+        std::nth_element(idx.begin() + lo, idx.begin() + mid, idx.begin() + hi,
+                         [&](int a, int b) {
+                             return Coord((*pts)[size_t(a)], axis) < Coord((*pts)[size_t(b)], axis);
+                         });
+        const double split = Coord((*pts)[size_t(idx[size_t(mid)])], axis);
+        const int l = BuildNode(lo, mid);
+        const int r = BuildNode(mid, hi);
+        nodes[size_t(id)].left = l;    // after the recursion: push_back may move nodes
+        nodes[size_t(id)].right = r;
+        nodes[size_t(id)].axis = axis;
+        nodes[size_t(id)].split = split;
+        return id;
     }
 
-    // Every point in the cube of cells within `ring` of p's cell.
-    template <class F>
-    void Visit(const Vec3& p, int ring, F&& f) const {
-        int cx, cy, cz;
-        CellOf(p, &cx, &cy, &cz);
-        for (int dz = -ring; dz <= ring; ++dz)
-            for (int dy = -ring; dy <= ring; ++dy)
-                for (int dx = -ring; dx <= ring; ++dx) {
-                    const int x = cx + dx, y = cy + dy, z = cz + dz;
-                    if (x < 0 || y < 0 || z < 0) continue;
-                    const uint64_t k = Key(x, y, z);
-                    auto it = std::lower_bound(
-                        keyed.begin(), keyed.end(), std::make_pair(k, -1));
-                    for (; it != keyed.end() && it->first == k; ++it)
-                        f(it->second);
+    // The k nearest to p (excluding `self`) within `radius`, nearest first,
+    // as (squared distance, index).
+    void Nearest(const Vec3& p, int self, int k, double radius,
+                 std::vector<std::pair<double, int>>* out) const {
+        out->clear();
+        if (nodes.empty() || k <= 0) return;
+        double worst = radius * radius;   // shrinks once k are held
+        auto visit = [&](auto&& self_, int n) -> void {
+            const Node& nd = nodes[size_t(n)];
+            if (nd.axis < 0) {
+                for (int q = nd.lo; q < nd.hi; ++q) {
+                    const int j = idx[size_t(q)];
+                    if (j == self) continue;
+                    const Vec3 d = (*pts)[size_t(j)] - p;
+                    const double d2 = d.Dot(d);
+                    if (d2 > worst) continue;
+                    out->emplace_back(d2, j);
+                    std::push_heap(out->begin(), out->end());
+                    if (int(out->size()) > k) {
+                        std::pop_heap(out->begin(), out->end());
+                        out->pop_back();
+                    }
+                    if (int(out->size()) == k) worst = out->front().first;
                 }
+                return;
+            }
+            const double diff = Coord(p, nd.axis) - nd.split;
+            const int nearSide = diff < 0.0 ? nd.left : nd.right;
+            const int farSide  = diff < 0.0 ? nd.right : nd.left;
+            self_(self_, nearSide);
+            if (diff * diff <= worst) self_(self_, farSide);
+        };
+        visit(visit, 0);
+        std::sort_heap(out->begin(), out->end());
     }
 };
 
@@ -155,20 +190,37 @@ public:
             return false;
         }
 
-        // CELL SIZE FROM THE POINT SPACING, assuming the points lie on
+        // THE SEARCH RADIUS FROM THE POINT SPACING, assuming the points lie on
         // surfaces -- which is what a reconstruction is. N points over a
-        // surface of extent E sit about E / sqrt(N) apart, and a cell of twice
-        // that holds a handful of them, so the 27-cell neighbourhood searched
-        // below holds on the order of a hundred candidates. Sizing for a
-        // VOLUME (E / cbrt(N)) puts hundreds of points in every cell on a
-        // surface and makes the search thousands of times slower.
+        // surface of extent E sit about E / sqrt(N) apart; neighbours are
+        // looked for within four times that (what the grid this replaced
+        // reached), so a point on a fragment of its own finds few or none
+        // and is dropped below.
         //
         // The extent is the 2-98 percentile box, for the reason the viewer
         // frames on percentiles: a few strays decide a bounding box.
-        const double extent = RobustExtent(pts);
+        Vec3 boxLo, boxHi;
+        RobustBox(pts, &boxLo, &boxHi);
+        const Vec3 span = boxHi - boxLo;
+        const double extent = std::max(1e-9, span.Norm());
         const double cell = std::max(1e-9, 2.0 * extent / std::sqrt(double(n)));
-        Grid grid;
-        grid.Build(pts, cell);
+
+        // FAR STRAYS ARE LEFT OUT, and dropped: anything more than one robust
+        // extent outside the 2-98 percentile box is nowhere near a surface
+        // the rest describe.
+        const Vec3 pad{extent, extent, extent};
+        const Vec3 keepLo = boxLo - pad, keepHi = boxHi + pad;
+        std::vector<char> inside(static_cast<size_t>(n), 0);
+        int far = 0;
+        for (int i = 0; i < n; ++i) {
+            const Vec3& p = pts[size_t(i)];
+            const bool ok = p.x >= keepLo.x && p.y >= keepLo.y && p.z >= keepLo.z &&
+                            p.x <= keepHi.x && p.y <= keepHi.y && p.z <= keepHi.z;
+            inside[size_t(i)] = ok ? 1 : 0;
+            far += ok ? 0 : 1;
+        }
+        KdTree tree;
+        tree.Build(pts, inside);
 
         const int k = std::clamp(int(m_neighbours), 3, 32);
         const double size = double(m_size), flat = double(m_flatness);
@@ -179,24 +231,18 @@ public:
         std::vector<double> spacings(static_cast<size_t>(n), 0.0);
         std::vector<int>    found(static_cast<size_t>(n), 0);
 
+        std::atomic<int> fitted{0};
         ParallelFor(n, [&](int i) {
+            if (const int d = ++fitted; d % 8192 == 0)
+                GroupProgress(double(d) / double(n), "fitting discs");
             const Vec3& p = pts[size_t(i)];
+            if (!inside[size_t(i)]) return;   // a far stray: dropped below
 
-            // The k nearest, widening the search until enough are found. A
-            // point on an isolated fragment may not find k within two rings,
-            // and gets whatever it has.
+            // The k nearest within the radius. A point on an isolated
+            // fragment may find fewer, and gets whatever it has.
             std::vector<std::pair<double, int>> near;
-            for (int ring = 1; ring <= 2; ++ring) {
-                near.clear();
-                grid.Visit(p, ring, [&](int j) {
-                    if (j == i) return;
-                    const Vec3 d = pts[size_t(j)] - p;
-                    near.emplace_back(d.Dot(d), j);
-                });
-                if (int(near.size()) >= k) break;
-            }
-            const int m = std::min(k, int(near.size()));
-            std::partial_sort(near.begin(), near.begin() + m, near.end());
+            tree.Nearest(p, i, k, 2.0 * cell, &near);
+            const int m = int(near.size());
 
             // Spacing: the mean distance to the neighbours found.
             double spacing = 0.0;
@@ -256,16 +302,21 @@ public:
         // background it sits in front of.
         int dropped = 0;
         const double factor = double(m_isolated);
-        if (factor > 0.0) {
-            std::vector<double> sorted = spacings;
-            std::nth_element(sorted.begin(), sorted.begin() + long(sorted.size() / 2),
-                             sorted.end());
-            const double limit = factor * sorted[sorted.size() / 2];
+        if (factor > 0.0 || far > 0) {
+            std::vector<double> sorted;
+            for (int i = 0; i < n; ++i)
+                if (inside[size_t(i)]) sorted.push_back(spacings[size_t(i)]);
+            double limit = std::numeric_limits<double>::max();
+            if (factor > 0.0 && !sorted.empty()) {
+                std::nth_element(sorted.begin(), sorted.begin() + long(sorted.size() / 2),
+                                 sorted.end());
+                limit = factor * sorted[sorted.size() / 2];
+            }
             std::vector<Splat> kept;
             std::vector<char> keptPlanar;
             kept.reserve(out.size());
             for (size_t i = 0; i < out.size(); ++i) {
-                if (found[i] < 3 || spacings[i] > limit) { ++dropped; continue; }
+                if (!inside[i] || found[i] < 3 || spacings[i] > limit) { ++dropped; continue; }
                 kept.push_back(out[i]);
                 keptPlanar.push_back(planar[i]);
             }
@@ -289,8 +340,11 @@ public:
                       "init_splats: %d Gaussians from %d points, %d oriented to "
                       "the surface, %d left spherical (too few neighbours); "
                       "%d isolated points dropped",
-                      nOut, n, nPlanar, nOut - nPlanar, dropped);
+                      nOut, n, nPlanar, nOut - nPlanar, dropped - far);
         m_note = buf;
+        if (far > 0)
+            m_note += "; " + std::to_string(far) + " far strays dropped (more than the "
+                      "cloud's extent outside its 2-98% box)";
         if (total > size_t(n))
             m_note += "; drawn at random from " + std::to_string(total) + " (max_splats)";
         return true;
@@ -299,22 +353,22 @@ public:
     std::string RunReport() const override { return m_note; }
 
 private:
-    static double RobustExtent(std::vector<Vec3> pts) {
-        auto pct = [&](auto get) {
+    // The 2-98 percentile box, per axis.
+    static void RobustBox(const std::vector<Vec3>& pts, Vec3* lo, Vec3* hi) {
+        auto pct = [&](auto get, double* a, double* b) {
             std::vector<double> v;
             v.reserve(pts.size());
             for (const Vec3& p : pts) v.push_back(get(p));
-            const size_t lo = size_t(0.02 * double(v.size() - 1));
-            const size_t hi = size_t(0.98 * double(v.size() - 1));
-            std::nth_element(v.begin(), v.begin() + long(lo), v.end());
-            const double a = v[lo];
-            std::nth_element(v.begin(), v.begin() + long(hi), v.end());
-            return v[hi] - a;
+            const size_t l = size_t(0.02 * double(v.size() - 1));
+            const size_t h = size_t(0.98 * double(v.size() - 1));
+            std::nth_element(v.begin(), v.begin() + long(l), v.end());
+            *a = v[l];
+            std::nth_element(v.begin(), v.begin() + long(h), v.end());
+            *b = v[h];
         };
-        const double ex = pct([](const Vec3& p) { return p.x; });
-        const double ey = pct([](const Vec3& p) { return p.y; });
-        const double ez = pct([](const Vec3& p) { return p.z; });
-        return std::max(1e-9, std::sqrt(ex * ex + ey * ey + ez * ez));
+        pct([](const Vec3& p) { return p.x; }, &lo->x, &hi->x);
+        pct([](const Vec3& p) { return p.y; }, &lo->y, &hi->y);
+        pct([](const Vec3& p) { return p.z; }, &lo->z, &hi->z);
     }
 
     // See the draw in RunReconstruct. Matches train_splats' max_gaussians.

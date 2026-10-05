@@ -537,15 +537,21 @@ private:
                  "shrinking the scene, and converge one link of the chain at a "
                  "time. 0 skips it, for comparison."}};
 
-    Param<float> m_smooth{this, "smooth", 0.0f, 0.0f, 100.0f,
+    // CAPPED AT 5. Every ray's pull is bounded (Huber on a bounded chord),
+    // the prior's is not, so a large weight simply outvotes the images: at
+    // 100, IMG_1533's camera path came back as a small loop that looked
+    // nothing like the walk. On the room scan 1 helped and 10 already hurt.
+    Param<float> m_smooth{this, "smooth", 0.0f, 0.0f, 5.0f,
         {.help = "For frames in sequence, a video: how strongly the camera is "
                  "held to a steady path in the refinement. Where few points "
                  "cross from one stretch of a walk to the next -- a pan across "
                  "a bare wall -- the rays alone let each side take its own "
                  "scale, and the reconstruction comes back as copies of the "
                  "scene at different sizes. Robust, so a real turn or change "
-                 "of pace costs little. 0 for photographs in no particular "
-                 "order."}};
+                 "of pace costs little. Around 1; much more outvotes the "
+                 "images themselves. 0 for photographs in no particular "
+                 "order.",
+         .step = 0.1}};
 
     Param<int> m_seed{this, "seed", 1, 0, 100000,
         {.help = "Random seed for the initial positions. The joint method "

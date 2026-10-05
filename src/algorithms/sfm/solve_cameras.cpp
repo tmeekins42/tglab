@@ -291,11 +291,13 @@ private:
         {.help = "relative_pose's estimator: 0 eight-point, 1 five-point."}};
     Param<int> m_minLength{this, "min_length", 3, 2, 20,
         {.help = "build_tracks': fewest frames a track must appear in."}};
-    Param<float> m_smooth{this, "smooth", 0.0f, 0.0f, 100.0f,
+    Param<float> m_smooth{this, "smooth", 0.0f, 0.0f, 5.0f,
         {.help = "global_position's: for a video, how strongly the camera is "
                  "held to a steady path. Keeps a pan across a bare wall from "
-                 "letting each side of it take its own scale. 0 for "
-                 "photographs in no particular order."}};
+                 "letting each side of it take its own scale. Around 1; much "
+                 "more outvotes the images and bends the path to the prior. "
+                 "0 for photographs in no particular order.",
+         .step = 0.1}};
     Param<float> m_maxDistance{this, "max_distance", 3.0f, 1.0f, 1000.0f,
         {.help = "triangulate's and bundle adjustment's: how far out, in "
                  "camera-ring radii, a point may be. 3 suits a walk around a "
