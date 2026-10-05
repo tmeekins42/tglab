@@ -86,6 +86,11 @@ public:
         }
         if (!src.Valid()) return;
 
+        // LOCAL, NOT MEMBERS. See demosaic_ahd: one instance is mapped across
+        // every frame of a group, so instance scratch is shared between the
+        // threads running those frames. Caught by TestNoSharedScratch.
+        PixelBuffer        m_in;
+        std::vector<float> m_s;
         m_in.Unpack(src);
         if (!m_in.Valid()) return;
 
@@ -206,8 +211,6 @@ public:
     }
 
 private:
-    PixelBuffer        m_in;
-    std::vector<float> m_s;
 };
 
 REGISTER_ALGORITHM(DemosaicStages);

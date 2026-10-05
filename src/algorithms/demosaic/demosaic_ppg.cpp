@@ -60,6 +60,11 @@ public:
         ImageView       dst = ctx.Out(0);
         if (!src.Valid() || !dst.Valid()) return;
 
+        // LOCAL, NOT MEMBERS. See demosaic_ahd: one instance is mapped across
+        // every frame of a group, so instance scratch is shared between the
+        // threads running those frames. Caught by TestNoSharedScratch.
+        PixelBuffer        m_in;
+        std::vector<float> m_s, m_g;
         m_in.Unpack(src);
         if (!m_in.Valid()) return;
 
@@ -67,7 +72,7 @@ public:
         const CfaPattern cfa = src.desc.cfa;
 
         if (cfa == CfaPattern::None || cfa == CfaPattern::XTrans) {
-            PassThrough(dst, w, h);
+            PassThrough(m_in, dst, w, h);
             return;
         }
 
@@ -442,7 +447,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     float m_camMul[3] = {1.0f, 1.0f, 1.0f};
     float m_rgbCam[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
 
-    void PassThrough(ImageView& dst, int w, int h) {
+    static void PassThrough(const PixelBuffer& m_in, ImageView& dst, int w, int h) {
         const int ch = m_in.Channels();
         const float scale = m_in.ValueScale();
         for (int y = 0; y < h; ++y)
@@ -454,8 +459,6 @@ void main(uint3 tid : SV_DispatchThreadID) {
             }
     }
 
-    PixelBuffer        m_in;
-    std::vector<float> m_s, m_g;
 };
 
 REGISTER_ALGORITHM(DemosaicPpg);

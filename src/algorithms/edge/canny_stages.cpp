@@ -99,6 +99,12 @@ public:
         // uses FormatSpec to size OUTPUTS and never converts an input, so an
         // RGBA8 image reaching here had its bytes read as floats -- garbage,
         // and the thresholds below then rejected everything.
+        // LOCAL, NOT MEMBERS: one instance runs every frame of a group at
+        // once, and scratch on the instance would be shared between them
+        // (see demosaic_ahd, and TestNoSharedScratch).
+        PixelBuffer          m_in;
+        std::vector<uint8_t> m_mark;
+        std::vector<int>     m_stack;
         m_in.Unpack(src);
         if (!m_in.Valid()) return;
 
@@ -151,9 +157,6 @@ private:
     Param<float> m_low {this, "low",  0.10f, 0.0f, 4.0f};
     Param<float> m_high{this, "high", 0.30f, 0.0f, 4.0f};
 
-    PixelBuffer          m_in;
-    std::vector<uint8_t> m_mark;
-    std::vector<int>     m_stack;
 };
 
 REGISTER_ALGORITHM(Hysteresis);

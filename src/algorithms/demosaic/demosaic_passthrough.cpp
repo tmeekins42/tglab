@@ -37,6 +37,11 @@ public:
         ImageView       dst = ctx.Out(0);
         if (!src.Valid() || !dst.Valid()) return;
 
+        // LOCAL, NOT MEMBERS. See demosaic_ahd: one instance is mapped across
+        // every frame of a group, so instance scratch is shared between the
+        // threads running those frames. Caught by TestNoSharedScratch.
+        PixelBuffer        m_in, m_out;
+        std::vector<float> m_rgba;
         m_in.Unpack(src);
         if (!m_in.Valid()) return;
         m_out.AllocLike(m_in);
@@ -72,7 +77,7 @@ public:
             }
         }
 
-        WriteHalf(dst, w, h);
+        WriteHalf(m_rgba, dst, w, h);
     }
 
     // --- GPU implementation -------------------------------------------------
@@ -139,7 +144,7 @@ private:
     float m_black = 0.0f;
     float m_range = 1.0f;
 
-    void WriteHalf(ImageView& dst, int w, int h) const {
+    static void WriteHalf(const std::vector<float>& m_rgba, ImageView& dst, int w, int h) {
         for (int y = 0; y < h; ++y)
             for (int x = 0; x < w; ++x) {
                 uint16_t* p = dst.At<uint16_t>(x, y);
@@ -154,8 +159,6 @@ private:
         "pattern visible. Off shows the raw luminance the sensor actually "
         "stored. Neither interpolates -- both are one sample per pixel."};
 
-    PixelBuffer        m_in, m_out;
-    std::vector<float> m_rgba;
 };
 
 REGISTER_ALGORITHM(DemosaicPassthrough);
