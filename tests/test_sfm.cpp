@@ -60,6 +60,18 @@ using namespace tglab;
 
 static int g_fail = 0;
 
+// The device for the GPU sections, or none when TGLAB_TESTS_NO_GPU is set.
+// The release workflow sets it: a hosted runner has no GPU, only Microsoft's
+// software renderer, and there the splat rasteriser's device was removed
+// part-way through (0.19.0's first build) -- which says nothing about the
+// code, and every GPU section after it then found no device at all. The
+// same checks pass on WARP on a desktop.
+static HRESULT TestDevice(IUnknown* adapter, D3D_FEATURE_LEVEL level, REFIID riid,
+                          void** out) {
+    if (std::getenv("TGLAB_TESTS_NO_GPU")) return E_FAIL;
+    return D3D12CreateDevice(adapter, level, riid, out);
+}
+
 static void Check(bool cond, const std::string& what) {
     std::printf("%s  %s\n", cond ? "[ ok ]" : "[FAIL]", what.c_str());
     if (!cond) ++g_fail;
@@ -3270,7 +3282,7 @@ int main() {
         std::printf("\n--- gpu sweep vs cpu ---\n");
 
         ID3D12Device* dev = nullptr;
-        if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0,
+        if (FAILED(TestDevice(nullptr, D3D_FEATURE_LEVEL_11_0,
                                      IID_PPV_ARGS(&dev)))) {
             std::printf("       no D3D12 device; skipped\n");
         } else {
@@ -3764,7 +3776,7 @@ int main() {
     {
         std::printf("\n--- splat rasteriser, GPU against CPU ---\n");
         ID3D12Device* dev = nullptr;
-        if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0,
+        if (FAILED(TestDevice(nullptr, D3D_FEATURE_LEVEL_11_0,
                                      IID_PPV_ARGS(&dev)))) {
             std::printf("       no D3D12 device; skipped\n");
         } else {
@@ -3915,7 +3927,7 @@ int main() {
     {
         std::printf("\n--- densification on the GPU ---\n");
         ID3D12Device* dev = nullptr;
-        if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev)))) {
+        if (FAILED(TestDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev)))) {
             std::printf("       no D3D12 device; not checked\n");
         } else {
             ComputeContext gpu;
@@ -4088,7 +4100,7 @@ int main() {
     {
         std::printf("\n--- deferred shading on the GPU ---\n");
         ID3D12Device* dev = nullptr;
-        if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev)))) {
+        if (FAILED(TestDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev)))) {
             std::printf("       no D3D12 device; not checked\n");
         } else {
             ComputeContext gpu;
@@ -4556,7 +4568,7 @@ int main() {
             // payload swap, three backwards gathered by kAccum, and the
             // reflection step on the device; the environment on the CPU.
             ID3D12Device* dev = nullptr;
-            if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0,
+            if (FAILED(TestDevice(nullptr, D3D_FEATURE_LEVEL_11_0,
                                          IID_PPV_ARGS(&dev)))) {
                 std::printf("       no D3D12 device; GPU reflections not checked\n");
             } else {
@@ -4789,7 +4801,7 @@ int main() {
             // kernel and the coefficients stepped by their own. Same scene,
             // same degree: the fit must match the CPU reference's.
             ID3D12Device* dev = nullptr;
-            if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0,
+            if (FAILED(TestDevice(nullptr, D3D_FEATURE_LEVEL_11_0,
                                          IID_PPV_ARGS(&dev)))) {
                 std::printf("       no D3D12 device; GPU spherical harmonics not checked\n");
             } else {
@@ -4911,7 +4923,7 @@ int main() {
         //   * THREE HUNDRED steps, comparing the fit, which says the loop as
         //     a whole converges the same way.
         ID3D12Device* dev = nullptr;
-        if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0,
+        if (FAILED(TestDevice(nullptr, D3D_FEATURE_LEVEL_11_0,
                                      IID_PPV_ARGS(&dev)))) {
             std::printf("       no D3D12 device; GPU training not checked\n");
         } else {

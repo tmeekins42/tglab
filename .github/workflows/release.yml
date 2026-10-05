@@ -57,7 +57,13 @@ jobs:
 
       # The CPU-only suites gate the release: if the language, the pipeline, the
       # filters or the demosaics are broken, nothing should be published.
+      # TGLAB_TESTS_NO_GPU: the sfm suite's GPU sections stand down. The
+      # runner's software renderer removed the device part-way through them
+      # (0.19.0's first build), which gates a release on something no user's
+      # GPU does.
       - name: Test (CPU suites)
+        env:
+          TGLAB_TESTS_NO_GPU: '1'
         run: ctest --test-dir build -C Release --output-on-failure -E runtime
 
       # The runtime suite is reported but does not gate, because a hosted runner
