@@ -46,6 +46,27 @@ jobs:
           if (-not (Test-Path "$dir/dxil.dll"))       { throw "dxil.dll not in $dir" }
           "DXC_BIN=$dir" | Out-File -FilePath $env:GITHUB_ENV -Append
 
+      # The network weights (models/*.tgw) are not in the repository -- 63 MB
+      # of binaries -- but the archive ships them, so they are made here from
+      # the published checkpoints exactly as the README's "from source" steps
+      # do. Measured: the three files come out byte-identical to a developer
+      # machine's (torch 2.14.1+cpu). 0.19.1's first build failed packaging
+      # for want of them.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Make the network weights
+        shell: pwsh
+        run: |
+          python -m pip install --quiet numpy
+          python -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          New-Item -ItemType Directory -Force models | Out-Null
+          python tools/nn_convert.py dad models/dad.tgw
+          python tools/nn_convert.py loma_b128 models/dedode_b128.tgw --prefix _descriptor.
+          python tools/nn_convert.py loma_b128 models/loma_b128.tgw --exclude _detector. --exclude _descriptor.
+          Get-ChildItem models
+
       - name: Configure
         run: >
           cmake -S . -B build -A x64
@@ -109,7 +130,8 @@ jobs:
             'tglab.exe', 'dxcompiler.dll', 'dxil.dll',
             'LICENSE', 'READ-ME-FIRST.txt',
             'licenses/libraw-LICENSE.LGPL', 'licenses/libraw-COPYRIGHT',
-            'scripts/hello.tgl', 'assets/test.png'
+            'scripts/hello.tgl', 'assets/test.png',
+            'models/dad.tgw', 'models/dedode_b128.tgw', 'models/loma_b128.tgw'
           )
           foreach ($r in $required) {
             if (-not ($names -match [regex]::Escape($r))) {
