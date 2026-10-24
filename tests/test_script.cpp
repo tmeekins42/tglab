@@ -137,6 +137,95 @@ static bool WriteExifFixture(const std::string& path) {
     return true;
 }
 
+// merge_hdr's rewrite, on one synthetic bracket: measured exposure ratios,
+// one weight per pixel, and deghosting. Its own function for the same
+// stack-size reason as TestPly.
+static void TestMergeHdrRewrite() {
+    // The three things the rewrite is for, on one synthetic bracket.
+    //
+    // Scene radiance ramps 0.05 -> 4.0 across the columns, coloured
+    // (R, R/2, R/4), shot at 0.1, 0.2 and 0.5 s. The longest frame's EXIF
+    // LIES -- it claims 0.4 s -- and the shortest has a bright "moving"
+    // square the others do not. Each frame clips at 1.0.
+    {
+        constexpr int S = 64;
+        auto Rad = [](int x) { return 0.05f + 3.95f * float(x) / float(S - 1); };
+        auto Shot = [&](float exifShutter, float actual, bool square) {
+            Image img;
+            ImageDesc d;
+            d.width = S; d.height = S; d.format = Format::RGBA32F;
+            d.linear = true; d.shutter = exifShutter; d.aperture = 2.0f; d.iso = 100.0f;
+            img.Alloc(d);
+            ImageView v = img.MapCpuWrite();
+            float* p = reinterpret_cast<float*>(v.data);
+            for (int y = 0; y < S; ++y)
+                for (int x = 0; x < S; ++x) {
+                    float r = Rad(x) * actual;
+                    if (square && x >= 8 && x < 24 && y >= 8 && y < 24) r *= 3.0f;
+                    float* q = p + (size_t(y) * S + size_t(x)) * 4;
+                    q[0] = std::min(r, 1.0f);
+                    q[1] = std::min(r * 0.5f, 1.0f);
+                    q[2] = std::min(r * 0.25f, 1.0f);
+                    q[3] = 1.0f;
+                }
+            return img;
+        };
+        ImageSet s3;
+        s3.images.push_back(Shot(0.1f, 0.1f, true));
+        s3.images.push_back(Shot(0.2f, 0.2f, false));
+        s3.images.push_back(Shot(0.4f, 0.5f, false));
+        s3.shape = Shape::Of("exposure", 3);
+
+        SourceImage g3; g3.name = "ramp"; g3.index = 0;
+        g3.shape = Shape::Of("exposure", 3);
+        std::vector<SourceImage> n3{g3};
+
+        Program p3; std::string e3;
+        Parse("g = image(\"ramp\")\nh = merge_hdr(g)\ndisplay(h)\n", &p3, &e3);
+        UiState u3; Pipeline pl3;
+        Check(Interpret(p3, n3, &u3, &pl3).ok, "the ramp bracket interprets");
+        std::vector<Data> sv;
+        sv.push_back(Data{std::move(s3)});
+        std::string x3;
+        const bool ok3 = pl3.Execute(&sv, nullptr, &x3);
+        Check(ok3, ok3 ? "the ramp bracket merges" : ("execute: " + x3).c_str());
+        const Data* o3 = ok3 ? pl3.Resolve(pl3.Viewers().back().source, &sv) : nullptr;
+        const auto* im3 = o3 ? std::get_if<Image>(o3) : nullptr;
+        if (im3) {
+            ImageView v = const_cast<Image&>(*im3).MapCpuRead();
+            const float* p = reinterpret_cast<const float*>(v.data);
+            auto At = [&](int x, int y, int c) { return p[(size_t(y) * S + size_t(x)) * 4 + size_t(c)]; };
+            // The level is anchored on the middle frame: 0.2 s at ISO 100
+            // f/2 is relative exposure 5, so out = R * 0.2 / 5.
+            auto Want = [&](int x) { return Rad(x) * 0.2f / 5.0f; };
+
+            // Shadows come from the longest frame -- the one whose EXIF is
+            // wrong by a third of a stop. Trusting it reads 25% low.
+            const float shadow = At(1, 40, 0);
+            Check(std::abs(shadow / Want(1) - 1.0f) < 0.02f,
+                  "a measured ratio corrects an EXIF that is off (" +
+                      std::to_string(shadow / Want(1)) + "x of true)");
+
+            // Where only red clips in the long frame, a per-channel weight
+            // took red from the short frames and green from the long one,
+            // with its wrong ratio: the hue moved. One weight per pixel
+            // keeps R:G at exactly 2.
+            const int xc = 40;   // R = 2.56: long-frame red 1.0 clipped, green 0.64 not
+            const float rg = At(xc, 40, 0) / std::max(At(xc, 40, 1), 1e-9f);
+            Check(std::abs(rg / 2.0f - 1.0f) < 0.01f,
+                  "one weight per pixel keeps the hue where one channel clips (R:G " +
+                      std::to_string(rg) + ")");
+
+            // The square exists only in the short frame. Deghosted, its
+            // interior reads the scene the other two frames agree on.
+            const float sq = At(16, 16, 0);
+            Check(std::abs(sq / Want(16) - 1.0f) < 0.02f,
+                  "deghosting leaves out a frame where it saw something else (" +
+                      std::to_string(sq / Want(16)) + "x of true)");
+        }
+    }
+}
+
 // The .ply tests, in a function of their own: main's frame is already near
 // the 1 MB stack, since MSVC reserves every block's locals at entry.
 // Video: decoding, choosing the sharpest frame per time slot, and turning a
@@ -3032,6 +3121,9 @@ int main() {
                       "and says so rather than merging as though exposures matched");
             }
         }
+
+        // Its own function, for main's stack: see TestPly.
+        TestMergeHdrRewrite();
     }
 
     // --- tonemap -------------------------------------------------------------

@@ -12,12 +12,23 @@
 #               when there is no other transform to fold into, because the
 #               resample would cost more than the alignment gains.
 #
-#   merge_hdr   reads each frame's shutter, aperture and ISO from EXIF and
-#               divides them out, so every frame contributes the same radiance
-#               where it is well exposed. The result is scene-linear with real
-#               headroom: a seven-frame bracket reaches 900-odd with the
-#               midtones near 2.0. That is why it is displayed raw as well --
-#               it is the data worth keeping, not yet a picture.
+#   merge_hdr   divides each frame's exposure out, so every frame contributes
+#               the same radiance where it is well exposed. The result is
+#               scene-linear with real headroom: a seven-frame bracket reaches
+#               900-odd with the midtones near 2.0. That is why it is displayed
+#               raw as well -- it is the data worth keeping, not yet a picture.
+#
+#               Three things it does that are worth knowing, all in its report:
+#               it MEASURES the exposure ratios rather than trusting EXIF (and
+#               keeps EXIF for a pair that is not one clean ratio -- the light
+#               changed between shots); it weights each pixel as a whole, so a
+#               channel clipping in one frame cannot shift the hue; and it
+#               DEGHOSTS, leaving a frame out wherever it disagrees with the
+#               middle of the bracket. On Tim's brackets that is what removed
+#               the doubled cloud edges (hdrtest2), the overlaid sage branches
+#               (hdrtest1) and the triple leaves in the grass (hdrtest3). Turn
+#               `deghost` off to see the difference -- or when the light
+#               changed and you want the average of it rather than one moment.
 #
 #   _develop.tgl  everything after the merge -- tone mapping, the develop
 #               controls, denoise, and the creative effects -- lives in a
