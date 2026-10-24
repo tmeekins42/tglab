@@ -156,7 +156,14 @@ bool SaveImage(const std::string& path, Image& img, SaveFormat fmt,
             for (int x = 0; x < w; ++x) {
                 const float* p = pb.At(x, y);
                 float* o = &rgb[(size_t(y) * size_t(w) + size_t(x)) * 3];
-                for (int c = 0; c < 3; ++c) o[c] = p[(ch >= 3) ? c : 0] / scale;
+                // Clamped at zero, because RGBE has no sign. stb packs each
+                // channel as an unsigned byte against the shared exponent, so a
+                // negative wrapped to a large POSITIVE value: an out-of-gamut
+                // yellow (blue slightly below zero) was written with blue
+                // near its maximum, and hdrtest3's petals came out magenta in
+                // every file written -- 2.1 million pixels of one frame.
+                for (int c = 0; c < 3; ++c)
+                    o[c] = std::max(0.0f, p[(ch >= 3) ? c : 0] / scale);
             }
         if (!stbi_write_hdr(path.c_str(), w, h, 3, rgb.data())) {
             *err = "could not write '" + path + "'";
