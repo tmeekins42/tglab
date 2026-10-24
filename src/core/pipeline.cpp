@@ -490,6 +490,13 @@ bool Pipeline::RunFusedReduction(int reduceStage, const std::vector<int>& chain,
 
     const std::string axis = red.reduceAxis.empty() ? set->shape.Axes()[0].name : red.reduceAxis;
     if (!r->Begin(int(set->images.size()), axis, err)) return false;
+
+    // Finish reports through the stage's GroupProgress; see RunReduction.
+    red.algo->SetGroupProgress(progress);
+    struct ClearProgress {
+        AlgorithmBase* a;
+        ~ClearProgress() { a->SetGroupProgress(nullptr); }
+    } clearProgress{red.algo.get()};
     if (GpuWhy()) std::fprintf(stderr, "[fuse] chain of %zu stages, %zu frames\n",
                                chain.size(), set->images.size());
 
@@ -501,9 +508,10 @@ bool Pipeline::RunFusedReduction(int reduceStage, const std::vector<int>& chain,
         // progress alone would sit at one number the whole time.
         if (progress) {
             char what[64];
-            std::snprintf(what, sizeof what, "%s  frame %d/%d", red.algoName.c_str(),
-                          int(f) + 1, int(set->images.size()));
-            progress->Set(int(f), int(set->images.size()), what);
+            std::snprintf(what, sizeof what, "frame %d/%d", int(f) + 1,
+                          int(set->images.size()));
+            red.algo->GroupProgress(r->AcceptShare() * double(f) / double(set->images.size()),
+                                    what);
             // Per frame as well as per stage: this loop IS the slow part of a
             // multi-frame merge, so an elapsed time that only advanced between
             // stages would sit frozen for the whole of it.
@@ -586,8 +594,17 @@ bool Pipeline::RunFusedReduction(int reduceStage, const std::vector<int>& chain,
 }
 
 bool Pipeline::RunReduction(Stage& s, const std::vector<const Data*>& in,
-                            const CancelToken* cancel, std::string* err) {
+                            const CancelToken* cancel, Progress* progress,
+                            std::string* err) {
     auto Where = [&] { return "line " + std::to_string(s.line) + ": '" + s.algoName + "' "; };
+
+    // Progress through the stage's own GroupProgress: the frames move the bar
+    // through Reducer::AcceptShare, and Finish reports the rest itself.
+    s.algo->SetGroupProgress(progress);
+    struct ClearProgress {
+        AlgorithmBase* a;
+        ~ClearProgress() { a->SetGroupProgress(nullptr); }
+    } clearProgress{s.algo.get()};
 
     if (in.size() != 1 || !in[0]) { *err = Where() + "takes one input"; return false; }
 
@@ -662,6 +679,11 @@ bool Pipeline::RunReduction(Stage& s, const std::vector<const Data*>& in,
                 return false;
             }
             if (!r->Accept(k, set->images[size_t(idx)], err)) return false;
+            if (outCount == 1) {
+                char what[48];
+                std::snprintf(what, sizeof what, "frame %d/%d", k + 1, extent);
+                s.algo->GroupProgress(r->AcceptShare() * double(k + 1) / double(extent), what);
+            }
         }
 
         Image out;
@@ -1973,7 +1995,7 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
         // of that path applies -- the output's size comes from the accumulator,
         // not from an input, and there is no single input image to size it by.
         if (s.algo->IsReduction()) {
-            if (!RunReduction(s, in, cancel, err)) return false;
+            if (!RunReduction(s, in, cancel, progress, err)) return false;
             s.valid = true;
             continue;
         }

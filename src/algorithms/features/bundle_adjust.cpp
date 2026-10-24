@@ -324,8 +324,11 @@ bool BundleAdjust::RunAlign(std::vector<Image>* images, std::string* err) {
         // will notice when it stops being correct.
     }
 
-    for (int i = 0; i < n; ++i) {
-        const Affine t = TransformOf((*images)[size_t(i)]);
+    // K^-1 H K for one homography, forced to the nearest rotation by Gram-
+    // Schmidt. False when the input is degenerate or a REFLECTION -- see
+    // stitch_panorama's Orthonormalise for how a reflection, forced to a
+    // rotation, comes out a confident 180 degrees wrong.
+    auto toRotation = [&](const Affine& t, double Rm[9]) -> bool {
         float H[9];
         t.To3x3(H);
 
@@ -336,12 +339,15 @@ bool BundleAdjust::RunAlign(std::vector<Image>* images, std::string* err) {
             M[1 * 3 + c] = (double(H[1 * 3 + c]) - cy * double(H[2 * 3 + c])) / focal;
             M[2 * 3 + c] =  double(H[2 * 3 + c]);
         }
-        double Rm[9];
         for (int r = 0; r < 3; ++r) {
             Rm[r * 3 + 0] = M[r * 3 + 0] * focal;
             Rm[r * 3 + 1] = M[r * 3 + 1] * focal;
             Rm[r * 3 + 2] = M[r * 3 + 0] * cx + M[r * 3 + 1] * cy + M[r * 3 + 2];
         }
+        const double det = Rm[0] * (Rm[4] * Rm[8] - Rm[5] * Rm[7]) -
+                           Rm[1] * (Rm[3] * Rm[8] - Rm[5] * Rm[6]) +
+                           Rm[2] * (Rm[3] * Rm[7] - Rm[4] * Rm[6]);
+        if (!(det > 0.0)) return false;
 
         // ORTHONORMALISE BEFORE CONVERTING. RToAxisAngle reads the angle from
         // the trace and the axis from the antisymmetric part, and BOTH are
@@ -349,26 +355,56 @@ bool BundleAdjust::RunAlign(std::vector<Image>* images, std::string* err) {
         // trace of R, so the recovered angle is not the rotation's angle. The
         // stored Affine always carries some scale, because its h22 is pinned to
         // 1 and a rotation-induced homography's is not.
-        {
-            auto dot = [&](int a, int b) {
-                return Rm[a * 3] * Rm[b * 3] + Rm[a * 3 + 1] * Rm[b * 3 + 1] +
-                       Rm[a * 3 + 2] * Rm[b * 3 + 2];
-            };
-            const double n0 = std::sqrt(dot(0, 0));
-            if (n0 > 1e-12) {
-                for (int c = 0; c < 3; ++c) Rm[c] /= n0;
-                const double d10 = dot(1, 0);
-                for (int c = 0; c < 3; ++c) Rm[3 + c] -= d10 * Rm[c];
-                const double n1 = std::sqrt(dot(1, 1));
-                if (n1 > 1e-12) {
-                    for (int c = 0; c < 3; ++c) Rm[3 + c] /= n1;
-                    Rm[6] = Rm[1] * Rm[5] - Rm[2] * Rm[4];
-                    Rm[7] = Rm[2] * Rm[3] - Rm[0] * Rm[5];
-                    Rm[8] = Rm[0] * Rm[4] - Rm[1] * Rm[3];
-                }
+        auto dot = [&](int a, int b) {
+            return Rm[a * 3] * Rm[b * 3] + Rm[a * 3 + 1] * Rm[b * 3 + 1] +
+                   Rm[a * 3 + 2] * Rm[b * 3 + 2];
+        };
+        const double n0 = std::sqrt(dot(0, 0));
+        if (n0 <= 1e-12) return false;
+        for (int c = 0; c < 3; ++c) Rm[c] /= n0;
+        const double d10 = dot(1, 0);
+        for (int c = 0; c < 3; ++c) Rm[3 + c] -= d10 * Rm[c];
+        const double n1 = std::sqrt(dot(1, 1));
+        if (n1 <= 1e-12) return false;
+        for (int c = 0; c < 3; ++c) Rm[3 + c] /= n1;
+        Rm[6] = Rm[1] * Rm[5] - Rm[2] * Rm[4];
+        Rm[7] = Rm[2] * Rm[3] - Rm[0] * Rm[5];
+        Rm[8] = Rm[0] * Rm[4] - Rm[1] * Rm[3];
+        return true;
+    };
+
+    // EACH LINK FORCED TO A ROTATION, THEN COMPOSED -- not each frame's
+    // composed transform forced to one. A chained homography accumulates
+    // perspective drift link after link; on a 138-frame video pan the composed
+    // transforms reached shifts of 487000 px, and forcing those to rotations
+    // gave frames 72 onward a 30-degree roll flip that the solve, a local
+    // method, could not climb out of: the panorama came out as two sweeps
+    // bent away from each other. A product of rotations is a rotation however
+    // long the chain, which is how stitch_panorama builds its cameras too.
+    // A link that cannot be read (no inverse, a reflection) falls back to the
+    // frame's own composed transform.
+    std::vector<double> seedR(size_t(n) * 9, 0.0);
+    for (int i = 0; i < n; ++i) {
+        double* Ri = &seedR[size_t(i) * 9];
+        const Affine t = TransformOf((*images)[size_t(i)]);
+        bool done = false;
+        if (i > 0) {
+            bool ok = false;
+            const Affine prevInv = TransformOf((*images)[size_t(i - 1)]).Inverse(&ok);
+            double L[9];
+            if (ok && toRotation(t.Then(prevInv), L)) {
+                const double* P = &seedR[size_t(i - 1) * 9];
+                for (int r = 0; r < 3; ++r)
+                    for (int c = 0; c < 3; ++c)
+                        Ri[r * 3 + c] = L[r * 3 + 0] * P[0 * 3 + c] +
+                                        L[r * 3 + 1] * P[1 * 3 + c] +
+                                        L[r * 3 + 2] * P[2 * 3 + c];
+                done = true;
             }
         }
-        RToAxisAngle(Rm, &w[size_t(i) * 3]);
+        if (!done && !toRotation(t, Ri))
+            for (int k = 0; k < 9; ++k) Ri[k] = (k % 4 == 0) ? 1.0 : 0.0;
+        RToAxisAngle(Ri, &w[size_t(i) * 3]);
     }
 
     auto rebuild = [&]() {
@@ -425,6 +461,7 @@ bool BundleAdjust::RunAlign(std::vector<Image>* images, std::string* err) {
     const int maxIter = std::max(1, int(m_iterations));
     for (int iter = 0; iter < maxIter; ++iter) {
         if (GroupCancelled()) { *err = "cancelled"; return false; }   // see SetGroupCancel
+        GroupProgress(double(iter) / double(maxIter), "refining rotations");
         std::fill(A.begin(), A.end(), 0.0);
         std::fill(B.begin(), B.end(), 0.0);
 
@@ -607,6 +644,13 @@ bool BundleAdjust::RunAlign(std::vector<Image>* images, std::string* err) {
         float h[9];
         for (int k = 0; k < 9; ++k) h[k] = float(out[k]);
         AttachTransform(&(*images)[size_t(i)], Affine::From3x3(h));
+
+        // And the camera itself, so the stitcher need not re-derive the focal
+        // and the rotations from H. See RotationCamera.
+        RotationCamera cam;
+        cam.focal = focal;
+        for (int k = 0; k < 9; ++k) cam.R[k] = float(Ri[k]);
+        AttachRotationCamera(&(*images)[size_t(i)], cam);
     }
     return true;
 }

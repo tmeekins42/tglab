@@ -1,4 +1,4 @@
-# Panorama stitching: detect -> match(chained) -> align -> project.
+# Panorama stitching: detect -> match(chained) -> align_features -> bundle_adjust -> project.
 #
 # Drop a sweep of frames into the palette, in the order they were shot, and
 # this stitches them. Everything here is the ordinary feature pipeline until
@@ -166,11 +166,18 @@ gain = check("gain compensation", 0)
 # Crop before developing: a stitch leaves ragged edges where the frames did not
 # overlap, and there is no reason to develop pixels that are about to be thrown
 # away.
+#
+# NO align() BETWEEN align_features AND bundle_adjust. It used to sit there, and
+# it damaged every link: align refines an AFFINE warp, and its round trip into
+# centred coordinates and back is exact only for one -- applied to these
+# homographies it moved the corners of a 5-degree link by about 213 px and a
+# 15-degree one by 884 px, which bundle_adjust then had to climb back from.
+# align now leaves a homography alone anyway; it is simply not part of this
+# chain. bundle_adjust is the refinement a panorama wants.
 developed = frames
        => det()
        => match_ann(chain = 1, window = 2)
        => align_features(model = 2)
-       => align()
        => bundle_adjust()
        => stitch_panorama(projection = proj, focal = focal, winner_takes_all = ghostfix, gain_compensation = gain)
        => display("panorama")

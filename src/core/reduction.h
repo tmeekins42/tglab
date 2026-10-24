@@ -49,6 +49,14 @@ public:
 
     // Produces the result. Called once, after the last Accept.
     virtual bool Finish(Image* out, std::string* err) = 0;
+
+    // How much of the progress bar the frames take, 0..1. The pipeline moves
+    // the bar through [0, AcceptShare()] as frames are accepted; the rest is
+    // Finish's, which reports it through AlgorithmBase::GroupProgress. A merge
+    // whose frames ARE the work keeps 1. A stitcher, which only collects
+    // pixels as frames arrive and does everything once the last is in, gives
+    // most of the bar to Finish.
+    virtual double AcceptShare() const { return 1.0; }
 };
 
 } // namespace tglab

@@ -352,6 +352,7 @@ public:
         // component can be measured across all of them before any is attached.
         std::map<size_t, Affine> solvedT;
         m_skipped = 0;
+        m_perspective = 0;
         m_didNormalize = false;
         for (size_t i = 1; i < images->size(); ++i) {
             ImageView mv = (*images)[i].MapCpuRead();
@@ -373,6 +374,21 @@ public:
             // refined here rather than thrown away. With nothing attached this
             // is identity, which is the same as starting from scratch.
             Affine t = TransformOf((*images)[i]);
+
+            // A HOMOGRAPHY IS LEFT AS IT IS. This solver is affine -- six
+            // parameters -- and works in centred coordinates; converting a
+            // transform with perspective terms there and back is not exact
+            // (ToCentred/ToCorner move only the translation, which is right for
+            // an affine map and wrong once MapPoint divides by w). In
+            // panorama.tgl, where align ran after align_features(model = 2),
+            // that round trip alone moved the corners of a 5-degree link by
+            // about 213 px and of a 15-degree one by 884 px, before any solve.
+            // Whatever attached a homography knew more than an affine
+            // refinement can add to it.
+            if (!t.IsAffine()) {
+                ++m_perspective;
+                continue;
+            }
 
             // Whether this frame was ALREADY going to be resampled.
             //
@@ -513,6 +529,10 @@ public:
                         " under " + std::to_string(float(m_minShift)).substr(0, 4) +
                         " px left unwarped";
         }
+        if (m_perspective)
+            m_report += ", " + std::to_string(m_perspective) +
+                        " with a homography already attached left as they were "
+                        "(an affine refinement cannot improve one)";
         if (m_didNormalize) {
             std::snprintf(buf, sizeof buf,
                           " (removed %.3f deg / %.5f scale common to all)",
@@ -701,6 +721,7 @@ private:
     Affine      m_removed;              // the common part, when one was removed
     bool        m_didNormalize = false;
     int         m_skipped = 0;      // frames left unwarped as not worth it
+    int         m_perspective = 0;  // frames whose homography was left as it was
 };
 
 } // namespace

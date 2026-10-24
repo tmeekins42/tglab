@@ -1017,9 +1017,11 @@ int main(int argc, char** argv) {
             if (!dumpDir.empty() && d) {
                 if (const Image* one = std::get_if<Image>(d)) {
                     std::filesystem::create_directories(dumpDir);
+                    // SaveImage, not SavePng: a panorama or a merge is float, kept
+                    // linear as .hdr; 8-bit images go to .png as before.
                     Image copy = const_cast<Image&>(*one).Clone();
                     std::string e;
-                    if (!SavePng(dumpDir + "/" + vd.name + ".png", copy, &e))
+                    if (!SaveImage(dumpDir + "/" + vd.name + (copy.Desc().format == Format::RGBA8 ? ".png" : ".hdr"), copy, &e))
                         std::printf("dump %s: %s\n", vd.name.c_str(), e.c_str());
                 }
                 if (const ImageSet* set = std::get_if<ImageSet>(d)) {

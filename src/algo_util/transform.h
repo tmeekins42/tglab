@@ -205,6 +205,46 @@ inline void AttachTransform(Image* img, const Affine& t) {
                         std::make_shared<const TransformSidecar>(t));
 }
 
+// A ROTATING CAMERA: the focal length and rotation a panorama solve found for
+// this frame, beside the homography it wrote (H = K R K^-1, principal point at
+// the image centre). R maps a REFERENCE-frame ray into this frame's camera
+// space, as stitch_panorama's Frame::R does.
+//
+// Carried because the homography alone loses the focal: a stitcher that has
+// only H must re-estimate f, and the estimate it can make (sqrt(-h02/h20)) is
+// exact only for a pure pan -- with pitch and roll it is biased, and re-chaining
+// rotations at the wrong f made every link slightly non-rotational again,
+// drifting ~8 px over a 15-frame sweep in simulation. bundle_adjust has the
+// answer; this is how it reaches the stitcher.
+inline constexpr const char* kRotationCameraSidecar = "rotation_camera";
+
+struct RotationCamera {
+    double focal = 0.0;
+    float  R[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+};
+
+class RotationCameraSidecar : public SidecarBase {
+public:
+    explicit RotationCameraSidecar(const RotationCamera& c) : m_c(c) {}
+    const RotationCamera& Get() const { return m_c; }
+    bool DerivedFromPixels() const override { return true; }
+
+private:
+    RotationCamera m_c;
+};
+
+// The camera attached to an image, or null when none was solved.
+inline const RotationCamera* RotationCameraOf(const Image& img) {
+    if (const auto* s = img.Sidecar<RotationCameraSidecar>(kRotationCameraSidecar))
+        return &s->Get();
+    return nullptr;
+}
+
+inline void AttachRotationCamera(Image* img, const RotationCamera& c) {
+    img->Sidecars().Set(kRotationCameraSidecar,
+                        std::make_shared<const RotationCameraSidecar>(c));
+}
+
 // Bilinear sample of `src` at a fractional coordinate, edge-clamped.
 //
 // Bilinear rather than nearest because the whole point is SUB-pixel alignment:

@@ -255,6 +255,7 @@ public:
 
         bool anyMatches = false;
         for (size_t i = 0; i < images->size(); ++i) {
+            GroupProgress(double(i) / double(images->size()), "solving pairs");
             Image& img = (*images)[i];
             const MatchSidecar* ms = MatchesOf(img);
             if (!ms || ms->Matches().empty()) continue;

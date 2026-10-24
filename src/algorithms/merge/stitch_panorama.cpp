@@ -95,6 +95,11 @@ struct Frame {
     // reference-frame ray to this frame's camera space. See Orthonormalise.
     float R[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
 
+    // The camera bundle_adjust solved for this frame, when it ran. See
+    // RotationCamera, and Finish for when it is trusted.
+    bool           hasCam = false;
+    RotationCamera cam;
+
     int W() const { return buf.Width(); }
     int H() const { return buf.Height(); }
 };
@@ -226,6 +231,7 @@ public:
         m_focal = 0.0f;
         m_placed = 0;
         m_flipped = -1;
+        m_dropped = 0;
         m_note.clear();
         return true;
     }
@@ -261,20 +267,29 @@ public:
         bool ok = false;
         f.inv = f.t.Inverse(&ok);
         f.invertible = ok;
+        if (const RotationCamera* c = RotationCameraOf(img)) {
+            f.hasCam = true;
+            f.cam = *c;
+        }
         m_frames.push_back(std::move(f));
         return true;
     }
 
     bool Finish(Image* out, std::string* err) override;
 
+    // The frames only arrive here; everything else happens in Finish, which
+    // reports the rest of the bar itself.
+    double AcceptShare() const override { return 0.1; }
+
     std::string RunReport() const override {
         if (!m_note.empty()) return m_note;
         if (m_placed == 0) return {};
-        char flip[96] = "";
+        char flip[160] = "";
         if (m_flipped >= 0)
             std::snprintf(flip, sizeof flip,
-                          " -- frame %d and later DROPPED, their link was not a rotation",
-                          m_flipped);
+                          " -- %d frame%s DROPPED (first: frame %d), their link was not a "
+                          "rotation; the rest chained on from the last placed frame",
+                          m_dropped, m_dropped == 1 ? "" : "s", m_flipped);
         // The gain figure is worth seeing rather than hiding: a correction of
         // more than about a third of a stop means the frames disagreed a lot,
         // and a compensation that large is as likely to be masking a real
@@ -296,11 +311,13 @@ public:
         char buf[384];
         std::snprintf(buf, sizeof buf,
                       "%s: %d frames onto %dx%d, focal %.0f px (%.0f deg fov), "
-                      "overlap %.0f%% disagreeing %.1f%%%s%s%s",
+                      "overlap %.0f%% disagreeing %.1f%%%s%s%s%s",
                       ProjName(), m_placed, m_outW, m_outH, double(m_focal),
                       double(FovDeg()), 100.0 * m_overlapPixels,
                       100.0 * double(m_disagree), gain, flip,
-                      m_straightened ? "; straightened about the pan axis" : "");
+                      m_straightened ? "; straightened about the pan axis" : "",
+                      m_usedCameras ? "; cameras as bundle_adjust solved them"
+                                    : "; cameras re-derived from the transforms");
         return buf;
     }
 
@@ -352,6 +369,54 @@ private:
     // they are nonsense: a link with almost no rotation makes both h02 and h20
     // nearly zero, and their ratio is then whatever the residuals happen to be.
     // A mean would let one of those swamp fourteen good ones.
+    // Whether every frame carries a solved camera that still agrees with its
+    // transform: one shared focal, and K R K^-1 equal to the attached
+    // transform to float precision. See Finish.
+    bool CamerasConsistent() const {
+        if (m_frames.empty()) return false;
+        const double f0 = m_frames[0].cam.focal;
+        if (f0 <= 0.0) return false;
+        const double cx = 0.5 * double(m_desc.width), cy = 0.5 * double(m_desc.height);
+        for (const Frame& fr : m_frames) {
+            if (!fr.hasCam || !fr.invertible) return false;
+            if (std::fabs(fr.cam.focal - f0) > 1e-6 * f0) return false;
+            // H = K R K^-1, written out as bundle_adjust writes it.
+            const float* R = fr.cam.R;
+            double RK[9], H[9];
+            for (int r = 0; r < 3; ++r) {
+                RK[r * 3 + 0] = R[r * 3 + 0] / f0;
+                RK[r * 3 + 1] = R[r * 3 + 1] / f0;
+                RK[r * 3 + 2] = R[r * 3 + 2] - (cx / f0) * R[r * 3 + 0] - (cy / f0) * R[r * 3 + 1];
+            }
+            for (int c = 0; c < 3; ++c) {
+                H[0 * 3 + c] = f0 * RK[0 * 3 + c] + cx * RK[2 * 3 + c];
+                H[1 * 3 + c] = f0 * RK[1 * 3 + c] + cy * RK[2 * 3 + c];
+                H[2 * 3 + c] = RK[2 * 3 + c];
+            }
+            // Compared as MATRICES, relative to their size, not by mapping
+            // points: a frame 70 degrees round from the reference sends the
+            // reference's corners to coordinates in the tens of thousands, or
+            // behind the camera, where float rounding alone exceeds any pixel
+            // tolerance (IMG_1531 fell back for exactly that). bundle_adjust
+            // normalises its H the way From3x3 does, so an untouched transform
+            // agrees to float precision.
+            float h[9];
+            for (int k = 0; k < 9; ++k) h[k] = float(H[k]);
+            const Affine fromCam = Affine::From3x3(h);
+            float a[9], b[9];
+            fr.t.To3x3(a);
+            fromCam.To3x3(b);
+            float scale = 0.0f, diff = 0.0f;
+            for (int k = 0; k < 9; ++k) {
+                if (!std::isfinite(a[k]) || !std::isfinite(b[k])) return false;
+                scale = std::max(scale, std::fabs(a[k]));
+                diff = std::max(diff, std::fabs(a[k] - b[k]));
+            }
+            if (diff > 1e-4f * std::max(scale, 1.0f)) return false;
+        }
+        return true;
+    }
+
     float EstimateFocal() const {
         std::vector<float> est;
         const float cx = 0.5f * float(m_desc.width);
@@ -615,6 +680,7 @@ private:
         return true;
     }
     bool m_straightened = false;
+    bool m_usedCameras = false;   // bundle_adjust's cameras, not re-derived ones
 
     std::vector<Frame> m_frames;
     ImageDesc          m_desc{};
@@ -630,6 +696,7 @@ private:
     float              m_seamBefore = 0.0f, m_seamAfter = 0.0f;  // RMS seam gap
     // The first frame whose link could not be read as a rotation, or -1.
     int                m_flipped = -1;
+    int                m_dropped = 0;    // frames left out of the chain
     double             m_overlapPixels = 0.0;
     std::string        m_note;
 };
@@ -655,7 +722,20 @@ bool StitchPanorama::Finish(Image* out, std::string* err) {
         return true;
     }
 
+    // THE SOLVED CAMERAS, when bundle_adjust ran: its focal and its rotations,
+    // used as they are. Re-deriving them from the homographies -- the focal by
+    // the pure-pan formula, the rotations by re-chaining links at that focal --
+    // threw the solve's answer away and reintroduced drift wherever the camera
+    // pitched or rolled. Trusted only when every frame has one, they share one
+    // focal, no focal was set by hand (the rotations are tied to the solved
+    // one), and each frame's transform still says what its camera does -- a
+    // stage that re-aligned after the solve would leave a stale camera behind.
+    m_usedCameras = false;
+    if (m_focalOverride <= 0.0f && Proj() != kPlane && CamerasConsistent())
+        m_usedCameras = true;
+
     m_focal = float(m_focalOverride);
+    if (m_usedCameras) m_focal = float(m_frames[0].cam.focal);
     if (m_focal <= 0.0f) m_focal = EstimateFocal();
     if (m_focal <= 0.0f) {
         // The fallback is the frame width, which corresponds to a 53-degree
@@ -708,7 +788,11 @@ bool StitchPanorama::Finish(Image* out, std::string* err) {
     // construction however long the chain runs. The per-link residual still
     // accumulates as ANGLE error -- that is inherent to sequential alignment --
     // but it can no longer turn into a reflection.
-    if (Proj() != kPlane) {
+    if (m_usedCameras) {
+        for (Frame& f : m_frames)
+            for (int k = 0; k < 9; ++k) f.R[k] = f.cam.R[k];
+        m_straightened = bool(m_straighten) && Straighten();
+    } else if (Proj() != kPlane) {
         // K^-1 H K for one homography, forced to a rotation.
         //
         // Written explicitly rather than as three matrix multiplies: this is
@@ -736,45 +820,57 @@ bool StitchPanorama::Finish(Image* out, std::string* err) {
         for (int i = 0; i < 9; ++i)
             m_frames[0].R[i] = (i % 4 == 0) ? 1.0f : 0.0f;
 
+        // FROM THE LAST FRAME THAT WAS PLACED, not simply the previous one. A
+        // frame that cannot be placed keeps the identity R it was born with,
+        // and chaining the next frame from it put that frame where the
+        // REFERENCE is -- misplaced, not dropped, while the report said
+        // "dropped". Now only the frame that failed is left out, and the
+        // chain carries on from the last good one: its transform is still a
+        // valid map from the reference, so the link to it is as good as any.
+        size_t lastGood = 0;
         for (size_t i = 1; i < m_frames.size(); ++i) {
             Frame& f = m_frames[i];
-            if (!f.invertible) continue;
+            if (!f.invertible) {
+                if (m_flipped < 0) m_flipped = int(i);
+                ++m_dropped;
+                continue;
+            }
 
-            // The LINK from the previous frame, recovered by undoing the
-            // previous accumulation: L = T[i] . T[i-1]^-1.
+            // The LINK from the last placed frame, recovered by undoing its
+            // accumulation: L = T[i] . T[k]^-1.
             //
             // Recovered rather than passed in, because the aligner's contract
             // is "a transform per frame" and it should stay that way -- a
             // stitcher that demanded the un-composed links would constrain
             // every aligner to produce them, including ones that never chain.
             bool ok = false;
-            const Affine prevInv = m_frames[i - 1].t.Inverse(&ok);
+            const Affine prevInv = m_frames[lastGood].t.Inverse(&ok);
             const Affine link = ok ? f.t.Then(prevInv) : f.t;
 
             float L[9];
             if (!toRotation(link, L)) {
-                // A link that could not be read as a rotation ends the usable
-                // chain: everything after it is positioned relative to a
-                // frame whose own orientation is unknown. Marked rather than
-                // skipped, so the report can say which frame and the viewer
-                // is not left to infer it from a picture.
+                // A link that cannot be read as a rotation: this frame is left
+                // out, marked so the report can say which one.
                 f.invertible = false;
                 if (m_flipped < 0) m_flipped = int(i);
+                ++m_dropped;
                 continue;
             }
 
-            // R[i] = L . R[i-1], a product of rotations and therefore a
+            // R[i] = L . R[k], a product of rotations and therefore a
             // rotation -- which is the whole point of doing it here rather
             // than after the chain was already composed.
-            const float* P = m_frames[i - 1].R;
+            const float* P = m_frames[lastGood].R;
             for (int r = 0; r < 3; ++r)
                 for (int c = 0; c < 3; ++c)
                     f.R[r * 3 + c] = L[r * 3 + 0] * P[0 * 3 + c] +
                                      L[r * 3 + 1] * P[1 * 3 + c] +
                                      L[r * 3 + 2] * P[2 * 3 + c];
+            lastGood = i;
         }
         m_straightened = bool(m_straighten) && Straighten();
     }
+
 
     // A pixel in frame `f` -> the ray it came from, in REFERENCE camera space.
     //
@@ -979,6 +1075,8 @@ bool StitchPanorama::Finish(Image* out, std::string* err) {
         std::vector<std::vector<Link>> links(m_frames.size());
 
         for (int y = 0; y < m_outH; y += stride) {
+            GroupProgress(0.1 + 0.1 * double(y) / double(std::max(1, m_outH)),
+                          "matching exposure");
             const float v = minV + float(y);
             for (int x = 0; x < m_outW; x += stride) {
                 const float u = minU + float(x);
@@ -1180,6 +1278,12 @@ bool StitchPanorama::Finish(Image* out, std::string* err) {
 
     m_placed = 0;
     for (size_t fi = 0; fi < m_frames.size(); ++fi) {
+        {
+            char what[48];
+            std::snprintf(what, sizeof what, "compositing frame %d/%d", int(fi) + 1,
+                          int(m_frames.size()));
+            GroupProgress(0.2 + 0.8 * double(fi) / double(m_frames.size()), what);
+        }
         const Frame& f = m_frames[fi];
         if (!f.invertible) continue;
         ++m_placed;

@@ -379,7 +379,7 @@ private:
                         const CancelToken* cancel, Progress* progress,
                         std::string* err);
     bool RunReduction(Stage& s, const std::vector<const Data*>& in,
-                      const CancelToken* cancel, std::string* err);
+                      const CancelToken* cancel, Progress* progress, std::string* err);
     // `out` for the same reason as RunStageOnce, which is its only caller.
     // Note that this path remains single-threaded per Stage regardless: the
     // compiled kernel and the scratch planes are cached ON the Stage and
