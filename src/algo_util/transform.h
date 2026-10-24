@@ -295,6 +295,59 @@ inline void SampleBilinear(const PixelBuffer& src, float x, float y, float* out)
     }
 }
 
+// Lanczos-3 sample of `src` at a fractional coordinate, edge-clamped, the
+// result held within the range of the 4x4 pixels around it.
+//
+// Sharper than bilinear, which is a low-pass at every fractional offset --
+// align measured 8-16% sharpness lost to it on sub-pixel shifts, and a stitch
+// resamples every pixel of every frame. Lanczos alone rings at hard edges (a
+// dark halo beside a bright window), so the result is clamped to the min/max
+// of its nearest 4x4 neighbours: within smooth regions the clamp never
+// engages, and at an edge it removes exactly the overshoot. (lightcraft's
+// merge sampler does the same.) An exact pixel centre returns the pixel
+// verbatim, as SampleBilinear does.
+inline void SampleLanczos3(const PixelBuffer& src, float x, float y, float* out) {
+    const int w = src.Width(), h = src.Height(), ch = src.Channels();
+    const float cx = std::clamp(x, 0.0f, float(w - 1));
+    const float cy = std::clamp(y, 0.0f, float(h - 1));
+    const int x0 = int(std::floor(cx)), y0 = int(std::floor(cy));
+    const float fx = cx - float(x0), fy = cy - float(y0);
+    if (fx == 0.0f && fy == 0.0f) {
+        const float* p = src.At(x0, y0);
+        for (int c = 0; c < ch; ++c) out[c] = p[c];
+        return;
+    }
+    auto lanczos = [](float t) {
+        if (t == 0.0f) return 1.0f;
+        if (t <= -3.0f || t >= 3.0f) return 0.0f;
+        const float pt = 3.14159265358979f * t;
+        return 3.0f * std::sin(pt) * std::sin(pt / 3.0f) / (pt * pt);
+    };
+    float wx[6], wy[6], sx = 0.0f, sy = 0.0f;
+    for (int k = 0; k < 6; ++k) {
+        wx[k] = lanczos(fx - float(k - 2)); sx += wx[k];
+        wy[k] = lanczos(fy - float(k - 2)); sy += wy[k];
+    }
+    for (int k = 0; k < 6; ++k) { wx[k] /= sx; wy[k] /= sy; }
+
+    float acc[4] = {0, 0, 0, 0}, lo[4], hi[4];
+    for (int c = 0; c < ch; ++c) { lo[c] = 3.4e38f; hi[c] = -3.4e38f; }
+    for (int j = 0; j < 6; ++j) {
+        const int yy = std::clamp(y0 + j - 2, 0, h - 1);
+        for (int i = 0; i < 6; ++i) {
+            const int xx = std::clamp(x0 + i - 2, 0, w - 1);
+            const float* p = src.At(xx, yy);
+            const float wgt = wx[i] * wy[j];
+            const bool inner = i >= 1 && i <= 4 && j >= 1 && j <= 4;
+            for (int c = 0; c < ch; ++c) {
+                acc[c] += wgt * p[c];
+                if (inner) { lo[c] = std::min(lo[c], p[c]); hi[c] = std::max(hi[c], p[c]); }
+            }
+        }
+    }
+    for (int c = 0; c < ch; ++c) out[c] = std::clamp(acc[c], lo[c], hi[c]);
+}
+
 // Luminance at a fractional coordinate, which is what the solver compares.
 // Separate from the full sample because the solver reads one number per point
 // and interpolating three channels to then collapse them would be three times

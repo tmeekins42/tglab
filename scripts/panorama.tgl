@@ -130,12 +130,19 @@ focal = slider("focal (px, 0 = estimate)", 0, 20000, 0)
 #   that, and no amount of bundling will either -- one 8-parameter warp cannot
 #   give near and far content different displacements at the same time.
 #
-# For the second case, turn off the cross-fade. Feathering AVERAGES the frames
-# that overlap, and averaging two offset copies of a branch is precisely what
-# makes the doubled image; winner_takes_all picks one frame per pixel instead,
-# so there is nothing to average and nothing to ghost. The trade is that
-# exposure steps between frames stop being hidden and show as seams.
-ghostfix = check("winner takes all (parallax)", 0)
+# For the second case, the stitcher no longer averages by default. Feathering
+# AVERAGES the frames that overlap, and averaging two offset copies of a branch
+# is precisely what makes the doubled image. stitch_panorama now blends
+# MULTI-BAND (its `multiband`, on by default): each pixel's fine detail comes
+# from the one best-placed frame, so nothing ghosts, while exposure and
+# vignetting -- the coarse bands -- cross-fade over the whole overlap, so the
+# sky shows no step. Measured on panotest1: the bottom-band ghosting of the old
+# feather blend is gone (as sharp as winner_takes_all), and the hard seams and
+# the 0.4-stop step winner_takes_all left in the sky are gone too.
+#
+# winner_takes_all is still here for comparison: hard seams and no blend at
+# all, so every exposure difference between frames shows as a step.
+ghostfix = check("winner takes all (hard seams, no blend)", 0)
 
 # EXPOSURE SEAMS, which winner_takes_all makes visible: without a cross-fade
 # there is nothing left to hide a brightness step between frames.

@@ -58,6 +58,7 @@
 // stripped -- and it cannot disagree with the geometry that was actually
 // solved.
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <string>
@@ -68,6 +69,7 @@
 #include "../../algo_util/transform.h"
 #include "../../algo_util/color.h"
 #include "../../core/algorithm.h"
+#include "../../core/parallel.h"
 #include "../../core/reduction.h"
 
 namespace tglab {
@@ -99,6 +101,11 @@ struct Frame {
     // RotationCamera, and Finish for when it is trusted.
     bool           hasCam = false;
     RotationCamera cam;
+
+    // Where this frame lands on the canvas, in canvas pixels (inclusive
+    // bounds, with a small margin), so compositing visits only these.
+    int bx0 = 0, by0 = 0, bx1 = -1, by1 = -1;
+    float fu0 = 1e30f, fu1 = -1e30f, fv0 = 1e30f, fv1 = -1e30f;   // surface units
 
     int W() const { return buf.Width(); }
     int H() const { return buf.Height(); }
@@ -135,6 +142,132 @@ struct Frame {
 // SVD): the input is already close to a rotation, and for a near-rotation the
 // two agree to well under a pixel. That "already close" is exactly what
 // per-link application buys, and what per-frame application destroyed.
+// --- multi-band blending helpers ---------------------------------------------
+//
+// Burt & Adelson's pyramids, on a plain float plane: REDUCE blurs with the
+// 5-tap binomial [1 4 6 4 1]/16 and keeps every other sample; EXPAND is its
+// interpolating inverse. Edges clamp. Sizes halve rounding up, so a plane
+// whose sides are multiples of 2^L reduces exactly L times.
+struct MbPlane {
+    int w = 0, h = 0, ch = 0;
+    std::vector<float> d;
+    void Alloc(int W, int H, int C) { w = W; h = H; ch = C; d.assign(size_t(W) * size_t(H) * size_t(C), 0.0f); }
+    float* At(int x, int y) { return &d[(size_t(y) * size_t(w) + size_t(x)) * size_t(ch)]; }
+    const float* At(int x, int y) const { return &d[(size_t(y) * size_t(w) + size_t(x)) * size_t(ch)]; }
+};
+
+void MbReduce(const MbPlane& a, MbPlane* o) {
+    const int w2 = (a.w + 1) / 2, h2 = (a.h + 1) / 2, C = a.ch;
+    MbPlane t;
+    t.Alloc(w2, a.h, C);
+    ParallelFor(size_t(a.h), [&](size_t yy) {
+        const int y = int(yy);
+        for (int x = 0; x < w2; ++x) {
+            float* q = t.At(x, y);
+            static const float k[5] = {1.0f / 16, 4.0f / 16, 6.0f / 16, 4.0f / 16, 1.0f / 16};
+            for (int i = 0; i < 5; ++i) {
+                const float* p = a.At(std::clamp(2 * x + i - 2, 0, a.w - 1), y);
+                for (int c = 0; c < C; ++c) q[c] += k[i] * p[c];
+            }
+        }
+    });
+    o->Alloc(w2, h2, C);
+    ParallelFor(size_t(h2), [&](size_t yy) {
+        const int y = int(yy);
+        static const float k[5] = {1.0f / 16, 4.0f / 16, 6.0f / 16, 4.0f / 16, 1.0f / 16};
+        for (int x = 0; x < w2; ++x) {
+            float* q = o->At(x, y);
+            for (int i = 0; i < 5; ++i) {
+                const float* p = t.At(x, std::clamp(2 * y + i - 2, 0, a.h - 1));
+                for (int c = 0; c < C; ++c) q[c] += k[i] * p[c];
+            }
+        }
+    });
+}
+
+// Back up to W x H. With the binomial kernel, an even output sample is
+// (s[i-1] + 6 s[i] + s[i+1]) / 8 and an odd one (s[i] + s[i+1]) / 2.
+void MbExpand(const MbPlane& a, int W, int H, MbPlane* o) {
+    const int C = a.ch;
+    auto tap = [](int x, int n, int* i0, int* i1, int* i2, float* w0, float* w1, float* w2) {
+        const int i = x / 2;
+        if ((x & 1) == 0) {
+            *i0 = std::clamp(i - 1, 0, n - 1); *i1 = std::clamp(i, 0, n - 1); *i2 = std::clamp(i + 1, 0, n - 1);
+            *w0 = 0.125f; *w1 = 0.75f; *w2 = 0.125f;
+        } else {
+            *i0 = std::clamp(i, 0, n - 1); *i1 = std::clamp(i + 1, 0, n - 1); *i2 = *i1;
+            *w0 = 0.5f; *w1 = 0.5f; *w2 = 0.0f;
+        }
+    };
+    MbPlane t;
+    t.Alloc(W, a.h, C);
+    ParallelFor(size_t(a.h), [&](size_t yy) {
+        const int y = int(yy);
+        for (int x = 0; x < W; ++x) {
+            int i0, i1, i2; float w0, w1, w2;
+            tap(x, a.w, &i0, &i1, &i2, &w0, &w1, &w2);
+            const float *p0 = a.At(i0, y), *p1 = a.At(i1, y), *p2 = a.At(i2, y);
+            float* q = t.At(x, y);
+            for (int c = 0; c < C; ++c) q[c] = w0 * p0[c] + w1 * p1[c] + w2 * p2[c];
+        }
+    });
+    o->Alloc(W, H, C);
+    ParallelFor(size_t(H), [&](size_t yy) {
+        const int y = int(yy);
+        int i0, i1, i2; float w0, w1, w2;
+        tap(y, a.h, &i0, &i1, &i2, &w0, &w1, &w2);
+        for (int x = 0; x < W; ++x) {
+            const float *p0 = t.At(x, i0), *p1 = t.At(x, i1), *p2 = t.At(x, i2);
+            float* q = o->At(x, y);
+            for (int c = 0; c < C; ++c) q[c] = w0 * p0[c] + w1 * p1[c] + w2 * p2[c];
+        }
+    });
+}
+
+// PUSH-PULL: fills where `valid` is 0 from the coarser levels of what IS
+// valid, leaving valid samples exactly as they were. A tile around a frame
+// has holes wherever the frame does not reach; the pyramid built from it must
+// not see black there, or the frame's coarse bands would carry its own edge
+// into the blend as a dark halo.
+void MbPushPull(MbPlane* img, const MbPlane& valid) {
+    std::vector<MbPlane> pw(1), vw(1);
+    pw[0] = *img;
+    vw[0] = valid;
+    for (size_t i = 0; i < pw[0].d.size(); ++i) pw[0].d[i] *= valid.d[i / size_t(img->ch)];
+    while (pw.back().w > 1 || pw.back().h > 1) {
+        MbPlane a, b;
+        MbReduce(pw.back(), &a);
+        MbReduce(vw.back(), &b);
+        pw.push_back(std::move(a));
+        vw.push_back(std::move(b));
+    }
+    // Top down: where a level has weight, its own normalised value; where it
+    // has little, the expansion of the coarser level's.
+    MbPlane filled;
+    for (int l = int(pw.size()) - 1; l >= 0; --l) {
+        MbPlane& P = pw[size_t(l)];
+        const MbPlane& V = vw[size_t(l)];
+        MbPlane E;
+        const bool top = l == int(pw.size()) - 1;
+        if (!top) MbExpand(filled, P.w, P.h, &E);
+        for (int y = 0; y < P.h; ++y)
+            for (int x = 0; x < P.w; ++x) {
+                const float v = V.At(x, y)[0];
+                const float a = std::clamp(v, 0.0f, 1.0f);
+                float* p = P.At(x, y);
+                for (int c = 0; c < P.ch; ++c) {
+                    const float own = v > 1e-8f ? p[c] / v : 0.0f;
+                    const float coarse = top ? own : E.At(x, y)[c];
+                    p[c] = a * own + (1.0f - a) * coarse;
+                }
+            }
+        filled = std::move(P);
+    }
+    // Valid samples come back exactly: at level 0 the weight is 0 or 1.
+    for (size_t i = 0; i < img->d.size(); ++i)
+        if (valid.d[i / size_t(img->ch)] <= 0.0f) img->d[i] = filled.d[i];
+}
+
 bool Orthonormalise(float m[9]) {
     // The input, kept for the determinant test at the end: the rows are
     // normalised in place below, which changes the determinant magnitude but
@@ -591,7 +724,29 @@ private:
         "residual-by-band figures show parallax (near content misaligning "
         "while far content is fine), which no global warp can fix. The cost "
         "is that exposure steps between frames become visible seams, since "
-        "there is no longer a cross-fade to hide them."};
+        "there is no longer a cross-fade to hide them -- multiband keeps the "
+        "hard seam for detail and blends the exposure instead."};
+
+    // On by default: it is what neither feathering (ghosts) nor
+    // winner_takes_all (exposure steps) gets right. winner_takes_all, when
+    // set, still means hard seams with no blend at all.
+    Param<bool> m_multiband{this, "multiband", true,
+        "Blend across the seams band by band (Burt & Adelson): each pixel's fine "
+        "detail comes from the one best-placed frame, as with winner_takes_all, "
+        "so a small misalignment cannot become a double image, while exposure "
+        "and vignetting -- the coarse bands -- cross-fade over the whole overlap, "
+        "so the sky shows no step. Linear frames are blended in log, where a "
+        "brightness difference is an offset the coarse bands absorb. Ignored when "
+        "winner_takes_all is on."};
+
+    static constexpr const char* kSamplerNames[] = {"bilinear", "lanczos-3"};
+    Param<int> m_sampler{this, "sampler", 1, 0, 1,
+        {.help = "How frames are resampled onto the canvas. Lanczos-3 keeps the "
+                 "fine detail bilinear softens (align measured 8-16% sharpness "
+                 "lost to bilinear on sub-pixel shifts), clamped to the range of "
+                 "the nearest 4x4 pixels so hard edges do not ring. Bilinear is "
+                 "about nine times cheaper per sample.",
+         .choices = kSamplerNames, .choiceCount = 2}};
 
     // See Straighten.
     Param<bool> m_straighten{this, "straighten", true,
@@ -908,7 +1063,7 @@ bool StitchPanorama::Finish(Image* out, std::string* err) {
     float minU = 1e30f, maxU = -1e30f, minV = 1e30f, maxV = -1e30f;
     bool any = false;
 
-    for (const Frame& f : m_frames) {
+    for (Frame& f : m_frames) {
         if (!f.invertible) continue;
         // Sixteen points a side is far more than the curvature needs and costs
         // nothing at this scale.
@@ -939,6 +1094,8 @@ bool StitchPanorama::Finish(Image* out, std::string* err) {
                 }
                 minU = std::min(minU, u); maxU = std::max(maxU, u);
                 minV = std::min(minV, v); maxV = std::max(maxV, v);
+                f.fu0 = std::min(f.fu0, u); f.fu1 = std::max(f.fu1, u);
+                f.fv0 = std::min(f.fv0, v); f.fv1 = std::max(f.fv1, v);
                 any = true;
             }
     }
@@ -973,6 +1130,18 @@ bool StitchPanorama::Finish(Image* out, std::string* err) {
 
     m_outW = std::max(1, int(std::lround(wD)));
     m_outH = std::max(1, int(std::lround(hD)));
+
+    // Each frame's footprint in canvas pixels. The border was sampled at
+    // sixteen points a side, so a curved edge can bulge slightly between
+    // samples: the margin covers that.
+    for (Frame& f : m_frames) {
+        if (!f.invertible || f.fu1 < f.fu0) continue;
+        const int margin = 4 + int(0.01f * float(std::max(f.W(), f.H())));
+        f.bx0 = std::clamp(int(std::floor(f.fu0 - minU)) - margin, 0, m_outW - 1);
+        f.bx1 = std::clamp(int(std::ceil(f.fu1 - minU)) + margin, 0, m_outW - 1);
+        f.by0 = std::clamp(int(std::floor(f.fv0 - minV)) - margin, 0, m_outH - 1);
+        f.by1 = std::clamp(int(std::ceil(f.fv1 - minV)) + margin, 0, m_outH - 1);
+    }
 
     ImageDesc od = m_desc;
     od.width  = m_outW;
@@ -1273,8 +1442,21 @@ bool StitchPanorama::Finish(Image* out, std::string* err) {
     // beat. Only allocated in the mode that uses it: this is one float per
     // output pixel, which on a 42 MP canvas is 170 MB.
     const bool wta = bool(m_winnerTakesAll);
+    // MULTI-BAND: the same hard seams as winner-takes-all, recorded as a label
+    // per canvas pixel, then blended band by band in MultibandBlend below.
+    // Winner-takes-all alone already makes every pixel one frame's and so
+    // cannot ghost; it is the BLEND across that seam that it lacks.
+    const bool mb = bool(m_multiband) && !wta;
+    const bool hard = wta || mb;
     std::vector<float> best;
-    if (wta) best.assign(size_t(m_outW) * size_t(m_outH), -1.0f);
+    if (hard) best.assign(size_t(m_outW) * size_t(m_outH), -1.0f);
+    std::vector<int> label;
+    if (mb) label.assign(size_t(m_outW) * size_t(m_outH), -1);
+    const bool lanczos = int(m_sampler) == 1;
+    auto sample = [lanczos](const PixelBuffer& b, float x, float y, float* o) {
+        if (lanczos) SampleLanczos3(b, x, y, o);
+        else         SampleBilinear(b, x, y, o);
+    };
 
     m_placed = 0;
     for (size_t fi = 0; fi < m_frames.size(); ++fi) {
@@ -1282,15 +1464,19 @@ bool StitchPanorama::Finish(Image* out, std::string* err) {
             char what[48];
             std::snprintf(what, sizeof what, "compositing frame %d/%d", int(fi) + 1,
                           int(m_frames.size()));
-            GroupProgress(0.2 + 0.8 * double(fi) / double(m_frames.size()), what);
+            GroupProgress(0.2 + (mb ? 0.4 : 0.8) * double(fi) / double(m_frames.size()), what);
         }
         const Frame& f = m_frames[fi];
-        if (!f.invertible) continue;
+        if (!f.invertible || f.bx1 < f.bx0) continue;
         ++m_placed;
+        const float k = gainOn ? float(std::exp(gains[fi].k)) : 1.0f;
 
-        for (int y = 0; y < m_outH; ++y) {
+        // Only this frame's footprint, and its rows in parallel: each row
+        // writes only its own canvas pixels.
+        ParallelFor(size_t(f.by1 - f.by0 + 1), [&](size_t yi) {
+            const int y = f.by0 + int(yi);
             const float v = minV + float(y);
-            for (int x = 0; x < m_outW; ++x) {
+            for (int x = f.bx0; x <= f.bx1; ++x) {
                 const float u = minU + float(x);
 
                 float sx, sy;
@@ -1309,7 +1495,7 @@ bool StitchPanorama::Finish(Image* out, std::string* err) {
                 }
 
                 // Outside this frame contributes nothing. Checked BEFORE
-                // sampling: SampleBilinear edge-clamps, so an unchecked read
+                // sampling: the samplers edge-clamp, so an unchecked read
                 // outside would smear the border pixel across the canvas
                 // rather than leaving it to another frame.
                 if (sx < 0.0f || sy < 0.0f ||
@@ -1317,7 +1503,7 @@ bool StitchPanorama::Finish(Image* out, std::string* err) {
 
                 // Distance to the nearest edge of THIS frame. Zero at the
                 // border, so a frame fades out exactly where it stops having
-                // data and its neighbour takes over -- and, in winner-takes-all,
+                // data and its neighbour takes over -- and, with hard seams,
                 // the same measure picks the frame that sees this pixel most
                 // centrally, which is the one least likely to be distorted or
                 // vignetted here.
@@ -1326,7 +1512,7 @@ bool StitchPanorama::Finish(Image* out, std::string* err) {
                 const float dmin = std::min(du, dv);
 
                 double wgt = 1.0;
-                if (bool(m_feather) || wta) {
+                if (bool(m_feather) || hard) {
                     // +1e-3 so a pixel exactly on the border still contributes
                     // something: a seam where every frame has weight zero would
                     // be a one-pixel hole.
@@ -1334,21 +1520,19 @@ bool StitchPanorama::Finish(Image* out, std::string* err) {
                 }
 
                 float sm[4] = {0, 0, 0, 0};
-                SampleBilinear(f.buf, sx, sy, sm);
+                sample(f.buf, sx, sy, sm);
 
                 // Apply this frame's correction before it contributes.
                 //
                 // A multiply on every channel, NOT on luminance alone: scaling
                 // luminance and leaving the channels would shift the hue, and
                 // an exposure difference is a scaling of the light itself.
-                if (gainOn) {
-                    const float k = float(std::exp(gains[fi].k));
+                if (gainOn)
                     for (int c = 0; c < ch; ++c) sm[c] *= k;
-                }
 
                 const size_t pi = size_t(y) * size_t(m_outW) + size_t(x);
                 const size_t bi = pi * size_t(ch);
-                if (wta) {
+                if (hard) {
                     // REPLACE rather than accumulate. Nothing is averaged, so
                     // nothing can ghost; the pixel is whatever the best-placed
                     // frame saw there.
@@ -1357,6 +1541,7 @@ bool StitchPanorama::Finish(Image* out, std::string* err) {
                         for (int c = 0; c < ch; ++c)
                             acc[bi + size_t(c)] = double(sm[c]);
                         wsum[pi] = 1.0;
+                        if (mb) label[pi] = int(fi);
                     }
                 } else {
                     for (int c = 0; c < ch; ++c)
@@ -1374,7 +1559,7 @@ bool StitchPanorama::Finish(Image* out, std::string* err) {
                 sq[pi]  += y0 * y0;
                 cnt[pi] += 1;
             }
-        }
+        });
     }
 
     // The disagreement metric: RMS spread between frames, over the pixels where
@@ -1406,6 +1591,165 @@ bool StitchPanorama::Finish(Image* out, std::string* err) {
         *err = "stitch_panorama: result size mismatch";
         return false;
     }
+
+    // --- multi-band blend (Burt & Adelson 1983) --------------------------------
+    //
+    // Each frame contributes its Laplacian band l weighted by its seam mask
+    // blurred to level l. Fine detail therefore changes hands within a few
+    // pixels of the seam -- nothing is averaged at full resolution, so a small
+    // misregistration cannot become a double image -- while the coarse bands,
+    // which carry exposure and vignetting, blend across the whole overlap: no
+    // step where winner-takes-all leaves one. Linear frames are blended in LOG,
+    // where a gain difference is an offset the coarse bands simply absorb.
+    if (mb) {
+        const int C = ch >= 3 ? 3 : 1;
+        const bool logDomain = m_desc.linear || m_desc.format != Format::RGBA8;
+        const int L = std::clamp(int(std::floor(std::log2(double(std::min(m_desc.width,
+                                                                          m_desc.height))))) - 3,
+                                 1, 7);
+        const int unit = 1 << L;
+        const int Wp = (m_outW + unit - 1) / unit * unit, Hp = (m_outH + unit - 1) / unit * unit;
+
+        // A floor for the log: well below anything a covered pixel holds.
+        double meanLevel = 0.0;
+        size_t covered = 0;
+        for (size_t i = 0; i < wsum.size(); ++i)
+            if (wsum[i] > 0.0) { meanLevel += std::max(0.0, acc[i * size_t(ch)]); ++covered; }
+        meanLevel = covered ? meanLevel / double(covered) : 1.0;
+        const float eps = float(std::max(1e-12, 1e-4 * meanLevel));
+        auto enc = [&](float v) { return logDomain ? std::log(std::max(v, 0.0f) + eps) : v; };
+
+        std::vector<MbPlane> accL(size_t(L) + 1), wL(size_t(L) + 1);
+        for (int l = 0; l <= L; ++l) {
+            accL[size_t(l)].Alloc(Wp >> l, Hp >> l, C);
+            wL[size_t(l)].Alloc(Wp >> l, Hp >> l, 1);
+        }
+
+        for (size_t fi = 0; fi < m_frames.size(); ++fi) {
+            {
+                char what[48];
+                std::snprintf(what, sizeof what, "blending frame %d/%d", int(fi) + 1,
+                              int(m_frames.size()));
+                GroupProgress(0.6 + 0.4 * double(fi) / double(m_frames.size()), what);
+            }
+            const Frame& f = m_frames[fi];
+            if (!f.invertible || f.bx1 < f.bx0) continue;
+            const float k = gainOn ? float(std::exp(gains[fi].k)) : 1.0f;
+
+            // The frame's tile, aligned to the coarsest level's grid so every
+            // level of it sits exactly on the canvas-wide accumulators.
+            const int tx0 = f.bx0 / unit * unit, ty0 = f.by0 / unit * unit;
+            const int tx1 = std::min(Wp, (f.bx1 + 1 + unit - 1) / unit * unit);
+            const int ty1 = std::min(Hp, (f.by1 + 1 + unit - 1) / unit * unit);
+            const int tw = tx1 - tx0, th = ty1 - ty0;
+            if (tw <= 0 || th <= 0) continue;
+
+            MbPlane img, valid, mask;
+            img.Alloc(tw, th, C);
+            valid.Alloc(tw, th, 1);
+            mask.Alloc(tw, th, 1);
+            std::atomic<long long> owned{0};
+            ParallelFor(size_t(th), [&](size_t yy) {
+                const int y = ty0 + int(yy);
+                if (y >= m_outH) return;
+                const float v = minV + float(y);
+                for (int x = tx0; x < tx1 && x < m_outW; ++x) {
+                    const size_t pi = size_t(y) * size_t(m_outW) + size_t(x);
+                    if (label[pi] == int(fi)) { mask.At(x - tx0, int(yy))[0] = 1.0f; ++owned; }
+                    const float u = minU + float(x);
+                    float sx, sy;
+                    if (usePlane) {
+                        f.t.MapPoint(u + cx, v + cy, &sx, &sy);
+                    } else {
+                        float dx, dy, dz;
+                        CanvasToRay(u, v, &dx, &dy, &dz);
+                        if (!refRayToPixel(f, dx, dy, dz, &sx, &sy)) continue;
+                    }
+                    if (sx < 0.0f || sy < 0.0f ||
+                        sx > float(f.W() - 1) || sy > float(f.H() - 1)) continue;
+                    float sm[4] = {0, 0, 0, 0};
+                    sample(f.buf, sx, sy, sm);
+                    float* q = img.At(x - tx0, int(yy));
+                    for (int c = 0; c < C; ++c) q[c] = enc(sm[c] * k);
+                    valid.At(x - tx0, int(yy))[0] = 1.0f;
+                }
+            });
+            if (owned.load() == 0) continue;   // no seam territory: nothing to add
+            MbPushPull(&img, valid);
+
+            // Gaussian pyramids of the frame and of its mask, then the frame's
+            // Laplacian bands, accumulated under the mask's.
+            std::vector<MbPlane> g(1), m(1);
+            g[0] = std::move(img);
+            m[0] = std::move(mask);
+            for (int l = 1; l <= L; ++l) {
+                MbPlane a, b;
+                MbReduce(g.back(), &a);
+                MbReduce(m.back(), &b);
+                g.push_back(std::move(a));
+                m.push_back(std::move(b));
+            }
+            for (int l = 0; l <= L; ++l) {
+                MbPlane band = g[size_t(l)];
+                if (l < L) {
+                    MbPlane e;
+                    MbExpand(g[size_t(l) + 1], band.w, band.h, &e);
+                    for (size_t i = 0; i < band.d.size(); ++i) band.d[i] -= e.d[i];
+                }
+                MbPlane& A = accL[size_t(l)];
+                MbPlane& Wt = wL[size_t(l)];
+                const int ox = tx0 >> l, oy = ty0 >> l;
+                const MbPlane& M = m[size_t(l)];
+                ParallelFor(size_t(band.h), [&](size_t yy) {
+                    const int y = int(yy);
+                    if (oy + y >= A.h) return;
+                    for (int x = 0; x < band.w && ox + x < A.w; ++x) {
+                        const float wgt = M.At(x, y)[0];
+                        if (wgt <= 0.0f) continue;
+                        float* a = A.At(ox + x, oy + y);
+                        const float* b = band.At(x, y);
+                        for (int c = 0; c < C; ++c) a[c] += wgt * b[c];
+                        Wt.At(ox + x, oy + y)[0] += wgt;
+                    }
+                });
+            }
+        }
+
+        // Collapse, coarse to fine.
+        auto normalised = [&](int l) {
+            MbPlane& A = accL[size_t(l)];
+            const MbPlane& Wt = wL[size_t(l)];
+            for (int y = 0; y < A.h; ++y)
+                for (int x = 0; x < A.w; ++x) {
+                    const float wgt = Wt.At(x, y)[0];
+                    float* a = A.At(x, y);
+                    for (int c = 0; c < C; ++c) a[c] = wgt > 1e-8f ? a[c] / wgt : 0.0f;
+                }
+        };
+        normalised(L);
+        MbPlane result = std::move(accL[size_t(L)]);
+        for (int l = L - 1; l >= 0; --l) {
+            normalised(l);
+            MbPlane e;
+            MbExpand(result, accL[size_t(l)].w, accL[size_t(l)].h, &e);
+            for (size_t i = 0; i < e.d.size(); ++i) e.d[i] += accL[size_t(l)].d[i];
+            result = std::move(e);
+        }
+
+        for (int y = 0; y < m_outH; ++y)
+            for (int x = 0; x < m_outW; ++x) {
+                const size_t pi = size_t(y) * size_t(m_outW) + size_t(x);
+                if (wsum[pi] <= 0.0) continue;   // uncovered: left to the loop below
+                const float* r = result.At(x, y);
+                for (int c = 0; c < C; ++c) {
+                    const double val = logDomain ? std::max(0.0, double(std::exp(r[c])) - eps)
+                                                 : double(r[c]);
+                    acc[pi * size_t(ch) + size_t(c)] = val;
+                }
+                // A one-channel image has nothing else; RGBA keeps its alpha.
+            }
+    }
+
     for (size_t i = 0; i < wsum.size(); ++i) {
         const double w = wsum[i];
         const size_t bi = i * size_t(ch);
