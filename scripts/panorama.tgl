@@ -136,9 +136,11 @@ focal = slider("focal (px, 0 = estimate)", 0, 20000, 0)
 # MULTI-BAND (its `multiband`, on by default): each pixel's fine detail comes
 # from the one best-placed frame, so nothing ghosts, while exposure and
 # vignetting -- the coarse bands -- cross-fade over the whole overlap, so the
-# sky shows no step. Measured on panotest1: the bottom-band ghosting of the old
-# feather blend is gone (as sharp as winner_takes_all), and the hard seams and
-# the 0.4-stop step winner_takes_all left in the sky are gone too.
+# sky shows no hard step. Measured on panotest1: the bottom-band ghosting of the
+# old feather blend is gone (as sharp as winner_takes_all), and winner_takes_all's
+# hard seam lines in the sky are gone. A frame shot at a different exposure is
+# softened into a broad brightness change rather than removed -- that is the
+# gain compensation below.
 #
 # winner_takes_all is still here for comparison: hard seams and no blend at
 # all, so every exposure difference between frames shows as a step.
@@ -147,8 +149,13 @@ ghostfix = check("winner takes all (hard seams, no blend)", 0)
 # EXPOSURE SEAMS, which winner_takes_all makes visible: without a cross-fade
 # there is nothing left to hide a brightness step between frames.
 #
-# One gain per frame, solved from the overlaps. Measured on this sweep it takes
-# overlap disagreement from 29.0% to 26.1%.
+# One gain per frame, solved from the overlaps -- ON by default now, because it
+# pairs with the multi-band blend: the blend removes the seams, this removes the
+# brightness difference a seam-free blend would otherwise spread across the
+# overlap. Solved directly as least squares, from patches that do not touch
+# clipping, with EXIF exposure as a weak prior. Measured on panotest1 with
+# multiband: the seam gap falls 0.087 -> 0.071 stops (the rest is parallax), and
+# the broad bright block at the right of the sky -- _L0A1220, below -- is gone.
 #
 # `frame_exposure` says what there is to correct, from the raws:
 #
@@ -168,7 +175,7 @@ ghostfix = check("winner takes all (hard seams, no blend)", 0)
 # until it hits its limit. Measured, the ramps railed with the same sign on all
 # fifteen frames -- which tilts the whole panorama and corrects no seam, and
 # looked far worse than the seams it was meant to remove.
-gain = check("gain compensation", 0)
+gain = check("gain compensation", 1)
 
 # Crop before developing: a stitch leaves ragged edges where the frames did not
 # overlap, and there is no reason to develop pixels that are about to be thrown
