@@ -137,6 +137,59 @@ static bool WriteExifFixture(const std::string& path) {
     return true;
 }
 
+// tonemap keeps a bright saturated colour's hue: the curve runs on luminance
+// and every channel is scaled alike. Its own function, for main's stack.
+static void TestTonemapHue() {
+    constexpr int S = 64;
+    auto Scene = [&]() {
+        Image img;
+        ImageDesc d; d.width = S; d.height = S; d.format = Format::RGBA32F; d.linear = true;
+        img.Alloc(d);
+        ImageView v = img.MapCpuWrite();
+        float* p = reinterpret_cast<float*>(v.data);
+        for (int y = 0; y < S; ++y)
+            for (int x = 0; x < S; ++x) {
+                float* q = p + (size_t(y) * S + size_t(x)) * 4;
+                // A grey ramp over a wide range, for the operator to measure...
+                const float g = 0.01f * std::pow(400.0f, float(x) / float(S - 1));
+                q[0] = q[1] = q[2] = g; q[3] = 1.0f;
+                // ...and a bright saturated yellow far above grey.
+                if (y >= 40 && y < 48 && x >= 40 && x < 48) { q[0] = 40.0f; q[1] = 30.0f; q[2] = 2.0f; }
+            }
+        return img;
+    };
+    auto Run = [&](bool preserve, float* rg, float* gb) {
+        auto algo = Registry::Get().Create("tonemap");
+        if (!algo) return false;
+        if (ParamBase* pp = algo->FindParam("preserve_hue")) { std::string pe; pp->SetFromScript(Value(preserve ? 1.0 : 0.0), &pe); }
+        Pipeline p;
+        std::vector<Data> srcs;
+        srcs.push_back(Data{Scene()});
+        p.AddStage(std::move(algo), "tonemap", {{-1, 0}}, 1, 1);
+        std::string e;
+        if (!p.Execute(&srcs, nullptr, &e)) return false;
+        const Data* d = p.Resolve({0, 0}, &srcs);
+        const auto* im = d ? std::get_if<Image>(d) : nullptr;
+        if (!im) return false;
+        ImageView v = const_cast<Image&>(*im).MapCpuRead();
+        PixelBuffer pb; pb.Unpack(v);
+        const float* q = pb.At(44, 44);
+        *rg = q[0] / std::max(q[1], 1e-9f);
+        *gb = q[1] / std::max(q[2], 1e-9f);
+        return true;
+    };
+    float rg = 0, gb = 0, rg0 = 0, gb0 = 0;
+    if (Run(true, &rg, &gb) && Run(false, &rg0, &gb0)) {
+        Check(std::abs(rg / (40.0f / 30.0f) - 1.0f) < 0.01f && std::abs(gb / 15.0f - 1.0f) < 0.01f,
+              "tonemap keeps a bright yellow's channel ratios (R:G " + std::to_string(rg) +
+                  ", G:B " + std::to_string(gb) + "; 1.333 and 15 in)");
+        Check(gb0 < gb * 0.8f,
+              "where the per-channel curve squeezes them toward white (G:B " + std::to_string(gb0) + ")");
+    } else {
+        Check(false, "tonemap runs on the hue fixture");
+    }
+}
+
 // merge_hdr's rewrite, on one synthetic bracket: measured exposure ratios,
 // one weight per pixel, and deghosting. Its own function for the same
 // stack-size reason as TestPly.
@@ -3124,6 +3177,7 @@ int main() {
 
         // Its own function, for main's stack: see TestPly.
         TestMergeHdrRewrite();
+        TestTonemapHue();
     }
 
     // --- tonemap -------------------------------------------------------------

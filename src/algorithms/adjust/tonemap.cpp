@@ -193,7 +193,39 @@ public:
         std::vector<float>& dp = dst.Data();
         const int dch = dst.Channels();
 
-        for (int i = 0; i < n; ++i) {
+        // HUE-PRESERVING: one curve on luminance, the same factor on all three
+        // channels. Applied per channel, the curve compresses the brightest
+        // channel of a saturated colour hardest, so the channels converge as
+        // they rise: a bright yellow drifts toward white, an orange sunset
+        // toward yellow, and the merge's colour is changed by the operator
+        // whose job is only brightness. Scaling the pixel keeps its channel
+        // ratios exactly.
+        //
+        // A channel the scaling would push past the operator's ceiling is
+        // brought back by desaturating toward the luminance -- the smallest
+        // move that fits, as clip_repair's in-gamut solve does -- rather than
+        // clipped, which would shift the hue after all.
+        const bool hue = m_preserveHue && ch >= 3 && dch >= 3;
+        const float ceiling = kGreyIn * (1.0f + shoulder);
+        for (int i = 0; i < n && hue; ++i) {
+            const float* s = &sp[size_t(i) * ch];
+            float* d = &dp[size_t(i) * dch];
+            float rgb[3] = {s[0] * scale, s[1] * scale, s[2] * scale};
+            const float l = Luma(rgb);
+            if (l > kGreyIn) {
+                const float lc = Compress(l, shoulder);
+                const float k  = lc / l;
+                float mx = 0.0f;
+                for (float& v : rgb) { v *= k; mx = std::max(mx, v); }
+                if (mx > ceiling && mx > lc) {
+                    const float t = (mx - ceiling) / (mx - lc);   // 0..1
+                    for (float& v : rgb) v += t * (lc - v);
+                }
+            }
+            d[0] = rgb[0]; d[1] = rgb[1]; d[2] = rgb[2];
+            if (dch == 4) d[3] = 1.0f;
+        }
+        for (int i = 0; i < n && !hue; ++i) {
             for (int c = 0; c < dch; ++c) {
                 if (c == 3 && dch == 4) { dp[size_t(i) * dch + 3] = 1.0f; continue; }
                 const int sc = (c < ch) ? c : (ch - 1);
@@ -264,6 +296,13 @@ private:
     // Still a real control: lower it to compress the highlights harder, which
     // is what a scene with a genuinely blown sky wants.
     Param<float> m_shoulder{this, "shoulder", 100.0f, 1.0f, 400.0f, {.step = 1.0, .softMin = 4.0f, .softMax = 200.0f}};
+
+    // On by default; off restores the per-channel curve for comparison.
+    Param<bool> m_preserveHue{this, "preserve_hue", true,
+        "Apply the curve to luminance and scale all three channels by the same "
+        "factor, so a bright saturated colour keeps its hue. Per channel, the "
+        "curve compresses the brightest channel hardest, and bright yellows "
+        "drift toward white, oranges toward yellow."};
 
 };
 
