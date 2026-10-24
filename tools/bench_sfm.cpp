@@ -41,6 +41,7 @@
 #include <vector>
 
 #include "../src/algo_util/features.h"
+#include "../src/algo_util/pixel_buffer.h"
 #include "../src/algo_util/linalg.h"
 #include "../src/algo_util/splat_raster.h"
 #include "../src/algo_util/splat_reflect.h"
@@ -925,6 +926,15 @@ int main(int argc, char** argv) {
         Pipeline sp;
         SourceImage src{"group", 0};
         src.shape = std::get<ImageSet>(s[0]).shape;   // a group, so reductions see a set
+        // A raw group arrives as mosaics, exactly as the app's palette holds
+        // it, and the interpreter inserts the demosaic only when told so. Left
+        // unset, every raw script here ran on the undemosaiced mosaic -- an
+        // HDR merge of CR2s came out entirely black.
+        {
+            const ImageDesc& fd = std::get<ImageSet>(s[0]).images.front().Desc();
+            src.isMosaic = fd.IsMosaic();
+            AsShotWhiteBalance(fd, &src.asShotKelvin, &src.asShotTint);
+        }
         std::vector<SourceImage> names{src};
         const InterpResult ir = Interpret(prog, names, &ui, &sp);
         if (!ir.ok) { std::printf("interpret: %s\n", ir.error.c_str()); return 1; }
@@ -1023,6 +1033,20 @@ int main(int argc, char** argv) {
                     std::string e;
                     if (!SaveImage(dumpDir + "/" + vd.name + (copy.Desc().format == Format::RGBA8 ? ".png" : ".hdr"), copy, &e))
                         std::printf("dump %s: %s\n", vd.name.c_str(), e.c_str());
+                    // .hdr cannot hold a negative, and an out-of-gamut colour
+                    // is exactly that -- so float images also go out raw:
+                    // int32 width, height, channels, then the floats.
+                    if (copy.Desc().format != Format::RGBA8) {
+                        ImageView cv = copy.MapCpuRead();
+                        PixelBuffer pb;
+                        pb.Unpack(cv);
+                        if (FILE* fp = std::fopen((dumpDir + "/" + vd.name + ".f32").c_str(), "wb")) {
+                            const int32_t hdr[3] = {pb.Width(), pb.Height(), pb.Channels()};
+                            std::fwrite(hdr, sizeof hdr, 1, fp);
+                            std::fwrite(pb.Data().data(), sizeof(float), pb.Data().size(), fp);
+                            std::fclose(fp);
+                        }
+                    }
                 }
                 if (const ImageSet* set = std::get_if<ImageSet>(d)) {
                     std::filesystem::create_directories(dumpDir);
@@ -1054,10 +1078,14 @@ int main(int argc, char** argv) {
                                 }
                             copy = std::move(g);
                         }
+                        // Float frames (a demosaiced raw is RGBA16F) as .hdr,
+                        // which SavePng refuses -- as the single-image dump does.
+                        const bool png = copy.Desc().format == Format::RGBA8;
                         char name[64];
-                        std::snprintf(name, sizeof(name), "_%02d.png", int(i));
+                        std::snprintf(name, sizeof(name), png ? "_%02d.png" : "_%02d.hdr", int(i));
                         std::string e;
-                        if (!SavePng(dumpDir + "/" + vd.name + name, copy, &e))
+                        if (!(png ? SavePng(dumpDir + "/" + vd.name + name, copy, &e)
+                                  : SaveImage(dumpDir + "/" + vd.name + name, copy, &e)))
                             std::printf("dump %s: %s\n", name, e.c_str());
                     }
                 }
