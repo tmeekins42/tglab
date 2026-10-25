@@ -442,7 +442,7 @@ so these names are the ones that matter in a script.
 
 | Category | Algorithms |
 |---|---|
-| **adjust** | `basic_adjust` (exposure, contrast, highlights, shadows, whites, blacks, vibrance, saturation, white balance), `brightness`, `crop` (trim and straighten, with a preview), `vignette`, `lens_correct` (distortion k1/k2, lateral CA measured or manual, vignetting, one resample), `film_grain`, `dehaze` (dark channel prior), `resize` (area-average on minify, bilinear on magnify) |
+| **adjust** | `basic_adjust` (exposure, contrast, highlights, shadows, whites, blacks, vibrance, saturation, white balance), `brightness`, `crop` (trim and straighten, with a preview), `vignette`, `clarity` (edge-aware local contrast: clarity and texture), `lens_correct` (distortion k1/k2, lateral CA measured or manual, vignetting, one resample), `film_grain`, `dehaze` (dark channel prior), `resize` (area-average on minify, bilinear on magnify) |
 | **tonemap** | `tonemap` (global), `tonemap_local` (illumination/detail split) |
 | **features** | `detect_sift`, `detect_surf`, `detect_akaze`, `detect_orb`, `detect_brisk`, `detect_dad` and `describe_dedode` (learned; see below), `draw_features`, `draw_matches`, `match_guided` (a second pass along epipolar lines) |
 | **match** | `match_brute` (exact), `match_ann` (k-d forest / LSH) |

@@ -762,6 +762,87 @@ static void TestSharpen() {
     }
 }
 
+// clarity: local contrast up (or down) at its scale, no halo at a strong edge,
+// texture at the finer scale, hue kept.
+static void TestClarity() {
+    constexpr int W = 400, H = 300;   // radius 2% of 300 = 6 px; texture 1 px
+    auto image = [&](auto fn) {
+        Image img;
+        ImageDesc d{W, H, Format::RGBA32F};
+        d.linear = true;
+        img.Alloc(d);
+        ImageView v = img.MapCpuWrite();
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                float* p = v.At<float>(x, y);
+                const float a = fn(x, y);
+                p[0] = a * 1.1f; p[1] = a; p[2] = a * 0.8f; p[3] = 1.0f;
+            }
+        return img;
+    };
+    // Gentle undulation (a third of a stop, 24 px period): detail, not edge.
+    auto wave = [&](float period) {
+        return image([=](int x, int) {
+            return 0.18f * std::exp2(0.3f * std::sin(6.2831853f * float(x) / period));
+        });
+    };
+    auto swing = [&](Image& im) {   // log2 range across the middle row
+        ImageView v = im.MapCpuRead();
+        float lo = 1e9f, hi = -1e9f;
+        for (int x = 100; x < 300; ++x) {
+            const float l = std::log2(v.At<float>(x, H / 2)[1]);
+            lo = std::min(lo, l); hi = std::max(hi, l);
+        }
+        return hi - lo;
+    };
+    std::string err;
+    Image base = wave(24.0f), up, down, tex;
+    const float s0 = swing(base);
+    if (RunFilter("clarity", wave(24.0f), {{"clarity", 1.0}}, &up, &err) &&
+        RunFilter("clarity", wave(24.0f), {{"clarity", -1.0}}, &down, &err)) {
+        const float su = swing(up), sd = swing(down);
+        Check(su > 1.2f * s0 && sd < 0.8f * s0,
+              "clarity raises local contrast, and negative clarity lowers it (" + std::to_string(s0) +
+                  " -> " + std::to_string(su) + " / " + std::to_string(sd) + " stops)");
+        ImageView v = up.MapCpuRead();
+        bool hue = true;
+        for (int x = 100; x < 140; ++x) {
+            const float* p = v.At<float>(x, H / 2);
+            if (std::fabs(p[0] / p[1] - 1.1f) > 1e-3f || std::fabs(p[2] / p[1] - 0.8f) > 1e-3f) hue = false;
+        }
+        Check(hue, "clarity changes brightness only: the channel ratios are kept");
+    } else {
+        Check(false, "clarity runs: " + err);
+    }
+    // Fine detail (6 px period): texture raises it.
+    Image fine = wave(6.0f);
+    const float f0 = swing(fine);
+    if (RunFilter("clarity", wave(6.0f), {{"texture", 1.0}}, &tex, &err)) {
+        Check(swing(tex) > 1.2f * f0, "texture raises fine detail (" + std::to_string(f0) + " -> " +
+                                          std::to_string(swing(tex)) + " stops)");
+    } else {
+        Check(false, "clarity (texture) runs: " + err);
+    }
+    // A strong step (3.6 stops): the flats beside it must not grow a halo.
+    auto step = [&] { return image([](int x, int) { return x < W / 2 ? 0.05f : 0.6f; }); };
+    Image stepOut;
+    if (RunFilter("clarity", step(), {{"clarity", 1.0}, {"texture", 1.0}}, &stepOut, &err)) {
+        ImageView v = stepOut.MapCpuRead();
+        float worst = 0;
+        for (int x = W / 2 - 12; x < W / 2 + 12; ++x) {
+            if (x == W / 2 - 1 || x == W / 2) continue;   // the edge pixels themselves
+            const float want = x < W / 2 ? 0.05f : 0.6f;
+            worst = std::max(worst, std::fabs(std::log2(v.At<float>(x, H / 2)[1] / want)));
+        }
+        // The guided filter leaves a residual of ~0.11 stops on the pixel
+        // beside the edge, gone within a few; an unsharp mask of the same
+        // radius puts 1.15 stops there (modelled), so this is a tenth of it.
+        Check(worst < 0.15f, "no halo beside a strong edge (worst " + std::to_string(worst) + " stops)");
+    } else {
+        Check(false, "clarity (step) runs: " + err);
+    }
+}
+
 static void TestFilmGrain() {
     const int W = 128, H = 128;
     auto flat = [&](float level) {
@@ -2041,6 +2122,7 @@ int main() {
     TestVignette();
     TestLensCorrect();
     TestSharpen();
+    TestClarity();
     TestFilmGrain();
     TestOrton();
     TestLut();

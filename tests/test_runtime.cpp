@@ -1420,6 +1420,12 @@ static void TestGpuAgreement(ID3D12Device* dev) {
          "o = sharpen(src, amount = 1.2, radius = 1.5, masking = 0.3)\n"
          "display(o)\n", 2.0, 0.75},
 
+        // clarity: two guided filters on log luminance, one gain per pixel.
+        {"clarity",
+         "src = image(\"test\")\n"
+         "o = clarity(src, clarity = 0.8, texture = 0.6)\n"
+         "display(o)\n", 2.0, 0.75},
+
         {"threshold_bernsen",
          "src = image(\"test\")\n"
          "o = threshold_bernsen(src, window = 15, contrast_min = 15, "
