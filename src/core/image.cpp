@@ -148,13 +148,15 @@ void Image::Alloc(const ImageDesc& d) {
     // describe the capture and survive.
     m_sidecars.DropDerived();
 
-    if (!d.Valid()) {
-        m_cpu.clear();
-        m_res = Residency::None;
-        return;
-    }
-    m_cpu.assign(d.SizeInBytes(), 0);
-    m_res = Residency::Cpu;
+    // THE PIXELS ARE ZERO, AND NOT YET STORED. The CPU buffer is allocated --
+    // zero-filled, as before -- the first time something maps it. Every
+    // stage's output is Alloc'd before it runs, and a GPU stage never maps
+    // its output at all: it acquires a texture and writes that. Filling a
+    // buffer for it cost 133 ms of a 45 MP tonemap_local slider tick (360 MB
+    // of RGBA16F zeroed per dirty stage per run), and then kept that buffer
+    // alive beside the texture, doubling host memory for every GPU result.
+    std::vector<uint8_t>().swap(m_cpu);
+    m_res = d.Valid() ? Residency::Cpu : Residency::None;
 }
 
 void Image::Reset() {
@@ -169,7 +171,9 @@ ImageView Image::MapCpuRead() {
     // The one blocking sync point. When the pixels live only on the GPU, this
     // is where they come back — which is why displaying a GPU result should go
     // through the SRV instead of calling this.
-    if (!HasCpu() && HasGpu()) {
+    if (HasCpu()) {
+        EnsureCpuStorage();   // an Alloc'd image is zeros until first mapped
+    } else if (HasGpu()) {
         EnsureCpuStorage();
         if (ReadbackFromGpu(*this)) {
             m_res = Residency::Both;
@@ -203,6 +207,7 @@ ImageView Image::MapCpuWrite() {
 void Image::MarkGpuResident() {
     // The GPU now holds the authoritative pixels; the CPU copy is stale.
     m_res = Residency::Gpu;
+    std::vector<uint8_t>().swap(m_cpu);   // and not worth its memory
 }
 
 size_t Image::DropGpuCopy() {

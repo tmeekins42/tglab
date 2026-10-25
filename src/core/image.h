@@ -305,11 +305,9 @@ public:
     // lives somewhere else -- a result the UI draws straight from its GPU
     // texture, where the descriptor is all the UI needs.
     //
-    // Distinct from Alloc(): that zero-fills a full CPU buffer, so using it for
-    // a shell would both burn the memory it was meant to save (84 MB for a
-    // 21 MP RGBA16F result, per viewer, per run) and, worse, report
-    // Residency::Cpu -- so callers would happily read a full image of zeros and
-    // believe it.
+    // Distinct from Alloc(): that makes an image of ZEROS (stored lazily, on
+    // first map), reported as Residency::Cpu -- so a shell made with it would
+    // let callers read a full image of zeros and believe it.
     void AdoptDesc(const ImageDesc& d);
     void Reset();
 

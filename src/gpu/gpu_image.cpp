@@ -39,7 +39,7 @@ GpuResidency* Image::AcquireGpuWrite(ComputeContext& ctx) {
     // Writing on the GPU makes the CPU copy stale. Marking it here — before
     // the dispatch — is what lets a chain of GPU stages skip readback
     // entirely: nothing asks for CPU pixels in between.
-    m_res = Residency::Gpu;
+    MarkGpuResident();
     TouchGpuUse(*this);
     return m_gpu.get();
 }
