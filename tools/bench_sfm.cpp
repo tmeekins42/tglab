@@ -38,6 +38,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <random>
 #include <vector>
 
 #include "../src/algo_util/features.h"
@@ -737,6 +738,9 @@ int main(int argc, char** argv) {
     int detMaxDim = -1;          // negative: leave the detector's own default
     int detColour = -1;          // negative: leave the detector's default
     std::string script;
+    // --shuffle SEED: the frames in a random order, for testing what does not
+    // depend on it (match_ann's any_order). 0 = as given.
+    int shuffleSeed = 0;
     std::string dumpDir;   // --dump: save every image-set viewer as PNGs
     bool useGpu = false;   // --gpu: give the pipeline a D3D12 device
 
@@ -763,6 +767,7 @@ int main(int argc, char** argv) {
         else if (a == "--colour" && i + 1 < argc) detColour = std::atoi(argv[++i]);
         else if (a == "--script" && i + 1 < argc)   script = argv[++i];
         else if (a == "--dump" && i + 1 < argc)     dumpDir = argv[++i];
+        else if (a == "--shuffle" && i + 1 < argc)  shuffleSeed = std::atoi(argv[++i]);
         else if (a == "--gpu")                         useGpu = true;
         else if (a == "--cameras")                     printCameras = true;
         else if (a == "--progress")                    showProgress = true;
@@ -886,6 +891,11 @@ int main(int argc, char** argv) {
             std::printf("  %dx%d -> %dx%d\n", full.Desc().width, full.Desc().height,
                         small.Desc().width, small.Desc().height);
         set.images.push_back(std::move(small));
+    }
+    if (shuffleSeed != 0) {
+        std::mt19937 rng{static_cast<unsigned>(shuffleSeed)};
+        std::shuffle(set.images.begin(), set.images.end(), rng);
+        std::printf("  frames shuffled (seed %d)\n", shuffleSeed);
     }
     set.shape = Shape{{{"frame", int(set.images.size())}}};
     std::printf("  loaded %d in %.0f ms\n\n", int(set.images.size()),

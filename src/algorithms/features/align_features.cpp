@@ -36,6 +36,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
 #include <random>
 #include <string>
 #include <vector>
@@ -44,6 +45,7 @@
 #include "../../algo_util/linalg.h"
 #include "../../algo_util/transform.h"
 #include "../../core/algorithm.h"
+#include "../../core/parallel.h"
 
 namespace tglab {
 namespace {
@@ -239,11 +241,18 @@ public:
         m_broke = -1;
         m_rejected = -1;
         m_note.clear();
+        m_graph = false;
+        m_graphPairs = m_graphRejected = m_unplaced = m_depth = m_graphInconsistent = 0;
+        m_root = -1;
 
         if (!images || images->size() < 2) {
             *err = "align_features needs a group of at least two images";
             return false;
         }
+
+        for (const Image& im : *images)
+            if (const MatchSidecar* ms = MatchesOf(im); ms && ms->anyOrder)
+                return RunAlignGraph(images, err);
 
         // Each frame's solved transform, indexed as the images are, for
         // composing a chain. Identity for the reference and for anything that
@@ -549,6 +558,24 @@ public:
     std::string RunReport() const override {
         if (!m_note.empty()) return m_note;
         if (m_frames == 0) return {};
+        if (m_graph) {
+            char g[512];
+            std::snprintf(g, sizeof g,
+                          "%s, any order: %d pairs solved%s%s, joined by their strongest "
+                          "%d into one tree rooted at frame %d (at most %d links from "
+                          "it), %d of %d inlier matches on the tree, largest shift %.1f px%s",
+                          ModelName(), m_graphPairs,
+                          m_graphRejected ? (" (" + std::to_string(m_graphRejected) +
+                                             " rejected as implausible)").c_str() : "",
+                          m_graphInconsistent ? (", " + std::to_string(m_graphInconsistent) +
+                                                 " dropped for disagreeing with the tree").c_str() : "",
+                          m_solved, m_root, m_depth, m_inliers, m_matches,
+                          double(m_worstShift),
+                          m_unplaced ? (" -- " + std::to_string(m_unplaced) +
+                                        " frame(s) UNPLACED: no solved pair joins them "
+                                        "to the rest").c_str() : "");
+            return g;
+        }
         char buf[256];
         char chain[64] = "";
         if (m_chained > 0)
@@ -581,6 +608,235 @@ public:
     bool HasGPU() const override { return false; }
 
 private:
+    // ANY ORDER: the pairs came from match_ann's any_order, chosen by what the
+    // frames look like, so a frame's predecessor in the group is not its
+    // neighbour in the scene and there is no chain to compose.
+    //
+    // Instead EVERY matched pair is solved, and the frames are joined by the
+    // maximum spanning tree of those solves, weighted by inlier count: the
+    // strongest pairs that connect everything, with no cycles to disagree.
+    // The tree is rooted at its CENTRE -- the frame whose furthest frame is
+    // fewest links away -- because error accumulates with every link composed,
+    // and a centre root halves the longest path a chain from one end has.
+    //
+    // A pair that fails, or solves implausibly far (see the shift check in
+    // RunAlign), is simply not an edge -- not fatal, as it is in a chain,
+    // because the tree can route around it. Every pair's RANSAC verdict is
+    // written back, so bundle_adjust then uses all of them, tree or not.
+    bool RunAlignGraph(std::vector<Image>* images, std::string* err) {
+        const int n = int(images->size());
+        struct Edge { int a = 0, b = 0; Affine t; int inliers = 0; int set = -1; bool tree = false; };   // t: a -> b
+        std::vector<std::vector<Edge>> per(static_cast<size_t>(n));
+        std::vector<int> matchCount(static_cast<size_t>(n), 0), frameHas(static_cast<size_t>(n), 0);
+        std::vector<std::shared_ptr<MatchSidecar>> marked(static_cast<size_t>(n));
+        std::vector<int> rejected(static_cast<size_t>(n), 0);
+
+        ParallelFor(size_t(n), [&](size_t i) {
+            Image& img = (*images)[i];
+            const MatchSidecar* ms = MatchesOf(img);
+            const FeatureSidecar* myF = FeaturesOf(img);
+            if (!ms || !myF || ms->sets.empty()) return;
+            frameHas[i] = 1;
+            auto mk = std::make_shared<MatchSidecar>(*ms);
+            for (size_t si = 0; si < mk->sets.size(); ++si) {
+                MatchSet& set = mk->sets[si];
+                set.inlier.assign(set.matches.size(), 0);
+                if (set.reference < 0 || set.reference >= n || set.reference == int(i)) continue;
+                const FeatureSidecar* refF = FeaturesOf((*images)[size_t(set.reference)]);
+                if (!refF) continue;
+                std::vector<Pair> pairs;
+                std::vector<int> fromMatch;
+                for (size_t mi = 0; mi < set.matches.size(); ++mi) {
+                    const Match& m = set.matches[mi];
+                    if (m.a < 0 || size_t(m.a) >= refF->keypoints.size()) continue;
+                    if (m.b < 0 || size_t(m.b) >= myF->keypoints.size()) continue;
+                    const Keypoint& ka = refF->keypoints[size_t(m.a)];
+                    const Keypoint& kb = myF->keypoints[size_t(m.b)];
+                    pairs.push_back({ka.x, ka.y, kb.x, kb.y});
+                    fromMatch.push_back(int(mi));
+                }
+                matchCount[i] += int(pairs.size());
+                Edge e;
+                std::vector<int> inlierIdx;
+                if (!Ransac(pairs, &e.t, &e.inliers, &inlierIdx)) continue;
+                const ImageDesc& d = img.Desc();
+                if (MaxCornerShift(e.t, d.width, d.height) > 1.5f * float(std::max(d.width, d.height))) {
+                    ++rejected[i];
+                    continue;
+                }
+                for (int pi : inlierIdx)
+                    if (pi >= 0 && size_t(pi) < fromMatch.size())
+                        set.inlier[size_t(fromMatch[size_t(pi)])] = 1;
+                e.a = set.reference;
+                e.b = int(i);
+                e.set = int(si);
+                per[i].push_back(e);
+            }
+            marked[i] = std::move(mk);
+        });
+
+        std::vector<Edge> edges;
+        for (int i = 0; i < n; ++i) {
+            for (const Edge& e : per[size_t(i)]) edges.push_back(e);
+            m_matches += matchCount[size_t(i)];
+            m_frames  += frameHas[size_t(i)];
+            m_graphRejected += rejected[size_t(i)];
+        }
+        // Frames that are only ever a reference still count as frames.
+        for (const Edge& e : edges) frameHas[size_t(e.a)] = 1;
+        m_frames = 0;
+        for (int i = 0; i < n; ++i) m_frames += frameHas[size_t(i)];
+        m_graphPairs = int(edges.size());
+        if (edges.empty()) {
+            *err = "align_features: no pair of frames solved -- check that the "
+                   "frames overlap, or try another detector";
+            return false;
+        }
+
+        // Kruskal, strongest first.
+        std::sort(edges.begin(), edges.end(),
+                  [](const Edge& x, const Edge& y) { return x.inliers > y.inliers; });
+        std::vector<int> dsu(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i) dsu[size_t(i)] = i;
+        auto findSet = [&](int x) {
+            while (dsu[size_t(x)] != x) x = dsu[size_t(x)] = dsu[size_t(dsu[size_t(x)])];
+            return x;
+        };
+        std::vector<std::vector<std::pair<int, size_t>>> adj(static_cast<size_t>(n));   // (other, edge)
+        for (size_t k = 0; k < edges.size(); ++k) {
+            const int ra = findSet(edges[k].a), rb = findSet(edges[k].b);
+            if (ra == rb) continue;
+            dsu[size_t(ra)] = rb;
+            edges[k].tree = true;
+            adj[size_t(edges[k].a)].push_back({edges[k].b, k});
+            adj[size_t(edges[k].b)].push_back({edges[k].a, k});
+            m_inliers += edges[k].inliers;
+        }
+
+        // The largest connected piece is the panorama; anything else is
+        // left unaligned and reported.
+        std::vector<int> compSize(static_cast<size_t>(n), 0);
+        for (int i = 0; i < n; ++i) if (frameHas[size_t(i)]) ++compSize[size_t(findSet(i))];
+        int bigRoot = -1;
+        for (int i = 0; i < n; ++i)
+            if (bigRoot < 0 || compSize[size_t(i)] > compSize[size_t(bigRoot)]) bigRoot = i;
+        auto bfs = [&](int from, std::vector<int>* dist, std::vector<int>* parent) {
+            dist->assign(size_t(n), -1);
+            parent->assign(size_t(n), -1);
+            std::vector<int> q{from};
+            (*dist)[size_t(from)] = 0;
+            for (size_t h = 0; h < q.size(); ++h)
+                for (const auto& [o, k] : adj[size_t(q[h])])
+                    if ((*dist)[size_t(o)] < 0) {
+                        (*dist)[size_t(o)] = (*dist)[size_t(q[h])] + 1;
+                        (*parent)[size_t(o)] = q[h];
+                        q.push_back(o);
+                    }
+            return q.back();   // a furthest frame
+        };
+        int start = -1;
+        for (int i = 0; i < n; ++i) if (findSet(i) == bigRoot && frameHas[size_t(i)]) { start = i; break; }
+        std::vector<int> dist, parent;
+        const int u = bfs(start, &dist, &parent);
+        const int v = bfs(u, &dist, &parent);
+        // The middle of the u-v path, the tree's longest.
+        int root = v;
+        for (int step = 0; step < dist[size_t(v)] / 2; ++step) root = parent[size_t(root)];
+        bfs(root, &dist, &parent);
+        m_root = root;
+
+        // Compose outward from the root, in BFS order so a parent is always
+        // placed before its child.
+        std::vector<int> orderBfs;
+        for (int i = 0; i < n; ++i) if (dist[size_t(i)] >= 0) orderBfs.push_back(i);
+        std::sort(orderBfs.begin(), orderBfs.end(),
+                  [&](int x, int y) { return dist[size_t(x)] < dist[size_t(y)]; });
+        std::vector<Affine> C(static_cast<size_t>(n));
+        for (int c : orderBfs) {
+            if (c == root) continue;
+            const int p = parent[size_t(c)];
+            const Edge* e = nullptr;
+            for (const auto& [o, k] : adj[size_t(c)]) if (o == p) e = &edges[k];
+            if (!e) continue;
+            if (e->a == p) {
+                C[size_t(c)] = e->t.Then(C[size_t(p)]);          // root -> p -> c
+            } else {
+                bool ok = false;
+                const Affine inv = e->t.Inverse(&ok);           // p -> c is t's inverse
+                if (!ok) continue;
+                C[size_t(c)] = inv.Then(C[size_t(p)]);
+            }
+            m_depth = std::max(m_depth, dist[size_t(c)]);
+        }
+        // EVERY PAIR OFF THE TREE MUST AGREE WITH IT. Such a pair solved on
+        // its own, and RANSAC can find a confident, wrong answer -- a run of
+        // repeating texture, a look-alike stretch of skyline. Its transform is
+        // compared with what the tree says relates the same two frames, at
+        // the frame's corners, and a pair that disagrees by more than 5% of
+        // the frame has its matches cleared, so bundle_adjust does not try to
+        // satisfy it. Measured on panotest1 in any order before this check:
+        // BA's middle-band residual sat at 73 px and its RMS at 2.3 px, where
+        // the same frames in sequence reach 1.5.
+        for (const Edge& e : edges) {
+            if (e.tree || dist[size_t(e.a)] < 0 || dist[size_t(e.b)] < 0) continue;
+            bool ok = false;
+            const Affine aInv = C[size_t(e.a)].Inverse(&ok);
+            if (!ok) continue;
+            const Affine viaTree = C[size_t(e.b)].Then(aInv);
+            const ImageDesc& d = (*images)[size_t(e.a)].Desc();
+            float worst = 0.0f;
+            const float cx[4] = {0.0f, float(d.width), 0.0f, float(d.width)};
+            const float cy[4] = {0.0f, 0.0f, float(d.height), float(d.height)};
+            for (int q = 0; q < 4; ++q) {
+                float x1, y1, x2, y2;
+                e.t.MapPoint(cx[q], cy[q], &x1, &y1);
+                viaTree.MapPoint(cx[q], cy[q], &x2, &y2);
+                worst = std::max(worst, std::hypot(x1 - x2, y1 - y2));
+            }
+            MatchSet& set = marked[size_t(e.b)]->sets[size_t(e.set)];
+            if (!(worst <= 0.05f * float(std::max(d.width, d.height)))) {
+                std::fill(set.inlier.begin(), set.inlier.end(), uint8_t(0));
+                ++m_graphInconsistent;
+                continue;
+            }
+            // ...and match by match, as a chain checks its window: an inlier
+            // of the pair's own solve that is far from where the tree puts it
+            // is near content moving with parallax over the wider baseline
+            // these pairs span -- consistent for that one pair, wrong for a
+            // rotation. Loose, three RANSAC thresholds, because the tree's
+            // estimate still carries the error BA is about to remove.
+            const FeatureSidecar* fa = FeaturesOf((*images)[size_t(e.a)]);
+            const FeatureSidecar* fb = FeaturesOf((*images)[size_t(e.b)]);
+            if (!fa || !fb) continue;
+            const float loose = 3.0f * float(m_threshold);
+            for (size_t k = 0; k < set.matches.size(); ++k) {
+                if (!set.inlier[k]) continue;
+                const Match& m = set.matches[k];
+                const Keypoint& ka = fa->keypoints[size_t(m.a)];
+                const Keypoint& kb = fb->keypoints[size_t(m.b)];
+                float px, py;
+                viaTree.MapPoint(ka.x, ka.y, &px, &py);
+                if ((px - kb.x) * (px - kb.x) + (py - kb.y) * (py - kb.y) > loose * loose)
+                    set.inlier[k] = 0;
+            }
+        }
+        for (int i = 0; i < n; ++i)
+            if (marked[size_t(i)]) (*images)[size_t(i)].Sidecars().Set(kMatchSidecar, marked[size_t(i)]);
+
+        for (int c : orderBfs) {
+            if (c == root) continue;
+            Image& img = (*images)[size_t(c)];
+            const Affine prior = TransformOf(img);
+            AttachTransform(&img, prior.IsIdentity() ? C[size_t(c)] : C[size_t(c)].Then(prior));
+            const ImageDesc& d = img.Desc();
+            m_worstShift = std::max(m_worstShift, MaxCornerShift(C[size_t(c)], d.width, d.height));
+            ++m_solved;
+        }
+        m_unplaced = m_frames - int(orderBfs.size());
+        m_graph = true;
+        return true;
+    }
+
     const char* ModelName() const {
         switch (std::clamp(int(m_model), 0, 2)) {
             case 0:  return "similarity";
@@ -780,6 +1036,11 @@ private:
     int         m_rejected = -1;
     float       m_worstShift = 0.0f;
     std::string m_note;
+    // Any-order runs: see RunAlignGraph.
+    bool        m_graph = false;
+    int         m_graphPairs = 0, m_graphRejected = 0, m_unplaced = 0;
+    int         m_graphInconsistent = 0;   // off-tree pairs that disagreed with it
+    int         m_root = -1, m_depth = 0;
 };
 
 } // namespace

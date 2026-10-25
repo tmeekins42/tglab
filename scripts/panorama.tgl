@@ -1,4 +1,4 @@
-# Panorama stitching: detect -> match(chained) -> align_features -> bundle_adjust -> project.
+# Panorama stitching: detect -> match(chained, or any order) -> align_features -> bundle_adjust -> project.
 #
 # Drop a sweep of frames into the palette, in the order they were shot, and
 # this stitches them. Everything here is the ordinary feature pipeline until
@@ -177,6 +177,21 @@ ghostfix = check("winner takes all (hard seams, no blend)", 0)
 # looked far worse than the seams it was meant to remove.
 gain = check("gain compensation", 1)
 
+# FRAMES IN ANY ORDER, on by default. Everything above about chaining assumes
+# the group is in the order it was shot, and Windows does not always hand
+# dropped files over that way -- a chain then pairs frames thirty degrees
+# apart. With this on, match_ann pairs each frame with the `window` frames
+# that LOOK most like it (plus whatever keeps them all connected), and
+# align_features joins them by the maximum spanning tree of the solved pairs,
+# rooted at its centre, instead of in sequence. A pair that disagrees with the
+# tree is dropped before bundle adjustment sees it.
+#
+# Measured: panotest1 shuffled stitches to the same 11391x3970 canvas, 17.9%
+# disagreement and seam gap as in order; the 138-frame IMG_1531 video shuffled
+# gives 15.8% against the chain's 16.2%, with bundle residuals by band of
+# 1.9/1.6/2.0 px against 1.9/2.3/2.7. Off, it is the chain described above.
+anyorder = check("frames in any order", 1)
+
 # Crop before developing: a stitch leaves ragged edges where the frames did not
 # overlap, and there is no reason to develop pixels that are about to be thrown
 # away.
@@ -190,7 +205,7 @@ gain = check("gain compensation", 1)
 # chain. bundle_adjust is the refinement a panorama wants.
 developed = frames
        => det()
-       => match_ann(chain = 1, window = 2)
+       => match_ann(chain = 1, window = 2 + anyorder, any_order = anyorder)
        => align_features(model = 2)
        => bundle_adjust()
        => stitch_panorama(projection = proj, focal = focal, winner_takes_all = ghostfix, gain_compensation = gain)

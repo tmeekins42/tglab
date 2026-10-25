@@ -399,9 +399,10 @@ public:
         }
 
         const int fixedRef = std::clamp(int(m_reference), 0, int(images->size()) - 1);
-        const bool chain   = bool(m_chain);
+        const bool anyOrder = bool(m_anyOrder);
+        const bool chain    = bool(m_chain) && !anyOrder;
 
-        if (!chain) {
+        if (!chain && !anyOrder) {
             const FeatureSidecar* r0 = FeaturesOf((*images)[size_t(fixedRef)]);
             if (!r0) {
                 *err = "match_ann: the reference image has no features -- "
@@ -432,11 +433,17 @@ public:
         m_revisits = 0;
         if (chain && int(m_revisit) > 0)
             m_revisits = SelectRevisits(*images, window, int(m_revisit), &revisitFor);
+        // In any order EVERY pair comes from appearance: the selector fills
+        // the same list the revisits use, and there are no index neighbours.
+        if (anyOrder) {
+            SelectByAppearance(*images, std::max(1, int(m_window)), &revisitFor);
+            for (auto& r : revisitFor) std::sort(r.begin(), r.end());
+        }
 
         // Which pairs, decided up front so the indexes can be built for
         // exactly the frames that need them.
         const size_t nImg = images->size();
-        const int nNeighbours = chain ? window : 1;
+        const int nNeighbours = anyOrder ? 0 : chain ? window : 1;
         std::vector<std::vector<std::pair<int, bool>>> refsOf(nImg);   // (reference, revisit)
         std::vector<char> isRef(nImg, 0), isQuery(nImg, 0);
         for (size_t i = 0; i < nImg; ++i) {
@@ -461,7 +468,7 @@ public:
                 refsOf[i].push_back({refIdx, w > nNeighbours});
                 isRef[size_t(refIdx)] = 1;
                 isQuery[i] = 1;
-                if (!chain) break;
+                if (!chain && !anyOrder) break;
             }
         }
 
@@ -510,7 +517,7 @@ public:
                     const FeatureSidecar* ref = FeaturesOf((*images)[size_t(refIdx)]);
                     MatchSet set;
                     set.reference = refIdx;
-                    set.revisit = revisit;
+                    set.revisit = revisit && !anyOrder;
                     MatchPair(*ref, *fs, fwdF[size_t(refIdx)], fwdL[size_t(refIdx)],
                               revF[i], revL[i], isFloat, &set);
                     ms->considered += set.considered;
@@ -527,6 +534,7 @@ public:
                 m_kept  += int(set.matches.size());
                 ++m_pairs;
             }
+            made[i]->anyOrder = anyOrder;
             made[i]->matcher = m_loma ? "loma" : m_exact ? "exact (GPU)"
                              : isFloat ? "ann (kd-forest)" : "ann (lsh)";
             (*images)[i].Sidecars().Set(kMatchSidecar, made[i]);
@@ -547,6 +555,7 @@ public:
         std::snprintf(buf, sizeof buf, "matched %d pair%s %s: %d of %d candidates kept", m_pairs,
                       m_pairs == 1 ? "" : "s", how, m_kept, m_total);
         std::string s = buf;
+        if (bool(m_anyOrder)) s += "; pairs chosen by appearance, in any order";
         if (m_revisits > 0) {
             s += "; " + std::to_string(m_revisits) + " of them revisits -- far apart "
                  "in the sequence, alike in view";
@@ -731,6 +740,14 @@ private:
         "reference. What a panorama needs. Costs this matcher its main "
         "advantage -- the index must be rebuilt for every pair."};
 
+    Param<bool> m_anyOrder{this, "any_order", false,
+        "Pair the frames by what they look like rather than by their order in "
+        "the group: each frame matches the `window` frames most like it, plus "
+        "whatever keeps them all connected. For a panorama whose files arrived "
+        "out of order, a sweep shot in two passes, or a grid. Overrides "
+        "`chain` and `reference`; align_features then joins the frames by the "
+        "strongest pairs rather than in sequence."};
+
     Param<int> m_checks{this, "checks", 256, 1, 4000,
         {.help = "How many candidates to examine per query. THE speed/accuracy "
                  "control: higher finds more of what brute force would, and "
@@ -787,20 +804,29 @@ private:
     // at any feature count or scene. The chosen pairs then go through the
     // same matching as the neighbours, and relative_pose decides whether
     // each one is real.
-    int SelectRevisits(const std::vector<Image>& images, int window, int perFrame,
-                       std::vector<std::vector<int>>* out) const {
+    // A sample of every frame's strongest descriptors in one index over the
+    // whole group: what both pair selectors vote with.
+    struct VotePool {
+        DescriptorSet pool;
+        std::vector<int> owner;                  // pool row -> frame
+        std::vector<std::vector<size_t>> mine;   // frame -> its pool rows
+        KdForest forest;
+        LshTables lsh;
+        bool isFloat = false;
+    };
+    bool BuildVotePool(const std::vector<Image>& images, VotePool* vp) const {
         const int n = int(images.size());
         const size_t kSample = 300;
-        DescriptorSet pool;
-        std::vector<int> owner;
-        std::vector<std::vector<size_t>> mine;   // each frame's rows in the pool
+        DescriptorSet& pool = vp->pool;
+        std::vector<int>& owner = vp->owner;
+        std::vector<std::vector<size_t>>& mine = vp->mine;   // each frame's rows in the pool
         mine.resize(size_t(n));
         for (int f = 0; f < n; ++f) {
             const FeatureSidecar* fs = FeaturesOf(images[size_t(f)]);
             if (!fs || fs->descriptors.Count() == 0) continue;
             const DescriptorSet& d = fs->descriptors;
             if (pool.kind == DescriptorKind::None) { pool.kind = d.kind; pool.dim = d.dim; }
-            if (d.kind != pool.kind || d.dim != pool.dim) return 0;
+            if (d.kind != pool.kind || d.dim != pool.dim) return false;
             // The STRONGEST responses, not every n-th keypoint: a stride picks
             // a different 3% of a 10000-keypoint frame from each frame, so two
             // frames of the same view rarely sampled the same corner -- a
@@ -830,12 +856,121 @@ private:
                                   d.BinaryAt(k) + d.BytesPerBinary());
             }
         }
-        if (owner.empty()) return 0;
-        const bool isFloat = pool.kind == DescriptorKind::Float;
-        KdForest forest;
-        LshTables lsh;
+        if (owner.empty()) return false;
+        const bool isFloat = vp->isFloat = pool.kind == DescriptorKind::Float;
+        KdForest& forest = vp->forest;
+        LshTables& lsh = vp->lsh;
         if (isFloat) forest.Build(pool, std::max(1, int(m_trees)), 8, 777u);
         else         lsh.Build(pool, std::max(1, int(m_trees)), int(m_keyBits), 777u);
+        return true;
+    }
+
+    // ANY ORDER: each frame's partners chosen by what it looks like, with no
+    // assumption that its neighbours in the group are its neighbours in the
+    // scene. Tim drops files on the palette and Windows does not always keep
+    // their order, so a chain paired frames thirty degrees apart; a sweep shot
+    // in two passes, or a grid, has no single order that works at all.
+    //
+    // SOFT VOTES, not a ratio test. Every sampled corner votes for each frame
+    // whose copy of it is about as close as the best one. A ratio test between
+    // frames is the wrong question here: in a panorama a corner is genuinely
+    // in two or three overlapping frames, so the best and second-best
+    // candidates are both right and a ratio test throws the vote away.
+    //
+    // Each frame keeps its `perFrame` highest-scoring partners that reach a
+    // fifth of its best score, and the maximum spanning tree of the scores is
+    // added on top, so the pair graph is connected whenever the votes are --
+    // a frame that is nobody's top choice is still joined to something.
+    int SelectByAppearance(const std::vector<Image>& images, int perFrame,
+                           std::vector<std::vector<int>>* out) const {
+        const int n = int(images.size());
+        VotePool vp;
+        if (!BuildVotePool(images, &vp)) return 0;
+        const float ratio = float(m_ratio);
+        const int checks = std::max(1, int(m_checks));
+        std::vector<float> soft(size_t(n) * size_t(n), 0.0f);
+        ParallelFor(size_t(n), [&](size_t fi) {
+            const int f = int(fi);
+            if (GroupCancelled()) return;
+            std::vector<Candidate> c;
+            std::vector<int> hit;
+            for (size_t row : vp.mine[fi]) {
+                if (vp.isFloat) vp.forest.Search(vp.pool.FloatAt(row), checks, &c);
+                else            vp.lsh.Search(vp.pool.BinaryAt(row), checks, &c);
+                float b1 = std::numeric_limits<float>::max();
+                for (const Candidate& cd : c)
+                    if (cd.index >= 0 && vp.owner[size_t(cd.index)] != f) b1 = std::min(b1, cd.dist);
+                if (b1 == std::numeric_limits<float>::max()) continue;
+                const float aboutAsClose = b1 / ratio;
+                hit.clear();
+                for (const Candidate& cd : c) {
+                    if (cd.index < 0 || cd.dist > aboutAsClose) continue;
+                    const int g = vp.owner[size_t(cd.index)];
+                    if (g == f || std::find(hit.begin(), hit.end(), g) != hit.end()) continue;
+                    hit.push_back(g);
+                    soft[fi * size_t(n) + size_t(g)] += 1.0f;
+                }
+            }
+        });
+        auto score = [&](int a, int b) {
+            return soft[size_t(a) * size_t(n) + size_t(b)] + soft[size_t(b) * size_t(n) + size_t(a)];
+        };
+
+        std::vector<char> taken(size_t(n) * size_t(n), 0);
+        int added = 0;
+        auto take = [&](int f, int g) {
+            const int a = std::min(f, g), b = std::max(f, g);
+            char& t = taken[size_t(a) * size_t(n) + size_t(b)];
+            if (t) return;
+            t = 1;
+            (*out)[size_t(b)].push_back(a);
+            ++added;
+        };
+        for (int f = 0; f < n; ++f) {
+            std::vector<std::pair<float, int>> cand;
+            for (int g = 0; g < n; ++g)
+                if (g != f && score(f, g) > 0.0f) cand.emplace_back(score(f, g), g);
+            std::sort(cand.begin(), cand.end(), std::greater<>());
+            if (cand.empty()) continue;
+            const float bar = std::max(3.0f, 0.2f * cand.front().first);
+            for (size_t k = 0; k < cand.size() && int(k) < perFrame; ++k)
+                if (cand[k].first >= bar) take(f, cand[k].second);
+        }
+        // The maximum spanning tree of the scores (Prim), always included.
+        {
+            std::vector<char> in(size_t(n), 0);
+            std::vector<float> best(size_t(n), -1.0f);
+            std::vector<int> from(size_t(n), -1);
+            in[0] = 1;
+            for (int g = 1; g < n; ++g) { best[size_t(g)] = score(0, g); from[size_t(g)] = 0; }
+            for (int it = 1; it < n; ++it) {
+                int pick = -1;
+                for (int g = 0; g < n; ++g)
+                    if (!in[size_t(g)] && (pick < 0 || best[size_t(g)] > best[size_t(pick)])) pick = g;
+                if (pick < 0 || best[size_t(pick)] <= 0.0f) break;   // the rest share nothing
+                in[size_t(pick)] = 1;
+                take(pick, from[size_t(pick)]);
+                for (int g = 0; g < n; ++g)
+                    if (!in[size_t(g)] && score(pick, g) > best[size_t(g)]) {
+                        best[size_t(g)] = score(pick, g);
+                        from[size_t(g)] = pick;
+                    }
+            }
+        }
+        return added;
+    }
+
+    int SelectRevisits(const std::vector<Image>& images, int window, int perFrame,
+                       std::vector<std::vector<int>>* out) const {
+        const int n = int(images.size());
+        VotePool vp;
+        if (!BuildVotePool(images, &vp)) return 0;
+        const DescriptorSet& pool = vp.pool;
+        const std::vector<int>& owner = vp.owner;
+        const std::vector<std::vector<size_t>>& mine = vp.mine;
+        const bool isFloat = vp.isFloat;
+        KdForest& forest = vp.forest;
+        LshTables& lsh = vp.lsh;
 
         // THE RUNNER-UP COMES FROM ANOTHER PLACE. A video's consecutive frames
         // carry nearly the same descriptor for the same corner, so the best

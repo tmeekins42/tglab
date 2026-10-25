@@ -271,6 +271,57 @@ bool BundleAdjust::RunAlign(std::vector<Image>* images, std::string* err) {
     std::vector<double> w(size_t(n) * 3, 0.0);
     std::vector<double> R(size_t(n) * 9, 0.0);
 
+    // THE SEED WALKS A TREE, not the frame order. Each frame is seeded from a
+    // NEIGHBOUR it shares observations with -- the maximum spanning tree of
+    // the observation counts, walked out from frame 0 -- rather than from the
+    // frame before it in the group. For a sweep in order the tree is the
+    // chain, or a stronger window pair, and nothing changes; for frames in any
+    // order (match_ann's any_order), frame i-1 may be on the far side of the
+    // panorama, and the "link" between them is no link at all.
+    std::vector<int> seedParent(size_t(n), -1), seedOrder;
+    {
+        std::vector<int> cnt(size_t(n) * size_t(n), 0);
+        for (const Obs& o : obs) {
+            const int a = std::min(o.i, o.j), b = std::max(o.i, o.j);
+            ++cnt[size_t(a) * size_t(n) + size_t(b)];
+        }
+        struct E { int a, b, c; };
+        std::vector<E> es;
+        for (int a = 0; a < n; ++a)
+            for (int b = a + 1; b < n; ++b)
+                if (cnt[size_t(a) * size_t(n) + size_t(b)] > 0)
+                    es.push_back({a, b, cnt[size_t(a) * size_t(n) + size_t(b)]});
+        std::sort(es.begin(), es.end(), [](const E& x, const E& y) { return x.c > y.c; });
+        std::vector<int> dsu(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i) dsu[size_t(i)] = i;
+        auto findSet = [&](int x) {
+            while (dsu[size_t(x)] != x) x = dsu[size_t(x)] = dsu[size_t(dsu[size_t(x)])];
+            return x;
+        };
+        std::vector<std::vector<int>> adj(static_cast<size_t>(n));
+        for (const E& e : es) {
+            const int ra = findSet(e.a), rb = findSet(e.b);
+            if (ra == rb) continue;
+            dsu[size_t(ra)] = rb;
+            adj[size_t(e.a)].push_back(e.b);
+            adj[size_t(e.b)].push_back(e.a);
+        }
+        std::vector<char> seen(size_t(n), 0);
+        for (int s0 = 0; s0 < n; ++s0) {
+            if (seen[size_t(s0)]) continue;
+            seen[size_t(s0)] = 1;
+            const size_t from = seedOrder.size();
+            seedOrder.push_back(s0);
+            for (size_t h = from; h < seedOrder.size(); ++h)
+                for (int o : adj[size_t(seedOrder[h])])
+                    if (!seen[size_t(o)]) {
+                        seen[size_t(o)] = 1;
+                        seedParent[size_t(o)] = seedOrder[h];
+                        seedOrder.push_back(o);
+                    }
+        }
+    }
+
     // THE FOCAL SEED HAS TO COME FIRST, because every rotation is read through
     // it: K^-1 H K with the wrong K yields the wrong R.
     //
@@ -286,9 +337,10 @@ bool BundleAdjust::RunAlign(std::vector<Image>* images, std::string* err) {
     // terms nearly zero and their ratio is noise.
     {
         std::vector<double> est;
-        for (int i = 1; i < n; ++i) {
+        for (int i = 0; i < n; ++i) {
+            if (seedParent[size_t(i)] < 0) continue;
             bool ok = false;
-            const Affine prevInv = TransformOf((*images)[size_t(i - 1)]).Inverse(&ok);
+            const Affine prevInv = TransformOf((*images)[size_t(seedParent[size_t(i)])]).Inverse(&ok);
             if (!ok) continue;
             Affine toC;   toC.m[2] = float(-cx);  toC.m[5] = float(-cy);
             Affine fromC; fromC.m[2] = float(cx); fromC.m[5] = float(cy);
@@ -373,7 +425,7 @@ bool BundleAdjust::RunAlign(std::vector<Image>* images, std::string* err) {
         return true;
     };
 
-    // EACH LINK FORCED TO A ROTATION, THEN COMPOSED -- not each frame's
+    // EACH TREE LINK FORCED TO A ROTATION, THEN COMPOSED -- not each frame's
     // composed transform forced to one. A chained homography accumulates
     // perspective drift link after link; on a 138-frame video pan the composed
     // transforms reached shifts of 487000 px, and forcing those to rotations
@@ -384,16 +436,17 @@ bool BundleAdjust::RunAlign(std::vector<Image>* images, std::string* err) {
     // A link that cannot be read (no inverse, a reflection) falls back to the
     // frame's own composed transform.
     std::vector<double> seedR(size_t(n) * 9, 0.0);
-    for (int i = 0; i < n; ++i) {
+    for (int i : seedOrder) {
         double* Ri = &seedR[size_t(i) * 9];
         const Affine t = TransformOf((*images)[size_t(i)]);
         bool done = false;
-        if (i > 0) {
+        const int par = seedParent[size_t(i)];
+        if (par >= 0) {
             bool ok = false;
-            const Affine prevInv = TransformOf((*images)[size_t(i - 1)]).Inverse(&ok);
+            const Affine prevInv = TransformOf((*images)[size_t(par)]).Inverse(&ok);
             double L[9];
             if (ok && toRotation(t.Then(prevInv), L)) {
-                const double* P = &seedR[size_t(i - 1) * 9];
+                const double* P = &seedR[size_t(par) * 9];
                 for (int r = 0; r < 3; ++r)
                     for (int c = 0; c < 3; ++c)
                         Ri[r * 3 + c] = L[r * 3 + 0] * P[0 * 3 + c] +

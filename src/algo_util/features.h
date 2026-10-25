@@ -277,6 +277,12 @@ public:
     // threshold that is probably discarding real matches too.
     int considered = 0;
 
+    // The pairs were chosen by appearance (match_ann's any_order), so the
+    // frames' order in the group means nothing and the first set is not a
+    // link to the frame before. align_features joins such frames by their
+    // strongest pairs instead of in sequence.
+    bool anyOrder = false;
+
     bool DerivedFromPixels() const override { return true; }
 };
 

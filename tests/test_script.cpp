@@ -137,6 +137,85 @@ static bool WriteExifFixture(const std::string& path) {
     return true;
 }
 
+// Panorama frames OUT OF ORDER: match_ann's any_order pairs them by
+// appearance and align_features joins them by a spanning tree, so where each
+// frame lands cannot depend on where it sits in the group. Five frames of one
+// photograph, each shifted a known step, handed over shuffled; every pair's
+// relative transform must come out as the difference of their steps. A chain
+// on the same order fails outright (see "does not follow" above). Its own
+// function, for main's stack.
+static void TestAnyOrderAlign() {
+    Image photo;
+    std::string perr;
+#ifdef TGLAB_SOURCE_DIR
+    const std::string lp =
+        (std::filesystem::path(TGLAB_SOURCE_DIR) / "assets" / "test.png").string();
+#else
+    const std::string lp = "assets/test.png";
+#endif
+    if (!LoadImageFile(lp, &photo, &perr)) { Check(false, "any order: fixture loads"); return; }
+    auto shifted = [&](int step) {
+        ImageView v = photo.MapCpuRead();
+        PixelBuffer in; in.Unpack(v);
+        Image out; out.Alloc(v.desc);
+        ImageView ov = out.MapCpuWrite();
+        PixelBuffer ob; ob.Unpack(ov);
+        for (int y = 0; y < in.Height(); ++y)
+            for (int x = 0; x < in.Width(); ++x) {
+                float sm[4] = {0, 0, 0, 0};
+                SampleBilinear(in, float(x) - 9.0f * float(step), float(y) + 4.0f * float(step), sm);
+                for (int c = 0; c < in.Channels(); ++c) ob.At(x, y)[c] = sm[c];
+            }
+        ob.PackInto(ov);
+        return out;
+    };
+    const int order[5] = {3, 0, 4, 1, 2};   // the true step of each group slot
+    ImageSet set;
+    for (int k : order) set.images.push_back(shifted(k));
+    set.shape = Shape{{{"frame", 5}}};
+    std::vector<Data> s;
+    s.push_back(Data{std::move(set)});
+
+    auto setp = [](AlgorithmBase* a, const char* n, double v) {
+        if (ParamBase* pb = a->FindParam(n)) { std::string e; pb->SetFromScript(Value(v), &e); }
+    };
+    Pipeline p;
+    p.AddStage(Registry::Get().Create("detect_sift"), "detect_sift", {{-1, 0}}, 1, 1);
+    auto m = Registry::Get().Create("match_ann");
+    setp(m.get(), "any_order", 1.0);
+    setp(m.get(), "window", 2.0);
+    setp(m.get(), "ratio", 0.95);
+    p.AddStage(std::move(m), "match_ann", {{0, 0}}, 1, 2);
+    auto a = Registry::Get().Create("align_features");
+    setp(a.get(), "model", 2.0);
+    p.AddStage(std::move(a), "align_features", {{1, 0}}, 1, 3);
+    std::string e;
+    const bool ran = p.Execute(&s, nullptr, &e);
+    Check(ran, ran ? "any order: shuffled frames align" : ("any order: " + e).c_str());
+    if (!ran) return;
+    const std::string rep = p.Stages()[2].Report();
+    Check(rep.find("any order") != std::string::npos && rep.find("UNPLACED") == std::string::npos,
+          "any order: joined by a tree, every frame placed (\"" + rep + "\")");
+    const Data* out = p.Resolve({2, 0}, &s);
+    const auto* os = out ? std::get_if<ImageSet>(out) : nullptr;
+    if (!os || os->images.size() != 5) { Check(false, "any order: five frames out"); return; }
+    float worst = 0.0f;
+    for (int i = 0; i < 5; ++i)
+        for (int j = 0; j < 5; ++j) {
+            if (i == j) continue;
+            bool ok = false;
+            const Affine iInv = TransformOf(os->images[size_t(i)]).Inverse(&ok);
+            const Affine rel = TransformOf(os->images[size_t(j)]).Then(iInv);   // i -> j
+            float x, y;
+            rel.MapPoint(100.0f, 100.0f, &x, &y);
+            const float d = float(order[j] - order[i]);
+            worst = std::max(worst, std::hypot(x - (100.0f + 9.0f * d), y - (100.0f - 4.0f * d)));
+        }
+    // 2.5 px: two homography fits composed, on a bilinear-warped fixture.
+    Check(worst < 2.5f, "any order: every pair lands its true step apart (worst " +
+                            std::to_string(worst) + " px)");
+}
+
 // tonemap keeps a bright saturated colour's hue: the curve runs on luminance
 // and every channel is scaled alike. Its own function, for main's stack.
 static void TestTonemapHue() {
@@ -3178,6 +3257,7 @@ int main() {
         // Its own function, for main's stack: see TestPly.
         TestMergeHdrRewrite();
         TestTonemapHue();
+        TestAnyOrderAlign();
     }
 
     // --- tonemap -------------------------------------------------------------
