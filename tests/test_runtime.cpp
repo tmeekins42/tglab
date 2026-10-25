@@ -1004,6 +1004,18 @@ static void TestPassSkipping(ID3D12Device* dev) {
         // Fixed thresholds: the fixture has no noise, so adaptive ones are zero
         // at any chroma_k and the passes genuinely would not change.
         {"wavelet chroma", "o = wavelet_denoise(src, adaptive = 0, chroma = %V)", "0.05", "0.1", false},
+        // A change TWO STAGES UP. The stage feeding the multi-pass one is
+        // itself unchanged, which is what made its output look unchanged when
+        // an input's identity was that stage's own hashes alone: the passes
+        // were skipped over stale planes, and the cached measurement (the
+        // airlight, the percentiles) was the old image's.
+        {"tonemap_local, upstream drag",
+         "a = brightness(src, brightness = %V)\nb = gaussian_blur(a, sigma = 1)\no = tonemap_local(b)",
+         "0.0", "0.3", false},
+        {"dehaze, upstream drag",
+         "a = brightness(src, brightness = %V)\nb = gaussian_blur(a, sigma = 1)\n"
+         "o = dehaze(b, enabled = 1, strength = 0.6)",
+         "0.0", "0.3", false},
     };
     for (const Case& c : cases) {
         auto script = [&](const char* v) {

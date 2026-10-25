@@ -62,6 +62,10 @@ struct Stage {
     // Versions of the palette images this stage read, so replacing one is
     // detected as a change rather than looking identical.
     uint64_t             sourceHash = 0;
+    // Everything this stage's result depends on: its own parameters and
+    // sources, and the chainHash of every stage it reads, recursively. What
+    // InputIdentity hands out -- see there for why one hop was not enough.
+    uint64_t             chainHash = 0;
     bool                 valid     = false;   // outputs hold a usable result
 
     // Switched off and producing NOTHING: its `enabled` box is unticked but it

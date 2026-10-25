@@ -371,12 +371,20 @@ static bool DownsampleImage(const Image& src, int w, int h, Image* out) {
 // One function rather than two copies, because the proxy cache and the
 // measurement cache are asking exactly the same question, and a divergence
 // between them would show up as one of them serving stale data.
+//
+// THE WHOLE CHAIN, NOT ONE HOP. This was the producing stage's own parameter
+// and source hashes, which do not change when something FURTHER up changes:
+// with tonemap -> basic_adjust -> wavelet_denoise, dragging tonemap left
+// basic_adjust's hashes as they were, so the wavelet stage's input "had not
+// changed" -- and its cached noise measurement, its skipped GPU passes, and
+// a proxy-cached downscale all served results computed from the old image.
+// chainHash folds in every stage upstream; see Execute.
 uint64_t Pipeline::InputIdentity(const Stage& s, size_t port) const {
     if (port >= s.inputs.size()) return 0;
     const PortRef& sr = s.inputs[port];
     if (sr.stage >= 0 && size_t(sr.stage) < m_stages.size()) {
         const Stage& ps = m_stages[size_t(sr.stage)];
-        return ps.paramHash ^ (ps.sourceHash * 1099511628211ull);
+        return (ps.chainHash ^ uint64_t(sr.port)) * 1099511628211ull;
     }
     // A palette source: its version already distinguishes a replaced image
     // from the same one.
@@ -1114,6 +1122,23 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
             }
             s.sourceHash = h;
         }
+    }
+
+    // Each stage's chain hash, in stage order -- a stage only reads stages
+    // before it, so theirs are ready. See InputIdentity.
+    for (Stage& s : m_stages) {
+        uint64_t h = 1469598103934665603ull;
+        auto mix = [&](uint64_t v) { h = (h ^ v) * 1099511628211ull; };
+        mix(s.paramHash);
+        mix(s.sourceHash);
+        mix(std::hash<std::string>{}(s.algoName));
+        for (const PortRef& r : s.inputs) {
+            mix(uint64_t(int64_t(r.stage)));
+            mix(uint64_t(r.port));
+            if (r.stage >= 0 && size_t(r.stage) < m_stages.size())
+                mix(m_stages[size_t(r.stage)].chainHash);
+        }
+        s.chainHash = h;
     }
 
     m_gpuStages = 0;
