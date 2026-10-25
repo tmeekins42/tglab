@@ -140,6 +140,22 @@ it runs, so freeing one mid-run would be a use-after-free rather than merely a
 wrong picture. **Status** reports what was freed, since the cost of a
 collection is a re-upload on the next use.
 
+Three more things keep a session's memory where it should be:
+
+- **A GPU result has no CPU copy.** An image is allocated lazily: its system
+  memory appears only if something maps it, and a GPU write releases a stale
+  one. Before, every stage output zero-filled a full CPU buffer it never used —
+  360 MB per stage per run at 45 MP.
+- **Textures are reused between runs.** A freed stage output goes back to its
+  context's pool and the next run takes an exact size/format match before
+  allocating. A texture the viewer still holds is never pooled; the pool is
+  capped at 1.5 GB and 24 textures, and the collector empties it when it runs.
+- **The previous run's dead results go when the next run starts**, not when it
+  ends. The stage cache keeps the last pipeline so a slider tick can reuse it;
+  whatever the new run cannot reuse — everything, when you switch groups — is
+  freed right after the cache check, so two groups' merges are never held at
+  once.
+
 ### Previews while you drag
 
 A 45 MP frame cannot be re-processed at 60 Hz, so while a slider is moving the
@@ -178,7 +194,18 @@ audited by the test suite rather than inferred:
 
 A region result carries its own placement (`originX/originY`, `fullW/fullH`) so
 the viewer can draw a window onto the picture without it jumping to the corner
-or changing size.
+or changing size. Only the stages that actually ran on the region are trimmed;
+the cached full-frame results above them stay whole, which is what keeps a
+zoomed-in drag from re-running everything upstream on the next tick.
+
+**A tick re-runs less than its stage.** Within a multi-pass GPU stage, the
+passes a changed setting cannot affect are skipped when their results are still
+in the scratch planes — dragging `tonemap_local`'s `range` re-runs one pass of
+seven. And a measurement that depends only on the input (a tone mapper's
+percentiles, dehaze's airlight, the noise level `wavelet_denoise` adapts to,
+`lens_correct`'s chromatic aberration) is cached against that input's identity,
+which covers **every stage upstream**, so a change anywhere above it re-measures
+and a change below it does not.
 
 ---
 
@@ -437,7 +464,7 @@ defaults.
 
 ## Algorithms
 
-79 registered. `choose("x", "category")` offers every algorithm in a category,
+83 registered. `choose("x", "category")` offers every algorithm in a category,
 so these names are the ones that matter in a script.
 
 | Category | Algorithms |
@@ -448,7 +475,7 @@ so these names are the ones that matter in a script.
 | **match** | `match_brute` (exact), `match_ann` (k-d forest / LSH) |
 | **merge** | `merge_hdr`, `merge_mean`, `align`, `align_features`, `bundle_adjust`, `stitch_panorama`, `reshape` |
 | **demosaic** | `demosaic_ahd` (default), `demosaic_consistent`, `demosaic_malvar`, `demosaic_ppg`, `demosaic_vng`, `demosaic_bilinear`, `demosaic_passthrough`, `demosaic_stages` (every intermediate as its own image, for debugging), `hot_pixel_repair`, `highlight_reconstruct` (rebuilds partly clipped highlights from the surrounding colour, after the demosaic) |
-| **denoise** | `wavelet_denoise` |
+| **denoise** | `wavelet_denoise` (à-trous, thresholds from the noise measured in the image) |
 | **filter** | `sharpen` (unsharp mask in log luminance: hue kept, halo limit, edge masking), `gaussian_blur`, `box_blur`, `median_blur`, `bilateral`, `guided_filter`, `nonlocal_means`, `anisotropic_diffusion`, `kuwahara`, `kuwahara_generalized`, `symmetric_nearest`, `bloom` (glow and halation), `orton` |
 | **edge** | `sobel`, `canny`, `non_max_suppression`, `hysteresis` |
 | **threshold** | `threshold`, `threshold_otsu`, `threshold_isodata`, `threshold_triangle`, `threshold_adaptive_mean`, `threshold_adaptive_gaussian`, `threshold_niblack`, `threshold_sauvola`, `threshold_bernsen` |
@@ -608,22 +635,42 @@ content misaligns while the distance is fine. **No homography can fix that** —
 one 8-parameter warp cannot give near and far content different displacements at
 once.
 
-For that case, `winner_takes_all` takes each output pixel from a single frame
-instead of blending. Feathering *averages* the overlapping frames, and averaging
-two offset copies of a branch is exactly what makes the doubled image; choosing
-one frame cannot ghost because there is nothing to average. It also avoids the
-softening that blending causes even at perfect alignment, since each frame is
-independently resampled and the average of two softened copies is softer still.
+**Blending is multi-band by default** (Burt & Adelson). Feathering *averages*
+the overlapping frames, and averaging two offset copies of a branch is exactly
+what makes the doubled image. Multi-band keeps hard seams for the fine detail —
+each output pixel's detail comes from one frame, so it cannot ghost — and blends
+band by band, so an exposure difference is spread over a distance that grows
+with the band's scale and vanishes into the coarse bands. Each frame is pushed
+and pulled to fill past its own edge first, so that edge cannot leak in as a
+halo. Measured on a 15-frame sweep: the feather blend's ghosting in the near
+foreground is gone, as sharp as `winner_takes_all`, and the hard seams and
+0.4-stop sky step that `winner_takes_all` leaves blend away. Frames resample
+Lanczos-3, range-clamped so edges do not ring.
 
-The trade is that exposure steps stop being hidden. `gain_compensation` solves
-one gain per frame from the overlaps, in log space so what gets averaged is a
-brightness *ratio*. It constrains the **seam** rather than the whole overlap,
-and compares local patches rather than single pixels — two frames sampled at one
-canvas point are looking at different scene points wherever registration is
-imperfect, and in a high-contrast scene that difference is half a stop for
-reasons having nothing to do with exposure. Measured on a 15-frame sweep, the
-seam gap went 0.299 → 0.180 stops; patch comparison was worth 3× over
-single-pixel.
+`winner_takes_all` is still there: every output pixel from a single frame,
+nothing blended. It shows exposure steps as hard seams.
+
+`gain_compensation` (on by default) solves one gain per frame from the
+overlaps, in log space so what gets averaged is a brightness *ratio*, directly
+from the normal equations so every frame is placed against every other at once.
+It constrains the **seam** rather than the whole overlap and compares local
+patches rather than single pixels — two frames sampled at one canvas point look
+at different scene points wherever registration is imperfect, and in a
+high-contrast scene that difference is half a stop for reasons having nothing to
+do with exposure. Patches touching clipping are left out (a blown sky reads
+equal in every frame whatever the exposure), and EXIF exposure is a weak prior
+that pins the overall level. Measured on a 15-frame sweep, the seam gap went
+0.087 → 0.071 stops.
+
+**Frames in any order** (`match_ann(any_order = 1)`, on in `panorama.tgl`).
+Each frame is paired with the frames that look most like it — soft votes over a
+pool of every frame's strongest descriptors — plus the maximum spanning tree of
+those votes so the pairs connect. `align_features` then solves every pair,
+joins the frames along the maximum spanning tree of inlier counts rooted at its
+centre, and checks every off-tree pair against the tree, clearing the matches
+of any that disagree before `bundle_adjust` sees them. A shuffled 15-frame sweep
+stitches to the same canvas, disagreement and seam gap as the ordered one.
+`solve_cameras` does the same for structure from motion.
 
 **A per-frame gain cannot fix a difference that varies across the frame.** A
 per-frame *ramp* was built for that and removed: every constraint is a
@@ -631,8 +678,9 @@ difference between two frames, so a tilt applied identically to all of them is
 invisible to the fit and drifts until it hits its limit. Measured, the ramps
 railed with the same sign on all fifteen frames — which tilts the whole panorama
 and corrects no seam. The remaining residual is within-frame variation (lens
-falloff plus the scene's own gradient), and fixing it needs either a measured
-flat field or a seam-aware blend, not a better global fit.
+falloff plus the scene's own gradient). Multi-band blending now hides most of
+it, and `lens_correct`'s `vignette`, applied to each frame before the stitch,
+removes the lens's part at the source.
 
 ### Learned features
 
@@ -1014,19 +1062,27 @@ other tools, which `scripts/view_ply.tgl` opens in the 3D viewer.
   different rates and a grey cloud comes out **purple**. An airlight is a colour,
   and a colour brighter than white is not one.
 
-  The GPU path is a deliberate approximation of the CPU one, not a translation
-  of it: the transmission map runs at full resolution rather than quarter scale,
-  a box smooth replaces the guided filter, and the airlight comes from a strided
-  sample of ~300k pixels. Each trade buys interactivity; the two agree to a mean
-  of about 0.6 on a 0–255 scale. Because the airlight depends only on the
-  *photograph* and not on any slider, it is **cached across a drag** — the
-  measurement is the whole remaining cost, and skipping it is what makes the
-  sliders live. `patch` is the exception, since it is the window the dark
-  channel is minimised over, so changing it re-measures.
+  The GPU path runs the CPU's algorithm pass for pass — the quarter working
+  scale above 2 MP, the guided filter, the bilinear recovery — in twelve passes
+  over planes mostly a sixteenth of the image, and agrees with the CPU to a
+  maximum of 1/255. Only the airlight differs slightly, being measured from a
+  strided sample. Because the airlight depends only on the *photograph* and not
+  on any slider, it is **cached across a drag**, and dragging `strength` skips
+  the dark-channel passes it cannot affect: a warm tick at 45 MP is about 6 ms.
+  `patch` is the exception, since it is the window the dark channel is
+  minimised over, so changing it re-measures.
 - **`align`** solves each frame of a group against a reference and attaches the
   transform as a sidecar; it warps nothing itself. Merges sample through it if
   present. A correction below half a pixel is skipped when there is no other
   transform to fold into, because the resample costs more than it gains.
+
+  The solve is **robust**: each iteration measures the spread of its residuals
+  and weights every sample point by it (Huber first, then Tukey's biweight), so
+  whatever moved between exposures has no say. It samples the strongest
+  gradients, which are exactly the edges of a drifting cloud; least squares
+  followed them, moving every frame of an 8-frame bracket by up to 4.9 px while
+  the mountains under them had moved less than one, and the merged ridgeline
+  came out doubled.
 - **`crop`** trims and straightens in one stage, because they are one
   operation: rotating leaves empty corner wedges that have to be cropped, and
   cropping first puts them back. `preview` draws the crop rectangle on the full
@@ -1039,12 +1095,75 @@ other tools, which `scripts/view_ply.tgl` opens in the 3D viewer.
   turns straightening into a comparison instead of a guess. Screen-aligned lines
   would keep their own angle while the rectangle turned under them, and matching
   the two would mean nothing.
-- **`merge_hdr`** reads shutter, aperture and ISO from EXIF and divides them
-  out, producing scene-linear radiance with real headroom.
+- **`merge_hdr`** produces scene-linear radiance with real headroom. It merges
+  in the camera's balanced RGB, before the colour matrix, where the demosaic's
+  clamp is what marks a sample clipped, and applies the matrix once to the
+  result.
+  - **One weight per pixel**, from its brightest channel over a 3×3
+    neighbourhood, times exposure (the shot-noise-optimal weight). Per-channel
+    weights took red from one exposure and blue from another wherever a single
+    channel neared clipping — pink and cyan patches in a cloud.
+  - **Exposure ratios are measured** between neighbouring frames (median log
+    ratio over pixels both expose well) rather than trusted from EXIF, and
+    chained from the middle frame. A pair whose ratio is not one consistent
+    number — the light changed — keeps EXIF, and the report says so.
+  - **Deghosting is per pixel**, and soft. A frame is faded out where its
+    radiance disagrees with the frame chosen as judge, over a ramp either side
+    of `ghost_threshold` rather than at a cut, so a moving cloud does not become
+    a patchwork of moments. The judge is the reference where it exposes well and
+    otherwise the frame **most other frames agree with**; where at least two
+    more frames agree with another frame than with the reference, the reference
+    is outvoted, gradually. A clipped reference is a floor: a darker frame
+    reading well below its clip saw something else, and where none is
+    consistent the pixel is filled from the merged cloud around it.
 - **`tonemap` vs `tonemap_local`** — the global operator applies one curve to
   every pixel: no halos, but it cannot give the sky more of the display without
   taking the same from the land. The local one splits illumination from detail
   and compresses only the illumination. Watch strong edges for halos.
+
+  `tonemap` is **hue-preserving** (`preserve_hue`, on): the curve runs on
+  luminance and the pixel is scaled as a whole, so a saturated colour keeps its
+  channel ratios instead of washing toward white as its brightest channel is
+  compressed hardest. Both have GPU paths that match the CPU exactly.
+- **`wavelet_denoise`** is an à-trous wavelet shrinkage, separately for luma
+  and chroma. With `adaptive` (on) it **measures the noise** in each band of
+  the image in front of it and sets the thresholds as `luma_k` and `chroma_k`
+  times that; a developed photo's noise is not white — demosaicing correlates
+  it — so a fixed table left colour mottling. At a preview scale it drops the
+  finest levels, which do not exist there, so the preview matches the result.
+- **`highlight_reconstruct`** rebuilds partly clipped highlights. Where one or
+  two channels clipped and the rest were measured — the warm halo of a
+  streetlight, a sunlit cloud's edge — the demosaic's clamp leaves the pixel
+  paler and flatter than the scene. This stage learns the colour of the bright,
+  reliable pixels around the clipped area, spreads it in with a pull-push
+  pyramid, and rebuilds the clipped channels at that colour and the level the
+  measured ones imply. Fully clipped cores go neutral, rising from the clip
+  level at their rim, so they blend into the halo instead of stepping up from
+  it. Put it straight after the demosaic.
+- **`lens_correct`** undoes radial distortion (`k1`, `k2`), lateral chromatic
+  aberration and vignetting in one resample, with every quantity relative to
+  the frame so a proxy matches the result. `auto_ca` (on) measures red's and
+  blue's magnification against green from the photograph's own radial edges, to
+  a twentieth of a pixel. `fill` scales the result so no corner is left empty.
+  **Put it first**, on each frame, before `align`, a merge or a stitch — they
+  all work better on undistorted frames, and the vignetting gain belongs to
+  linear light. `hdr.tgl`, `panorama.tgl`, `develop.tgl` and `sfm.tgl` do.
+- **`sharpen`** is an unsharp mask in log luminance: one gain per pixel, so hue
+  is kept and colour noise is not amplified, and an edge is the same size in
+  stops wherever it sits. `limit` caps how many stops any pixel may change;
+  `masking` sharpens only near edges, keyed on the gradient of the blurred
+  image, so grain and smooth skin are left alone.
+- **`clarity`** raises local contrast without halos: the detail is log
+  luminance minus a guided filter of itself, which follows any edge stronger
+  than its threshold, so the edge itself is not in the detail being raised.
+  `clarity` works at a large radius (a percentage of the frame), `texture` at a
+  tenth of it with large swings tamed. Beside a strong edge it leaves a tenth of
+  the halo an unsharp mask of the same radius paints in.
+- **White balance is done in camera space.** `basic_adjust`'s `kelvin` and
+  `tint` compute the camera's own multipliers for that illuminant, through its
+  colour matrix, and re-balance with one 3×3: the matrix undone, the camera's
+  gains swapped for the new ones, the matrix put back. Gains applied to sRGB can
+  neutralise a grey just as well, but move every other colour differently.
 - **`demosaic_ahd`** is the default. It interpolates green *along* edges rather
   than across them, so thin high-contrast detail keeps its colour instead of
   breaking into speckles.
@@ -1152,9 +1271,19 @@ leave the judgement to you:
 | `bench_dehaze <image>` | Dehaze on a real image. `BENCH_ALGO=brightness` times a trivial algorithm instead, which gives the framework's own unpack/pack floor — worth knowing before optimising anything. |
 | `bench_stitch <raw>...` | The whole panorama chain headlessly, printing every stage's report. `--gain`, `--wta`. |
 | `bench_sfm <dir> --script s.tgl` | A 3D script headlessly, printing every stage's report. `--gpu` gives it a device; `--dump DIR` saves every image viewer as PNG and renders splats from orbit viewpoints beside the middle camera — where floaters show. |
+| `bench_drag <image> <script with %V> <v1> <v2>...` | What a slider drag costs, tick by tick: each value is substituted for `%V` and run against the previous pipeline exactly as the app does, printing the time and the first stage that re-ran. `--proxy S` for a preview scale, `--region x,y,w,h` for a zoomed-in view, `--group a b c` for a group. |
 | `bench_nn dad\|dedode\|loma <weights> <reference>` | A learned network against PyTorch, layer by layer, on the CPU and the GPU, and timed. The reference comes from `tools/nn_reference.py`. |
 | `frame_exposure <raw>...` | What actually differs across a sweep: EXIF settings, measured brightness, centre vs surround. Says whether seams want a per-frame gain or something spatial. |
 | `vignette_profile <raw>...` | Lens falloff measured by averaging frames in sensor coordinates. **Reads its own verdict**: it refuses to call a result a lens profile when the variation is not radial. |
+
+**Diagnostic switches**, environment variables read at start-up:
+
+| Variable | Prints |
+|---|---|
+| `TGLAB_STAGETIME` | Per GPU stage, per run: output allocation, measurement, kernel lookup, texture acquisition and the whole run, and how many passes were skipped. |
+| `TGLAB_PASSTIME` | Per pass of a multi-pass GPU stage. |
+| `TGLAB_ALIGN` | Every frame `align` solves: shift, rotation and scale. |
+| `TGLAB_FRAMEDBG` | UI frames slower than 50 ms. |
 
 Or `ctest --test-dir build -C Release` for all of them. `build.ps1` configures,
 builds and tests in one step.
@@ -1182,22 +1311,23 @@ src/
 
 ## Known limitations
 
-- **Intermediates are not freed until the pipeline is replaced.** A 12-stage
+- **Intermediates are held while their pipeline is current.** A 12-stage
   45 MP RGBA16F chain holds roughly 8 GB. The stage cache is what makes
   dragging a slider cheap, so collecting eagerly would trade one problem for
-  another.
+  another. What a new run cannot reuse is freed as soon as it starts.
 - **A GPU stage binds one input.** The root signature has four SRV slots, but
   no multi-input algorithm has a kernel yet.
 - **The automatic thresholds have no GPU path**, because deriving a level from
   a histogram pins the algorithm to the CPU.
 - **Tonal control ranges do not follow the pixel format.** `threshold`'s level
   is fixed at 0..255, so on a float image everything falls below it.
-- **A chained match is by list order.** `chain = 1` pairs frame *i* with frame
-  *i−1* as the group holds them, so frames out of order pair views that were
-  never adjacent. That fails *confidently* — a spurious pairing was measured at
-  91% inliers, indistinguishable from a real one by rate alone — so the aligner
-  rejects any solve displacing a frame more than 1.5 frame widths and says why.
-  Sort a group by name or date before stitching.
+- **A chained match is by list order** unless `any_order` is on. `chain = 1`
+  pairs frame *i* with frame *i−1* as the group holds them, so frames out of
+  order pair views that were never adjacent. That fails *confidently* — a
+  spurious pairing was measured at 91% inliers, indistinguishable from a real
+  one by rate alone — so the aligner rejects any solve displacing a frame more
+  than 1.5 frame widths and says why. `any_order` pairs frames by appearance
+  instead; `panorama.tgl` turns it on.
 - **The overlap-disagreement metric measures more than alignment.** Two frames
   with a 3.9 px reprojection RMS still report ~10%, because it is luminance
   variance and a handheld pan has real exposure and vignetting differences

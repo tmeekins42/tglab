@@ -658,6 +658,17 @@ longer set — the debug layer says "descriptor heap … is different from curre
 set descriptor heap", and the app crashes. Restoring ImGui's heap afterwards is
 the whole fix. It only reproduced in Debug; the Release build ran happily.
 
+**And a second one: a descriptor has a GPU lifetime too.** A command list reads
+its descriptors when it *executes*, not when it is recorded. The heap's free
+list is last-in first-out, so a descriptor freed at once is the very next one
+handed out — and a viewer recreating its display texture (whenever the shown
+image changes size) wrote the new texture's view into the slot that frames
+already submitted were about to sample. They drew the new, unfilled texture: a
+one-frame flash of garbage or the transparency checkerboard. Resources were
+already released on the frame fence (`Device::DeferRelease`); their descriptors
+now are too (`Device::DeferFreeSrv`). Anything that frees a view whose resource
+may still be drawn must use it.
+
 ### Filters
 
 Everything in `Category()=="filter"` is interchangeable, so
@@ -898,6 +909,111 @@ refuses rather than silently truncating.
 Only single-input, single-output stages may iterate — anything else has no
 obvious pair of buffers to alternate between.
 
+### Multi-pass GPU stages
+
+An algorithm whose passes do *different* things — a demosaic, a guided filter,
+a wavelet cascade — returns them from `GpuPasses()`. Each pass names its HLSL
+and the buffers it reads and writes: negative indices are the stage's ports
+(`-1` is input 0 or output 0), non-negative ones index a pool of scratch planes
+the framework allocates and keeps between runs:
+
+```cpp
+int        GpuScratchCount()  const override { return 3; }
+FormatSpec GpuScratchPlanes() const override { return FormatSpec::R32F; }
+
+std::vector<GpuPass> GpuPasses() const override {
+    // Static: GpuPasses returns raw pointers into the strings.
+    static const std::string logp = std::string(kCommon) + kLogHlsl;
+    static const std::string blur = std::string(kCommon) + kBlurHlsl;
+    static const std::string comb = std::string(kCommon) + kCombineHlsl;
+    return {{logp.c_str(), "log",     {-1},        {0}},
+            {blur.c_str(), "blurH",   {0},         {1}},
+            {blur.c_str(), "blurV",   {1},         {2}},
+            {comb.c_str(), "combine", {-1, 0, 2},  {-1}}};
+}
+
+std::vector<uint32_t> GpuPassConstants(int pass) const override { ... }
+```
+
+(`sharpen.cpp` is that stage in full.) What the framework gives you, and what
+it asks in return:
+
+- **Kernels compile once and planes allocate once.** Kernels come from the
+  context's cache keyed on their full source, and the planes are carried to the
+  next run when the stage is the same algorithm. A stage that dropped them
+  recompiled every pass through DXC on every slider tick.
+- **Planes can differ.** `GpuScratchPlaneFormat(i)` gives a plane its own
+  format — `RG32F`/`RG16F` exist for planes that carry two values, which as
+  `RGBA32F` spent half their bandwidth on padding — and
+  `GpuScratchPlaneDivisor(i)` makes it N times smaller than the output (rounded
+  down, as `w / k` is on the CPU). A pass writing a smaller plane is dispatched
+  over that plane and gets its size as `Width`/`Height`.
+- **A thread can cover a run of pixels.** `GpuPass::divX`/`divY` say how many
+  output pixels one thread walks. A box filter whose window is hundreds of
+  pixels wide should gather it once per run and slide it (add the entering
+  sample, drop the leaving one) rather than gather 2r+1 samples per pixel:
+  `tonemap_local`'s base-layer boxes went 499 → 134 ms a tick at 45 MP that way.
+  Re-gather at the start of every run so float error in the running sum cannot
+  build up.
+- **Passes a setting cannot affect are skipped.** Each pass is keyed on its
+  source, its constants, its grid, the identity of what it reads, and the region
+  and scale. A pass whose key is unchanged and whose result is still in its
+  plane does not run. **So give each pass only the constants it reads** —
+  if every pass gets every slider's value, every pass looks changed whenever
+  anything moves, and nothing is ever skipped. `dehaze` is the example: its
+  dark-channel passes do not read `strength`, so dragging `strength` re-runs
+  only the recovery.
+
+### Measuring the input for the GPU
+
+Some constants come from the *content* — a tone mapper's percentiles, an
+airlight, a noise level, a chromatic aberration. Return true from
+`GpuNeedsInputPixels()` and do the measurement in `MeasureForGpu()`, which gets
+the input before any pass runs. It forces a readback, so:
+
+- **Read only what you need.** Sample the mapped pixels directly rather than
+  `PixelBuffer::Unpack()`-ing the whole frame to look at a stride grid —
+  `tonemap_local` spent 835 ms of a 1.7 s tick unpacking 45 MP to read a few
+  hundred thousand pixels.
+- **Cache it if it depends only on the input.** Return true from
+  `MeasurementDependsOnlyOnInput()` and implement `SaveMeasurement()` /
+  `RestoreMeasurement()`. The pipeline stores the blob against the input's
+  identity, which folds in every stage upstream, so a change anywhere above
+  re-measures and a slider on this stage does not. **Only** what depends on
+  the input belongs in the blob: fold a parameter in and dragging it will
+  silently reuse a stale answer, which looks like a slightly wrong picture
+  rather than a bug. Where a parameter does change the measurement (dehaze's
+  `patch`), save it in the blob and refuse a restore that does not match.
+- **Make the CPU path measure the same way.** The same stride grid, the same
+  fit — share the function — or the two paths place their curves differently
+  and the parity test is the first to notice.
+
+A GPU-path note for the info panel goes through `RunReport()`, from members the
+GPU path set; the CPU path reports per call through `ctx.SetReport()`. The
+filters suite fails any per-frame algorithm whose `RunReport()` holds state a
+CPU run left behind, because one instance runs every frame of a group.
+
+### Declaring how a stage behaves on previews
+
+Two declarations decide what the preview machinery may do with a stage, and
+both are audited by tests rather than inferred:
+
+- `ReachPixels()` — how far the stage reads from the pixel it writes, at full
+  resolution. A zoomed-in run is cropped to the visible rectangle grown by the
+  summed reach of the stages re-running. Forget it and tile edges show seams;
+  a wavelet cascade's reach is `2(2^L - 1)`, not its first level's.
+- `RegionSafe()` — false when the result depends on the whole frame: anything
+  measuring a global statistic, and any warp (`lens_correct`) or measurement
+  whose answer would change as the view pans.
+
+Pixel-unit parameters scale with the preview (`ctx.ScaledPx`,
+`GpuScaledPx`). Better still, state geometry as a fraction of the frame
+(`lens_correct`, `clarity`) and it is right at every scale with nothing to
+scale. An algorithm whose finest scales do not exist at a preview's resolution
+should say what it does instead: `wavelet_denoise` drops its finest
+`log2(1/scale)` levels and runs the rest at the thresholds of the full-resolution
+levels they stand for, so the preview matches the result.
+
 **Data the algorithm supplies itself.** Constants go in the constant buffer and
 images arrive through ports, which covers almost everything. `apply_lut` is
 where both run out: a 33³ colour LUT is 431 KB against the constant buffer's
@@ -986,6 +1102,16 @@ slow one, because every comparison built on it is then meaningless — which is
 what `tglab_pyramid_tests` exists to prevent.
 
 ### Verifying a GPU kernel
+
+**Time the repeated case.** A stage that recompiles a kernel, reallocates a
+plane or re-measures its input on every tick looks fine in every one-shot
+benchmark and every test, and costs all of it again each time a slider moves.
+`bench_drag` runs a script template once per value against the previous
+pipeline, exactly as the app does, and prints each tick's time and the first
+stage that re-ran — with `--region` for a zoomed-in drag and `--group` for a
+bracket. `TGLAB_STAGETIME=1` splits each GPU stage's time into allocation,
+measurement, kernel lookup, texture acquisition and the run, and counts the
+passes skipped.
 
 **Compute → Compare CPU / GPU** runs the pipeline twice, forced to each
 backend, and reports max/mean/RMSE difference, the count of pixels beyond
