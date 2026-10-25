@@ -191,9 +191,9 @@ public:
         const float white = linear ? kLinearShoulder : 1.0f;
         const float shadowTop = linear ? kLinearShadowTop : 0.5f;
 
-        // White balance gains, derived once rather than per pixel.
-        float wbR = 1.0f, wbG = 1.0f, wbB = 1.0f;
-        WhiteBalanceGains(&wbR, &wbG, &wbB);
+        // The white balance, derived once rather than per pixel.
+        float wb[9];
+        WhiteBalanceMatrix(wb);
         const float expGain = std::pow(2.0f, float(m_exposure));
 
         for (int y = 0; y < h; ++y) {
@@ -212,7 +212,11 @@ public:
                     b = DecodeIn(p[2] / scale, linear);
                 }
 
-                Apply(&r, &g, &b, wbR, wbG, wbB, expGain, white, shadowTop);
+                const float r0 = r, g0 = g, b0 = b;
+                r = wb[0] * r0 + wb[1] * g0 + wb[2] * b0;
+                g = wb[3] * r0 + wb[4] * g0 + wb[5] * b0;
+                b = wb[6] * r0 + wb[7] * g0 + wb[8] * b0;
+                Apply(&r, &g, &b, 1.0f, 1.0f, 1.0f, expGain, white, shadowTop);
 
                 if (ch == 1) {
                     m_out.Set(x, y, 0, EncodeOut(Luma(r, g, b), linear) * scale);
@@ -241,7 +245,7 @@ RWTexture2D<float4> Dst : register(u0);
 cbuffer Params : register(b0) {
     uint  Width;
     uint  Height;
-    uint  WbR, WbG, WbB;        // precomputed white-balance gains
+    uint  Wb0, Wb1, Wb2, Wb3, Wb4, Wb5, Wb6, Wb7, Wb8;   // white balance, row-major 3x3
     uint  ExpGain;              // 2^exposure
     uint  Contrast;
     uint  Highlights, Shadows;
@@ -268,8 +272,10 @@ void main(uint3 tid : SV_DispatchThreadID) {
     // Scene-linear input is already linear -- decoding it again would be wrong.
     float3 c = (Linear != 0) ? texel.rgb : SrgbToLinear(texel.rgb);
 
-    // --- white balance ---
-    c *= float3(asfloat(WbR), asfloat(WbG), asfloat(WbB));
+    // --- white balance: a 3x3, since on a raw it is done in camera space ---
+    c = float3(dot(float3(asfloat(Wb0), asfloat(Wb1), asfloat(Wb2)), c),
+               dot(float3(asfloat(Wb3), asfloat(Wb4), asfloat(Wb5)), c),
+               dot(float3(asfloat(Wb6), asfloat(Wb7), asfloat(Wb8)), c));
 
     // --- exposure: a straight multiply, which is only correct in linear ---
     c *= asfloat(ExpGain);
@@ -345,10 +351,12 @@ void main(uint3 tid : SV_DispatchThreadID) {
     }
 
     std::vector<uint32_t> GpuConstants(int) const override {
-        float wbR = 1.0f, wbG = 1.0f, wbB = 1.0f;
-        WhiteBalanceGains(&wbR, &wbG, &wbB);
+        float wb[9];
+        WhiteBalanceMatrix(wb);
 
-        return {FloatBits(wbR), FloatBits(wbG), FloatBits(wbB),
+        return {FloatBits(wb[0]), FloatBits(wb[1]), FloatBits(wb[2]),
+                FloatBits(wb[3]), FloatBits(wb[4]), FloatBits(wb[5]),
+                FloatBits(wb[6]), FloatBits(wb[7]), FloatBits(wb[8]),
                 FloatBits(std::pow(2.0f, float(m_exposure))),
                 FloatBits(float(m_contrast)),
                 FloatBits(float(m_highlights)), FloatBits(float(m_shadows)),
@@ -363,10 +371,11 @@ void main(uint3 tid : SV_DispatchThreadID) {
     // paths so they cannot disagree.
     void CaptureWhiteBalance(const ImageDesc& d) {
         for (int i = 0; i < 3; ++i) {
-            m_camMul[i] = d.camMul[i];
-            m_preMul[i] = d.preMul[i];
+            m_wbDesc.camMul[i] = d.camMul[i];
+            m_wbDesc.preMul[i] = d.preMul[i];
         }
-        m_hasDaylightWb = d.hasDaylightWb;
+        for (int i = 0; i < 9; ++i) m_wbDesc.rgbCam[i] = d.rgbCam[i];
+        m_wbDesc.hasDaylightWb = d.hasDaylightWb;
     }
 
 
@@ -413,7 +422,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     }
 
 private:
-    // The white-balance gains, from kelvin and tint.
+    // The white balance, from kelvin and tint, as a 3x3 on linear sRGB.
     //
     // Two axes, which is what white balance actually has: a colour temperature
     // along the Planckian locus, and a green/magenta offset perpendicular to it
@@ -422,67 +431,41 @@ private:
     // file's temperature alone still left red and blue both off by 1.078, equal
     // in both, which is a pure green shift by definition.
     //
-    // A third relative "temperature" nudge used to sit on top. It was dropped
-    // once kelvin could start at the camera's own value: a small warm/cool
-    // adjustment is just a small move in Kelvin, and having two controls for one
-    // axis meant neither said clearly what it did.
-    //
     // The demosaic has already applied camMul, so the image arrives balanced as
-    // the camera saw it -- meaning a request is applied RELATIVE to that. Undo
-    // the camera's choice, apply the asked-for illuminant, and the two cancel
-    // exactly when the two agree. That cancellation is what makes the number
-    // mean something rather than being an arbitrary curve.
+    // the camera saw it -- meaning a request is applied RELATIVE to that, and the
+    // two cancel exactly when they agree.
+    //
+    // IN CAMERA SPACE. White balance is a gain per photosite colour, before the
+    // camera matrix; the demosaic applied the camera's as rgbCam * diag(camMul).
+    // So a new balance is the matrix undone, the camera's gains swapped for the
+    // requested illuminant's, and the matrix put back -- one 3x3 per image,
+    // CameraWhiteBalanceMatrix. Gains applied to sRGB after the matrix (what this
+    // used to do) neutralise a grey just as well but shift every other colour
+    // differently, since sRGB's primaries are not the sensor's; and they mixed
+    // camera-space ratios (camMul / preMul) with sRGB-space gains in one product.
     //
     // Without preMul there is nothing to measure against, so this leaves the
     // image alone. That is the honest behaviour for a JPEG, which carries no
-    // record of where neutral was.
+    // record of where neutral was. Tint is still meaningful on its own -- a
+    // plain green/magenta push -- so it stays available there.
     //
-    // Gains are normalised on luminance, so changing the white balance does not
-    // double as an exposure change.
-    void WhiteBalanceGains(float* r, float* g, float* b) const {
-        *r = 1.0f;
-        *g = 1.0f;
-        *b = 1.0f;
+    // Normalised on luminance, so changing the white balance does not double as
+    // an exposure change.
+    void WhiteBalanceMatrix(float* m) const {
+        for (int i = 0; i < 9; ++i) m[i] = (i % 4 == 0) ? 1.0f : 0.0f;
 
         const float k = float(m_kelvin);
-        if (k > 1.0f && m_hasDaylightWb) {
-            // The requested illuminant, and D65, both as gains on this sensor.
-            // preMul is the camera's D65 reference, so the ratio between the two
-            // expresses the request in camera space.
-            float wr = 1.0f, wg = 1.0f, wb = 1.0f;
-            KelvinGains(k, float(m_tint), &wr, &wg, &wb);
-
-            float dr = 1.0f, dg = 1.0f, db = 1.0f;
-            KelvinGains(kD65Kelvin, 0.0f, &dr, &dg, &db);
-
-            // What the camera already applied, relative to its daylight
-            // reference: the correction to undo.
-            const float shotR = m_camMul[0] / std::max(m_preMul[0], 1e-6f);
-            const float shotB = m_camMul[2] / std::max(m_preMul[2], 1e-6f);
-
-            *r = (wr / std::max(dr, 1e-6f)) / std::max(shotR, 1e-6f);
-            *g = wg / std::max(dg, 1e-6f);
-            *b = (wb / std::max(db, 1e-6f)) / std::max(shotB, 1e-6f);
-        } else {
-            // No reference to anchor to. Tint is still meaningful on its own --
-            // it is a straightforward green/magenta push, not something that
-            // needs to know where neutral was -- so it stays available.
-            const float n = float(m_tint);
-            *g = 1.0f - n * 0.3f;
-            *r = 1.0f + n * 0.15f;
-            *b = 1.0f + n * 0.15f;
+        if (k > 1.0f && m_wbDesc.hasDaylightWb) {
+            CameraWhiteBalanceMatrix(m_wbDesc, k, float(m_tint), m);
+            return;
         }
-
-        *r = std::max(*r, 0.0f);
-        *g = std::max(*g, 0.0f);
-        *b = std::max(*b, 0.0f);
-
-        const float lum = Luma(*r, *g, *b);
-        if (lum > 1e-6f) {
-            *r /= lum;
-            *g /= lum;
-            *b /= lum;
-        }
+        const float n = float(m_tint);
+        float r = std::max(1.0f + n * 0.15f, 0.0f);
+        float g = std::max(1.0f - n * 0.3f, 0.0f);
+        float b = std::max(1.0f + n * 0.15f, 0.0f);
+        const float lum = Luma(r, g, b);
+        if (lum > 1e-6f) { r /= lum; g /= lum; b /= lum; }
+        m[0] = r; m[4] = g; m[8] = b;
     }
     // The CPU path, matching the shader step for step. Kept in sync because
     // compare mode checks one against the other.
@@ -687,10 +670,9 @@ private:
 
     // White-balance references from the input descriptor, needed by the Kelvin
     // control. Set in both paths -- RunCPU reads the descriptor directly, and
-    // PrepareGpu is where the GPU path first sees it.
-    float m_camMul[3]     = {1.0f, 1.0f, 1.0f};
-    float m_preMul[3]     = {1.0f, 1.0f, 1.0f};
-    bool  m_hasDaylightWb = false;
+    // PrepareGpu is where the GPU path first sees it. Only the white-balance
+    // fields (camMul, preMul, rgbCam, hasDaylightWb) are filled.
+    ImageDesc m_wbDesc{};
 
 };
 

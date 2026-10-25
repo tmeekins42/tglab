@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "../src/algo_util/pixel_buffer.h"
+#include "../src/algo_util/white_balance.h"
 #include "../src/core/algorithm.h"
 #include "../src/core/pipeline.h"
 #include "../src/script/interp.h"
@@ -393,6 +394,81 @@ static void TestKelvinWhiteBalance() {
 //     non-square image the mid-edges darken equally. Normalising to the
 //     shorter axis -- the obvious mistake -- would clip the long edges flat
 //     while the corners were still untouched.
+// WHITE BALANCE IS A CAMERA-SPACE OPERATION. With a real camera matrix (rows
+// mixing the channels, as every sensor's does), re-balancing a raw shot under
+// 3000 K that the camera balanced for 5500 K must give what balancing for
+// 3000 K in the camera would have given -- for every colour, not just grey.
+// Gains on sRGB can make the grey right and still leave the colours off,
+// which is checked too, so the test is known to tell the two apart.
+static void TestCameraSpaceWhiteBalance() {
+    std::printf("\n--- white balance in camera space ---\n");
+    ImageDesc base{4, 1, Format::RGBA32F};
+    base.linear = true;
+    base.hasDaylightWb = true;
+    const float cam[9] = {1.9f, -0.8f, -0.1f, -0.2f, 1.5f, -0.3f, 0.05f, -0.55f, 1.5f};
+    for (int i = 0; i < 9; ++i) base.rgbCam[i] = cam[i];
+    base.preMul[0] = 2.0f; base.preMul[1] = 1.0f; base.preMul[2] = 1.5f;
+
+    float mul3[3], mul55[3];
+    if (!CameraWhiteMultipliers(base, 3000.0f, 0.0f, mul3) ||
+        !CameraWhiteMultipliers(base, 5500.0f, 0.0f, mul55)) {
+        Check(false, "camera multipliers computed");
+        return;
+    }
+    // What the sensor records under 3000 K: a grey, then three colours.
+    const float tint[4][3] = {{1, 1, 1}, {1.4f, 0.9f, 0.7f}, {0.7f, 1.0f, 1.3f}, {1.1f, 1.3f, 0.6f}};
+    auto render = [&](const float* mul) {
+        ImageDesc d = base;
+        for (int c = 0; c < 3; ++c) d.camMul[c] = mul[c];
+        Image img;
+        img.Alloc(d);
+        ImageView v = img.MapCpuWrite();
+        for (int x = 0; x < 4; ++x) {
+            float q[3];
+            for (int c = 0; c < 3; ++c) q[c] = 0.3f / mul3[c] * tint[x][c] * mul[c];
+            float* p = v.At<float>(x, 0);
+            for (int r = 0; r < 3; ++r) p[r] = cam[r * 3] * q[0] + cam[r * 3 + 1] * q[1] + cam[r * 3 + 2] * q[2];
+            p[3] = 1.0f;
+        }
+        return img;
+    };
+    Image truth = render(mul3), fixed;
+    std::string err;
+    if (!RunFilter("basic_adjust", render(mul55), {{"kelvin", 3000.0}, {"tint", 0.0}}, &fixed, &err)) {
+        Check(false, "basic_adjust re-balances: " + err);
+        return;
+    }
+    ImageView t = truth.MapCpuRead(), f = fixed.MapCpuRead();
+    const float k = t.At<float>(0, 0)[1] / f.At<float>(0, 0)[1];   // exposure aside
+    float worst = 0;
+    for (int x = 0; x < 4; ++x)
+        for (int c = 0; c < 3; ++c)
+            worst = std::max(worst, std::fabs(f.At<float>(x, 0)[c] * k / t.At<float>(x, 0)[c] - 1.0f));
+    Check(worst < 0.01f, "re-balancing in camera space matches balancing in the camera, every colour (worst " +
+                             std::to_string(worst) + ")");
+
+    // The same request as gains on sRGB, chosen to make the grey exactly right.
+    Image wrong = render(mul55);
+    ImageView w = wrong.MapCpuRead();
+    float g[3];
+    for (int c = 0; c < 3; ++c) g[c] = t.At<float>(0, 0)[c] / w.At<float>(0, 0)[c];
+    float colourErr = 0;
+    for (int x = 1; x < 4; ++x)
+        for (int c = 0; c < 3; ++c)
+            colourErr = std::max(colourErr, std::fabs(w.At<float>(x, 0)[c] * g[c] / t.At<float>(x, 0)[c] - 1.0f));
+    Check(colourErr > 0.03f, "...where sRGB gains that fix the grey leave the colours off (" +
+                                 std::to_string(colourErr) + ")");
+
+    // And the as-shot estimate, under the same matrix, names 3000 K.
+    ImageDesc shot = base;
+    for (int c = 0; c < 3; ++c) shot.camMul[c] = mul3[c];
+    float kk = 0, tt = 0;
+    AsShotWhiteBalance(shot, &kk, &tt);
+    Check(std::fabs(kk - 3000.0f) < 15.0f && std::fabs(tt) < 0.01f,
+          "as-shot white balance recovered through the camera matrix (" + std::to_string(kk) + " K, tint " +
+              std::to_string(tt) + ")");
+}
+
 static void TestVignette() {
     const int W = 300, H = 200;    // 3:2, so aspect errors show
     auto flat = [&] {
@@ -1961,6 +2037,7 @@ static void TestProxyBehaviour() {
 int main() {
     std::string err;
     TestKelvinWhiteBalance();
+    TestCameraSpaceWhiteBalance();
     TestVignette();
     TestLensCorrect();
     TestSharpen();

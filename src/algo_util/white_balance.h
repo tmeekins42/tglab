@@ -38,6 +38,25 @@ void PlanckianXy(float kelvin, float* x, float* y);
 // does not double as an exposure slider.
 void KelvinGains(float kelvin, float tint, float* gr, float* gg, float* gb);
 
+// WHITE BALANCE IN CAMERA SPACE. A sensor's white balance is a gain per
+// photosite colour, applied BEFORE the camera matrix -- a von Kries
+// adaptation in the camera's own primaries. The same gains applied to sRGB
+// after the matrix (what KelvinGains gives) neutralise a grey just as well,
+// but move every other colour differently, because sRGB's primaries are not
+// the sensor's.
+//
+// The camera multipliers (green = 1) that make the white of (kelvin, tint)
+// neutral on this camera: its white in sRGB, taken back through the camera
+// matrix into daylight-balanced camera space, and divided out of the daylight
+// gains. False when `d` carries no daylight reference or no invertible matrix.
+bool CameraWhiteMultipliers(const ImageDesc& d, float kelvin, float tint, float* mul);
+
+// The 3x3, on linear sRGB, that re-balances a demosaiced raw from the
+// camera's choice (camMul) to (kelvin, tint): rgbCam * diag(new / camMul) *
+// inv(rgbCam), normalised so white keeps its luminance. The identity when the
+// two agree.
+bool CameraWhiteBalanceMatrix(const ImageDesc& d, float kelvin, float tint, float* m);
+
 // The temperature and tint the camera chose for a shot, recovered from its
 // white-balance metadata.
 //

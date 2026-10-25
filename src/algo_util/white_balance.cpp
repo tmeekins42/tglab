@@ -25,7 +25,12 @@ void PlanckianXy(float kelvin, float* outX, float* outY) {
     *outY = y;
 }
 
-void KelvinGains(float kelvin, float tint, float* gr, float* gg, float* gb) {
+namespace {
+
+// The white of (kelvin, tint) in linear sRGB, at unit luminance, each
+// component floored well above zero: see kKelvinMin for what a near-zero
+// divisor did.
+void KelvinWhite(float kelvin, float tint, float* r, float* g, float* b) {
     float x = 0.0f, y = 0.0f;
     PlanckianXy(kelvin, &x, &y);
 
@@ -37,19 +42,77 @@ void KelvinGains(float kelvin, float tint, float* gr, float* gg, float* gb) {
     const float Y = 1.0f;
     const float Z = (1.0f - x - y) / y;
 
-    float r = 0.0f, g = 0.0f, b = 0.0f;
-    XyzToLinearSrgb(X, Y, Z, &r, &g, &b);
-
-    // Floored well above zero rather than at an epsilon: see kKelvinMin for
-    // what a near-zero divisor did here.
+    XyzToLinearSrgb(X, Y, Z, r, g, b);
     constexpr float kMinComponent = 0.02f;
-    r = std::max(r, kMinComponent);
-    g = std::max(g, kMinComponent);
-    b = std::max(b, kMinComponent);
+    *r = std::max(*r, kMinComponent);
+    *g = std::max(*g, kMinComponent);
+    *b = std::max(*b, kMinComponent);
+}
 
+bool Invert3(const float* m, float* inv) {
+    const double a = m[0], b = m[1], c = m[2], d = m[3], e = m[4], f = m[5],
+                 g = m[6], h = m[7], k = m[8];
+    const double det = a * (e * k - f * h) - b * (d * k - f * g) + c * (d * h - e * g);
+    if (std::abs(det) < 1e-9) return false;
+    const double r = 1.0 / det;
+    inv[0] = float((e * k - f * h) * r); inv[1] = float((c * h - b * k) * r); inv[2] = float((b * f - c * e) * r);
+    inv[3] = float((f * g - d * k) * r); inv[4] = float((a * k - c * g) * r); inv[5] = float((c * d - a * f) * r);
+    inv[6] = float((d * h - e * g) * r); inv[7] = float((b * g - a * h) * r); inv[8] = float((a * e - b * d) * r);
+    return true;
+}
+
+}  // namespace
+
+void KelvinGains(float kelvin, float tint, float* gr, float* gg, float* gb) {
+    float r = 0.0f, g = 0.0f, b = 0.0f;
+    KelvinWhite(kelvin, tint, &r, &g, &b);
     *gr = g / r;
     *gg = 1.0f;
     *gb = g / b;
+}
+
+bool CameraWhiteMultipliers(const ImageDesc& d, float kelvin, float tint, float* mul) {
+    if (!d.hasDaylightWb) return false;
+    float inv[9];
+    if (!Invert3(d.rgbCam, inv)) return false;
+    float s[3];
+    KelvinWhite(kelvin, tint, &s[0], &s[1], &s[2]);
+    // The illuminant's white in the camera's daylight-balanced space: rgbCam
+    // maps daylight-balanced camera RGB to sRGB, so its inverse takes the white
+    // back. Divided by the daylight gains, that is what the sensor itself
+    // records under this light -- and the multipliers are its reciprocal.
+    float c[3], top = 0.0f;
+    for (int i = 0; i < 3; ++i) {
+        c[i] = inv[i * 3] * s[0] + inv[i * 3 + 1] * s[1] + inv[i * 3 + 2] * s[2];
+        top = std::max(top, c[i]);
+    }
+    if (top <= 0.0f) return false;
+    for (int i = 0; i < 3; ++i) mul[i] = d.preMul[i] / std::max(c[i], 0.02f * top);
+    const float g = std::max(mul[1], 1e-9f);
+    for (int i = 0; i < 3; ++i) mul[i] /= g;
+    return true;
+}
+
+bool CameraWhiteBalanceMatrix(const ImageDesc& d, float kelvin, float tint, float* m) {
+    float mul[3], inv[9];
+    if (!CameraWhiteMultipliers(d, kelvin, tint, mul) || !Invert3(d.rgbCam, inv)) return false;
+    float g[3];
+    for (int i = 0; i < 3; ++i) g[i] = mul[i] / std::max(d.camMul[i], 1e-6f);
+    // rgbCam * diag(g) * inv(rgbCam).
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c) {
+            float v = 0.0f;
+            for (int k = 0; k < 3; ++k) v += d.rgbCam[r * 3 + k] * g[k] * inv[k * 3 + c];
+            m[r * 3 + c] = v;
+        }
+    // Normalised on the luminance it gives white, so a change of white
+    // balance is not also a change of exposure.
+    float w[3];
+    for (int r = 0; r < 3; ++r) w[r] = m[r * 3] + m[r * 3 + 1] + m[r * 3 + 2];
+    const float lum = Luma(w[0], w[1], w[2]);
+    if (lum <= 1e-6f) return false;
+    for (int i = 0; i < 9; ++i) m[i] /= lum;
+    return true;
 }
 
 void AsShotWhiteBalance(const ImageDesc& d, float* kelvin, float* tint) {
@@ -57,12 +120,14 @@ void AsShotWhiteBalance(const ImageDesc& d, float* kelvin, float* tint) {
     *tint   = 0.0f;
     if (!d.hasDaylightWb) return;
 
-    // What the camera applied, relative to its own daylight reference.
-    const float shotR = d.camMul[0] / std::max(d.preMul[0], 1e-6f);
-    const float shotB = d.camMul[2] / std::max(d.preMul[2], 1e-6f);
-
-    float dr = 1.0f, dg = 1.0f, db = 1.0f;
-    KelvinGains(kD65Kelvin, 0.0f, &dr, &dg, &db);
+    // The camera multipliers each (kelvin, tint) implies, in the same model
+    // basic_adjust applies -- so feeding the answer back is the identity.
+    auto model = [&](float k, float t, float* mr, float* mb) {
+        float mul[3] = {1.0f, 1.0f, 1.0f};
+        CameraWhiteMultipliers(d, k, t, mul);
+        *mr = mul[0]; *mb = mul[2];
+    };
+    const float camR = std::max(d.camMul[0], 1e-6f), camB = std::max(d.camMul[2], 1e-6f);
 
     // The two axes are NOT independent: moving tint shifts y, which changes the
     // R/B ratio as well as the green level -- measured, tint +0.6 moves R/B by
@@ -79,14 +144,13 @@ void AsShotWhiteBalance(const ImageDesc& d, float* kelvin, float* tint) {
     for (int pass = 0; pass < 8; ++pass) {
         // Temperature, by bisection on R/B at the current tint. Monotonic in k,
         // so this needs no convergence criterion.
-        const float target = shotR / std::max(shotB, 1e-6f);
+        const float target = camR / camB;
         float lo = kKelvinMin, hi = kKelvinMax;
         for (int i = 0; i < 32; ++i) {
             const float mid = 0.5f * (lo + hi);
-            float wr = 1.0f, wg = 1.0f, wb = 1.0f;
-            KelvinGains(mid, t, &wr, &wg, &wb);
-            const float ratio = (wr / std::max(dr, 1e-6f)) /
-                                std::max(wb / std::max(db, 1e-6f), 1e-6f);
+            float mr, mb;
+            model(mid, t, &mr, &mb);
+            const float ratio = mr / std::max(mb, 1e-6f);
             if (ratio < target) lo = mid; else hi = mid;
         }
         k = 0.5f * (lo + hi);
@@ -97,10 +161,10 @@ void AsShotWhiteBalance(const ImageDesc& d, float* kelvin, float* tint) {
         float loT = -1.0f, hiT = 1.0f;
         for (int i = 0; i < 32; ++i) {
             const float midT = 0.5f * (loT + hiT);
-            float wr = 1.0f, wg = 1.0f, wb = 1.0f;
-            KelvinGains(k, midT, &wr, &wg, &wb);
-            const float offR = (wr / std::max(dr, 1e-6f)) / std::max(shotR, 1e-6f);
-            const float offB = (wb / std::max(db, 1e-6f)) / std::max(shotB, 1e-6f);
+            float mr, mb;
+            model(k, midT, &mr, &mb);
+            const float offR = mr / camR;
+            const float offB = mb / camB;
             const float green = 0.5f * (offR + offB);
             // Green above 1 means the pair is too green, which more tint fixes.
             if (green > 1.0f) loT = midT; else hiT = midT;
