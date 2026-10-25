@@ -9,7 +9,14 @@
 # is compressed into a tiny range. On an under-exposed ARW pushed 1.85 stops,
 # denoising first kept 6% of the detail against 88% for denoising after.
 
-# The luma range is deliberately much smaller than chroma's.
+# THE THRESHOLDS ARE MEASURED (`adaptive`, on by default): wavelet_denoise
+# estimates the noise in each band of this photograph and sets luma_k and
+# chroma_k as multiples of it, so one setting suits an ISO 100 frame and a
+# pushed ISO 6400 one. Its report prints the noise it found, level by level.
+# Turn adaptive off for the fixed luma/chroma below, which mean what they say
+# whatever the photograph.
+#
+# The fixed luma range is deliberately much smaller than chroma's.
 #
 # On a Bayer sensor green is sampled at half of all sites while red and blue
 # get a quarter each, so the pixel-scale speckle -- the coloured dots visible

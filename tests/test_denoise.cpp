@@ -38,6 +38,9 @@ static Image MakeNoisy(int dim, double sigma, unsigned seed) {
 static Image Run(const Image& src, double luma, double chroma, int levels) {
     auto algo = Registry::Get().Create("wavelet_denoise");
     std::string e;
+    // Fixed thresholds: these checks are about the transform, not the noise
+    // estimate, which has its own check below.
+    algo->FindParam("adaptive")->SetFromScript(Value(0.0), &e);
     algo->FindParam("luma")->SetFromScript(Value(luma), &e);
     algo->FindParam("chroma")->SetFromScript(Value(chroma), &e);
     algo->FindParam("levels")->SetFromScript(Value(double(levels)), &e);
@@ -104,6 +107,31 @@ int main() {
         left /= n; right /= n;
         std::printf("       edge %.3f -> %.3f (input 0.25 -> 0.75)\n", left, right);
         Check(right - left > 0.40, "the step edge survives denoising");
+    }
+    {
+        // The noise estimate recovers noise of a known size. Per-channel sigma
+        // 0.05 gives luma (R + 2G + B)/4 a sigma of 0.05 * sqrt(6)/4 = 0.0306,
+        // of which the finest a-trous band holds 0.891: 0.0273. The step edge
+        // is in the sample too, and the median is what keeps it out.
+        auto algo = Registry::Get().Create("wavelet_denoise");
+        Data dIn{noisy.Clone()};
+        Data dOut{Image{}};
+        std::get<Image>(dOut).Alloc(noisy.Desc());
+        const Data* p = &dIn;
+        std::string rep;
+        RunCtx ctx(std::span<const Data* const>(&p, 1), std::span<Data>(&dOut, 1),
+                   nullptr, nullptr, &rep);
+        algo->RunCPU(ctx);
+        const size_t k = rep.find("luma ");
+        const double got = k == std::string::npos ? 0.0 : std::atof(rep.c_str() + k + 5);
+        std::printf("       %s\n", rep.c_str());
+        Check(std::fabs(got / 0.0273 - 1.0) < 0.1,
+              "the noise estimate recovers the injected noise (" + std::to_string(got) +
+                  " against 0.0273)");
+        Image out = std::get<Image>(dOut).Clone();
+        const double s = FlatSigma(out);
+        std::printf("       adaptive defaults: sigma %.4f (%.0f%% of input)\n", s, 100.0 * s / sigma0);
+        Check(s < sigma0 * 0.6, "the adaptive defaults reduce noise");
     }
     std::printf("\n%s\n", g_fail ? "FAILURES PRESENT" : "all wavelet checks passed");
     return g_fail ? 1 : 0;

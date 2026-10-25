@@ -1199,34 +1199,24 @@ static void TestGpuAgreement(ID3D12Device* dev) {
          "display(o)\n", 255.0, 0.5},
 
 
-        // wavelet_denoise: five chained dispatches ping-ponging an accumulator,
-        // where every other GPU algorithm here is one or two passes. A parity
-        // mistake would leave the result in the scratch buffer and show the
-        // input unchanged, which the mean check below would catch and a "did it
-        // run" check would not.
+        // wavelet_denoise: a start pass, one per level, and a finish, over
+        // four scratch planes -- more passes than any other GPU algorithm here.
+        // A plane-index mistake would leave the result in a scratch buffer
+        // and show the input unchanged, which the mean check catches and a
+        // "did it run" check would not.
         //
         // The GPU fuses the separable blur into one 5x5 dilated pass while the
         // CPU does two 1D passes -- mathematically identical, but only because
         // the kernel is separable, which is worth having asserted.
         //
-        // The max tolerance is looser than its neighbours for a measured
-        // reason: the GPU.s ping-pong buffers take the output.s format, so on
-        // this RGBA8 fixture every one of the four levels rounds to 8 bits
-        // where the CPU stays in float. On an RGBA32F image the same code
-        // agrees to 4e-7, which is what says the difference is quantisation
-        // rather than a divergence. The MEAN check below is the one that would
-        // catch a real bug, and it is held tight.
-        //
-        // The max tolerance is looser than its neighbours for a measured reason:
-        // the GPU's ping-pong buffers take the output's format, so on this RGBA8
-        // fixture every one of the four levels rounds to 8 bits where the CPU
-        // stays in float. On an RGBA32F image the same code agrees to 4e-7,
-        // which is what says the difference is quantisation and not a
-        // divergence. The MEAN check is the one that would catch a real bug.
+        // Max 2 on this RGBA8 fixture, measured at 1. It was 10 (16 with
+        // level_dep) when the GPU ping-ponged in the output's own format and
+        // rounded every level to 8 bits; the scratch planes are half float
+        // now, so the only rounding left is the final write.
         {"wavelet_denoise",
          "src = image(\"test\")\n"
-         "o = wavelet_denoise(src, luma = 0.03, chroma = 0.09, levels = 4)\n"
-         "display(o)\n", 10.0, 1.0},
+         "o = wavelet_denoise(src, adaptive = 0, luma = 0.03, chroma = 0.09, levels = 4)\n"
+         "display(o)\n", 2.0, 1.0},
 
         // The same, with level_dep ON. A separate entry because the default is
         // 0, so the row above exercises none of the level-dependent path -- the
@@ -1236,16 +1226,20 @@ static void TestGpuAgreement(ID3D12Device* dev) {
         // holds 0..255 for an 8-bit image while a UNORM texture reads as 0..1,
         // so middle grey is 45.9 on one side and 0.18 on the other.
         //
-        // Max tolerance 16 rather than 10 for the reason above: level_dep gives
-        // each pixel its own threshold, so the 8-bit rounding between levels
-        // lands differently per pixel instead of uniformly. The MEAN is the
-        // check that says the paths agree, and it is held to the same 1.0 as
-        // its neighbour -- it measures 0.46.
+        // Max 2, measured at 1, for the same reason as above.
         {"wavelet_denoise",
          "src = image(\"test\")\n"
-         "o = wavelet_denoise(src, luma = 0.03, chroma = 0.09, levels = 4, "
+         "o = wavelet_denoise(src, adaptive = 0, luma = 0.03, chroma = 0.09, levels = 4, "
          "level_dep = 1.0)\n"
-         "display(o)\n", 16.0, 1.0},
+         "display(o)\n", 2.0, 1.0},
+
+        // And ADAPTIVE, the default: the GPU path measures the noise in
+        // MeasureForGpu from a readback, the CPU from its own buffer, and the
+        // two must reach the same thresholds or this diverges.
+        {"wavelet_denoise",
+         "src = image(\"test\")\n"
+         "o = wavelet_denoise(src, levels = 4)\n"
+         "display(o)\n", 2.0, 1.0},
 
         {"threshold_bernsen",
          "src = image(\"test\")\n"

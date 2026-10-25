@@ -18,7 +18,7 @@
 #
 #   neutral values a stage whose settings do nothing is skipped anyway --
 #                  gaussian_blur at sigma 0, brightness at 0 gain 1,
-#                  wavelet_denoise at luma 0 chroma 0. This costs nothing to
+#                  wavelet_denoise at luma_k 0 chroma_k 0. This costs nothing to
 #                  use but means giving up the settings.
 #
 # The status line says how many stages were bypassed, so "did that actually
