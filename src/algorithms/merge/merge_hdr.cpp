@@ -109,6 +109,114 @@ inline float Smoothstep(float a, float b, float x) {
     return t * t * (3.0f - 2.0f * t);
 }
 
+// FILLS WHAT NO FRAME SAW, from what surrounds it.
+//
+// Where the reference is clipped and every darker frame saw something dimmer
+// than the clip -- a cloud that drifted over a patch of sky between frames --
+// the scene's value there is unknown, only bounded below by the clip. The
+// merged neighbours that WERE measured (clipped in the reference too, so the
+// same bright material) are spread in by a pull-push pyramid at half
+// resolution, and each pixel goes over to that by `amount`, never below the
+// level it already had. Leaving the clipped reference's flat value there
+// instead made grey blotches in a bright cloud; pasting in the darker frames
+// made holes of sky.
+void FillUnseen(std::vector<float>& px, int ch, int w, int h,
+                const std::vector<float>& amount, const std::vector<uint8_t>& source) {
+    const int w2 = std::max(1, (w + 1) / 2), h2 = std::max(1, (h + 1) / 2);
+    struct Lv { int w, h; std::vector<float> c; };   // r, g, b, weight
+    std::vector<Lv> lv(1);
+    lv[0].w = w2; lv[0].h = h2;
+    lv[0].c.assign(size_t(w2) * size_t(h2) * 4, 0.0f);
+    ParallelFor(size_t(h2), [&](size_t cy) {
+        for (int cx = 0; cx < w2; ++cx) {
+            float* o = &lv[0].c[(cy * size_t(w2) + size_t(cx)) * 4];
+            int k = 0;
+            for (int dy = 0; dy < 2; ++dy)
+                for (int dx = 0; dx < 2; ++dx) {
+                    const int x = 2 * cx + dx, y = 2 * int(cy) + dy;
+                    if (x >= w || y >= h) continue;
+                    ++k;
+                    const size_t i = size_t(y) * size_t(w) + size_t(x);
+                    if (!source[i]) continue;
+                    for (int c = 0; c < 3; ++c) o[c] += px[i * size_t(ch) + size_t(c)];
+                    o[3] += 1.0f;
+                }
+            if (k) for (int c = 0; c < 4; ++c) o[c] /= float(k);
+        }
+    });
+    while (lv.back().w > 1 || lv.back().h > 1) {
+        const Lv& f = lv.back();
+        Lv g;
+        g.w = std::max(1, (f.w + 1) / 2); g.h = std::max(1, (f.h + 1) / 2);
+        g.c.assign(size_t(g.w) * size_t(g.h) * 4, 0.0f);
+        for (int y = 0; y < g.h; ++y)
+            for (int x = 0; x < g.w; ++x) {
+                float* o = &g.c[(size_t(y) * size_t(g.w) + size_t(x)) * 4];
+                int k = 0;
+                for (int dy = 0; dy < 2; ++dy)
+                    for (int dx = 0; dx < 2; ++dx) {
+                        const int sx = 2 * x + dx, sy = 2 * y + dy;
+                        if (sx >= f.w || sy >= f.h) continue;
+                        ++k;
+                        const float* q = &f.c[(size_t(sy) * size_t(f.w) + size_t(sx)) * 4];
+                        for (int c = 0; c < 4; ++c) o[c] += q[c];
+                    }
+                for (int c = 0; c < 4; ++c) o[c] /= float(k);
+            }
+        lv.push_back(std::move(g));
+    }
+    // Normalise the top, then push down: each level's own (weighted) colour
+    // blended with the coarser estimate where its weight is thin.
+    {
+        float* t = lv.back().c.data();
+        if (t[3] > 0.0f) for (int c = 0; c < 3; ++c) t[c] /= t[3];
+        t[3] = 1.0f;
+    }
+    auto sample = [](const Lv& l, int x, int y, float* out) {
+        const float fx = std::clamp((float(x) + 0.5f) * 0.5f - 0.5f, 0.0f, float(l.w - 1));
+        const float fy = std::clamp((float(y) + 0.5f) * 0.5f - 0.5f, 0.0f, float(l.h - 1));
+        const int x0 = int(fx), y0 = int(fy);
+        const int x1 = std::min(x0 + 1, l.w - 1), y1 = std::min(y0 + 1, l.h - 1);
+        const float tx = fx - float(x0), ty = fy - float(y0);
+        for (int c = 0; c < 3; ++c) {
+            auto at = [&](int xx, int yy) { return l.c[(size_t(yy) * size_t(l.w) + size_t(xx)) * 4 + size_t(c)]; };
+            const float a = at(x0, y0) + (at(x1, y0) - at(x0, y0)) * tx;
+            const float b = at(x0, y1) + (at(x1, y1) - at(x0, y1)) * tx;
+            out[c] = a + (b - a) * ty;
+        }
+    };
+    constexpr float kPrior = 0.05f;
+    for (int li = int(lv.size()) - 2; li >= 0; --li) {
+        Lv& f = lv[size_t(li)];
+        const Lv& g = lv[size_t(li + 1)];
+        ParallelFor(size_t(f.h), [&](size_t y) {
+            for (int x = 0; x < f.w; ++x) {
+                float* o = &f.c[(y * size_t(f.w) + size_t(x)) * 4];
+                float e[3];
+                sample(g, x, int(y), e);
+                const float d = o[3] + kPrior;
+                for (int c = 0; c < 3; ++c) o[c] = (o[c] + kPrior * e[c]) / d;
+                o[3] = 1.0f;
+            }
+        });
+    }
+    const Lv& l0 = lv[0];
+    ParallelFor(size_t(h), [&](size_t y) {
+        for (int x = 0; x < w; ++x) {
+            const size_t i = y * size_t(w) + size_t(x);
+            const float a = amount[i];
+            if (a <= 0.0f) continue;
+            float e[3];
+            sample(l0, x, int(y), e);
+            float* q = &px[i * size_t(ch)];
+            // Never below the level the pixel already had: the clip is a floor.
+            const float have = q[0] + q[1] + q[2], fill = e[0] + e[1] + e[2];
+            const float lift = (fill > 1e-9f && fill < have) ? have / fill : 1.0f;
+            for (int c = 0; c < 3; ++c) q[c] += (e[c] * lift - q[c]) * a;
+        }
+    });
+}
+
 // 3x3 inverse. False when the matrix is (near) singular.
 bool Invert3(const float* m, float* inv) {
     const double a = m[0], b = m[1], c = m[2], d = m[3], e = m[4], f = m[5],
@@ -509,6 +617,8 @@ public:
 
         std::vector<int> unexposedRows(size_t(h), 0), noSampleRows(size_t(h), 0);
         std::vector<int> ghostRows(size_t(h), 0), movedRows(size_t(h), 0);
+        std::vector<float> unseenW(deghost ? N : 0, 0.0f);
+        std::vector<uint8_t> fillSource(deghost ? N : 0, 0);
         std::atomic<int> rowsDone{0};
         ParallelFor(size_t(h), [&](size_t yy) {
             const int y = int(yy);
@@ -519,6 +629,8 @@ public:
             float wc[kMaxDeghost];        // clip weight 0..1
             bool  ok[kMaxDeghost];
             bool  keepK[kMaxDeghost];
+            float gate[3][kMaxDeghost];   // per anchor: how much each frame agrees
+            float low[kMaxDeghost];       // consistent with the reference's clip floor
             const int nk = std::min(n, kMaxDeghost);
             for (int x = 0; x < w; ++x) {
                 const size_t i = size_t(y) * size_t(w) + size_t(x);
@@ -552,65 +664,189 @@ public:
                     auto agree  = [&](int a, int b) {
                         return std::abs(std::log(rad[a] / rad[b])) <= T;
                     };
+                    // SOFT, not a cut. How much frame k counts beside anchor a:
+                    // fully within half the threshold, not at all past one and
+                    // a half. A hard cut at the threshold switched a frame on
+                    // and off along every contour where a moving cloud's
+                    // frames disagreed by about that much, and the merge
+                    // became a patchwork of different moments with an edge at
+                    // each switch.
+                    auto weigh = [&](int a, float* g) {
+                        for (int k = 0; k < nk; ++k) {
+                            g[k] = 1.0f;
+                            if (k == a || !floorOk(k)) continue;
+                            const float d = std::abs(std::log(rad[k] / rad[a]));
+                            const float t = std::clamp((d - 0.5f * T) / T, 0.0f, 1.0f);
+                            g[k] = 1.0f - t * t * (3.0f - 2.0f * t);
+                        }
+                    };
 
-                    int anchor = -1;
+                    // TWO ANCHORS, BLENDED. The reference where it exposes the
+                    // pixel well; where it does not, the walk below. Choosing
+                    // one or the other at a clip weight of 0.5 switched the
+                    // anchor along every brightness contour through a cloud
+                    // near the reference's clip level -- and the two anchors,
+                    // shot at different moments, disagree about a moving cloud.
+                    // So across the reference's clip ramp the two merges are
+                    // blended by its clip weight.
+                    // THE CLIP IS A FLOOR. Where the reference is clipped the
+                    // scene was at least its clip level, so a darker frame
+                    // reading well below that was shot at another moment --
+                    // the sky a cloud later drifted over. Each such frame fades
+                    // out (the same soft ramp as the agreement), and none of
+                    // them can be the anchor. Only "under half" used to count,
+                    // and bright sky passed, pasting holes of blue into cloud.
+                    const Frame& rf = m_frames[size_t(ref)];
+                    const bool refClip = ok[refPos] && own[refPos] >= 0.96f * rf.ceiling;
+                    const double floorRad = 0.96 * double(rf.ceiling) * fac[size_t(ref)];
+                    float bestLow = 0.0f;
+                    bool anyDarker = false;
+                    for (int k = 0; k < nk; ++k) {
+                        low[k] = 1.0f;
+                        if (!refClip || k >= refPos || !ok[k]) continue;
+                        const double got = double(own[k]) * fac[size_t(order[size_t(k)])];
+                        if (got > 0.0) {
+                            const float d = float(std::log(floorRad / got));
+                            const float t = std::clamp((d - 0.5f * T) / T, 0.0f, 1.0f);
+                            low[k] = 1.0f - t * t * (3.0f - 2.0f * t);
+                        } else {
+                            low[k] = 0.0f;
+                        }
+                        if (floorOk(k)) { anyDarker = true; bestLow = std::max(bestLow, low[k]); }
+                    }
+                    // How far no darker frame could see this pixel at all.
+                    const float unseen = (refClip && anyDarker) ? 1.0f - bestLow : 0.0f;
+                    unseenW[i] = unseen;
+                    fillSource[i] = (refClip && unseen <= 0.0f) ? 1 : 0;
+
+                    // SUPPORT: how many other frames, each counted by how well it
+                    // exposes the pixel, agree with frame a. The anchor should be
+                    // the frame the bracket agrees with, not just the first
+                    // usable one: on hdrtest2 an extra frame shot moments
+                    // earlier, of a thinner cloud, sat next to the reference,
+                    // and where the frame beyond it neared its own clip the old
+                    // check ("agrees with the next one along") was skipped --
+                    // so it anchored unchecked, threw out the four frames that
+                    // agreed with each other, and left holes in the cloud.
+                    auto support = [&](int a) {
+                        float sp = 0.0f;
+                        for (int k = 0; k < nk; ++k) {
+                            if (k == a || !floorOk(k) || low[k] < 0.5f) continue;
+                            const float d = std::abs(std::log(rad[k] / rad[a]));
+                            const float t = std::clamp((d - 0.5f * T) / T, 0.0f, 1.0f);
+                            sp += std::min(1.0f, 2.0f * wc[k]) * (1.0f - t * t * (3.0f - 2.0f * t));
+                        }
+                        return sp;
+                    };
+
+                    const bool refOk = floorOk(refPos);
+                    const float tRef = refOk ? std::clamp((wc[refPos] - 0.3f) / 0.4f, 0.0f, 1.0f) : 0.0f;
+                    const float bRef = tRef * tRef * (3.0f - 2.0f * tRef);
+                    int alt = -1;
                     bool moved = false;
-                    if (usable(refPos)) {
-                        anchor = refPos;
-                    } else if (ok[refPos]) {
+                    if (bRef < 1.0f && ok[refPos]) {
                         const bool clipped = wc[refPos] < 0.5f;
                         const int step = clipped ? -1 : 1;
+                        float best = -1.0f;
                         for (int p = refPos + step; p >= 0 && p < nk; p += step) {
-                            if (!usable(p)) continue;
-                            const int q = p + step;
-                            if (q >= 0 && q < nk && usable(q) && !agree(p, q)) continue;
-                            anchor = p;
-                            break;
+                            if (!usable(p) || low[p] < 0.5f) continue;
+                            const float sp = support(p);
+                            if (sp > best + 1e-3f) { best = sp; alt = p; }   // ties: the nearer
                         }
-                        // A highlight that MOVED. The reference is genuinely
-                        // clipped here, so the scene is at least its clip level;
-                        // a darker frame that says it is under half of that saw
-                        // something else, and pasting it in puts sky in a cloud.
-                        if (clipped && anchor >= 0 && anchor < refPos) {
-                            const Frame& rf = m_frames[size_t(ref)];
-                            if (own[refPos] >= 0.96f * rf.ceiling) {
-                                const double bound = 0.96 * double(rf.ceiling) * fac[size_t(ref)];
-                                float amx = 0.0f;
-                                for (int c = 0; c < C; ++c) amx = std::max(amx, v[anchor][c]);
-                                if (double(amx) * fac[size_t(order[size_t(anchor)])] < 0.5 * bound) {
-                                    moved = true;
-                                    for (int k = 0; k < refPos; ++k) keepK[k] = false;
-                                }
+                    }
+                    // A highlight that MOVED: no darker frame is consistent with
+                    // the clip floor. FillUnseen settles its value afterwards.
+                    moved = unseen >= 0.5f;
+                    // The anchors in play and their shares.
+                    int anc[3] = {-1, -1, -1};
+                    float share[3] = {0.0f, 0.0f, 0.0f};
+                    if (refOk && bRef > 0.0f) { anc[0] = refPos; share[0] = bRef; }
+                    if (alt >= 0 && !moved && bRef < 1.0f) { anc[1] = alt; share[1] = 1.0f - bRef; }
+                    if (anc[0] < 0 && anc[1] >= 0) share[1] = 1.0f;
+                    if (anc[1] < 0 && anc[0] >= 0) share[0] = 1.0f;
+                    // THE REFERENCE OUTVOTED. Where at least two more frames
+                    // agree with some other frame than with the reference, the
+                    // reference is the one that moved, and its share goes over
+                    // to that frame -- gradually, between one and two votes, so
+                    // the hand-over has no edge. Where every frame differs (a
+                    // bush in the wind) no frame has that support and the
+                    // reference keeps the pixel, which is what keeps one moment
+                    // from being stitched out of many.
+                    if (anc[0] >= 0) {
+                        const float sr = support(refPos);
+                        int cons = -1; float sc = sr;
+                        for (int k = 0; k < nk; ++k) {
+                            if (k == refPos || !usable(k) || low[k] < 0.5f) continue;
+                            const float sk = support(k);
+                            if (sk > sc + 1e-3f) { sc = sk; cons = k; }
+                        }
+                        if (cons >= 0) {
+                            const float t = std::clamp(sc - sr - 1.0f, 0.0f, 1.0f);
+                            const float over = t * t * (3.0f - 2.0f * t);
+                            if (over > 0.0f) {
+                                anc[2] = cons;
+                                share[2] = share[0] * over;
+                                share[0] *= 1.0f - over;
                             }
                         }
                     }
+
                     bool dropped = moved;
-                    if (anchor >= 0 && !moved) {
+                    for (int j = 0; j < 3; ++j) {
+                        if (anc[j] < 0) continue;
+                        weigh(anc[j], gate[j]);
+                        const int a = anc[j];
+                        const float wa = wc[a] * wn[size_t(order[size_t(a)])];
                         for (int k = 0; k < nk; ++k) {
-                            if (k == anchor || !floorOk(k)) continue;
-                            if (agree(k, anchor)) continue;
-                            keepK[k] = false;
+                            if (gate[j][k] >= 0.5f || !floorOk(k)) continue;
                             // Counted only when it would have mattered: a dark
                             // frame's shadow sample carries almost no weight.
-                            const float wk = wc[k] * wn[size_t(order[size_t(k)])];
-                            const float wa = wc[anchor] * wn[size_t(order[size_t(anchor)])];
-                            if (wk >= 0.1f * wa) dropped = true;
+                            if (wc[k] * wn[size_t(order[size_t(k)])] >= 0.1f * wa) dropped = true;
                         }
                     }
                     ghostRows[yy] += dropped ? 1 : 0;
                     movedRows[yy] += moved ? 1 : 0;
 
+                    // Each anchor's weighted merge, then the blend.
+                    double sum[3] = {0, 0, 0}, shareSum = 0.0;
                     int rescue = -1; float rescueW = 0.0f;
                     for (int k = 0; k < nk; ++k) {
                         if (!ok[k]) continue;
-                        const int fi = order[size_t(k)];
                         if (anyValid < 0) anyValid = k;
-                        const float w0 = wc[k] * wn[size_t(fi)];
-                        if (w0 > rescueW && !(moved && k < refPos)) { rescueW = w0; rescue = k; }
-                        if (!keepK[k] || w0 <= 0.0f) continue;
-                        const double s = double(w0) * fac[size_t(fi)];
-                        for (int c = 0; c < C; ++c) num[c] += s * double(v[k][c]);
-                        den += double(w0);
+                        const float w0 = wc[k] * wn[size_t(order[size_t(k)])];
+                        if (w0 > rescueW && low[k] >= 0.5f) { rescueW = w0; rescue = k; }
+                    }
+                    for (int j = 0; j < 3; ++j) {
+                        if (anc[j] < 0 || share[j] <= 0.0f) continue;
+                        double nj[3] = {0, 0, 0}, dj = 0.0;
+                        for (int k = 0; k < nk; ++k) {
+                            if (!ok[k] || !keepK[k]) continue;
+                            const int fi = order[size_t(k)];
+                            const float w0 = wc[k] * wn[size_t(fi)] * gate[j][k] * low[k];
+                            if (w0 <= 0.0f) continue;
+                            const double sc = double(w0) * fac[size_t(fi)];
+                            for (int c = 0; c < C; ++c) nj[c] += sc * double(v[k][c]);
+                            dj += double(w0);
+                        }
+                        if (dj <= 1e-7) continue;
+                        for (int c = 0; c < C; ++c) sum[c] += share[j] * nj[c] / dj;
+                        shareSum += share[j];
+                    }
+                    if (shareSum > 0.0) {
+                        for (int c = 0; c < C; ++c) num[c] = sum[c] / shareSum;
+                        den = 1.0;
+                    } else if (!moved) {
+                        // No anchor (nothing exposes the pixel well enough to
+                        // judge by): every frame, weighted, as before.
+                        for (int k = 0; k < nk; ++k) {
+                            if (!ok[k]) continue;
+                            const int fi = order[size_t(k)];
+                            const float w0 = wc[k] * wn[size_t(fi)] * low[k];
+                            if (w0 <= 0.0f) continue;
+                            const double sc = double(w0) * fac[size_t(fi)];
+                            for (int c = 0; c < C; ++c) num[c] += sc * double(v[k][c]);
+                            den += double(w0);
+                        }
                     }
                     if (anyValid < 0) {
                         ++noSampleRows[yy];
@@ -670,6 +906,11 @@ public:
             const int done = ++rowsDone;
             if ((done & 63) == 0) GroupProgress(0.6 + 0.4 * double(done) / double(h), "merging");
         });
+        if (deghost && oc >= 3) {
+            bool any = false;
+            for (float u : unseenW) if (u > 0.0f) { any = true; break; }
+            if (any) FillUnseen(op, oc, w, h, unseenW, fillSource);
+        }
         if (deghost) {
             size_t g = 0, m = 0;
             for (int y = 0; y < h; ++y) { g += size_t(ghostRows[size_t(y)]); m += size_t(movedRows[size_t(y)]); }
