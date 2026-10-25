@@ -140,10 +140,11 @@ struct Stage {
         return out;
     }
 
-    // Compiled kernel, cached so dragging a slider does not recompile HLSL
-    // every frame. shared_ptr because Stage is moved between pipelines and the
-    // kernel outlives any single run.
-    std::shared_ptr<ComputeKernel> kernel;
+    // The compiled kernel for THIS run, owned by the ComputeContext's kernel
+    // cache (SharedKernel, keyed on the full source) and looked up afresh at
+    // the start of every GPU run -- so it is never carried between pipelines,
+    // and cannot outlive the context that compiled it. See RunStageGpu.
+    const ComputeKernel* kernel = nullptr;
 
     // Second GPU image for iterative stages to ping-pong against, cached for
     // the same reason as the kernel: reallocating it per slider drag would cost
@@ -151,11 +152,10 @@ struct Stage {
     std::shared_ptr<GpuImage> gpuScratch;
     ImageDesc                 scratchDesc{};
 
-    // Multi-pass stages: one compiled kernel per declared pass, and the pool of
-    // scratch planes they share. Cached for the same reason as the above --
-    // recompiling four kernels and reallocating three full-size planes on every
-    // slider nudge would dwarf the work itself.
-    std::vector<std::shared_ptr<ComputeKernel>> passKernels;
+    // Multi-pass stages: one kernel per declared pass, looked up like `kernel`,
+    // and the pool of scratch planes they share, carried between pipelines --
+    // reallocating full-size planes on every slider nudge would dwarf the work.
+    std::vector<const ComputeKernel*>           passKernels;
     std::vector<std::shared_ptr<GpuImage>>      gpuPlanes;
     ImageDesc                                   planeDesc{};
 };

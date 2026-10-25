@@ -42,6 +42,18 @@ static bool GpuPassTiming() {
     return on;
 }
 
+// Where a GPU stage's time goes -- output allocation, measurement, kernel
+// lookup, and the run as a whole -- printed per stage per run. Diagnostic
+// only. Written when a 1.7 s tonemap_local slider tick turned out to be 0 ms
+// of dispatch: the passes were fine, and everything around them was not.
+static bool StageTiming() {
+    static const bool on = GetEnvironmentVariableA("TGLAB_STAGETIME", nullptr, 0) > 0;
+    return on;
+}
+static double MsSince(std::chrono::steady_clock::time_point t) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
+}
+
 // Optional per-frame callback for diagnosing fused-reduction memory growth.
 // Null in normal builds; set by tools/group_merge.
 std::function<void(int)> g_frameTrace;
@@ -775,9 +787,12 @@ bool Pipeline::RunStageOnce(Stage& s, const std::vector<const Data*>& in,
                    "' could not determine output size";
             return false;
         }
+        const auto allocT0 = std::chrono::steady_clock::now();
         Image img;
         img.Alloc(d);
         (*out)[p] = Data{std::move(img)};
+        if (StageTiming())
+            std::fprintf(stderr, "[stage] %s alloc %.1f ms\n", s.algoName.c_str(), MsSince(allocT0));
     }
 
     // GPU when asked for and available; otherwise CPU. A GPU failure falls back
@@ -792,7 +807,11 @@ bool Pipeline::RunStageOnce(Stage& s, const std::vector<const Data*>& in,
     bool ranOnGpu = false;
     if (wantGpu) {
         std::string gpuErr;
-        if (RunStageGpu(s, in, out, gpu, &gpuErr)) {
+        const auto gpuT0 = std::chrono::steady_clock::now();
+        const bool okG = RunStageGpu(s, in, out, gpu, &gpuErr);
+        if (StageTiming())
+            std::fprintf(stderr, "[stage] %s gpu run %.1f ms\n", s.algoName.c_str(), MsSince(gpuT0));
+        if (okG) {
             ranOnGpu = true;
             ++m_gpuStages;
         } else {
@@ -1204,7 +1223,6 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
             // pipeline is discarded right after this call. The compiled kernel
             // comes along too, so an unchanged stage never recompiles.
             m_stages[firstDirty].outputs = std::move(prev->m_stages[firstDirty].outputs);
-            m_stages[firstDirty].kernel  = prev->m_stages[firstDirty].kernel;
             m_stages[firstDirty].valid   = true;
 
             // A cached BYPASSED stage is valid and holds nothing: its result is
@@ -1328,9 +1346,12 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
         for (size_t i = firstDirty; i < m_stages.size(); ++i) {
             if (i >= prev->m_stages.size()) break;
             if (m_stages[i].algoName == prev->m_stages[i].algoName) {
-                m_stages[i].kernel      = prev->m_stages[i].kernel;
                 m_stages[i].gpuScratch  = prev->m_stages[i].gpuScratch;
                 m_stages[i].scratchDesc = prev->m_stages[i].scratchDesc;
+                // The multi-pass planes too, which were dropped here: every
+                // tick reallocated every scratch plane of a multi-pass stage.
+                m_stages[i].gpuPlanes   = prev->m_stages[i].gpuPlanes;
+                m_stages[i].planeDesc   = prev->m_stages[i].planeDesc;
             }
         }
     }
@@ -2123,6 +2144,12 @@ bool Pipeline::RunStageGpu(Stage& s, const std::vector<const Data*>& in,
     // look at the pixels first. Opt-in, because reaching them can force a
     // readback of a GPU-resident intermediate -- and the algorithms that do not
     // need it must not pay for that. See GpuNeedsInputPixels.
+    auto lapT0 = std::chrono::steady_clock::now();
+    auto lap = [&](const char* what) {
+        if (!StageTiming()) return;
+        std::fprintf(stderr, "[stage] %s %s %.1f ms\n", s.algoName.c_str(), what, MsSince(lapT0));
+        lapT0 = std::chrono::steady_clock::now();
+    };
     if (s.algo->GpuNeedsInputPixels()) {
         std::vector<const Image*> inImages;
         inImages.reserve(in.size());
@@ -2197,30 +2224,35 @@ bool Pipeline::RunStageGpu(Stage& s, const std::vector<const Data*>& in,
     auto withPrelude = [](const char* src) {
         return std::string(kColorHlsl) + "\n#line 1\n" + src;
     };
+    lap("measure");
     const std::vector<AlgorithmBase::GpuPass> passes = s.algo->GpuPasses();
 
+    // FROM THE CONTEXT'S CACHE, keyed on the full source, every run. This
+    // used to cache on the stage and carry the kernel to the next pipeline --
+    // but only the single kernel was carried, so every multi-pass stage
+    // recompiled ALL its passes through DXC on every slider tick: 80 of a
+    // 210 ms wavelet_denoise tick at 45 MP, 56 of dehaze's 185. Keying on the
+    // source also means a pass whose HLSL depends on a setting can never be
+    // handed a kernel compiled from another version of it.
     if (!passes.empty()) {
-        if (s.passKernels.size() != passes.size()) {
-            s.passKernels.clear();
-            for (const AlgorithmBase::GpuPass& p : passes) {
-                auto k = std::make_shared<ComputeKernel>();
-                std::string compileErr;
-                const std::string label = s.algoName + "." + p.name;
-                if (!gpu->CreateKernel(withPrelude(p.source), "main", label, k.get(),
-                                       &compileErr)) {
-                    s.passKernels.clear();
-                    *err = compileErr;
-                    return false;
-                }
-                s.passKernels.push_back(std::move(k));
+        s.passKernels.clear();
+        for (const AlgorithmBase::GpuPass& p : passes) {
+            std::string compileErr;
+            const std::string src = withPrelude(p.source);
+            const ComputeKernel* k =
+                gpu->SharedKernel(src, src, &compileErr, s.algoName + "." + p.name);
+            if (!k) {
+                s.passKernels.clear();
+                *err = compileErr;
+                return false;
             }
+            s.passKernels.push_back(k);
         }
-    } else if (!s.kernel) {
-        s.kernel = std::make_shared<ComputeKernel>();
+    } else {
         std::string compileErr;
-        if (!gpu->CreateKernel(withPrelude(s.algo->GpuSource()), "main", s.algoName,
-                               s.kernel.get(), &compileErr)) {
-            s.kernel.reset();
+        const std::string src = withPrelude(s.algo->GpuSource());
+        s.kernel = gpu->SharedKernel(src, src, &compileErr, s.algoName);
+        if (!s.kernel) {
             *err = compileErr;
             return false;
         }
@@ -2278,6 +2310,7 @@ bool Pipeline::RunStageGpu(Stage& s, const std::vector<const Data*>& in,
                      s.algoName.c_str(), od.width, od.height);
         std::fflush(stderr);
     }
+    lap("kernels");
     // Multi-pass: several DIFFERENT kernels over a shared pool of scratch
     // planes. See AlgorithmBase::GpuPasses.
     if (!passes.empty()) {

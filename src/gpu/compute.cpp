@@ -225,12 +225,12 @@ bool ComputeContext::CreateKernel(const std::string& hlsl, const std::string& en
 }
 
 const ComputeKernel* ComputeContext::SharedKernel(const std::string& key, const std::string& hlsl,
-                                                  std::string* err) {
+                                                  std::string* err, const std::string& debugName) {
     std::lock_guard<std::mutex> lock(m_kernelMtx);
     auto& slot = m_kernels[key];
     if (!slot) {
         auto k = std::make_unique<ComputeKernel>();
-        if (!CreateKernel(hlsl, "main", key, k.get(), err)) {
+        if (!CreateKernel(hlsl, "main", debugName.empty() ? key : debugName, k.get(), err)) {
             m_kernels.erase(key);   // retried next time, not cached as failed
             return nullptr;
         }

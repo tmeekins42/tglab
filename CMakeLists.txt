@@ -493,6 +493,14 @@ if(MSVC)
     target_compile_definitions(bench_sfm PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
 
+# What a slider drag costs, tick by tick: a script template run repeatedly
+# against the previous pipeline, as the app does. See the tool's header.
+add_executable(bench_drag tools/bench_drag.cpp $<TARGET_OBJECTS:tglab_algorithms>)
+target_link_libraries(bench_drag PRIVATE tglab_core imgui d3d12 dxgi)
+if(MSVC)
+    target_compile_definitions(bench_drag PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
 add_executable(bench_dehaze tools/bench_dehaze.cpp $<TARGET_OBJECTS:tglab_algorithms>)
 target_link_libraries(bench_dehaze PRIVATE tglab_core)
 if(MSVC)

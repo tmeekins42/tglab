@@ -164,8 +164,12 @@ public:
     // every kernel through DXC: measured, ten kernels at tens of milliseconds
     // each turned an 85 ms network into a 550 ms one inside the pipeline,
     // where a fresh engine serves every frame. Thread-safe; null on failure.
+    //
+    // `debugName`, when given, labels the kernel in compile errors and PIX
+    // captures instead of the key -- the pipeline keys its stages' kernels on
+    // their full source, which is no name to read an error under.
     const ComputeKernel* SharedKernel(const std::string& key, const std::string& hlsl,
-                                      std::string* err);
+                                      std::string* err, const std::string& debugName = {});
 
     bool CreateImage(const ImageDesc& d, GpuImage* out);
     bool Upload(const ImageView& src, GpuImage* dst);
