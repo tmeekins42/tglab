@@ -449,7 +449,7 @@ so these names are the ones that matter in a script.
 | **merge** | `merge_hdr`, `merge_mean`, `align`, `align_features`, `bundle_adjust`, `stitch_panorama`, `reshape` |
 | **demosaic** | `demosaic_ahd` (default), `demosaic_consistent`, `demosaic_malvar`, `demosaic_ppg`, `demosaic_vng`, `demosaic_bilinear`, `demosaic_passthrough`, `demosaic_stages` (every intermediate as its own image, for debugging), `hot_pixel_repair`, `highlight_reconstruct` (rebuilds partly clipped highlights from the surrounding colour, after the demosaic) |
 | **denoise** | `wavelet_denoise` |
-| **filter** | `gaussian_blur`, `box_blur`, `median_blur`, `bilateral`, `guided_filter`, `nonlocal_means`, `anisotropic_diffusion`, `kuwahara`, `kuwahara_generalized`, `symmetric_nearest`, `bloom` (glow and halation), `orton` |
+| **filter** | `sharpen` (unsharp mask in log luminance: hue kept, halo limit, edge masking), `gaussian_blur`, `box_blur`, `median_blur`, `bilateral`, `guided_filter`, `nonlocal_means`, `anisotropic_diffusion`, `kuwahara`, `kuwahara_generalized`, `symmetric_nearest`, `bloom` (glow and halation), `orton` |
 | **edge** | `sobel`, `canny`, `non_max_suppression`, `hysteresis` |
 | **threshold** | `threshold`, `threshold_otsu`, `threshold_isodata`, `threshold_triangle`, `threshold_adaptive_mean`, `threshold_adaptive_gaussian`, `threshold_niblack`, `threshold_sauvola`, `threshold_bernsen` |
 | **color** | `grayscale`, `apply_lut` (3D .cube LUTs) |

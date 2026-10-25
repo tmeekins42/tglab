@@ -1414,6 +1414,12 @@ static void TestGpuAgreement(ID3D12Device* dev) {
          "o = lens_correct(src, k1 = 0.05)\n"
          "display(o)\n", 2.0, 0.5},
 
+        // sharpen: log luminance, a separable blur, one gain per pixel.
+        {"sharpen",
+         "src = image(\"test\")\n"
+         "o = sharpen(src, amount = 1.2, radius = 1.5, masking = 0.3)\n"
+         "display(o)\n", 2.0, 0.75},
+
         {"threshold_bernsen",
          "src = image(\"test\")\n"
          "o = threshold_bernsen(src, window = 15, contrast_min = 15, "

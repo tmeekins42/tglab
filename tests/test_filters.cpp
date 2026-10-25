@@ -619,6 +619,73 @@ static void TestLensCorrect() {
     }
 }
 
+// sharpen: steeper edges, the same hue, a bounded halo, and noise left alone.
+static void TestSharpen() {
+    constexpr int W = 128, H = 32;
+    // A soft vertical edge between two colours, in linear light.
+    auto edge = [&](float noise) {
+        Image img;
+        ImageDesc d{W, H, Format::RGBA32F};
+        d.linear = true;
+        img.Alloc(d);
+        ImageView v = img.MapCpuWrite();
+        uint32_t s = 12345;
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+                const float t = 1.0f / (1.0f + std::exp(-(float(x) - 64.0f) / 1.5f));
+                const float k = 1.0f + noise * (float(s & 0xFFFF) / 65535.0f - 0.5f);
+                float* p = v.At<float>(x, y);
+                const float a = (0.05f + 0.6f * t) * k;
+                p[0] = a * 1.2f; p[1] = a; p[2] = a * 0.7f; p[3] = 1.0f;
+            }
+        return img;
+    };
+    auto g = [](Image& im, int x, int y, int c = 1) { return im.MapCpuRead().At<float>(x, y)[c]; };
+    std::string err;
+    Image soft = edge(0), sharp, capped;
+    if (RunFilter("sharpen", edge(0), {{"amount", 1.0}, {"radius", 2.0}, {"limit", 3.0}}, &sharp, &err) &&
+        RunFilter("sharpen", edge(0), {{"amount", 1.0}, {"limit", 0.1}}, &capped, &err)) {
+        // Across the shoulders, where an unsharp mask acts.
+        const float s0 = g(soft, 67, 16) - g(soft, 61, 16), s1 = g(sharp, 67, 16) - g(sharp, 61, 16);
+        Check(s1 > 1.1f * s0, "sharpen raises the contrast across a soft edge (" + std::to_string(s0) + " -> " +
+                                  std::to_string(s1) + ")");
+        Check(std::fabs(g(sharp, 5, 16) - g(soft, 5, 16)) < 1e-4f &&
+                  std::fabs(g(sharp, 120, 16) - g(soft, 120, 16)) < 1e-4f,
+              "sharpen leaves flat areas alone");
+        bool hue = true;
+        for (int x = 56; x < 72; ++x)
+            if (std::fabs(g(sharp, x, 16, 0) / g(sharp, x, 16, 1) - 1.2f) > 1e-3f ||
+                std::fabs(g(sharp, x, 16, 2) / g(sharp, x, 16, 1) - 0.7f) > 1e-3f) hue = false;
+        Check(hue, "sharpen changes brightness only: the channel ratios are kept");
+        float worst = 0;
+        for (int x = 0; x < W; ++x) worst = std::max(worst, std::fabs(std::log2(g(capped, x, 16) / g(soft, x, 16))));
+        Check(worst <= 0.1f + 1e-4f, "limit bounds the change at every pixel (" +
+                                          std::to_string(worst) + " stops)");
+    } else {
+        Check(false, "sharpen runs: " + err);
+    }
+    // Faint noise (+-1%) on the flats: masking leaves it, while the edge is
+    // still sharpened.
+    Image noisy = edge(0.02f), plain, masked;
+    if (RunFilter("sharpen", edge(0.02f), {{"amount", 1.0}, {"radius", 2.0}}, &plain, &err) &&
+        RunFilter("sharpen", edge(0.02f), {{"amount", 1.0}, {"radius", 2.0}, {"masking", 1.0}}, &masked, &err)) {
+        auto flatDiff = [&](Image& im) {
+            double s = 0;
+            for (int y = 0; y < H; ++y)
+                for (int x = 4; x < 40; ++x) s += std::fabs(g(im, x, y) - g(noisy, x, y));
+            return s;
+        };
+        const double p = flatDiff(plain), m = flatDiff(masked);
+        Check(m < 0.05 * p, "masking keeps faint noise unsharpened (" + std::to_string(p) + " -> " +
+                                std::to_string(m) + ")");
+        Check(g(masked, 67, 16) - g(masked, 61, 16) > 1.1f * (g(noisy, 67, 16) - g(noisy, 61, 16)),
+              "...and still sharpens the edge");
+    } else {
+        Check(false, "sharpen (masking) runs: " + err);
+    }
+}
+
 static void TestFilmGrain() {
     const int W = 128, H = 128;
     auto flat = [&](float level) {
@@ -1896,6 +1963,7 @@ int main() {
     TestKelvinWhiteBalance();
     TestVignette();
     TestLensCorrect();
+    TestSharpen();
     TestFilmGrain();
     TestOrton();
     TestLut();
