@@ -612,35 +612,65 @@ private:
 
         Affine t = ToCentred(tCorner, ref.cx, ref.cy);
 
+        // ROBUST, by iteratively reweighted least squares. Plain least squares
+        // let whatever MOVED between the frames vote with everything else, and
+        // the gradient-weighted sampling picks exactly the points that move
+        // most visibly: on hdrtest2 drifting cloud edges -- bright, so the
+        // largest residuals in linear luminance -- pulled frames up to 4.9 px
+        // while the mountains under them had moved under 1, and the merged
+        // ridge came out doubled. Each iteration now measures the residuals'
+        // spread (MAD) and weights every point by it: Huber on the first pass
+        // of a level, while the estimate may still be far off, then Tukey's
+        // biweight, which gives a point that moved no say at all.
+        std::vector<float> resid(pts.size(), 0.0f);
+        std::vector<uint8_t> valid(pts.size(), 0);
+        std::vector<float> absr;
+        absr.reserve(pts.size());
+
         for (int iter = 0; iter < kIters; ++iter) {
             double A[6][6] = {};
             double b[6] = {};
             int used = 0;
 
-            for (const Point& p : pts) {
+            // Residuals first, for their scale.
+            absr.clear();
+            for (size_t pi = 0; pi < pts.size(); ++pi) {
+                const Point& p = pts[pi];
+                valid[pi] = 0;
                 float wx, wy;
-                // Points carry CORNER coordinates; the solve works in centred
-                // space, so map the centred point and add the centre back to
-                // get a sampling position.
                 t.MapPoint(p.x - ref.cx, p.y - ref.cy, &wx, &wy);
                 wx += mov.cx;
                 wy += mov.cy;
-                // Points that warp outside the moving frame carry no
-                // information and would pull the fit toward the edge clamp.
                 if (wx < 1.0f || wy < 1.0f ||
                     wx > float(mov.w - 2) || wy > float(mov.h - 2)) continue;
-
-                // And the sample it lands on must be usable in the MOVING frame
-                // too. A point can be perfectly exposed in the reference and
-                // blown in a longer exposure, which is the common case in a
-                // bracket -- the reference check alone catches only half of it.
                 if (!mov.Ok(int(wx), int(wy)) || !mov.Ok(int(wx) + 1, int(wy) + 1))
                     continue;
+                resid[pi] = mov.Sample(wx, wy) - p.ref;
+                valid[pi] = 1;
+                absr.push_back(std::fabs(resid[pi]));
+            }
+            if (absr.size() < 12) break;
+            std::nth_element(absr.begin(), absr.begin() + absr.size() / 2, absr.end());
+            const float sigma = std::max(1.4826f * absr[absr.size() / 2], 1e-6f);
+            const bool huber = iter == 0;
+            const float cut = huber ? 1.345f * sigma : 4.685f * sigma;
 
-                const float r = mov.Sample(wx, wy) - p.ref;
+            for (size_t pi = 0; pi < pts.size(); ++pi) {
+                if (!valid[pi]) continue;
+                const Point& p = pts[pi];
+                const float r = resid[pi];
+                const float ar = std::fabs(r);
+                float wgt;
+                if (huber) {
+                    wgt = ar <= cut ? 1.0f : cut / ar;
+                } else {
+                    if (ar >= cut) continue;
+                    const float u = ar / cut, q = 1.0f - u * u;
+                    wgt = q * q;
+                }
                 for (int a = 0; a < 6; ++a) {
-                    b[a] -= double(p.j[a]) * double(r);
-                    for (int c = a; c < 6; ++c) A[a][c] += double(p.j[a]) * double(p.j[c]);
+                    b[a] -= double(wgt) * double(p.j[a]) * double(r);
+                    for (int c = a; c < 6; ++c) A[a][c] += double(wgt) * double(p.j[a]) * double(p.j[c]);
                 }
                 ++used;
             }

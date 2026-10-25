@@ -3488,7 +3488,10 @@ int main() {
         // Textured noise, because a solver needs gradients. A smooth gradient
         // would leave the fit under-constrained along its own direction, which
         // is the aperture problem and would make this pass for the wrong reason.
-        auto Textured = [](float dx, float dy) {
+        // `cloud`: the right 40% of the frame is a bright, strongly textured
+        // region whose content moves by cloudDx MORE than the scene does --
+        // a cloud drifting between exposures.
+        auto Textured = [](float dx, float dy, bool cloud = false, float cloudDx = 0.0f) {
             Image img;
             ImageDesc d;
             d.width = 256; d.height = 256; d.format = Format::RGBA32F;
@@ -3506,17 +3509,23 @@ int main() {
                         0.30f + 0.20f * std::sin(sx * 0.21f) * std::cos(sy * 0.17f)
                               + 0.10f * std::sin(sx * 0.73f + sy * 0.41f)
                               + 0.05f * std::cos(sx * 1.9f) * std::sin(sy * 1.7f);
+                    float out = val;
+                    if (cloud && x >= 154) {
+                        const float cx = sx - cloudDx;
+                        out = 0.7f + 0.25f * std::sin(cx * 0.3f) * std::cos(sy * 0.25f);
+                    }
                     const int i = y * 256 + x;
-                    for (int c = 0; c < 3; ++c) p[i * 4 + c] = val;
+                    for (int c = 0; c < 3; ++c) p[i * 4 + c] = out;
                     p[i * 4 + 3] = 1.0f;
                 }
             return img;
         };
 
-        auto SolveShift = [&](float dx, float dy, float* gotX, float* gotY) {
+        auto SolveShift = [&](float dx, float dy, float* gotX, float* gotY,
+                              bool cloud = false, float cloudDx = 0.0f) {
             ImageSet set;
-            set.images.push_back(Textured(0.0f, 0.0f));
-            set.images.push_back(Textured(dx, dy));
+            set.images.push_back(Textured(0.0f, 0.0f, cloud, 0.0f));
+            set.images.push_back(Textured(dx, dy, cloud, cloudDx));
             set.shape = Shape::Of("frame", 2);
 
             std::vector<SourceImage> nm{{"test", 0}};
@@ -3562,6 +3571,19 @@ int main() {
             Check(std::abs(gx - 0.4f) < 0.05f && std::abs(gy - 0.25f) < 0.05f,
                   "and a SUB-pixel shift (" + std::to_string(gx) + ", " +
                       std::to_string(gy) + " for 0.4, 0.25)");
+        }
+
+        // WHAT MOVED MUST NOT VOTE. The scene shifts by 1 px while a bright,
+        // strongly textured cloud over 40% of the frame drifts 4 px further.
+        // Plain least squares followed the cloud -- its residuals are the
+        // largest -- which on hdrtest2 doubled every ridge; the robust solve
+        // must recover the scene's shift.
+        if (SolveShift(1.0f, 0.0f, &gx, &gy, true, 4.0f)) {
+            Check(std::abs(gx - 1.0f) < 0.1f && std::abs(gy) < 0.1f,
+                  "align follows the scene, not a cloud drifting across it (" +
+                      std::to_string(gx) + ", " + std::to_string(gy) + " for 1, 0)");
+        } else {
+            Check(false, "align runs with a moving region");
         }
 
         // The reference frame keeps identity, so a merge that samples through
