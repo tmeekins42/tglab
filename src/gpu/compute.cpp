@@ -1,5 +1,7 @@
 #include "compute.h"
 
+#include <unordered_set>
+
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -50,8 +52,16 @@ DXGI_FORMAT ToDxgi(Format f) {
 
 } // namespace
 
+// Contexts alive and accepting textures back. See ComputeContext::RecycleTo.
+static std::mutex                                  g_liveMtx;
+static std::unordered_set<tglab::ComputeContext*>  g_live;
+
 bool ComputeContext::Init(ID3D12Device* device) {
     m_device = device;
+    {
+        std::lock_guard<std::mutex> lock(g_liveMtx);
+        g_live.insert(this);
+    }
 
     // Own queue: this context runs on the worker thread while ImGui submits on
     // the direct queue from the UI thread.
@@ -97,6 +107,13 @@ bool ComputeContext::Init(ID3D12Device* device) {
 void ComputeContext::Shutdown() {
     // A shut-down context is not ready, whatever else survives below.
     m_ready = false;
+    {
+        // No more textures accepted back; anything freed from here on is
+        // simply released.
+        std::lock_guard<std::mutex> lock(g_liveMtx);
+        g_live.erase(this);
+    }
+    TrimRecycled();
 
     if (m_queue && m_fence) {
         const UINT64 v = ++m_fenceVal;
@@ -239,7 +256,84 @@ const ComputeKernel* ComputeContext::SharedKernel(const std::string& key, const 
     return slot.get();
 }
 
+namespace {
+// A pool larger than this is releasing more than it saves. Two or three
+// full-size 45 MP outputs, which is what one slider tick frees.
+constexpr uint64_t kTexPoolBytes = 1536ull << 20;
+constexpr size_t   kTexPoolCount = 24;
+uint64_t TexBytes(const GpuImage& g) { return uint64_t(g.desc.SizeInBytes()); }
+bool SameTexture(const ImageDesc& a, const ImageDesc& b) {
+    return a.width == b.width && a.height == b.height && a.format == b.format;
+}
+} // namespace
+
+
+ComputeContext::~ComputeContext() {
+    // A context destroyed without Shutdown -- a tool's local -- must still stop
+    // accepting textures before its members go.
+    std::lock_guard<std::mutex> lock(g_liveMtx);
+    g_live.erase(this);
+}
+
+void ComputeContext::RecycleTo(ComputeContext* owner, GpuImage&& img) {
+    std::lock_guard<std::mutex> lock(g_liveMtx);
+    if (owner && g_live.count(owner)) owner->RecycleImage(std::move(img));
+    img.Release();
+}
+
+void ComputeContext::RecycleImage(GpuImage&& img) {
+    if (!img.Valid()) return;
+    // Held elsewhere -- by the viewer -- so not ours to reuse.
+    img.res->AddRef();
+    if (img.res->Release() != 1) { img.Release(); return; }
+    std::lock_guard<std::mutex> lock(m_texMtx);
+    const uint64_t b = TexBytes(img);
+    if (b > kTexPoolBytes) { img.Release(); return; }
+    // Oldest out first, until this one fits.
+    while (!m_texFree.empty() &&
+           (m_texBytes + b > kTexPoolBytes ||
+            m_texFree.size() + m_texPending.size() >= kTexPoolCount)) {
+        m_texBytes -= TexBytes(m_texFree.front());
+        m_texFree.erase(m_texFree.begin());
+    }
+    if (m_texBytes + b > kTexPoolBytes ||
+        m_texFree.size() + m_texPending.size() >= kTexPoolCount) {
+        img.Release();
+        return;
+    }
+    m_texBytes += b;
+    // With nothing recorded, nothing can be touching it: free at once.
+    // Otherwise it waits for the batch in flight to complete.
+    if (m_pendingWork) m_texPending.push_back(std::move(img));
+    else               m_texFree.push_back(std::move(img));
+}
+
+void ComputeContext::PromoteRecycledLocked() {
+    for (GpuImage& g : m_texPending) m_texFree.push_back(std::move(g));
+    m_texPending.clear();
+}
+
+size_t ComputeContext::TrimRecycled() {
+    std::lock_guard<std::mutex> lock(m_texMtx);
+    const size_t freed = size_t(m_texBytes);
+    m_texFree.clear();      // GpuImage releases on destruction
+    m_texPending.clear();
+    m_texBytes = 0;
+    return freed;
+}
+
 bool ComputeContext::CreateImage(const ImageDesc& d, GpuImage* out) {
+    {
+        std::lock_guard<std::mutex> lock(m_texMtx);
+        for (size_t i = 0; i < m_texFree.size(); ++i) {
+            if (!SameTexture(m_texFree[i].desc, d)) continue;
+            m_texBytes -= TexBytes(m_texFree[i]);
+            *out = std::move(m_texFree[i]);
+            out->desc = d;   // same raster; the rest of the descriptor is the new image's
+            m_texFree.erase(m_texFree.begin() + std::ptrdiff_t(i));
+            return true;
+        }
+    }
     D3D12_HEAP_PROPERTIES hp = {};
     hp.Type = D3D12_HEAP_TYPE_DEFAULT;
 
@@ -263,9 +357,15 @@ bool ComputeContext::CreateImage(const ImageDesc& d, GpuImage* out) {
     }
 
     ID3D12Resource* res = nullptr;
-    const HRESULT crhr = m_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
-                                                          D3D12_RESOURCE_STATE_COMMON,
-                                                          nullptr, IID_PPV_ARGS(&res));
+    HRESULT crhr = m_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                                    D3D12_RESOURCE_STATE_COMMON,
+                                                    nullptr, IID_PPV_ARGS(&res));
+    // Out of memory with textures sitting idle in the pool: give them back
+    // and try once more before reporting a failure.
+    if (FAILED(crhr) && TrimRecycled() > 0)
+        crhr = m_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                                 D3D12_RESOURCE_STATE_COMMON,
+                                                 nullptr, IID_PPV_ARGS(&res));
     if (FAILED(crhr)) {
         // ALWAYS reported, not gated behind TGLAB_GPUWHY.
         //
@@ -1013,6 +1113,12 @@ bool ComputeContext::Flush(std::string* err) {
     }
 
     releaseInflight();
+
+    // Textures returned during the batch are now untouched by anything.
+    {
+        std::lock_guard<std::mutex> lock(m_texMtx);
+        PromoteRecycledLocked();
+    }
 
     // Staging buffers are only safe to reuse once the GPU is done with them.
     for (ID3D12Resource* r : m_staging) if (r) RecycleStaging(r);

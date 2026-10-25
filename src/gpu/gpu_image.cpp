@@ -98,6 +98,12 @@ void SharedGpuTextureDeleter::operator()(SharedGpuTexture* p) const noexcept {
     delete p;
 }
 
+void DiscardGpuResidency(GpuResidency* g) {
+    if (!g) return;
+    g->owner = nullptr;   // so its destructor releases rather than recycles
+    delete g;
+}
+
 std::shared_ptr<SharedGpuTexture> ShareGpuTexture(const Image& img) {
     const GpuResidency* g = img.RawGpu();
     if (!g || !g->image.Valid()) return nullptr;

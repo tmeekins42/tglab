@@ -226,7 +226,9 @@ size_t Image::DropGpuCopy() {
     // The deleter releases the texture; see GpuResidency's destructor. Safe
     // here in core/ because the deleter is the indirection that keeps
     // GpuResidency incomplete in the header.
-    m_gpu.reset();
+    // Discarded, not recycled: a texture freed to save memory must not go
+    // back into the reuse pool, where it would still hold the memory.
+    DiscardGpuResidency(m_gpu.release());
 
     // CPU-only again. Deliberately assigned rather than masked: Residency::Cpu
     // IS the whole truth now, and clearing the bit would leave None on an

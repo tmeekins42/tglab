@@ -920,6 +920,66 @@ static void TestResidency(ID3D12Device* dev) {
               "MapCpuWrite() invalidates the GPU copy");
     }
 
+    // An Alloc'd image is zeros, stored lazily: nothing is allocated until it
+    // is mapped, and what a map then returns is zero.
+    {
+        Image img;
+        img.Alloc({32, 32, Format::RGBA8});
+        Check(img.HasCpu() && img.Valid(), "an Alloc'd image is CPU-resident zeros");
+        ImageView v = img.MapCpuRead();
+        bool zero = v.Valid();
+        for (int i = 0; zero && i < 32 * 32 * 4; ++i) zero = v.data[i] == 0;
+        Check(zero, "...and reads as zeros when first mapped");
+    }
+
+    // TEXTURE REUSE: a freed image's texture comes back for an image of the
+    // same size and format -- but only once no work can be touching it, and
+    // never while something else (the viewer) still holds it.
+    {
+        auto texOf = [](Image& im) {
+            const GpuResidency* g = im.RawGpu();
+            return g ? g->image.res : nullptr;
+        };
+        ID3D12Resource* first = nullptr;
+        {
+            Image a;
+            a.Alloc({128, 64, Format::RGBA16F});
+            Check(a.AcquireGpuWrite(gpu) != nullptr, "a GPU output allocates");
+            first = texOf(a);
+        }   // freed with nothing recorded: reusable at once
+        Image b;
+        b.Alloc({128, 64, Format::RGBA16F});
+        b.AcquireGpuWrite(gpu);
+        Check(first && texOf(b) == first, "a freed texture is reused for the same size");
+
+        Image c;
+        c.Alloc({128, 32, Format::RGBA16F});
+        c.AcquireGpuWrite(gpu);
+        Check(texOf(c) != first, "...and never for a different size");
+
+        // Shared with the viewer when freed: released, not pooled.
+        ID3D12Resource* shared = texOf(b);
+        auto view = ShareGpuTexture(b);
+        b.Reset();
+        Image d;
+        d.Alloc({128, 64, Format::RGBA16F});
+        d.AcquireGpuWrite(gpu);
+        Check(texOf(d) != shared, "a texture the viewer still holds is not reused");
+        view.reset();
+
+        // The VRAM collector's drop gives memory back rather than pooling it.
+        // Measured through the pool itself: a freed texture's address can be
+        // handed straight to the next allocation, so comparing pointers after
+        // a real release would prove nothing.
+        ImageView dv = d.MapCpuRead();   // resident on both, so droppable
+        (void)dv;
+        gpu.TrimRecycled();
+        Check(d.DropGpuCopy() > 0, "the collector can drop a both-resident copy");
+        Check(gpu.TrimRecycled() == 0, "a dropped copy is freed, not pooled");
+        c.Reset();
+        Check(gpu.TrimRecycled() > 0, "...while an ordinary free is pooled, and the pool can be emptied");
+    }
+
     gpu.Shutdown();
 }
 

@@ -2262,6 +2262,7 @@ bool Pipeline::RunStageGpu(Stage& s, const std::vector<const Data*>& in,
     // when a side is stale. Chained GPU stages therefore upload once at the
     // head and never read back in the middle: the intermediate images stay
     // GPU-resident, and nothing asks for their CPU pixels.
+    lap("kernels");
     std::vector<const GpuImage*> gin;
     std::vector<GpuImage*>       gout;
     gin.reserve(in.size());
@@ -2310,7 +2311,7 @@ bool Pipeline::RunStageGpu(Stage& s, const std::vector<const Data*>& in,
                      s.algoName.c_str(), od.width, od.height);
         std::fflush(stderr);
     }
-    lap("kernels");
+    lap("textures");
     // Multi-pass: several DIFFERENT kernels over a shared pool of scratch
     // planes. See AlgorithmBase::GpuPasses.
     if (!passes.empty()) {

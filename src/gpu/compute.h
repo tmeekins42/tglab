@@ -134,6 +134,8 @@ class ComputeContext {
 public:
     bool Init(ID3D12Device* device);
     void Shutdown();
+    ~ComputeContext();
+    ComputeContext() = default;
 
     // False once a dispatch has hung or the device was removed; the pipeline
     // then stops offering the GPU path for the rest of the session.
@@ -172,6 +174,29 @@ public:
                                       std::string* err, const std::string& debugName = {});
 
     bool CreateImage(const ImageDesc& d, GpuImage* out);
+
+    // TEXTURE REUSE. A stage's outputs are new images every run, and each
+    // used to be a new committed texture: 10 ms of a 31 ms wavelet_denoise
+    // slider tick at 45 MP, 33 ms of tonemap_local's. An image whose GPU copy
+    // is freed hands its texture back here instead, and CreateImage takes an
+    // exact match (size and format) before allocating.
+    //
+    // Three rules keep that safe:
+    //   * A texture something else still holds -- the viewer displays results
+    //     straight from them (SharedGpuTexture) -- is released, not pooled.
+    //   * A returned texture becomes reusable only after the NEXT completed
+    //     Flush, so no recorded or in-flight work can still be touching it.
+    //   * The pool is bounded, and emptied whenever an allocation fails or the
+    //     VRAM collector asks (TrimRecycled), so it can never be the reason
+    //     the card runs out.
+    void RecycleImage(GpuImage&& img);
+    size_t TrimRecycled();   // frees every pooled texture; returns bytes
+
+    // RecycleImage on `owner` if that context is still alive, else a plain
+    // release. An image can outlive the context that made its texture -- the
+    // palette's sources outlive the worker at exit -- so a freed image must
+    // not call into a context that has already gone.
+    static void RecycleTo(ComputeContext* owner, GpuImage&& img);
     bool Upload(const ImageView& src, GpuImage* dst);
     bool Readback(const GpuImage& src, ImageView* dst);
 
@@ -383,6 +408,12 @@ private:
         D3D12_HEAP_TYPE  type;
     };
     std::vector<PooledStaging> m_stagingPool;
+
+    // See RecycleImage. `pending` waits for the next completed flush.
+    std::mutex            m_texMtx;
+    std::vector<GpuImage> m_texPending, m_texFree;
+    uint64_t              m_texBytes = 0;
+    void                  PromoteRecycledLocked();
     ID3D12Resource* TakeStaging(D3D12_HEAP_TYPE type, UINT64 size);
     void            RecycleStaging(ID3D12Resource* r);
     ShaderCompiler               m_compiler;

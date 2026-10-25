@@ -408,6 +408,11 @@ private:
 // this declaration, which keeps the dependency pointing one way.
 std::shared_ptr<SharedGpuTexture> ShareGpuTexture(const Image& img);
 
+// Frees a GpuResidency's texture OUTRIGHT, never into its context's reuse
+// pool -- for the VRAM collector, whose whole point is to give memory back.
+// Defined in gpu/gpu_image.cpp, like ShareGpuTexture.
+void DiscardGpuResidency(GpuResidency* g);
+
 // The colour temperature and green/magenta offset the camera chose for a shot,
 // recovered from its white-balance metadata.
 //

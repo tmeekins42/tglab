@@ -310,6 +310,10 @@ void PipelineWorker::Run() {
     // are never touched by the UI thread.
     ComputeContext gpu;
     const bool haveGpu = m_device && gpu.Init(m_device);
+    if (haveGpu) {
+        std::lock_guard<std::mutex> lock(m_ctxMtx);
+        m_ctx = &gpu;
+    }
     // Lets Image::MapCpuRead() pull pixels back when they live only on the GPU.
     if (haveGpu) InstallGpuResidencyHooks();
 
@@ -572,7 +576,16 @@ void PipelineWorker::Run() {
 
     // Stage kernels hold PSOs created by this context, so they must go first.
     prev.Clear();
+    {
+        std::lock_guard<std::mutex> lock(m_ctxMtx);
+        m_ctx = nullptr;
+    }
     if (haveGpu) gpu.Shutdown();
+}
+
+size_t PipelineWorker::TrimGpuPool() {
+    std::lock_guard<std::mutex> lock(m_ctxMtx);
+    return m_ctx ? m_ctx->TrimRecycled() : 0;
 }
 
 } // namespace tglab

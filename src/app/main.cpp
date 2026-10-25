@@ -3465,6 +3465,10 @@ void App::Frame() {
                 for (Data& d : *m_sources) pool.push_back(&d);
 
                 const GpuCollectReport r = m_gpuBudget.Collect(pool, used, budget);
+                // Over budget: the worker's pooled textures go too. Held for
+                // reuse by the next run, owned by no image, so the collector
+                // would never find them on its own.
+                if (r.ran) m_worker.TrimGpuPool();
                 if (r.imagesFreed > 0) {
                     m_gpuCollectReport = r.Summary();
                     std::fprintf(stderr, "[vram] %s\n", m_gpuCollectReport.c_str());

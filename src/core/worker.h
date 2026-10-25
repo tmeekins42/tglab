@@ -249,10 +249,20 @@ public:
     // True while a job is queued or running (drives the "working" indicator).
     bool Busy() const { return m_busy.load(std::memory_order_relaxed); }
 
+    // Frees the textures the worker's compute context keeps for reuse (see
+    // ComputeContext::RecycleImage). For the VRAM collector, which cannot see
+    // them otherwise: they are memory the GPU holds and no image owns.
+    // Returns the bytes freed. Safe from any thread.
+    size_t TrimGpuPool();
+
     uint64_t LastFinishedSeq() const { return m_lastFinished.load(std::memory_order_relaxed); }
 
 private:
     void Run();
+
+    // The worker thread's compute context while it exists, for TrimGpuPool.
+    std::mutex      m_ctxMtx;
+    ComputeContext* m_ctx = nullptr;
 
     // The viewer for one declared display(), from the data its source holds.
     // False when there is nothing to show (an empty group, an unknown kind).

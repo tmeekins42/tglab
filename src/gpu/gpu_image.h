@@ -14,7 +14,9 @@ struct GpuResidency {
     GpuImage        image;
     ComputeContext* owner = nullptr;   // context that created `image`
 
-    ~GpuResidency() { image.Release(); }
+    // The texture goes back to its context's pool (see RecycleImage), which
+    // releases it instead if anything else still holds it.
+    ~GpuResidency() { ComputeContext::RecycleTo(owner, std::move(image)); }
 };
 
 // A GPU texture handed from the worker to the UI for display.
