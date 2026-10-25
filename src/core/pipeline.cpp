@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
+#include <string_view>
 #include <cstdio>
 #include <functional>
 #include <cassert>
@@ -810,7 +812,8 @@ bool Pipeline::RunStageOnce(Stage& s, const std::vector<const Data*>& in,
         const auto gpuT0 = std::chrono::steady_clock::now();
         const bool okG = RunStageGpu(s, in, out, gpu, &gpuErr);
         if (StageTiming())
-            std::fprintf(stderr, "[stage] %s gpu run %.1f ms\n", s.algoName.c_str(), MsSince(gpuT0));
+            std::fprintf(stderr, "[stage] %s gpu run %.1f ms (%d passes skipped)\n",
+                         s.algoName.c_str(), MsSince(gpuT0), s.passesSkipped);
         if (okG) {
             ranOnGpu = true;
             ++m_gpuStages;
@@ -1352,6 +1355,7 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
                 // tick reallocated every scratch plane of a multi-pass stage.
                 m_stages[i].gpuPlanes   = prev->m_stages[i].gpuPlanes;
                 m_stages[i].planeDesc   = prev->m_stages[i].planeDesc;
+                m_stages[i].passKeys    = prev->m_stages[i].passKeys;
             }
         }
     }
@@ -2057,6 +2061,13 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
             return false;
         }
     }
+    // The work has executed: what the passes wrote is now really in the
+    // planes, and the next run may skip what it does not change.
+    for (Stage& st : m_stages) {
+        if (st.pendingPassKeys.empty()) continue;
+        st.passKeys.swap(st.pendingPassKeys);
+        st.pendingPassKeys.clear();
+    }
 
     // TRIM THE MARGIN BACK OFF, so what the viewer receives is exactly the
     // rectangle it asked for.
@@ -2347,6 +2358,7 @@ bool Pipeline::RunStageGpu(Stage& s, const std::vector<const Data*>& in,
                 s.gpuPlanes.push_back(std::move(p));
             }
             s.planeDesc = planeDesc;
+            s.passKeys.clear();   // fresh planes hold nothing
         }
 
         // Resolve a declared index to a real buffer. Negative addresses the
@@ -2387,7 +2399,73 @@ bool Pipeline::RunStageGpu(Stage& s, const std::vector<const Data*>& in,
                              std::chrono::steady_clock::now() - tu).count());
         }
 
+        // SKIP THE PASSES WHOSE RESULTS ARE STILL IN THE PLANES.
+        //
+        // Dragging tonemap_local's `range` changes only its final combine
+        // pass; the six before it -- log, four box passes, the coefficients
+        // -- produce exactly what they produced last tick, and their planes
+        // still hold it. Each pass gets a key over everything its result
+        // depends on: its source, its constants, its grid, the identity of
+        // the stage inputs it reads, and the region and scale being run. The
+        // passes ahead of the first changed key are skipped -- provided no
+        // pass from there on overwrote, LAST run, a plane that the re-run
+        // passes still read before writing it themselves. A pass writing a
+        // stage OUTPUT always runs: outputs are new images every run.
+        const ImageDesc& kd = std::get<Image>((*out)[0]).Desc();
+        auto mix = [](uint64_t h, uint64_t v) { return (h ^ v) * 1099511628211ull; };
+        std::vector<uint64_t> keys(passes.size(), 0);
         for (size_t p = 0; p < passes.size(); ++p) {
+            uint64_t h = 1469598103934665603ull;
+            h = mix(h, std::hash<std::string_view>{}(passes[p].source ? passes[p].source : ""));
+            for (uint32_t c : s.algo->GpuPassConstants(int(p))) h = mix(h, c);
+            h = mix(h, passes[p].divX);
+            h = mix(h, passes[p].divY);
+            for (int idx : passes[p].reads) {
+                h = mix(h, uint64_t(int64_t(idx)));
+                if (idx < 0) h = mix(h, InputIdentity(s, size_t(-idx - 1)));
+            }
+            for (int idx : passes[p].writes) h = mix(h, uint64_t(int64_t(idx)));
+            h = mix(h, uint64_t(kd.width));
+            h = mix(h, uint64_t(kd.height));
+            h = mix(h, uint64_t(uint32_t(kd.originX)));
+            h = mix(h, uint64_t(uint32_t(kd.originY)));
+            uint32_t ps;
+            std::memcpy(&ps, &kd.proxyScale, 4);
+            h = mix(h, ps);
+            keys[p] = h ? h : 1;
+        }
+        size_t first = 0;
+        const bool extras = !s.algo->GpuExtraInputs().empty();
+        if (!extras && s.passKeys.size() == passes.size()) {
+            while (first < passes.size() && keys[first] == s.passKeys[first]) {
+                bool writesOutput = false;
+                for (int idx : passes[first].writes) writesOutput = writesOutput || idx < 0;
+                if (writesOutput) break;
+                ++first;
+            }
+            // Planes the re-run passes read before rewriting must not have
+            // been overwritten by a pass from `first` on.
+            std::vector<int> lastWriter(s.gpuPlanes.size(), -1);
+            for (size_t p = 0; p < passes.size(); ++p)
+                for (int idx : passes[p].writes)
+                    if (idx >= 0 && size_t(idx) < lastWriter.size()) lastWriter[size_t(idx)] = int(p);
+            std::vector<char> fresh(s.gpuPlanes.size(), 0);
+            for (size_t p = first; p < passes.size() && first > 0; ++p) {
+                for (int idx : passes[p].reads)
+                    if (idx >= 0 && size_t(idx) < fresh.size() && !fresh[size_t(idx)] &&
+                        lastWriter[size_t(idx)] >= int(first))
+                        first = 0;
+                for (int idx : passes[p].writes)
+                    if (idx >= 0 && size_t(idx) < fresh.size()) fresh[size_t(idx)] = 1;
+            }
+        }
+        s.passesSkipped = int(first);
+        // From here the planes are in flux: nothing past `first` is known to
+        // be there until this run's work has executed.
+        for (size_t p = first; p < s.passKeys.size(); ++p) s.passKeys[p] = 0;
+        s.pendingPassKeys = keys;
+
+        for (size_t p = first; p < passes.size(); ++p) {
             std::vector<const GpuImage*> passIn;
             std::vector<GpuImage*>       passOut;
             for (int idx : passes[p].reads) {

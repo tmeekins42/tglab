@@ -772,8 +772,19 @@ public:
         if (pass == 1 || pass == 2) radius = m_gpuPatch;
         else if (pass == 3)         radius = m_gpuRefine;
 
-        return {FloatBits(m_gpuA[0]), FloatBits(m_gpuA[1]), FloatBits(m_gpuA[2]),
-                FloatBits(omega), FloatBits(t0), FloatBits(protect),
+        // ONLY WHAT EACH PASS READS; the rest zero. The layout is shared, so
+        // the zeros cost nothing -- and the pipeline keys each pass on its
+        // constants to skip passes a slider cannot affect (RunStageGpu).
+        // Handing every pass `strength` made the dark-channel passes look
+        // changed on every strength tick, so all five re-ran for one that
+        // reads it. norm: A. min H/V: radius. refine: A, omega, protect,
+        // radius. recover: A, floor.
+        const bool usesA = pass == 0 || pass == 3 || pass == 4;
+        const float a0 = usesA ? m_gpuA[0] : 0.0f, a1 = usesA ? m_gpuA[1] : 0.0f,
+                    a2 = usesA ? m_gpuA[2] : 0.0f;
+        return {FloatBits(a0), FloatBits(a1), FloatBits(a2),
+                FloatBits(pass == 3 ? omega : 0.0f), FloatBits(pass == 4 ? t0 : 0.0f),
+                FloatBits(pass == 3 ? protect : 0.0f),
                 uint32_t(std::max(0, radius))};
     }
 

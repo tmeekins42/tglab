@@ -18,6 +18,7 @@
 
 #include "../src/core/algorithm.h"
 #include "../src/algo_util/histogram.h"
+#include "../src/algo_util/pixel_buffer.h"
 #include "../src/core/compare.h"
 #include "../src/core/pipeline.h"
 #include "../src/core/worker.h"
@@ -980,6 +981,74 @@ static void TestResidency(ID3D12Device* dev) {
         Check(gpu.TrimRecycled() > 0, "...while an ordinary free is pooled, and the pool can be emptied");
     }
 
+    gpu.Shutdown();
+}
+
+// SKIPPED PASSES MUST BE INVISIBLE. A multi-pass stage re-runs only the passes
+// a changed setting can affect, reusing what the earlier ones left in its
+// scratch planes (RunStageGpu). The property: a "drag" -- a run against the
+// previous pipeline with one setting changed -- produces exactly what a
+// from-scratch run at that setting does, bit for bit, while having skipped
+// passes. tonemap_local's range skips six of seven; dehaze's strength three of
+// five; wavelet's chroma none (every level reads it), included as the case
+// where skipping must not engage.
+static void TestPassSkipping(ID3D12Device* dev) {
+    Section("multi-pass stages skip passes a setting cannot affect");
+    ComputeContext gpu;
+    if (!gpu.Init(dev)) { Check(false, "compute context"); return; }
+
+    struct Case { const char* name; const char* tmpl; const char* v0; const char* v1; bool skips; };
+    const Case cases[] = {
+        {"tonemap_local range", "o = tonemap_local(src, range = %V)", "4", "6", true},
+        {"dehaze strength", "o = dehaze(src, enabled = 1, strength = %V)", "0.3", "0.6", true},
+        // Fixed thresholds: the fixture has no noise, so adaptive ones are zero
+        // at any chroma_k and the passes genuinely would not change.
+        {"wavelet chroma", "o = wavelet_denoise(src, adaptive = 0, chroma = %V)", "0.05", "0.1", false},
+    };
+    for (const Case& c : cases) {
+        auto script = [&](const char* v) {
+            std::string s = std::string("src = image(\"test\")\n") + c.tmpl + "\ndisplay(o)\n";
+            s.replace(s.find("%V"), 2, v);
+            return s;
+        };
+        auto read = [&](Pipeline& p, std::vector<Data>& src, std::vector<float>* out) {
+            const Data* d = p.Resolve(p.Viewers()[0].source, &src);
+            const auto* im = d ? std::get_if<Image>(d) : nullptr;
+            if (!im) return false;
+            ImageView v = const_cast<Image&>(*im).MapCpuRead();
+            PixelBuffer pb; pb.Unpack(v);
+            *out = pb.Data();
+            return true;
+        };
+        std::string e;
+        UiState u0, u1, u2;
+        auto p0 = std::make_unique<Pipeline>();
+        Pipeline p1, fresh;
+        std::vector<Data> s0, s1, s2;
+        const std::string a = script(c.v0), b = script(c.v1);
+        if (!BuildPipeline(a.c_str(), 256, &u0, p0.get(), &s0, &e) ||
+            !p0->Execute(&s0, nullptr, &e, &gpu, ExecMode::ForceGPU) ||
+            !BuildPipeline(b.c_str(), 256, &u1, &p1, &s1, &e) ||
+            !p1.Execute(&s1, p0.get(), &e, &gpu, ExecMode::ForceGPU) ||
+            !BuildPipeline(b.c_str(), 256, &u2, &fresh, &s2, &e) ||
+            !fresh.Execute(&s2, nullptr, &e, &gpu, ExecMode::ForceGPU)) {
+            Check(false, std::string(c.name) + ": runs (" + e + ")");
+            continue;
+        }
+        std::vector<float> got, want;
+        if (!read(p1, s1, &got) || !read(fresh, s2, &want) || got.size() != want.size()) {
+            Check(false, std::string(c.name) + ": both results readable");
+            continue;
+        }
+        double worst = 0.0;
+        for (size_t i = 0; i < got.size(); ++i) worst = std::max(worst, double(std::abs(got[i] - want[i])));
+        const int skipped = p1.Stages().back().passesSkipped;
+        Check(worst == 0.0, std::string(c.name) + ": a drag matches a fresh run exactly (worst " +
+                                std::to_string(worst) + ", " + std::to_string(skipped) + " passes skipped)");
+        Check(c.skips ? skipped > 0 : skipped == 0,
+              std::string(c.name) + (c.skips ? ": the unaffected passes were skipped"
+                                              : ": nothing skipped where every pass changed"));
+    }
     gpu.Shutdown();
 }
 
@@ -2992,6 +3061,7 @@ int main() {
         TestGpuPipeline(dev);
         TestBatchedBindings(dev);
         TestResidency(dev);
+        TestPassSkipping(dev);
         TestLinearAdjustAgreement(dev);
         TestCompare(dev);
         TestGpuResultIsDrawable(dev);

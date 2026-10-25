@@ -158,6 +158,17 @@ struct Stage {
     std::vector<const ComputeKernel*>           passKernels;
     std::vector<std::shared_ptr<GpuImage>>      gpuPlanes;
     ImageDesc                                   planeDesc{};
+
+    // What each pass computed into the planes, as a key per pass (see
+    // RunStageGpu): the passes ahead of the first one whose key changed need
+    // not run again, because their results are still in the planes. Zero
+    // means "not known to be there". `pendingPassKeys` holds a run's keys
+    // until its work has actually executed -- Execute commits them after its
+    // final flush, and a cancelled or failed run never does.
+    std::vector<uint64_t>                       passKeys;
+    std::vector<uint64_t>                       pendingPassKeys;
+    // How many passes the last run skipped, for TGLAB_STAGETIME.
+    int                                         passesSkipped = 0;
 };
 
 // A viewer declared by the script via display().
