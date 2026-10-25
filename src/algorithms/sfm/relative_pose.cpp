@@ -1445,7 +1445,18 @@ bool RelativePose::RunAlign(std::vector<Image>* images, std::string* err) {
     // since every link adds a little error -- 5 degrees plus 10% of the turn,
     // which also admits a focal a few percent off. A rejected revisit loses
     // its edge AND its matches, so build_tracks never unions them.
+    //
+    // IN ANY ORDER (match_ann's any_order) every pair was chosen by appearance,
+    // so EVERY pair is a candidate look-alike, and none is marked a revisit.
+    // There the chain is the spanning tree the strongest pairs grow, and every
+    // pair off that tree is checked against it by the same rule -- the turn
+    // between its two frames taken along the tree path through their common
+    // ancestor, since in a tree, unlike a chain, the difference of the two
+    // frames' turns from the root understates it.
     int revisitsKept = 0, revisitsDropped = 0;
+    bool anyOrder = false;
+    for (int f = 0; f < n; ++f)
+        if (reviseds[size_t(f)] && reviseds[size_t(f)]->anyOrder) anyOrder = true;
     {
         // Absolute rotations from neighbour edges only, by breadth-first
         // search from frame 0 over the strongest links.
@@ -1453,6 +1464,8 @@ bool RelativePose::RunAlign(std::vector<Image>* images, std::string* err) {
         Rabs.resize(size_t(n));
         std::vector<double> turned(size_t(n), 0.0);   // accumulated turn from the root
         std::vector<char> known(size_t(n), 0);
+        std::vector<int> parent(size_t(n), -1), depth(size_t(n), 0);
+        std::vector<std::pair<int, int>> treeEdges;   // (reference, frame) that grew the tree
         struct Link { int a, b; Mat3 R; int inl; };
         std::vector<Link> links;
         for (int f = 0; f < n; ++f)
@@ -1475,35 +1488,60 @@ bool RelativePose::RunAlign(std::vector<Image>* images, std::string* err) {
                     Rabs[size_t(l.b)] = l.R * Rabs[size_t(l.a)];
                     turned[size_t(l.b)] = turned[size_t(l.a)] + Mat3::Identity().AngleTo(l.R);
                     known[size_t(l.b)] = 1;
+                    parent[size_t(l.b)] = l.a;
+                    depth[size_t(l.b)] = depth[size_t(l.a)] + 1;
+                    treeEdges.push_back({l.a, l.b});
                     grew = true;
                 } else if (known[size_t(l.b)] && !known[size_t(l.a)]) {
                     Rabs[size_t(l.a)] = l.R.Transpose() * Rabs[size_t(l.b)];
                     turned[size_t(l.a)] = turned[size_t(l.b)] + Mat3::Identity().AngleTo(l.R);
                     known[size_t(l.a)] = 1;
+                    parent[size_t(l.a)] = l.b;
+                    depth[size_t(l.a)] = depth[size_t(l.b)] + 1;
+                    treeEdges.push_back({l.a, l.b});
                     grew = true;
                 }
             }
         }
+        auto onTree = [&](int a, int b) {
+            for (const auto& [x, y] : treeEdges)
+                if ((x == a && y == b) || (x == b && y == a)) return true;
+            return false;
+        };
+        // The turn along the tree between two frames: up to their common
+        // ancestor from each side.
+        auto turnBetween = [&](int a, int b) {
+            int x = a, y = b;
+            while (depth[size_t(x)] > depth[size_t(y)]) x = parent[size_t(x)];
+            while (depth[size_t(y)] > depth[size_t(x)]) y = parent[size_t(y)];
+            while (x != y && x >= 0 && y >= 0) { x = parent[size_t(x)]; y = parent[size_t(y)]; }
+            if (x < 0 || y < 0) return std::fabs(turned[size_t(a)] - turned[size_t(b)]);
+            return (turned[size_t(a)] - turned[size_t(x)]) + (turned[size_t(b)] - turned[size_t(x)]);
+        };
         const double deg = 3.14159265358979 / 180.0;
         for (int f = 0; f < n; ++f) {
             if (!reviseds[size_t(f)]) continue;
             auto& sets = reviseds[size_t(f)]->sets;
+            // The sets this check governs: revisits, or in any order all.
+            auto checked = [&](const MatchSet& st) { return st.revisit || anyOrder; };
             if (!outs[size_t(f)]) {
                 // Nothing solved here, revisits included: none may be used.
-                for (MatchSet& s : sets)
-                    if (s.revisit) s.inlier.assign(s.matches.size(), 0);
+                for (MatchSet& st : sets)
+                    if (checked(st)) st.inlier.assign(st.matches.size(), 0);
                 continue;
             }
             auto& edges = outs[size_t(f)]->edges;
             std::vector<RelativePoseSidecar::Edge> keep;
             for (size_t k = 0; k < edges.size(); ++k) {
                 const RelativePoseSidecar::Edge& e = edges[k];
-                if (!e.revisit) { keep.push_back(e); continue; }
                 const int a = e.reference;
+                const bool check = e.revisit || (anyOrder && !onTree(a, f));
+                if (!check) { keep.push_back(e); continue; }
                 bool ok = a >= 0 && a < n && known[size_t(a)] && known[size_t(f)];
                 if (ok) {
                     const Mat3 predicted = Rabs[size_t(f)] * Rabs[size_t(a)].Transpose();
-                    const double between = std::fabs(turned[size_t(f)] - turned[size_t(a)]);
+                    const double between = anyOrder ? turnBetween(a, f)
+                                                    : std::fabs(turned[size_t(f)] - turned[size_t(a)]);
                     ok = predicted.AngleTo(e.R) <= 5.0 * deg + 0.10 * between;
                 }
                 if (ok) { keep.push_back(e); ++revisitsKept; continue; }
@@ -1514,12 +1552,12 @@ bool RelativePose::RunAlign(std::vector<Image>* images, std::string* err) {
             // solved -- loses its matches, so no track is built through it.
             // (An EMPTY inlier list means "use them all", so an unsolved set
             // left alone would be the worst case, not the safe one.)
-            for (MatchSet& s : sets) {
-                if (!s.revisit) continue;
+            for (MatchSet& st : sets) {
+                if (!checked(st)) continue;
                 bool kept = false;
                 for (const RelativePoseSidecar::Edge& e : edges)
-                    if (e.revisit && e.reference == s.reference) kept = true;
-                if (!kept) s.inlier.assign(s.matches.size(), 0);
+                    if ((e.revisit || anyOrder) && e.reference == st.reference) kept = true;
+                if (!kept) st.inlier.assign(st.matches.size(), 0);
             }
         }
     }
@@ -1528,7 +1566,7 @@ bool RelativePose::RunAlign(std::vector<Image>* images, std::string* err) {
         const bool solvedHere = outs[size_t(f)] && !outs[size_t(f)]->edges.empty();
         bool hasRevisit = false;
         if (reviseds[size_t(f)])
-            for (const MatchSet& s : reviseds[size_t(f)]->sets) hasRevisit |= s.revisit;
+            for (const MatchSet& s : reviseds[size_t(f)]->sets) hasRevisit |= s.revisit || anyOrder;
         if (solvedHere)
             (*images)[size_t(f)].Sidecars().Set(kRelativePoseSidecar, std::move(outs[size_t(f)]));
         // Only when at least one pair solved: a frame whose every pair was
@@ -1560,7 +1598,8 @@ bool RelativePose::RunAlign(std::vector<Image>* images, std::string* err) {
         m_note += fb;
         if (revisitsKept + revisitsDropped > 0) {
             std::snprintf(fb, sizeof fb,
-                          "; revisits: %d agree with the chain, %d dropped",
+                          anyOrder ? "; any order: %d pairs off the tree agree with it, %d dropped"
+                                   : "; revisits: %d agree with the chain, %d dropped",
                           revisitsKept, revisitsDropped);
             m_note += fb;
         }

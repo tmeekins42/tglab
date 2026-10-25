@@ -465,7 +465,9 @@ public:
                     return false;
                 }
                 isFloat = ref->descriptors.kind == DescriptorKind::Float;
-                refsOf[i].push_back({refIdx, w > nNeighbours});
+                // A revisit only in a chain: in any order every pair came from
+                // appearance, and no pair is the odd one out.
+                refsOf[i].push_back({refIdx, w > nNeighbours && !anyOrder});
                 isRef[size_t(refIdx)] = 1;
                 isQuery[i] = 1;
                 if (!chain && !anyOrder) break;
@@ -517,7 +519,7 @@ public:
                     const FeatureSidecar* ref = FeaturesOf((*images)[size_t(refIdx)]);
                     MatchSet set;
                     set.reference = refIdx;
-                    set.revisit = revisit && !anyOrder;
+                    set.revisit = revisit;
                     MatchPair(*ref, *fs, fwdF[size_t(refIdx)], fwdL[size_t(refIdx)],
                               revF[i], revL[i], isFloat, &set);
                     ms->considered += set.considered;
