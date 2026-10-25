@@ -2536,6 +2536,118 @@ static void TestGpuBudget() {
 // correctly 1.0 when zoomed in, and not the region). This covers the half that
 // can be tested without a window: that the full run really does produce a full
 // frame after a cropped one, rather than reusing the crop from cache.
+// A ZOOMED-IN DRAG MUST KEEP THE CACHE ABOVE IT.
+//
+// Found on hdr.tgl: zoomed in on a ridge, every other tick of the sharpen
+// slider re-ran the whole HDR merge. The region run trims its margin off the
+// outputs at the end, and it trimmed EVERY stage's -- including the cached
+// full-frame results above the dragged stage, which the next tick then found
+// to be a window rather than the whole picture, and re-ran. Here a cached blur
+// stands in for the merge, under a neighbourhood stage being dragged (a margin
+// is needed for the trim to happen at all).
+static void TestRegionKeepsCache() {
+    std::printf("\n--- region drag keeps the cache ---\n");
+    const int dim = 400;
+    Image img;
+    img.Alloc({dim, dim, Format::RGBA32F});
+    {
+        ImageView v = img.MapCpuWrite();
+        for (int y = 0; y < dim; ++y)
+            for (int x = 0; x < dim; ++x) {
+                float* p = v.At<float>(x, y);
+                p[0] = p[1] = p[2] = ((x / 16) + (y / 16)) % 2 ? 0.7f : 0.2f;
+                p[3] = 1.0f;
+            }
+    }
+    auto run = [&](Pipeline* p, Pipeline* prev, Pipeline::Rect region, int radius) {
+        const std::string script =
+            "src = image(\"test\")\n"
+            "a = gaussian_blur(src, sigma = 3)\n"
+            "o = box_blur(a, radius = " + std::to_string(radius) + ")\n"
+            "display(o)\n";
+        UiState ui;
+        std::vector<Data> src;
+        src.push_back(Data{img.Clone()});
+        std::vector<SourceImage> names{{"test", 0}};
+        Program prog; std::string err;
+        if (!Parse(script, &prog, &err)) return false;
+        if (!Interpret(prog, names, &ui, p).ok) return false;
+        p->SetRegion(region);
+        return p->Execute(&src, prev, &err);
+    };
+    auto firstRerun = [](const Pipeline& p) {
+        const size_t i = p.FirstDirtyStage();
+        return i < p.Stages().size() ? p.Stages()[i].algoName : std::string("(none)");
+    };
+    const Pipeline::Rect zoom{120, 130, 150, 140};
+    std::vector<std::unique_ptr<Pipeline>> runs;
+    runs.push_back(std::make_unique<Pipeline>());
+    if (!run(runs.back().get(), nullptr, Pipeline::Rect{}, 2)) { Check(false, "the cold run succeeds"); return; }
+    bool kept = true;
+    std::string seen;
+    for (int r = 3; r <= 6; ++r) {
+        auto p = std::make_unique<Pipeline>();
+        if (!run(p.get(), runs.back().get(), zoom, r)) { Check(false, "a zoomed tick succeeds"); return; }
+        const std::string f = firstRerun(*p);
+        seen += " " + f;
+        if (f != "box_blur") kept = false;
+        runs.push_back(std::move(p));
+    }
+    Check(kept, "every zoomed tick re-runs only the dragged stage (re-ran:" + seen + ")");
+}
+
+// THE PREVIOUS RUN'S DEAD RESULTS GO AT THE START OF A RUN, NOT AT ITS END.
+//
+// Switching groups re-runs everything, and `prev` used to keep every stage's
+// result alive until the new run finished -- both pipelines' images held at
+// once. With two HDR groups that is two merges, two sets of intermediates and
+// two sets of aligned frames in VRAM together. After the cache scan nothing
+// reads them, so they are freed there.
+static void TestPrevReleasedEarly() {
+    std::printf("\n--- previous run released early ---\n");
+    auto make = [](float v) {
+        Image img;
+        img.Alloc({64, 64, Format::RGBA32F});
+        ImageView iv = img.MapCpuWrite();
+        for (int y = 0; y < 64; ++y)
+            for (int x = 0; x < 64; ++x) {
+                float* p = iv.At<float>(x, y);
+                p[0] = p[1] = p[2] = v + 0.001f * float(x); p[3] = 1.0f;
+            }
+        return img;
+    };
+    const std::string script =
+        "src = image(\"test\")\n"
+        "a = gaussian_blur(src, sigma = 2)\n"
+        "o = brightness(a, brightness = 0.1)\n"
+        "display(o)\n";
+    auto build = [&](Pipeline* p) {
+        UiState ui; Program prog; std::string err;
+        std::vector<SourceImage> names{{"test", 0}};
+        return Parse(script, &prog, &err) && Interpret(prog, names, &ui, p).ok;
+    };
+    Pipeline a, b;
+    std::string err;
+    std::vector<Data> s1, s2;
+    s1.push_back(Data{make(0.2f)});
+    s2.push_back(Data{make(0.6f)});
+    const std::vector<uint64_t> v1{1}, v2{2};   // a different source: nothing reusable
+    if (!build(&a) || !a.Execute(&s1, nullptr, &err, nullptr, ExecMode::Auto, &v1)) {
+        Check(false, "the first run succeeds: " + err);
+        return;
+    }
+    if (!build(&b) || !b.Execute(&s2, &a, &err, nullptr, ExecMode::Auto, &v2)) {
+        Check(false, "the second run succeeds: " + err);
+        return;
+    }
+    size_t held = 0;
+    for (const auto& st : a.Stages())
+        for (const Data& d : st.outputs) held += std::holds_alternative<Image>(d) ? 1 : 0;
+    Check(b.FirstDirtyStage() == 0, "a new source re-runs every stage");
+    Check(held == 0, "and the previous run holds none of its results once the new one has started (" +
+                         std::to_string(held) + " still held)");
+}
+
 static void TestRegionThenFull() {
     std::printf("\n--- region then full ---\n");
 
@@ -3108,6 +3220,8 @@ int main() {
     TestProxyPlacement();
     TestRegionOriginStable();
     TestRegionThenFull();
+    TestRegionKeepsCache();
+    TestPrevReleasedEarly();
     TestGpuBudget();
 
     ID3D12Device* dev = nullptr;

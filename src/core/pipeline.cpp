@@ -1387,6 +1387,18 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
                 m_stages[i].passKeys    = prev->m_stages[i].passKeys;
             }
         }
+
+        // WHAT THE PREVIOUS RUN COMPUTED FROM firstDirty ON IS DEAD: the scan
+        // above took everything reusable, and nothing below reads the rest.
+        // Freed now rather than when the caller drops `prev` after this run --
+        // otherwise both pipelines' results are held at once for the whole
+        // run. Switching from one HDR group to another held the first group's
+        // merge, its intermediates and align's copies of its frames in VRAM
+        // while the second was being built, so usage peaked at both together.
+        for (size_t i = firstDirty; i < prev->m_stages.size(); ++i) {
+            prev->m_stages[i].outputs.clear();
+            prev->m_stages[i].valid = false;
+        }
     }
 
     // Any exit from the stage loop -- an error, a cancellation, or falling off
@@ -2116,10 +2128,20 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
         // THROUGH a bypassed stage to an earlier stage's image, and two viewers
         // can land on the same one -- trimming per viewer would then crop the
         // same image twice. Walking the stages visits each exactly once.
-        for (Stage& st : m_stages) {
+        //
+        // ONLY THE STAGES THAT RAN ON THE REGION -- firstDirty onward -- and
+        // only images that are windows. The stages before firstDirty hold the
+        // CACHED full-frame results the next run reuses; trimming them cut the
+        // merged HDR down to the visible rectangle, so the next slider tick
+        // found it no longer a whole frame and re-ran the merge. Zoomed in,
+        // every other tick of a sharpen drag re-merged the bracket.
+        for (size_t si = m_firstDirty; si < m_stages.size(); ++si) {
+            Stage& st = m_stages[si];
             for (Data& od : st.outputs) {
             Image* im = std::get_if<Image>(&od);
             if (!im || !im->Desc().Valid()) continue;
+            const ImageDesc& wd = im->Desc();
+            if (wd.originX == 0 && wd.originY == 0 && wd.fullW == 0 && wd.fullH == 0) continue;
 
             // In the image's OWN pixels: the stages may have run on a proxy,
             // so the full-resolution margin has to come down with them.
