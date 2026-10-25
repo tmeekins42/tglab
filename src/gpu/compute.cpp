@@ -46,6 +46,8 @@ DXGI_FORMAT ToDxgi(Format f) {
         case Format::RGBA32F: return DXGI_FORMAT_R32G32B32A32_FLOAT;
         case Format::RGBA16F: return DXGI_FORMAT_R16G16B16A16_FLOAT;
         case Format::R32U:    return DXGI_FORMAT_R32_UINT;
+        case Format::RG32F:   return DXGI_FORMAT_R32G32_FLOAT;
+        case Format::RG16F:   return DXGI_FORMAT_R16G16_FLOAT;
         default:              return DXGI_FORMAT_UNKNOWN;
     }
 }

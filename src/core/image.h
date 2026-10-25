@@ -21,6 +21,8 @@ enum class Format : uint8_t {
     RGBA16F,    // 4 x half   — the working format for raw
     R32U,       // 1 x uint32 — GPU-side integer atomics (fixed-point sums);
                 //   device scratch only, never a pipeline image
+    RG32F,      // 2 x float  — a multi-pass stage's two-channel scratch plane
+    RG16F,      // 2 x half   —   (see GpuScratchPlaneFormat); device scratch only
 };
 
 // Colour filter array layout, naming the 2x2 tile's top-left quad.
@@ -66,6 +68,8 @@ enum class FormatSpec : uint8_t {
     R32F,
     RGBA32F,
     RGBA16F,
+    RG32F,          // scratch planes only: see AlgorithmBase::GpuScratchPlaneFormat
+    RG16F,
 };
 
 struct ImageDesc {

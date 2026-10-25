@@ -446,7 +446,7 @@ public:
 
     // --- GPU path ------------------------------------------------------------
     //
-    // Seven passes over four RGBA32F scratch planes. The structure follows the
+    // Seven passes over four RG32F scratch planes. The structure follows the
     // CPU path exactly, with one economy: log and log-squared travel together
     // in .x and .y of a single plane, so ONE separable box pass produces both
     // mean and meanSq. Doing them as separate planes would double the box work,
@@ -567,7 +567,9 @@ public:
     }
 
     int        GpuScratchCount()  const override { return 4; }
-    FormatSpec GpuScratchPlanes() const override { return FormatSpec::RGBA32F; }
+    // Two channels each -- log and log^2, then a and b -- so RG32F: the four
+    // planes as RGBA32F carried half their bandwidth as padding.
+    FormatSpec GpuScratchPlanes() const override { return FormatSpec::RG32F; }
 
     std::vector<GpuPass> GpuPasses() const override {
         // Assembled once: GpuPasses returns raw pointers, and rebuilding the

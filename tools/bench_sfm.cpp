@@ -95,6 +95,20 @@ void SetParam(AlgorithmBase* a, const char* name, double v) {
 // frame the same settings find tens of thousands of features, most of them on
 // texture too fine to repeat between views. Downscaling first is what the
 // reference pipelines do, and it makes the run tractable as a side effect.
+// A float image as raw floats: int32 width, height, channels, then the data.
+// .hdr cannot hold a negative, and an out-of-gamut colour is exactly that.
+void WriteF32(const std::string& path, Image& img) {
+    ImageView cv = img.MapCpuRead();
+    PixelBuffer pb;
+    pb.Unpack(cv);
+    if (FILE* fp = std::fopen(path.c_str(), "wb")) {
+        const int32_t hdr[3] = {pb.Width(), pb.Height(), pb.Channels()};
+        std::fwrite(hdr, sizeof hdr, 1, fp);
+        std::fwrite(pb.Data().data(), sizeof(float), pb.Data().size(), fp);
+        std::fclose(fp);
+    }
+}
+
 bool Downscale(const Image& in, int maxDim, Image* out) {
     const ImageDesc& d = in.Desc();
     const int longest = std::max(d.width, d.height);
@@ -1046,17 +1060,8 @@ int main(int argc, char** argv) {
                     // .hdr cannot hold a negative, and an out-of-gamut colour
                     // is exactly that -- so float images also go out raw:
                     // int32 width, height, channels, then the floats.
-                    if (copy.Desc().format != Format::RGBA8) {
-                        ImageView cv = copy.MapCpuRead();
-                        PixelBuffer pb;
-                        pb.Unpack(cv);
-                        if (FILE* fp = std::fopen((dumpDir + "/" + vd.name + ".f32").c_str(), "wb")) {
-                            const int32_t hdr[3] = {pb.Width(), pb.Height(), pb.Channels()};
-                            std::fwrite(hdr, sizeof hdr, 1, fp);
-                            std::fwrite(pb.Data().data(), sizeof(float), pb.Data().size(), fp);
-                            std::fclose(fp);
-                        }
-                    }
+                    if (copy.Desc().format != Format::RGBA8)
+                        WriteF32(dumpDir + "/" + vd.name + ".f32", copy);
                 }
                 if (const ImageSet* set = std::get_if<ImageSet>(d)) {
                     std::filesystem::create_directories(dumpDir);
@@ -1097,6 +1102,11 @@ int main(int argc, char** argv) {
                         if (!(png ? SavePng(dumpDir + "/" + vd.name + name, copy, &e)
                                   : SaveImage(dumpDir + "/" + vd.name + name, copy, &e)))
                             std::printf("dump %s: %s\n", name, e.c_str());
+                        if (!png) {
+                            char fname[64];
+                            std::snprintf(fname, sizeof(fname), "_%02d.f32", int(i));
+                            WriteF32(dumpDir + "/" + vd.name + fname, copy);
+                        }
                     }
                 }
                 if (const PointCloud* pc = std::get_if<PointCloud>(d);

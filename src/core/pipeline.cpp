@@ -71,6 +71,8 @@ static bool MatchesSpec(FormatSpec spec, Format f) {
         case FormatSpec::R32F:    return f == Format::R32F;
         case FormatSpec::RGBA32F: return f == Format::RGBA32F;
         case FormatSpec::RGBA16F: return f == Format::RGBA16F;
+        case FormatSpec::RG32F:   return f == Format::RG32F;
+        case FormatSpec::RG16F:   return f == Format::RG16F;
         case FormatSpec::SameAsInput:
         case FormatSpec::Any:     return true;
     }
@@ -758,6 +760,8 @@ bool Pipeline::RunStageOnce(Stage& s, const std::vector<const Data*>& in,
             case FormatSpec::R32F:        d.format = Format::R32F;    break;
             case FormatSpec::RGBA32F:     d.format = Format::RGBA32F; break;
             case FormatSpec::RGBA16F:     d.format = Format::RGBA16F; break;
+            case FormatSpec::RG32F:       d.format = Format::RG32F;   break;
+            case FormatSpec::RG16F:       d.format = Format::RG16F;   break;
             case FormatSpec::SameAsInput: /* keep base.format */      break;
             case FormatSpec::Any:         /* keep base.format */      break;
         }
@@ -1354,7 +1358,7 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
                 // The multi-pass planes too, which were dropped here: every
                 // tick reallocated every scratch plane of a multi-pass stage.
                 m_stages[i].gpuPlanes   = prev->m_stages[i].gpuPlanes;
-                m_stages[i].planeDesc   = prev->m_stages[i].planeDesc;
+                m_stages[i].planeDescs  = prev->m_stages[i].planeDescs;
                 m_stages[i].passKeys    = prev->m_stages[i].passKeys;
             }
         }
@@ -2327,37 +2331,46 @@ bool Pipeline::RunStageGpu(Stage& s, const std::vector<const Data*>& in,
     // planes. See AlgorithmBase::GpuPasses.
     if (!passes.empty()) {
         const ImageDesc outDesc = std::get<Image>((*out)[0]).Desc();
-        ImageDesc planeDesc = outDesc;
-        switch (s.algo->GpuScratchPlanes()) {
-            case FormatSpec::RGBA8:   planeDesc.format = Format::RGBA8;   break;
-            case FormatSpec::R32F:    planeDesc.format = Format::R32F;    break;
-            case FormatSpec::RGBA32F: planeDesc.format = Format::RGBA32F; break;
-            case FormatSpec::RGBA16F: planeDesc.format = Format::RGBA16F; break;
-            case FormatSpec::Any:
-            case FormatSpec::SameAsInput: break;
-        }
-        // The planes are intermediates, never displayed, so they carry no CFA
-        // and no transfer function. Leaving the input's CFA on them would make
-        // a later stage think it still had a mosaic to demosaic.
-        planeDesc.cfa    = CfaPattern::None;
-        planeDesc.linear = true;
-
         const int planeCount = std::max(0, s.algo->GpuScratchCount());
-        const bool resized = s.planeDesc.width  != planeDesc.width  ||
-                             s.planeDesc.height != planeDesc.height ||
-                             s.planeDesc.format != planeDesc.format;
+        std::vector<ImageDesc> descs(static_cast<size_t>(planeCount), outDesc);
+        for (int i = 0; i < planeCount; ++i) {
+            ImageDesc& pd = descs[size_t(i)];
+            switch (s.algo->GpuScratchPlaneFormat(i)) {
+                case FormatSpec::RGBA8:   pd.format = Format::RGBA8;   break;
+                case FormatSpec::R32F:    pd.format = Format::R32F;    break;
+                case FormatSpec::RGBA32F: pd.format = Format::RGBA32F; break;
+                case FormatSpec::RGBA16F: pd.format = Format::RGBA16F; break;
+                case FormatSpec::RG32F:   pd.format = Format::RG32F;   break;
+                case FormatSpec::RG16F:   pd.format = Format::RG16F;   break;
+                case FormatSpec::Any:
+                case FormatSpec::SameAsInput: break;
+            }
+            const int div = std::max(1, s.algo->GpuScratchPlaneDivisor(i));
+            pd.width  = std::max(1, (outDesc.width  + div - 1) / div);
+            pd.height = std::max(1, (outDesc.height + div - 1) / div);
+            // The planes are intermediates, never displayed, so they carry no
+            // CFA and no transfer function. Leaving the input's CFA on them
+            // would make a later stage think it still had a mosaic.
+            pd.cfa    = CfaPattern::None;
+            pd.linear = true;
+        }
+        bool resized = s.planeDescs.size() != descs.size();
+        for (size_t i = 0; !resized && i < descs.size(); ++i)
+            resized = s.planeDescs[i].width  != descs[i].width  ||
+                      s.planeDescs[i].height != descs[i].height ||
+                      s.planeDescs[i].format != descs[i].format;
         if (int(s.gpuPlanes.size()) != planeCount || resized) {
             s.gpuPlanes.clear();
             for (int i = 0; i < planeCount; ++i) {
                 auto p = std::make_shared<GpuImage>();
-                if (!gpu->CreateImage(planeDesc, p.get())) {
+                if (!gpu->CreateImage(descs[size_t(i)], p.get())) {
                     s.gpuPlanes.clear();
                     *err = "could not allocate scratch planes for a multi-pass stage";
                     return false;
                 }
                 s.gpuPlanes.push_back(std::move(p));
             }
-            s.planeDesc = planeDesc;
+            s.planeDescs = descs;
             s.passKeys.clear();   // fresh planes hold nothing
         }
 
@@ -2497,8 +2510,9 @@ bool Pipeline::RunStageGpu(Stage& s, const std::vector<const Data*>& in,
                 passOut.push_back(g);
             }
             uint32_t gx = 0, gy = 0;
-            if (passes[p].divX > 1 || passes[p].divY > 1) {
-                const ImageDesc& od = std::get<Image>((*out)[0]).Desc();
+            if ((passes[p].divX > 1 || passes[p].divY > 1) && !passOut.empty()) {
+                // Over what this pass WRITES, which may be a reduced plane.
+                const ImageDesc& od = passOut[0]->desc;
                 const uint32_t dx = std::max(1u, passes[p].divX), dy = std::max(1u, passes[p].divY);
                 const uint32_t tx = (uint32_t(od.width)  + dx - 1) / dx;
                 const uint32_t ty = (uint32_t(od.height) + dy - 1) / dy;
@@ -2574,6 +2588,8 @@ bool Pipeline::RunStageGpu(Stage& s, const std::vector<const Data*>& in,
         case FormatSpec::R32F:    desc.format = Format::R32F;    break;
         case FormatSpec::RGBA32F: desc.format = Format::RGBA32F; break;
         case FormatSpec::RGBA16F: desc.format = Format::RGBA16F; break;
+        case FormatSpec::RG32F:   desc.format = Format::RG32F;   break;
+        case FormatSpec::RG16F:   desc.format = Format::RG16F;   break;
         case FormatSpec::Any:
         case FormatSpec::SameAsInput:
             break;   // keep the output's format

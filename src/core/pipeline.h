@@ -157,7 +157,7 @@ struct Stage {
     // reallocating full-size planes on every slider nudge would dwarf the work.
     std::vector<const ComputeKernel*>           passKernels;
     std::vector<std::shared_ptr<GpuImage>>      gpuPlanes;
-    ImageDesc                                   planeDesc{};
+    std::vector<ImageDesc>                      planeDescs;   // one per plane
 
     // What each pass computed into the planes, as a key per pass (see
     // RunStageGpu): the passes ahead of the first one whose key changed need

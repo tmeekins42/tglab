@@ -21,6 +21,8 @@ int BytesPerPixel(Format f) {
         case Format::RGBA32F: return 16;
         case Format::RGBA16F: return 8;
         case Format::R32U:    return 4;
+        case Format::RG32F:   return 8;
+        case Format::RG16F:   return 4;
         case Format::Unknown: return 0;
     }
     return 0;
@@ -33,6 +35,8 @@ const char* FormatName(Format f) {
         case Format::RGBA32F: return "RGBA32F";
         case Format::RGBA16F: return "RGBA16F";
         case Format::R32U:    return "R32U";
+        case Format::RG32F:   return "RG32F";
+        case Format::RG16F:   return "RG16F";
         case Format::Unknown: return "Unknown";
     }
     return "Unknown";

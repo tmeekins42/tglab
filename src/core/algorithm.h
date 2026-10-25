@@ -751,6 +751,18 @@ public:
     virtual int        GpuScratchCount()  const { return 0; }
     virtual FormatSpec GpuScratchPlanes() const { return FormatSpec::R32F; }
 
+    // PER PLANE, when they differ: the format of plane `i`, and how many times
+    // smaller than the output it is on each side (1 = the output's size).
+    //
+    // One format for the whole pool made a two-channel plane pay for four --
+    // tonemap_local's log/log^2 and a/b planes went through RGBA32F, half the
+    // bandwidth wasted -- and one size made it impossible to run part of a
+    // stage at reduced scale, as dehaze's CPU path does for its transmission
+    // map. A pass writing a smaller plane is dispatched over that plane, and
+    // gets its width and height as the first two constants.
+    virtual FormatSpec GpuScratchPlaneFormat(int i) const { (void)i; return GpuScratchPlanes(); }
+    virtual int        GpuScratchPlaneDivisor(int i) const { (void)i; return 1; }
+
     // Root constants for a specific pass, when they differ between passes.
     // Defaults to GpuConstants(pass), so an algorithm whose passes share their
     // constants needs no override.
