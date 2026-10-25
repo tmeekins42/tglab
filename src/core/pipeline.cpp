@@ -2345,9 +2345,11 @@ bool Pipeline::RunStageGpu(Stage& s, const std::vector<const Data*>& in,
                 case FormatSpec::Any:
                 case FormatSpec::SameAsInput: break;
             }
+            // Rounded DOWN, as a CPU path computing at w / k does -- dehaze's,
+            // whose small map the GPU path has to match pixel for pixel.
             const int div = std::max(1, s.algo->GpuScratchPlaneDivisor(i));
-            pd.width  = std::max(1, (outDesc.width  + div - 1) / div);
-            pd.height = std::max(1, (outDesc.height + div - 1) / div);
+            pd.width  = std::max(1, outDesc.width  / div);
+            pd.height = std::max(1, outDesc.height / div);
             // The planes are intermediates, never displayed, so they carry no
             // CFA and no transfer function. Leaving the input's CFA on them
             // would make a later stage think it still had a mosaic.

@@ -562,12 +562,22 @@ public:
     // than it should, and the preview therefore read MORE haze than the full
     // run and corrected harder. That is why the proxy dehazed more strongly
     // than the settled image.
+    //
+    // The working scale and the radii at it, exactly as RunCPU derives them:
+    // 1/4 above 2 MP, and each radius divided by the same factor.
     void PrepareGpu(const std::vector<ImageDesc>& inputs) override {
         if (inputs.empty()) return;
-        const double ref =
-            double(std::max(inputs[0].width, inputs[0].height)) / 1000.0;
+        const int w = inputs[0].width, h = inputs[0].height;
+        const double ref = double(std::max(w, h)) / 1000.0;
+        m_gpuK = (size_t(w) * size_t(h) > 2000000) ? 4 : 1;
         m_gpuPatch  = std::max(1, int(std::lround(double(int(m_patch))  * ref)));
         m_gpuRefine = std::max(1, int(std::lround(double(int(m_refine)) * ref)));
+        if (m_gpuK > 1) {
+            m_gpuPatch  = std::max(1, m_gpuPatch  / m_gpuK);
+            m_gpuRefine = std::max(1, m_gpuRefine / m_gpuK);
+        }
+        m_gpuSmallW = std::max(1, w / m_gpuK);
+        m_gpuSmallH = std::max(1, h / m_gpuK);
     }
 
     // Stated in the image's own pixels by PrepareGpu above, so the framework
@@ -742,237 +752,321 @@ public:
         return true;
     }
 
-    // Five planes: the normalised dark channel, its patch minimum, the
-    // transmission map, and two for the guided filter's coefficients.
-    int        GpuScratchCount()  const override { return 5; }
+    // THE CPU PATH'S ALGORITHM, PASS FOR PASS. It used to box-smooth the
+    // transmission at full resolution in place of the guided filter -- a
+    // strided approximation that let edges follow the window rather than the
+    // picture, a halo on a branch against bright sky, and a CPU/GPU mean
+    // difference of up to 12/255 that the parity test had to allow. Now the
+    // GPU does what the CPU does, at the CPU's reduced scale (1/4 above 2 MP,
+    // see RunCPU), with the box sums as running sums over the CPU's clipped
+    // window. Only the airlight differs: it is still sampled (MeasureForGpu),
+    // so that a slider upstream does not force a full-frame readback.
+    //
+    //   P0  small     input -> S: k x k box average, rgb + luma      (1/k)
+    //   P1  norm      S -> D0: min over channels of I/A                (1/k)
+    //   P2  minH      D0 -> D1, P3 minV D1 -> D2: patch minimum        (1/k)
+    //   P4  prep      S, D2 -> G0: t = 1 - omega*dark, and the guided
+    //                 filter's I, p, I*p, I*I                          (1/k)
+    //   P5  box4H     G0 -> G1, P6 box4V G1 -> G2: their window means  (1/k)
+    //   P7  ab        G2 -> B0: a = cov/(var+eps), b = mean(p) - a*mean(I)
+    //   P8  box2H     B0 -> B1, P9 box2V B1 -> B2: means of a and b    (1/k)
+    //   P10 tfinal    B2, S -> T: t = mean(a)*I + mean(b), sky protected
+    //   P11 recover   input, T -> output: J = (I - A)/max(t, t0) + A, t
+    //                 sampled bilinearly from the small map           (full)
+    enum Plane { kS, kD0, kD1, kD2, kG0, kG1, kG2, kB0, kB1, kB2, kT, kPlanes };
+    int        GpuScratchCount() const override { return kPlanes; }
     FormatSpec GpuScratchPlanes() const override { return FormatSpec::R32F; }
+    FormatSpec GpuScratchPlaneFormat(int i) const override {
+        switch (i) {
+            case kS: case kG0: case kG1: case kG2: return FormatSpec::RGBA32F;
+            case kB0: case kB1: case kB2:          return FormatSpec::RG32F;
+            default:                               return FormatSpec::R32F;
+        }
+    }
+    int GpuScratchPlaneDivisor(int) const override { return m_gpuK; }
 
     std::vector<GpuPass> GpuPasses() const override {
+        constexpr uint32_t R = kGpuBoxRun;
         return {
-            // I/A per pixel, minimised across channels.
-            {kNormSrc,   "dehaze.norm",    {-1},     {0}},
-            // Patch minimum, separable: horizontal then vertical.
-            {kMinH,      "dehaze.minh",    {0},      {1}},
-            {kMinV,      "dehaze.minv",    {1},      {2}},
-            // t = 1 - omega*dark, refined against the image, sky protected.
-            {kRefine,    "dehaze.refine",  {-1, 2},  {3}},
-            // J = (I - A)/t + A.
-            {kRecover,   "dehaze.recover", {-1, 3},  {-1}},
+            {kSmall,   "dehaze.small",   {-1},          {kS}},
+            {kNorm,    "dehaze.norm",    {kS},          {kD0}},
+            {kMinH,    "dehaze.minh",    {kD0},         {kD1}},
+            {kMinV,    "dehaze.minv",    {kD1},         {kD2}},
+            {kPrep,    "dehaze.prep",    {kS, kD2},     {kG0}},
+            {kBox4H,   "dehaze.box4h",   {kG0},         {kG1}, R, 1},
+            {kBox4V,   "dehaze.box4v",   {kG1},         {kG2}, 1, R},
+            {kAb,      "dehaze.ab",      {kG2},         {kB0}},
+            {kBox2H,   "dehaze.box2h",   {kB0},         {kB1}, R, 1},
+            {kBox2V,   "dehaze.box2v",   {kB1},         {kB2}, 1, R},
+            {kTFinal,  "dehaze.tfinal",  {kB2, kS},     {kT}},
+            {kRecover, "dehaze.recover", {-1, kT},      {-1}},
         };
     }
 
+    // ONLY WHAT EACH PASS READS; the rest zero. The layout is shared, so the
+    // zeros cost nothing -- and the pipeline keys each pass on its constants
+    // to skip passes a slider cannot affect (RunStageGpu): dragging strength
+    // re-runs the guided filter and the recovery, not the dark channel.
     std::vector<uint32_t> GpuPassConstants(int pass) const override {
         const float omega   = std::clamp(float(m_strength), 0.0f, 1.0f);
         const float t0      = std::max(0.01f, float(m_floor));
         const float protect = std::clamp(float(m_skyProtect), 0.0f, 1.0f);
-
-        // The radius each pass uses. Only the two minimum passes and the
-        // refine pass care, and they want different ones.
+        const bool usesA = pass == 1 || pass == 10 || pass == 11;
         int radius = 0;
-        if (pass == 1 || pass == 2) radius = m_gpuPatch;
-        else if (pass == 3)         radius = m_gpuRefine;
-
-        // ONLY WHAT EACH PASS READS; the rest zero. The layout is shared, so
-        // the zeros cost nothing -- and the pipeline keys each pass on its
-        // constants to skip passes a slider cannot affect (RunStageGpu).
-        // Handing every pass `strength` made the dark-channel passes look
-        // changed on every strength tick, so all five re-ran for one that
-        // reads it. norm: A. min H/V: radius. refine: A, omega, protect,
-        // radius. recover: A, floor.
-        const bool usesA = pass == 0 || pass == 3 || pass == 4;
-        const float a0 = usesA ? m_gpuA[0] : 0.0f, a1 = usesA ? m_gpuA[1] : 0.0f,
-                    a2 = usesA ? m_gpuA[2] : 0.0f;
-        return {FloatBits(a0), FloatBits(a1), FloatBits(a2),
-                FloatBits(pass == 3 ? omega : 0.0f), FloatBits(pass == 4 ? t0 : 0.0f),
-                FloatBits(pass == 3 ? protect : 0.0f),
-                uint32_t(std::max(0, radius))};
+        if (pass == 2 || pass == 3) radius = m_gpuPatch;
+        if (pass == 5 || pass == 6 || pass == 8 || pass == 9) radius = m_gpuRefine;
+        return {FloatBits(usesA ? m_gpuA[0] : 0.0f), FloatBits(usesA ? m_gpuA[1] : 0.0f),
+                FloatBits(usesA ? m_gpuA[2] : 0.0f),
+                FloatBits(pass == 4 ? omega : 0.0f),
+                FloatBits(pass == 11 ? t0 : 0.0f),
+                FloatBits(pass == 10 ? protect : 0.0f),
+                uint32_t(std::max(0, radius)),
+                uint32_t((pass == 0 || pass == 11) ? m_gpuK : 0),
+                FloatBits(pass == 7 ? 1e-4f : 0.0f),          // the CPU's eps
+                uint32_t(pass == 11 ? m_gpuSmallW : 0),
+                uint32_t(pass == 11 ? m_gpuSmallH : 0)};
     }
 
 private:
+    static constexpr uint32_t kGpuBoxRun = 64;   // must match kBoxRun below
+
     // Each pass declares the same constant buffer. Repeated rather than
     // shared, because the framework compiles each pass's HLSL on its own and a
     // pass that omitted a field would silently misread the ones after it.
-    //
-    // min over channels of I/A -- the dark channel's per-pixel part.
-    static constexpr const char* kNormSrc = R"(
-Texture2D<float4>   Src : register(t0);
-RWTexture2D<float>  Dst : register(u0);
-
+#define DEHAZE_CB R"(
 cbuffer Constants : register(b0) {
     uint Width; uint Height;
     uint A0Bits; uint A1Bits; uint A2Bits;
     uint OmegaBits; uint FloorBits; uint ProtectBits;
-    uint Radius;
+    uint Radius; uint K; uint EpsBits; uint SmallW; uint SmallH;
 };
+float3 Air() { return float3(asfloat(A0Bits), asfloat(A1Bits), asfloat(A2Bits)); }
+)"
 
+    // k x k box average of the input -- the CPU's working-scale image. Edge
+    // samples clamp into the frame, as the CPU's do. .a carries luminance,
+    // the guided filter's guide.
+    static constexpr const char* kSmall = R"(
+Texture2D<float4>   Src : register(t0);
+RWTexture2D<float4> Dst : register(u0);
+)" DEHAZE_CB R"(
 [numthreads(8, 8, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
     if (tid.x >= Width || tid.y >= Height) return;
-    float3 A = float3(asfloat(A0Bits), asfloat(A1Bits), asfloat(A2Bits));
-    float3 c = Src[int2(tid.xy)].rgb / max(A, 1e-3);
-    Dst[tid.xy] = min(c.r, min(c.g, c.b));
+    uint sw, sh;
+    Src.GetDimensions(sw, sh);
+    int k = int(K);
+    float3 a = 0.0;
+    for (int dy = 0; dy < k; ++dy)
+        for (int dx = 0; dx < k; ++dx) {
+            int2 p = int2(min(int(tid.x) * k + dx, int(sw) - 1),
+                          min(int(tid.y) * k + dy, int(sh) - 1));
+            a += Src[p].rgb;
+        }
+    a /= float(k * k);
+    Dst[tid.xy] = float4(a, Luma(a));
 }
 )";
 
-    // Separable patch minimum. Two passes rather than a 2D window: the same
-    // answer for 2r+1 reads instead of (2r+1)^2.
-    //
-    // A straight loop rather than the CPU path's van Herk trick, which is a
-    // sequential scan and does not map onto independent threads. At the radii
-    // this uses the GPU's parallelism more than covers the difference.
+    // min over channels of I/A -- the dark channel's per-pixel part.
+    static constexpr const char* kNorm = R"(
+Texture2D<float4>   Src : register(t0);
+RWTexture2D<float>  Dst : register(u0);
+)" DEHAZE_CB R"(
+[numthreads(8, 8, 1)]
+void main(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= Width || tid.y >= Height) return;
+    float3 n = Src[tid.xy].rgb / Air();
+    Dst[tid.xy] = min(n.r, min(n.g, n.b));
+}
+)";
+
+    // The patch minimum, separable. A clamped coordinate repeats an edge
+    // sample that is already in the window, so the minimum is the CPU's
+    // clipped-window minimum exactly.
     static constexpr const char* kMinH = R"(
 Texture2D<float>    Src : register(t0);
 RWTexture2D<float>  Dst : register(u0);
-cbuffer Constants : register(b0) {
-    uint Width; uint Height;
-    uint A0Bits; uint A1Bits; uint A2Bits;
-    uint OmegaBits; uint FloorBits; uint ProtectBits;
-    uint Radius;
-};
-
+)" DEHAZE_CB R"(
 [numthreads(8, 8, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
     if (tid.x >= Width || tid.y >= Height) return;
     int r = int(Radius);
     float m = 1e30;
-    for (int i = -r; i <= r; ++i) {
-        int x = clamp(int(tid.x) + i, 0, int(Width) - 1);
-        m = min(m, Src[int2(x, tid.y)]);
-    }
+    for (int i = -r; i <= r; ++i)
+        m = min(m, Src[int2(clamp(int(tid.x) + i, 0, int(Width) - 1), tid.y)]);
     Dst[tid.xy] = m;
 }
 )";
-
     static constexpr const char* kMinV = R"(
 Texture2D<float>    Src : register(t0);
 RWTexture2D<float>  Dst : register(u0);
-cbuffer Constants : register(b0) {
-    uint Width; uint Height;
-    uint A0Bits; uint A1Bits; uint A2Bits;
-    uint OmegaBits; uint FloorBits; uint ProtectBits;
-    uint Radius;
-};
-
+)" DEHAZE_CB R"(
 [numthreads(8, 8, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
     if (tid.x >= Width || tid.y >= Height) return;
     int r = int(Radius);
     float m = 1e30;
-    for (int i = -r; i <= r; ++i) {
-        int y = clamp(int(tid.y) + i, 0, int(Height) - 1);
-        m = min(m, Src[int2(tid.x, y)]);
-    }
+    for (int i = -r; i <= r; ++i)
+        m = min(m, Src[int2(tid.x, clamp(int(tid.y) + i, 0, int(Height) - 1))]);
     Dst[tid.xy] = m;
 }
 )";
 
-    // t = 1 - omega*dark, smoothed against the image, with the sky floor.
-    //
-    // A BOX SMOOTH of the transmission rather than the CPU path's guided
-    // filter. The guided filter needs four box sums and two more passes over
-    // coefficient planes; a box smooth of the same radius keeps the map from
-    // being blocky, which is what the refinement is for, at a fraction of the
-    // dispatch count. The cost is that edges follow the window rather than the
-    // picture, so a hard depth edge keeps a little of the halo the guided
-    // filter removes -- visible on a branch against bright sky and nowhere
-    // else. Worth it here because this path exists to be dragged.
-    static constexpr const char* kRefine = R"(
-Texture2D<float4>   Img  : register(t0);
+    // The raw transmission, and the four quantities the guided filter averages.
+    static constexpr const char* kPrep = R"(
+Texture2D<float4>   S    : register(t0);
 Texture2D<float>    Dark : register(t1);
-RWTexture2D<float>  Dst  : register(u0);
-cbuffer Constants : register(b0) {
-    uint Width; uint Height;
-    uint A0Bits; uint A1Bits; uint A2Bits;
-    uint OmegaBits; uint FloorBits; uint ProtectBits;
-    uint Radius;
-};
-
+RWTexture2D<float4> Dst  : register(u0);
+)" DEHAZE_CB R"(
 [numthreads(8, 8, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
     if (tid.x >= Width || tid.y >= Height) return;
+    float I = S[tid.xy].a;
+    float p = 1.0 - asfloat(OmegaBits) * Dark[tid.xy];
+    Dst[tid.xy] = float4(I, p, I * p, I * I);
+}
+)";
 
-    float3 A = float3(asfloat(A0Bits), asfloat(A1Bits), asfloat(A2Bits));
-    float omega   = asfloat(OmegaBits);
-    float protect = asfloat(ProtectBits);
-
-    // Box average of the dark channel, subsampled so a large radius does not
-    // cost a large loop: the map is smooth, so every fourth sample describes
-    // it as well as every sample.
+    // Window means as RUNNING SUMS, a thread per run of kBoxRun pixels (see
+    // tonemap_local's box passes) -- over the CPU's CLIPPED window: samples
+    // past the edge are not counted, and the mean divides by how many were.
+    // That is BoxSum::Mean's rule, which replicating the edge would not be.
+#define DEHAZE_BOX_H(T) R"(
+static const int kBoxRun = 64;
+Texture2D<)" T R"(>   Src : register(t0);
+RWTexture2D<)" T R"(> Dst : register(u0);
+)" DEHAZE_CB R"(
+[numthreads(8, 8, 1)]
+void main(uint3 tid : SV_DispatchThreadID) {
+    int x0 = int(tid.x) * kBoxRun, y = int(tid.y), W = int(Width);
+    if (x0 >= W || y >= int(Height)) return;
     int r = int(Radius);
-    int stepp = max(1, r / 4);
-    float sum = 0.0; float cnt = 0.0;
-    for (int dy = -r; dy <= r; dy += stepp)
-        for (int dx = -r; dx <= r; dx += stepp) {
-            int x = clamp(int(tid.x) + dx, 0, int(Width) - 1);
-            int y = clamp(int(tid.y) + dy, 0, int(Height) - 1);
-            sum += Dark[int2(x, y)];
-            cnt += 1.0;
+    )" T R"( sum = 0;
+    for (int i = max(0, x0 - r); i <= min(W - 1, x0 + r); ++i) sum += Src[int2(i, y)];
+    int x1 = min(x0 + kBoxRun, W);
+    for (int x = x0; x < x1; ++x) {
+        if (x > x0) {
+            if (x + r < W)      sum += Src[int2(x + r, y)];
+            if (x - r - 1 >= 0) sum -= Src[int2(x - r - 1, y)];
         }
-    float dark = (cnt > 0.0) ? sum / cnt : Dark[int2(tid.xy)];
+        float n = float(min(W - 1, x + r) - max(0, x - r) + 1);
+        Dst[int2(x, y)] = sum / n;
+    }
+}
+)"
+#define DEHAZE_BOX_V(T) R"(
+static const int kBoxRun = 64;
+Texture2D<)" T R"(>   Src : register(t0);
+RWTexture2D<)" T R"(> Dst : register(u0);
+)" DEHAZE_CB R"(
+[numthreads(8, 8, 1)]
+void main(uint3 tid : SV_DispatchThreadID) {
+    int x = int(tid.x), y0 = int(tid.y) * kBoxRun, H = int(Height);
+    if (x >= int(Width) || y0 >= H) return;
+    int r = int(Radius);
+    )" T R"( sum = 0;
+    for (int i = max(0, y0 - r); i <= min(H - 1, y0 + r); ++i) sum += Src[int2(x, i)];
+    int y1 = min(y0 + kBoxRun, H);
+    for (int y = y0; y < y1; ++y) {
+        if (y > y0) {
+            if (y + r < H)      sum += Src[int2(x, y + r)];
+            if (y - r - 1 >= 0) sum -= Src[int2(x, y - r - 1)];
+        }
+        float n = float(min(H - 1, y + r) - max(0, y - r) + 1);
+        Dst[int2(x, y)] = sum / n;
+    }
+}
+)"
+    static constexpr const char* kBox4H = DEHAZE_BOX_H("float4");
+    static constexpr const char* kBox4V = DEHAZE_BOX_V("float4");
+    static constexpr const char* kBox2H = DEHAZE_BOX_H("float2");
+    static constexpr const char* kBox2V = DEHAZE_BOX_V("float2");
+#undef DEHAZE_BOX_H
+#undef DEHAZE_BOX_V
 
-    float t = 1.0 - omega * dark;
+    // The local linear model: within a window, t = a*I + b.
+    static constexpr const char* kAb = R"(
+Texture2D<float4>   M   : register(t0);
+RWTexture2D<float2> Dst : register(u0);
+)" DEHAZE_CB R"(
+[numthreads(8, 8, 1)]
+void main(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= Width || tid.y >= Height) return;
+    float4 m = M[tid.xy];                      // mean I, p, I*p, I*I
+    float cov = m.z - m.x * m.y;
+    float var = m.w - m.x * m.x;
+    float a = cov / (var + asfloat(EpsBits));
+    Dst[tid.xy] = float2(a, m.y - a * m.x);
+}
+)";
 
-    // Sky protection: where the pixel is already close to the airlight
-    // COLOUR, raise its floor. Measured on colour distance so a white
-    // building against blue sky is left alone.
+    // Every window's (a, b) averaged, applied to the guide, then the sky
+    // protection -- at the small scale, as on the CPU.
+    static constexpr const char* kTFinal = R"(
+Texture2D<float2>   AB  : register(t0);
+Texture2D<float4>   S   : register(t1);
+RWTexture2D<float>  Dst : register(u0);
+)" DEHAZE_CB R"(
+[numthreads(8, 8, 1)]
+void main(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= Width || tid.y >= Height) return;
+    float2 ab = AB[tid.xy];
+    float4 s = S[tid.xy];
+    float t = ab.x * s.a + ab.y;
+    float protect = asfloat(ProtectBits);
     if (protect > 0.0) {
-        float3 c = Img[int2(tid.xy)].rgb;
-        float d = length(c - A);
-        float near_ = saturate(1.0 - d / 0.15);
+        // Within about 15% of the airlight colour counts as sky.
+        float near_ = saturate(1.0 - length(s.rgb - Air()) / 0.15);
         t = max(t, near_ * protect);
     }
     Dst[tid.xy] = t;
 }
 )";
 
-    // J = (I - A)/max(t, t0) + A, at full resolution.
+    // J = (I - A)/max(t, t0) + A, at full resolution, the small map sampled
+    // bilinearly with the CPU's half-pixel convention.
     static constexpr const char* kRecover = R"(
 Texture2D<float4>   Src : register(t0);
 Texture2D<float>    T   : register(t1);
 RWTexture2D<float4> Dst : register(u0);
-cbuffer Constants : register(b0) {
-    uint Width; uint Height;
-    uint A0Bits; uint A1Bits; uint A2Bits;
-    uint OmegaBits; uint FloorBits; uint ProtectBits;
-    uint Radius;
-};
-
+)" DEHAZE_CB R"(
 [numthreads(8, 8, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
     if (tid.x >= Width || tid.y >= Height) return;
-    float3 A  = float3(asfloat(A0Bits), asfloat(A1Bits), asfloat(A2Bits));
+    float3 A  = Air();
     float  t0 = asfloat(FloorBits);
-    float4 c  = Src[int2(tid.xy)];
-    float  t  = max(T[int2(tid.xy)], t0);
-    float3 j  = (c.rgb - A) / t + A;
+    int k = int(K), sw = int(SmallW), sh = int(SmallH);
+    float fx = (k > 1) ? clamp((float(tid.x) + 0.5) / float(k) - 0.5, 0.0, float(sw - 1)) : float(tid.x);
+    float fy = (k > 1) ? clamp((float(tid.y) + 0.5) / float(k) - 0.5, 0.0, float(sh - 1)) : float(tid.y);
+    int x0 = int(fx), y0 = int(fy);
+    int x1 = min(x0 + 1, sw - 1), y1 = min(y0 + 1, sh - 1);
+    float wx = fx - float(x0), wy = fy - float(y0);
+    float ta = T[int2(x0, y0)] + (T[int2(x1, y0)] - T[int2(x0, y0)]) * wx;
+    float tb = T[int2(x0, y1)] + (T[int2(x1, y1)] - T[int2(x0, y1)]) * wx;
+    float t  = max(ta + (tb - ta) * wy, t0);
 
-    // CLAMPED WITHOUT SHIFTING THE HUE.
-    //
-    // Clamping each channel at zero on its own is what turns an over-strong
-    // correction into a COLOUR change: a pixel below the airlight recovers
-    // negative fastest in the channel where the gap is widest, so red hits the
-    // clamp while blue is still positive and a grey cloud comes out purple.
-    // That is a far worse artefact than the darkening it is standing in for,
-    // because it does not look like too much dehaze -- it looks broken.
-    //
-    // So when any channel goes negative, scale the whole pixel back toward
-    // black along its own colour instead. The result darkens, which is what
-    // the model is actually saying, and keeps its hue while doing it.
+    float4 c = Src[int2(tid.xy)];
+    float3 j = (c.rgb - A) / t + A;
+
+    // CLAMPED WITHOUT SHIFTING THE HUE: when any channel goes negative, the
+    // whole pixel moves back toward its original colour just far enough --
+    // clamping channels one at a time turns too much dehaze into a colour
+    // change (red hits zero first, and a grey cloud comes out purple).
     float m = min(j.r, min(j.g, j.b));
     if (m < 0.0) {
-        // How far along the line from the original colour to the recovered one
-        // we can travel before any channel crosses zero.
         float3 d = j - c.rgb;
-        float k = 1.0;
+        float kk = 1.0;
         [unroll] for (int i = 0; i < 3; ++i) {
-            if (d[i] < 0.0 && j[i] < 0.0) k = min(k, c.rgb[i] / max(-d[i], 1e-6));
+            if (d[i] < 0.0 && j[i] < 0.0) kk = min(kk, c.rgb[i] / max(-d[i], 1e-6));
         }
-        j = c.rgb + d * saturate(k);
+        j = c.rgb + d * saturate(kk);
     }
     // The top is left unclamped so a scene-linear image keeps its headroom.
     Dst[tid.xy] = float4(max(j, 0.0), c.a);
 }
 )";
+#undef DEHAZE_CB
 
 
     // Running minimum over one line, in O(1) per pixel REGARDLESS OF RADIUS
@@ -1087,9 +1181,11 @@ void main(uint3 tid : SV_DispatchThreadID) {
     // RunCPU, so there is nothing on the stack to carry them.
     bool  m_gpuValid  = false;
     float m_gpuA[3]   = {0.5f, 0.5f, 0.5f};
-    int   m_gpuPatch  = 12;
+    int   m_gpuPatch  = 12;   // at the working scale
     int   m_gpuRefine = 20;
     float m_gpuScale  = 1.0f;
+    int   m_gpuK      = 1;    // the working scale's divisor
+    int   m_gpuSmallW = 1, m_gpuSmallH = 1;
 };
 
 REGISTER_ALGORITHM(Dehaze);

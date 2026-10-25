@@ -752,7 +752,8 @@ public:
     virtual FormatSpec GpuScratchPlanes() const { return FormatSpec::R32F; }
 
     // PER PLANE, when they differ: the format of plane `i`, and how many times
-    // smaller than the output it is on each side (1 = the output's size).
+    // smaller than the output it is on each side (1 = the output's size;
+    // otherwise the output's size divided by it, rounded down, at least 1).
     //
     // One format for the whole pool made a two-channel plane pay for four --
     // tonemap_local's log/log^2 and a/b planes went through RGBA32F, half the

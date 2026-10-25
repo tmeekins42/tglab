@@ -1597,36 +1597,34 @@ static void TestCompare(ID3D12Device* dev) {
         Check(r.diffImage.Valid(), "diff image produced");
     }
 
-    // DEHAZE, whose two paths are deliberately not identical.
+    // DEHAZE: the GPU path is the CPU's algorithm, pass for pass -- working
+    // scale, patch minimum, guided filter, sky protection, bilinear recovery.
+    // Only the airlight is found differently (from a strided sample), which on
+    // these fixtures lands on the same value.
     //
-    // The GPU path estimates the airlight from a strided sample rather than a
-    // full scan, computes the map at full resolution rather than at 1/4 scale,
-    // and smooths it with a box rather than a guided filter. Each is a
-    // considered trade for a path that exists to be dragged.
-    //
-    // So this is not an equality check -- it is a check that the two are the
-    // same PICTURE. A tolerance this wide would hide a subtle error, but the
-    // failures that matter here are gross: a wrong airlight shifts every
-    // colour, and a mis-bound pass produces noise or black.
-    {
+    // At two sizes, because the algorithm itself changes with size: above 2 MP
+    // both paths estimate the map at 1/4 scale, below it at full. The 512
+    // fixture exercises one, the 1500 the other. When the GPU path was a box
+    // smooth at full resolution standing in for the guided filter, this
+    // allowed a mean difference of 12; it now measures under 0.5.
+    for (int dim : {512, 1500}) {
         UiState ui; Pipeline pipe; std::vector<Data> src; std::string e;
         BuildPipeline("src = image(\"test\")\nd = dehaze(src, strength = 0.7)\ndisplay(d)\n",
-                      512, &ui, &pipe, &src, &e);
+                      dim, &ui, &pipe, &src, &e);
         const CompareResult r = CompareCpuGpu(pipe, &src, &gpu, -1);
-        Check(r.ok, "dehaze compares" + (r.ok ? "" : ": " + r.error));
+        const std::string at = " at " + std::to_string(dim) + "x" + std::to_string(dim);
+        Check(r.ok, "dehaze compares" + at + (r.ok ? "" : ": " + r.error));
         if (r.ok) {
             std::printf("       CPU %.1f ms   GPU %.1f ms   speedup %.1fx   maxdiff %.3f  mean %.4f\n",
                         r.cpuMs, r.gpuMs, r.Speedup(), r.stats.maxAbsDiff,
                         r.stats.meanAbsDiff);
-            // The mean is the honest measure of "same picture": a handful of
-            // pixels may differ a lot where the two paths pick different
-            // window minima, but the image as a whole must not drift.
-            Check(r.stats.meanAbsDiff <= 12.0,
-                  "dehaze CPU and GPU produce the same picture (mean " +
-                      std::to_string(r.stats.meanAbsDiff) + ")");
+            Check(r.stats.meanAbsDiff <= 1.0 && r.stats.maxAbsDiff <= 4.0,
+                  "dehaze CPU and GPU produce the same picture" + at + " (mean " +
+                      std::to_string(r.stats.meanAbsDiff) + ", max " +
+                      std::to_string(r.stats.maxAbsDiff) + ")");
             // And the GPU path must actually be doing the work, not passing
             // the image through -- which would also produce a small diff.
-            Check(r.gpuImage.Valid(), "the GPU path produced an image");
+            Check(r.gpuImage.Valid(), "the GPU path produced an image" + at);
         }
     }
 
