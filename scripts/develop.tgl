@@ -10,6 +10,7 @@
 # Drop a raw file (.CR3, .ARW, .NEF, ...) onto the "test" row to develop it.
 
 developed = image("test")
+         => params( lens_correct )()   # first, on the linear frame: see _develop.tgl
 
 include "_develop.tgl"
 

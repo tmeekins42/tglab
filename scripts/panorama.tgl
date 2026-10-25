@@ -83,7 +83,12 @@
 # refines scale continuously through intra-octave layers where ORB can only
 # name a pyramid level. Reach for SIFT only if a pair refuses to solve.
 
-frames = image("group")
+# lens_correct FIRST, on every frame. Distortion is the one thing a stitch
+# cannot model: a homography maps straight lines to straight lines, so a
+# barrel-bent frame never quite fits its neighbour, and the error grows toward
+# the edges -- exactly where frames overlap. Lateral CA and vignetting show as
+# colour fringes and brightness steps along the seams.
+frames = image("group") => params( lens_correct )()
 
 det = choose("detector", [detect_orb, detect_brisk, detect_sift,
                           detect_surf, detect_akaze])

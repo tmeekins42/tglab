@@ -39,6 +39,9 @@
 #                  detail is compressed into almost nothing -- it would erase
 #                  exactly what it is meant to preserve.
 #
+#   sharpen        after denoise, so it restores detail rather than
+#                  amplifying the noise denoise just removed.
+#
 #   orton          a creative effect, so it goes after the corrections.
 #
 #   vignette       last, because it is a property of the lens rather than of
@@ -59,10 +62,17 @@
 #
 # A switched-off stage costs nothing at all: it is skipped entirely, with no
 # allocation, no dispatch and no copy, and passes its input straight through.
+#
+# NOT HERE: lens_correct. It belongs on each FRAME, straight after image() --
+# before align, a merge or a stitch, which all do better on undistorted frames,
+# and on linear data, where its vignetting gain is a true transmission. By the
+# time this fragment runs the frames are already merged, so each script that
+# includes it puts lens_correct first instead.
 
 developed = developed
          => params( basic_adjust, auto_exposure = 1 )()
          => params( dehaze )()
          => params( wavelet_denoise )()
+         => params( sharpen )()
          => params( orton )()
          => params( vignette )()

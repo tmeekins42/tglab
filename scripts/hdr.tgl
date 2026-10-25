@@ -55,7 +55,10 @@
 
 tonemap_op = choose("tonemapper", [tonemap, tonemap_local])
 
+# lens_correct FIRST, on every frame: align and the merge both do better on
+# undistorted frames, and the vignetting gain belongs to linear light.
 developed = image("group")
+         => params( lens_correct )()
          => params( align )()
          => params( merge_hdr )()
          => params( tonemap_op )()         

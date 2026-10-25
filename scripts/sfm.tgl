@@ -136,6 +136,14 @@ frames = image("group")
 # final reconstruction. Both are correct; they differ in how long you wait.
 small = params( resize, scale = 0.4 )( frames )
 
+# LENS CORRECTION, on the working frames. Structure from motion assumes a
+# pinhole camera, which draws straight lines straight; a lens's distortion
+# bends them, and the solver absorbs the bend as error in every camera and
+# point. After the resize because its corrections are relative to the frame --
+# the same at any size -- and measuring lateral CA on the small frames is far
+# cheaper than on full-resolution ones.
+small = params( lens_correct )( small )
+
 # LEARNED FEATURES BY DEFAULT: DaD finds the points and DeDoDe describes them
 # -- the detector and descriptor of LoMa (2026), run on tglab's own kernels.
 # Measured against the AKAZE line below, everything else as in this script:
