@@ -10,6 +10,7 @@
 // one where a plain Gaussian visibly fails.
 #include <chrono>
 #include <cstdlib>
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
@@ -504,6 +505,120 @@ static void TestVignette() {
 //   * At colour 0 the three channels share one field exactly, so the grain
 //     moves along luminance and has no hue at all.
 //   * It does not shift exposure: the mean survives.
+// lens_correct: each correction undoes a lens built to the documented model.
+static void TestLensCorrect() {
+    constexpr int W = 640, H = 480;
+    const double cx = W * 0.5, cy = H * 0.5, hd = 0.5 * std::hypot(double(W), double(H));
+    auto ring = [](double r) {   // soft concentric edges, every few pixels
+        const double t = std::clamp(std::sin(r / 5.0) * 2.0, -1.0, 1.0);
+        return float(0.3 + 0.2 * (t + 1.0));
+    };
+    auto image = [&](auto fn) {
+        Image img;
+        ImageDesc d{W, H, Format::RGBA32F};
+        d.linear = true;
+        img.Alloc(d);
+        ImageView v = img.MapCpuWrite();
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                float* p = v.At<float>(x, y);
+                fn(x + 0.5, y + 0.5, p);
+                p[3] = 1.0f;
+            }
+        return img;
+    };
+    // LATERAL CA: red drawn 2 per mille larger than green, blue 1.5 smaller.
+    const double aR = 0.002, aB = -0.0015;
+    auto fringed = [&] {
+        return image([&](double x, double y, float* p) {
+            const double r = std::hypot(x - cx, y - cy);
+            p[0] = ring(r / (1 + aR)); p[1] = ring(r); p[2] = ring(r / (1 + aB));
+        });
+    };
+    auto fringe = [&](Image& im) {   // mean |R-G| + |B-G| away from the centre
+        ImageView v = im.MapCpuRead();
+        double s = 0; int n = 0;
+        for (int y = 8; y < H - 8; ++y)
+            for (int x = 8; x < W - 8; ++x) {
+                if (std::hypot(x + 0.5 - cx, y + 0.5 - cy) < 0.4 * hd) continue;
+                const float* p = v.At<float>(x, y);
+                s += std::fabs(p[0] - p[1]) + std::fabs(p[2] - p[1]); ++n;
+            }
+        return s / n;
+    };
+    std::string err;
+    Image in = fringed(), autoOut, manualOut;
+    const double before = fringe(in);
+    if (RunFilter("lens_correct", fringed(), {{"fill", 0.0}}, &autoOut, &err) &&
+        RunFilter("lens_correct", fringed(),
+                  {{"auto_ca", 0.0}, {"fill", 0.0}, {"ca_red", 2.0}, {"ca_blue", -1.5}},
+                  &manualOut, &err)) {
+        const double a = fringe(autoOut), m = fringe(manualOut);
+        Check(a < 0.15 * before, "lens_correct auto_ca measures and removes lateral CA (fringe " +
+                                     std::to_string(before) + " -> " + std::to_string(a) + ")");
+        Check(m < 0.15 * before, "ca_red / ca_blue undo the magnifications they name (fringe " +
+                                     std::to_string(before) + " -> " + std::to_string(m) + ")");
+    } else {
+        Check(false, "lens_correct runs: " + err);
+    }
+
+    // DISTORTION: a straight vertical line photographed through a barrel lens
+    // (k1 = -0.1) bows; corrected with the same k1 it is straight again.
+    const double k1 = -0.1, lineX = 140.0;
+    auto bent = [&] {
+        return image([&](double x, double y, float* p) {
+            // The scene point the lens drew here: invert r_d = r (1 + k1 r^2).
+            const double dx = (x - cx) / hd, dy = (y - cy) / hd;
+            double ux = dx, uy = dy;
+            for (int i = 0; i < 20; ++i) {
+                const double f = 1 + k1 * (ux * ux + uy * uy);
+                ux = dx / f; uy = dy / f;
+            }
+            const double sx = cx + ux * hd;
+            const float v = float(std::exp(-0.5 * std::pow((sx - lineX) / 1.5, 2)));
+            p[0] = p[1] = p[2] = v;
+        });
+    };
+    auto wobble = [&](Image& im) {   // spread of the line's centroid over rows
+        ImageView v = im.MapCpuRead();
+        double lo = 1e9, hi = -1e9;
+        for (int y = 20; y < H - 20; y += 10) {
+            double s = 0, sw = 0;
+            for (int x = 0; x < W / 2; ++x) { const float q = v.At<float>(x, y)[1]; s += q * (x + 0.5); sw += q; }
+            if (sw > 0) { lo = std::min(lo, s / sw); hi = std::max(hi, s / sw); }
+        }
+        return hi - lo;
+    };
+    Image bentIn = bent(), straight;
+    const double bow = wobble(bentIn);
+    if (RunFilter("lens_correct", bent(), {{"k1", k1}, {"auto_ca", 0.0}, {"fill", 0.0}}, &straight, &err)) {
+        const double rest = wobble(straight);
+        Check(bow > 5.0 && rest < 0.3, "lens_correct straightens a barrel-bent line (bow " +
+                                            std::to_string(bow) + " px -> " + std::to_string(rest) + " px)");
+    } else {
+        Check(false, "lens_correct distortion runs: " + err);
+    }
+
+    // VIGNETTING: one stop lost at the corner, given back, in linear light.
+    auto flat = [&] { return image([](double, double, float* p) { p[0] = p[1] = p[2] = 0.25f; }); };
+    Image lit, same;
+    if (RunFilter("lens_correct", flat(), {{"vignette", 1.0}, {"auto_ca", 0.0}}, &lit, &err) &&
+        RunFilter("lens_correct", flat(), {}, &same, &err)) {
+        ImageView v = lit.MapCpuRead(), s = same.MapCpuRead();
+        const float c = v.At<float>(W / 2, H / 2)[1], k = v.At<float>(0, 0)[1];
+        Check(std::fabs(c - 0.25f) < 1e-3f && std::fabs(k - 0.5f) < 0.01f,
+              "vignette = 1 doubles the corner and leaves the centre (" + std::to_string(c) +
+                  ", " + std::to_string(k) + ")");
+        bool exact = true;
+        for (int y = 0; y < H && exact; ++y)
+            for (int x = 0; x < W; ++x)
+                if (s.At<float>(x, y)[1] != 0.25f) { exact = false; break; }
+        Check(exact, "lens_correct with nothing to correct returns the image exactly");
+    } else {
+        Check(false, "lens_correct vignette runs: " + err);
+    }
+}
+
 static void TestFilmGrain() {
     const int W = 128, H = 128;
     auto flat = [&](float level) {
@@ -1780,6 +1895,7 @@ int main() {
     std::string err;
     TestKelvinWhiteBalance();
     TestVignette();
+    TestLensCorrect();
     TestFilmGrain();
     TestOrton();
     TestLut();

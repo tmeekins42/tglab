@@ -1394,6 +1394,26 @@ static void TestGpuAgreement(ID3D12Device* dev) {
          "o = tonemap(src, exposure = 1.5, preserve_hue = 0)\n"
          "display(o)\n", 2.0, 0.5},
 
+        // lens_correct: one inverse map and a bicubic resample, the same on
+        // both sides -- every correction on at once, and fill's scale search,
+        // which both paths run from the same descriptor. Then auto_ca, whose
+        // magnifications the GPU path measures from a readback.
+        //
+        // Mean 0.75 rather than 0.5 for the first: nearly every output value is
+        // fractional (resampled, then a gain through the sRGB curve), and the
+        // CPU's RGBA8 pack TRUNCATES where the GPU's UNORM store rounds, so the
+        // CPU sits about half a level low wherever the fraction falls the
+        // wrong way. Measured 0.52, max 1.
+        {"lens_correct",
+         "src = image(\"test\")\n"
+         "o = lens_correct(src, k1 = -0.08, k2 = 0.02, auto_ca = 0, ca_red = 1.5, "
+         "ca_blue = -1, vignette = 0.6)\n"
+         "display(o)\n", 2.0, 0.75},
+        {"lens_correct",
+         "src = image(\"test\")\n"
+         "o = lens_correct(src, k1 = 0.05)\n"
+         "display(o)\n", 2.0, 0.5},
+
         {"threshold_bernsen",
          "src = image(\"test\")\n"
          "o = threshold_bernsen(src, window = 15, contrast_min = 15, "
