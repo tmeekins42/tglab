@@ -125,6 +125,59 @@ double MeanError(Image& img, int channel) {
 
 } // namespace
 
+// HIGHLIGHT RECONSTRUCTION RECOVERS A PARTLY CLIPPED COLOUR. A warm surround
+// (R:G:B = 4:2:1) holds a disc of the same colour 1.6x brighter, where red
+// passed the clamp and was cut to it while green and blue were still measured.
+// Clamped, the disc reads R:G = 1.25 -- paler than the scene. Rebuilt from the
+// surround's chromaticity at the level green and blue imply, it must come back
+// near 2. A flat neutral image with nothing clipped must pass unchanged, and a
+// plain (non-raw) image must pass through untouched.
+static void TestHighlightReconstruct() {
+    constexpr int W = 96, H = 96;
+    auto make = [&](bool disc) {
+        ImageDesc d{W, H, Format::RGBA32F};
+        d.linear = true;
+        d.camMul[0] = 1.0f; d.camMul[1] = 2.0f; d.camMul[2] = 2.0f;   // ceiling 1, max 2
+        for (int i = 0; i < 9; ++i) d.rgbCam[i] = (i % 4 == 0) ? 1.0f : 0.0f;
+        Image img;
+        img.Alloc(d);
+        ImageView v = img.MapCpuWrite();
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                const float dx = float(x - W / 2), dy = float(y - H / 2);
+                const float k = (disc && dx * dx + dy * dy < 12.0f * 12.0f) ? 1.6f : 0.9f;
+                float* p = v.At<float>(x, y);
+                p[0] = std::min(1.0f, k * 1.0f);
+                p[1] = k * 0.5f;
+                p[2] = k * 0.25f;
+                p[3] = 1.0f;
+            }
+        return img;
+    };
+    std::string err;
+    Image out;
+    if (RunDemosaic("highlight_reconstruct", make(true), {}, &out, &err)) {
+        ImageView o = out.MapCpuRead();
+        const float* c = o.At<float>(W / 2, H / 2);
+        const float* s = o.At<float>(8, 8);
+        Check(std::abs(c[0] / c[1] - 2.0f) < 0.15f && std::abs(c[1] - 0.8f) < 0.01f,
+              "highlight_reconstruct rebuilds a clipped red at the surround's colour (R " +
+                  std::to_string(c[0]) + " G " + std::to_string(c[1]) + " B " +
+                  std::to_string(c[2]) + ")");
+        Check(std::abs(s[0] - 0.9f) < 1e-4f && std::abs(s[1] - 0.45f) < 1e-4f,
+              "highlight_reconstruct leaves unclipped pixels exactly as they were");
+    } else {
+        Check(false, "highlight_reconstruct runs: " + err);
+    }
+    if (RunDemosaic("highlight_reconstruct", make(false), {}, &out, &err)) {
+        ImageView o = out.MapCpuRead();
+        const float* c = o.At<float>(W / 2, H / 2);
+        Check(std::abs(c[0] - 0.9f) < 1e-4f, "highlight_reconstruct with nothing clipped is a no-op");
+    } else {
+        Check(false, "highlight_reconstruct (nothing clipped) runs: " + err);
+    }
+}
+
 int main() {
     // (orientation checks run first: they need no fixture)
 
@@ -1252,6 +1305,8 @@ int main() {
             std::printf("(no D3D12 device - GPU agreement skipped)\n");
         }
     }
+
+    TestHighlightReconstruct();
 
     std::printf("\n%s\n", g_fail == 0 ? "all demosaic checks passed" : "FAILURES PRESENT");
     return g_fail == 0 ? 0 : 1;
