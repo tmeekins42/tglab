@@ -380,9 +380,20 @@ void Device::DeferRelease(ID3D12Resource* res) {
     m_pendingReleases.push_back({res, m_fenceLast + 1});
 }
 
+void Device::DeferFreeSrv(D3D12_CPU_DESCRIPTOR_HANDLE cpu, D3D12_GPU_DESCRIPTOR_HANDLE gpu) {
+    if (!cpu.ptr) return;
+    m_pendingSrvs.push_back({cpu, gpu, m_fenceLast + 1});
+}
+
 // force: release regardless of the fence, for shutdown after the queue is idle.
 void Device::CollectPendingReleases(bool force) {
     const UINT64 done = m_fence ? m_fence->GetCompletedValue() : 0;
+    for (auto& p : m_pendingSrvs) {
+        if (!force && p.fence > done) continue;
+        Srv().Free(p.cpu, p.gpu);
+        p.cpu.ptr = 0;
+    }
+    std::erase_if(m_pendingSrvs, [](const PendingSrv& p) { return p.cpu.ptr == 0; });
     for (auto& p : m_pendingReleases) {
         if (!force && p.fence > done) continue;
         p.res->Release();

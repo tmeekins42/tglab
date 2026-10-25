@@ -65,6 +65,19 @@ public:
     // error. Deferring the Release() to a known-complete fence value avoids it.
     void DeferRelease(ID3D12Resource* res);
 
+    // The same for a shader-visible descriptor: returned to the heap once the
+    // GPU has finished every frame submitted so far.
+    //
+    // A descriptor is read when the command list EXECUTES, not when it is
+    // recorded, and the heap's free list is last-in first-out -- so a slot
+    // freed at once was the very next one handed out. Recreating a viewer's
+    // display texture (whenever the shown image changes size, which a zoomed
+    // drag of sharpen's radius did on most ticks) freed the old SRV and wrote
+    // the new texture's into the same slot, and frames already submitted then
+    // drew the NEW texture -- uninitialised, or still a copy destination: a
+    // one-frame flash of garbage or the transparency checkerboard.
+    void DeferFreeSrv(D3D12_CPU_DESCRIPTOR_HANDLE cpu, D3D12_GPU_DESCRIPTOR_HANDLE gpu);
+
     // Video memory the process is using, and the driver's budget for it, in
     // bytes. Both zero when the adapter cannot report it.
     //
@@ -91,6 +104,12 @@ private:
         UINT64          fence = 0;
     };
     std::vector<PendingRelease> m_pendingReleases;
+    struct PendingSrv {
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu{};
+        D3D12_GPU_DESCRIPTOR_HANDLE gpu{};
+        UINT64 fence = 0;
+    };
+    std::vector<PendingSrv> m_pendingSrvs;
     void CollectPendingReleases(bool force);
 
     ID3D12Device*              m_device     = nullptr;

@@ -15,7 +15,7 @@ void RenderTarget::Release() {
     if (m_dev) {
         if (m_colour) m_dev->DeferRelease(m_colour);
         if (m_depth)  m_dev->DeferRelease(m_depth);
-        if (m_srv.ptr) m_dev->Srv().Free(m_srvCpu, m_srv);
+        if (m_srv.ptr) m_dev->DeferFreeSrv(m_srvCpu, m_srv);
     }
     m_colour = nullptr;
     m_depth = nullptr;

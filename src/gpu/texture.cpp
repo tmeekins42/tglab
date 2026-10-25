@@ -28,7 +28,7 @@ void GpuTexture::Release() {
         // Srv().Free() tolerates being called after the heap is gone, but the
         // descriptor is only meaningful while the device lives.
         if (deferrable) {
-            m_dev->Srv().Free(m_cpu, m_gpu);
+            m_dev->DeferFreeSrv(m_cpu, m_gpu);
             m_dev->DeferRelease(m_res);
         } else {
             m_res->Release();
