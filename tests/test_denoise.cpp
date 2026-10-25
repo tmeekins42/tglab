@@ -2,6 +2,7 @@
 // with strength, and edge preservation.
 #include <cstdio>
 #include <cmath>
+#include <cstring>
 #include <algorithm>
 #include <random>
 #include <span>
@@ -107,6 +108,32 @@ int main() {
         left /= n; right /= n;
         std::printf("       edge %.3f -> %.3f (input 0.25 -> 0.75)\n", left, right);
         Check(right - left > 0.40, "the step edge survives denoising");
+    }
+    {
+        // AT A PREVIEW SCALE the finest levels are dropped and the rest run at
+        // the thresholds of the full-resolution levels they stand for. So a
+        // 4-level denoise of a quarter-scale preview must equal, exactly, a
+        // 2-level denoise of the same pixels at full scale with the thresholds
+        // of full-resolution levels 2 and 3 -- a quarter of the finest's.
+        Image preview = noisy.Clone();
+        {
+            ImageDesc d = preview.Desc();
+            d.proxyScale = 0.25f;
+            Image tagged; tagged.Alloc(d);
+            ImageView src = preview.MapCpuRead(), dst = tagged.MapCpuWrite();
+            std::memcpy(dst.data, src.data, d.SizeInBytes());
+            preview = std::move(tagged);
+        }
+        Image a = Run(preview, 0.04, 0.10, 4);
+        Image b = Run(noisy, 0.04 / 4, 0.10 / 4, 2);
+        ImageView va = a.MapCpuRead(), vb = b.MapCpuRead();
+        double maxD = 0;
+        for (int y = 0; y < dim; ++y) for (int x = 0; x < dim; ++x)
+            for (int c = 0; c < 3; ++c)
+                maxD = std::max(maxD, std::fabs(double(va.At<float>(x, y)[c]) -
+                                                double(vb.At<float>(x, y)[c])));
+        Check(maxD < 1e-6, "a quarter-scale preview drops the two finest levels "
+                           "(max delta " + std::to_string(maxD) + ")");
     }
     {
         // The noise estimate recovers noise of a known size. Per-channel sigma

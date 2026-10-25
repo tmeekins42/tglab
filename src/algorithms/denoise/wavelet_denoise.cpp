@@ -343,7 +343,10 @@ public:
         const int ch = buf.Channels();
         const float scale = buf.ValueScale();
 
-        const int levels = std::clamp(int(m_levels), 1, 6);
+        // At a preview scale, the finest levels are of the full image's
+        // coarser ones -- see ProxyDrop.
+        const int drop   = ProxyDrop(ctx.PixelScale());
+        const int levels = EffectiveLevels(drop);
         // Thresholds are expressed as a fraction of the intensity range, so a
         // setting means the same thing on an 8-bit scan and a float raw. The
         // same units trap that made brightness apply its offset 255x over.
@@ -393,7 +396,7 @@ public:
 
             // This level's thresholds, in the buffer's units.
             float lumaT = 0.0f, chromaT = 0.0f;
-            LevelThresholds(noise, lvl, &lumaT, &chromaT);
+            LevelThresholds(noise, lvl, drop, &lumaT, &chromaT);
             lumaT *= scale;
             chromaT *= scale;
 
@@ -531,7 +534,7 @@ public:
     FormatSpec GpuScratchPlanes() const override { return FormatSpec::RGBA16F; }
 
     std::vector<GpuPass> GpuPasses() const override {
-        const int levels = std::clamp(int(m_levels), 1, 6);
+        const int levels = EffectiveLevels(ProxyDrop(GpuScaledPx(1.0f)));
         std::vector<GpuPass> p;
         p.push_back({kStart, "wavelet.start", {-1}, {0, 2}});
         for (int l = 0; l < levels; ++l) {
@@ -543,13 +546,14 @@ public:
     }
 
     std::vector<uint32_t> GpuPassConstants(int pass) const override {
-        const int levels = std::clamp(int(m_levels), 1, 6);
+        const int drop   = ProxyDrop(GpuScaledPx(1.0f));
+        const int levels = EffectiveLevels(drop);
         const int l = std::clamp(pass - 1, 0, levels - 1);
         // Thresholds are a fraction of the intensity range on both paths: a
         // texture reads 0..1 whatever its storage, so unlike the CPU's
         // PixelBuffer there is no 255 to apply.
         float lt = 0.0f, ct = 0.0f;
-        LevelThresholds(m_noise, l, &lt, &ct);
+        LevelThresholds(m_noise, l, drop, &lt, &ct);
         return {FloatBits(lt),
                 FloatBits(ct),
                 uint32_t(1 << l),
@@ -569,10 +573,39 @@ private:
     // With level_dep the threshold is later scaled by brightness relative to
     // middle grey, so the base is the noise AT middle grey -- the normalised
     // estimate -- blended by how much brightness dependence is asked for.
-    void LevelThresholds(const NoiseModel& nm, int l, float* luma, float* chroma) const {
+    // AT A PREVIEW SCALE the image is smaller, so each a-trous level covers
+    // more of the picture: at 1/4 scale, level 0 is the scale full-resolution
+    // level 2 works at. Run unchanged, a 4-level denoise of the preview took
+    // out structure up to 4x coarser than the final render does -- the preview
+    // looked smoother than what it previewed. So the `drop` finest levels go
+    // (they are below the preview's pixels), the rest run at the thresholds
+    // of the full-resolution levels they stand for, and at least one level
+    // always runs. With adaptive thresholds nothing more is needed: the noise
+    // is measured on the preview itself, level by level.
+    static int ProxyDrop(float scale) {
+        if (!(scale > 0.0f) || scale >= 1.0f) return 0;
+        return std::max(0, int(std::lround(std::log2(1.0 / double(scale)))));
+    }
+    int EffectiveLevels(int drop) const {
+        return std::max(1, std::clamp(int(m_levels), 1, kMaxLevels) - drop);
+    }
+
+    // How far the a-trous cascade reads: 2 * (2^L - 1) pixels of THIS run.
+    // Region rendering needs it to crop with a margin -- without one, a view
+    // zoomed in denoised its edge against a clamped border.
+    int ReachPixels() const override {
+        return 2 * ((1 << std::clamp(int(m_levels), 1, kMaxLevels)) - 1);
+    }
+
+    // The measured noise is the WHOLE picture's. Measured on a region it is
+    // that region's -- a patch of sky against a patch of shadow -- and the
+    // thresholds would change as the view pans. Fixed thresholds do not care.
+    bool RegionSafe() const override { return !bool(m_adaptive); }
+
+    void LevelThresholds(const NoiseModel& nm, int l, int drop, float* luma, float* chroma) const {
         l = std::clamp(l, 0, kMaxLevels - 1);
         if (!bool(m_adaptive)) {
-            const float f = 1.0f / float(1 << l);
+            const float f = 1.0f / float(1 << std::min(l + drop, 30));
             *luma = float(m_lumaStrength) * f;
             *chroma = float(m_chromaStrength) * f;
             return;
@@ -597,7 +630,7 @@ private:
             r += b;
         } else {
             float l0 = 0, c0 = 0;
-            LevelThresholds(nm, 0, &l0, &c0);
+            LevelThresholds(nm, 0, 0, &l0, &c0);
             std::snprintf(b, sizeof b, "thresholds %.4f / %.4f (fixed)", double(l0), double(c0));
             r = b;
         }
