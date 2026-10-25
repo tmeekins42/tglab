@@ -1382,6 +1382,18 @@ static void TestGpuAgreement(ID3D12Device* dev) {
          "o = wavelet_denoise(src, levels = 4)\n"
          "display(o)\n", 2.0, 1.0},
 
+        // tonemap: the percentiles measured from a readback's stride grid on
+        // the GPU path, from the unpacked buffer on the CPU -- the same grid,
+        // so the same fit -- and one curve applied per pixel. Both modes.
+        {"tonemap",
+         "src = image(\"test\")\n"
+         "o = tonemap(src, exposure = 1.5)\n"
+         "display(o)\n", 2.0, 0.5},
+        {"tonemap",
+         "src = image(\"test\")\n"
+         "o = tonemap(src, exposure = 1.5, preserve_hue = 0)\n"
+         "display(o)\n", 2.0, 0.5},
+
         {"threshold_bernsen",
          "src = image(\"test\")\n"
          "o = threshold_bernsen(src, window = 15, contrast_min = 15, "
