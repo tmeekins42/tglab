@@ -451,17 +451,37 @@ public:
 
     void MeasureForGpu(const std::vector<const Image*>& inputs) override {
         m_gpuValid = false;
+        m_measured = false;
         if (inputs.empty() || !inputs[0]) return;
 
         ImageView v = const_cast<Image*>(inputs[0])->MapCpuRead();
         if (!v.data) return;
-
-        PixelBuffer pb;
-        pb.Unpack(v);
-        if (!pb.Valid()) return;
-
-        const int w = pb.Width(), h = pb.Height(), ch = pb.Channels();
+        const ImageDesc& vd = v.desc;
+        const int w = vd.width, h = vd.height;
         if (w <= 0 || h <= 0) return;
+
+        // THE SAMPLED PIXELS READ DIRECTLY, not through PixelBuffer, whose
+        // Unpack converts the whole image to float to look at a few hundred
+        // thousand of them -- at 45 MP that was most of an 835 ms slider tick.
+        // Values in PixelBuffer's units (0..255 for RGBA8), as before, so the
+        // percentiles and the CPU path's agree.
+        auto lumAt = [&](int x, int y) -> float {
+            switch (vd.format) {
+                case Format::RGBA8: {
+                    const uint8_t* q = v.At<uint8_t>(x, y);
+                    const float p[3] = {float(q[0]), float(q[1]), float(q[2])};
+                    return Luma(p);
+                }
+                case Format::RGBA16F: {
+                    const uint16_t* q = v.At<uint16_t>(x, y);
+                    const float p[3] = {HalfToFloat(q[0]), HalfToFloat(q[1]), HalfToFloat(q[2])};
+                    return Luma(p);
+                }
+                case Format::RGBA32F: return Luma(v.At<float>(x, y));
+                case Format::R32F:    return *v.At<float>(x, y);
+                default:              return 0.0f;
+            }
+        };
 
         // Strided, like the CPU path's own measurement: a few hundred thousand
         // samples pin a percentile down, and a full sort at 45 MP would cost
@@ -469,31 +489,57 @@ public:
         std::vector<float> s;
         s.reserve(400000);
         const int stride = std::max(1, std::min(w, h) / 700);
-        const std::vector<float>& sp = pb.Data();
         for (int y = 0; y < h; y += stride)
-            for (int x = 0; x < w; x += stride) {
-                const float* p = &sp[(size_t(y) * size_t(w) + size_t(x)) * size_t(ch)];
-                const float lum = (ch >= 3)
-                    ? Luma(p) : p[0];
-                s.push_back(std::log2(std::max(lum, kFloor)));
-            }
+            for (int x = 0; x < w; x += stride)
+                s.push_back(std::log2(std::max(lumAt(x, y), kFloor)));
         if (s.size() < 1000) return;
 
         std::sort(s.begin(), s.end());
         auto pct = [&](double f) {
             return s[std::min(s.size() - 1, size_t(f * double(s.size() - 1) + 0.5))];
         };
-        const float low = pct(0.01), median = pct(0.50), high = pct(0.995);
-        if (!(high > low)) return;
+        m_pLow = pct(0.01);
+        m_pMedian = pct(0.50);
+        m_pHigh = pct(0.995);
+        m_measW = w;
+        m_measH = h;
+        m_measured = true;
+        Fit();
+    }
 
-        // Same fit as the CPU path, computed here so the shader receives two
-        // plain numbers rather than repeating the reasoning.
-        const float spanBefore = high - low;
+    // THE MEASUREMENT IS THE PICTURE'S, THE FIT IS THE SLIDERS'. Only the
+    // percentiles come from the pixels, so they are what the pipeline caches
+    // while a slider moves; range, exposure and radius are applied to them
+    // here, every run. Before, the fit was folded into the measurement, which
+    // therefore depended on `range` and could not be cached -- dragging range
+    // re-read and re-sorted the image on every tick.
+    bool MeasurementDependsOnlyOnInput() const override { return true; }
+    std::vector<uint32_t> SaveMeasurement() const override {
+        if (!m_measured) return {};
+        return {FloatBits(m_pLow), FloatBits(m_pMedian), FloatBits(m_pHigh),
+                uint32_t(m_measW), uint32_t(m_measH)};
+    }
+    bool RestoreMeasurement(const std::vector<uint32_t>& b) override {
+        if (b.size() != 5) return false;
+        auto f = [](uint32_t u) { float x; std::memcpy(&x, &u, 4); return x; };
+        m_pLow = f(b[0]); m_pMedian = f(b[1]); m_pHigh = f(b[2]);
+        m_measW = int(b[3]); m_measH = int(b[4]);
+        m_measured = true;
+        Fit();
+        return true;
+    }
+
+    // Same fit as the CPU path, computed here so the shader receives two
+    // plain numbers rather than repeating the reasoning.
+    void Fit() {
+        m_gpuValid = false;
+        if (!m_measured || !(m_pHigh > m_pLow)) return;
+        const float spanBefore = m_pHigh - m_pLow;
         const float target     = float(m_range);
         m_compression = (spanBefore > target) ? (target / spanBefore) : 1.0f;
         m_spanBefore  = spanBefore;
-        m_gpuOffset   = std::log2(kGreyIn) - m_compression * median + float(m_exposure);
-        m_gpuRadius   = std::max(2, int(float(m_radius) * 0.01f * float(std::min(w, h))));
+        m_gpuOffset   = std::log2(kGreyIn) - m_compression * m_pMedian + float(m_exposure);
+        m_gpuRadius   = std::max(2, int(float(m_radius) * 0.01f * float(std::min(m_measW, m_measH))));
         m_gpuValid    = true;
     }
 
@@ -677,6 +723,11 @@ private:
     // Separate from the CPU path's locals because the GPU path never runs
     // RunCPU, so there is nothing on the stack to carry them.
     bool  m_gpuValid  = false;
+    // The GPU path's measurement: the input's log-luminance percentiles,
+    // cached by the pipeline across runs. See Fit.
+    bool  m_measured = false;
+    float m_pLow = 0.0f, m_pMedian = 0.0f, m_pHigh = 0.0f;
+    int   m_measW = 0, m_measH = 0;
     float m_gpuOffset = 0.0f;
     int   m_gpuRadius = 8;
 };
