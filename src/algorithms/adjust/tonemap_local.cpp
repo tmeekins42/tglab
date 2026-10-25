@@ -154,36 +154,59 @@ void main(uint3 tid : SV_DispatchThreadID) {
 }
 )";
 
-// P1/P4: separable box, horizontal. Gathers 2r+1 along one axis.
+// P1/P4: separable box, horizontal -- a RUNNING SUM, as on the CPU.
 //
-// A running sum would be O(1) per pixel as on the CPU, but a compute thread
-// has no cheap way to carry state along a row. Two separable gathers are
-// O(2r) rather than O(r^2), which is what makes a 300-pixel radius practical:
-// 600 fetches per pixel instead of 360,000.
+// Each thread walks a run of kBoxRun pixels along its row: it gathers the full
+// 2r+1 window for the first, then slides it -- add the sample entering, drop
+// the one leaving -- for the rest. That is (2r+1)/kBoxRun + 2 fetches per pixel
+// rather than 2r+1. The base layer's radius is a PERCENTAGE of the image, ~300
+// px at 45 MP, so the plain gather was 601 fetches per pixel per pass, four
+// passes, and nearly all of a 470 ms slider tick. The window is re-gathered
+// at each run's start, so float error in the sliding sum cannot build up over
+// more than kBoxRun steps.
+//
+// The pass declares the run (GpuPass::divX), and the grid is a thread per run.
 const char* const kTlBoxHHlsl = R"(
+static const int kBoxRun = 64;
 [numthreads(8, 8, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
-    if (tid.x >= Width || tid.y >= Height) return;
+    int x0 = int(tid.x) * kBoxRun, y = int(tid.y);
+    if (x0 >= int(Width) || y >= int(Height)) return;
     int r = int(Radius);
+    float inv = 1.0 / float(2 * r + 1);
     float2 sum = 0.0;
     for (int i = -r; i <= r; ++i)
-        sum += T0[ClampXY(int(tid.x) + i, int(tid.y))].xy;
-    U0[tid.xy] = float4(sum / float(2 * r + 1), 0, 1);
+        sum += T0[ClampXY(x0 + i, y)].xy;
+    int x1 = min(x0 + kBoxRun, int(Width));
+    for (int x = x0; x < x1; ++x) {
+        if (x > x0)
+            sum += T0[ClampXY(x + r, y)].xy - T0[ClampXY(x - r - 1, y)].xy;
+        U0[int2(x, y)] = float4(sum * inv, 0, 1);
+    }
 }
 )";
 
-// P2/P5: separable box, vertical.
+// P2/P5: separable box, vertical, the same running sum down a column.
 const char* const kTlBoxVHlsl = R"(
+static const int kBoxRun = 64;
 [numthreads(8, 8, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
-    if (tid.x >= Width || tid.y >= Height) return;
+    int x = int(tid.x), y0 = int(tid.y) * kBoxRun;
+    if (x >= int(Width) || y0 >= int(Height)) return;
     int r = int(Radius);
+    float inv = 1.0 / float(2 * r + 1);
     float2 sum = 0.0;
     for (int i = -r; i <= r; ++i)
-        sum += T0[ClampXY(int(tid.x), int(tid.y) + i)].xy;
-    U0[tid.xy] = float4(sum / float(2 * r + 1), 0, 1);
+        sum += T0[ClampXY(x, y0 + i)].xy;
+    int y1 = min(y0 + kBoxRun, int(Height));
+    for (int y = y0; y < y1; ++y) {
+        if (y > y0)
+            sum += T0[ClampXY(x, y + r)].xy - T0[ClampXY(x, y - r - 1)].xy;
+        U0[int2(x, y)] = float4(sum * inv, 0, 1);
+    }
 }
 )";
+constexpr uint32_t kBoxRun = 64;   // must match the HLSL above
 
 // P3: the guided filter's local linear model.
 //
@@ -557,11 +580,11 @@ public:
 
         std::vector<GpuPass> p;
         p.push_back({logp.c_str(), "log",     {-1},        {0}});
-        p.push_back({boxh.c_str(), "boxH",    {0},         {1}});
-        p.push_back({boxv.c_str(), "boxV",    {1},         {2}});
+        p.push_back({boxh.c_str(), "boxH",    {0},         {1}, kBoxRun, 1});
+        p.push_back({boxv.c_str(), "boxV",    {1},         {2}, 1, kBoxRun});
         p.push_back({ab.c_str(),   "ab",      {2},         {1}});
-        p.push_back({boxh.c_str(), "boxABH",  {1},         {3}});
-        p.push_back({boxv.c_str(), "boxABV",  {3},         {1}});
+        p.push_back({boxh.c_str(), "boxABH",  {1},         {3}, kBoxRun, 1});
+        p.push_back({boxv.c_str(), "boxABV",  {3},         {1}, 1, kBoxRun});
         // The combine needs the original image, the log plane and the smoothed
         // a/b. Four reads, which is the SRV limit and the reason a and b share
         // one plane rather than taking two.

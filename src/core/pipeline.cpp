@@ -2418,8 +2418,17 @@ bool Pipeline::RunStageGpu(Stage& s, const std::vector<const Data*>& in,
                     }
                 passOut.push_back(g);
             }
+            uint32_t gx = 0, gy = 0;
+            if (passes[p].divX > 1 || passes[p].divY > 1) {
+                const ImageDesc& od = std::get<Image>((*out)[0]).Desc();
+                const uint32_t dx = std::max(1u, passes[p].divX), dy = std::max(1u, passes[p].divY);
+                const uint32_t tx = (uint32_t(od.width)  + dx - 1) / dx;
+                const uint32_t ty = (uint32_t(od.height) + dy - 1) / dy;
+                gx = (tx + 7) / 8;
+                gy = (ty + 7) / 8;
+            }
             if (!gpu->Dispatch(*s.passKernels[p], passIn, passOut,
-                               s.algo->GpuPassConstants(int(p)), err))
+                               s.algo->GpuPassConstants(int(p)), err, gx, gy))
                 return false;
 
             // Diagnostic: submit and wait per pass, so a hang can be attributed

@@ -731,6 +731,14 @@ public:
         // Non-negative values index the scratch pool, sized by GpuScratchCount().
         std::vector<int> reads;
         std::vector<int> writes;
+
+        // How many output pixels ONE thread covers, across and down. The grid
+        // is the output's size divided by these, in 8x8 groups. 1x1 -- a
+        // thread per pixel -- is the ordinary case; a sliding-window kernel
+        // walks a run of pixels per thread, carrying its sum along, and says
+        // how long the run is here.
+        uint32_t divX = 1;
+        uint32_t divY = 1;
     };
 
     virtual std::vector<GpuPass> GpuPasses() const { return {}; }

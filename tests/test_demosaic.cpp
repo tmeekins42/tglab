@@ -1127,11 +1127,11 @@ int main() {
                                     worst = std::max(worst,
                                         std::abs(double(a.At<float>(x, y)[c]) -
                                                  double(b.At<float>(x, y)[c])));
-                        // Loose enough for float order-of-operations -- the CPU
-                        // slides a running sum along a row while the shader
-                        // gathers 2r+1 samples, so the two accumulate in
-                        // different orders -- and far tighter than any wiring
-                        // mistake could survive.
+                        // Loose enough for float order-of-operations -- both
+                        // slide a running sum, but the shader restarts it every
+                        // 64 pixels (kBoxRun; this 96x72 fixture crosses that
+                        // boundary both ways) -- and far tighter than any
+                        // wiring mistake could survive.
                         Check(worst < 0.02,
                               "tonemap_local GPU matches CPU (worst " +
                                   std::to_string(worst) + ")");
