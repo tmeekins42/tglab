@@ -203,9 +203,17 @@ passes a changed setting cannot affect are skipped when their results are still
 in the scratch planes — dragging `tonemap_local`'s `range` re-runs one pass of
 seven. And a measurement that depends only on the input (a tone mapper's
 percentiles, dehaze's airlight, the noise level `wavelet_denoise` adapts to,
-`lens_correct`'s chromatic aberration) is cached against that input's identity,
-which covers **every stage upstream**, so a change anywhere above it re-measures
-and a change below it does not.
+`lens_correct`'s chromatic aberration, `upright`'s vanishing points) is cached
+against that input's identity, which covers **every stage upstream**, so a change
+anywhere above it re-measures and a change below it does not. In a group each
+frame is its own input: every frame keeps its own measurement and its own
+skipped passes.
+
+A measurement a moving preview cannot show may also be **kept for the length of
+a drag**: `wavelet_denoise`'s noise level is re-measured by any change above it,
+and was most of every tick of every slider upstream, so mid-drag it keeps the
+last one and the settled run measures exactly. A measurement the drag is meant
+to change — a tone mapper's percentiles — is never kept.
 
 ---
 
@@ -464,12 +472,12 @@ defaults.
 
 ## Algorithms
 
-83 registered. `choose("x", "category")` offers every algorithm in a category,
+86 registered. `choose("x", "category")` offers every algorithm in a category,
 so these names are the ones that matter in a script.
 
 | Category | Algorithms |
 |---|---|
-| **adjust** | `basic_adjust` (exposure, contrast, highlights, shadows, whites, blacks, vibrance, saturation, white balance), `brightness`, `crop` (trim and straighten, with a preview), `vignette`, `clarity` (edge-aware local contrast: clarity and texture), `lens_correct` (distortion k1/k2, lateral CA measured or manual, vignetting, one resample), `film_grain`, `dehaze` (dark channel prior), `resize` (area-average on minify, bilinear on magnify) |
+| **adjust** | `basic_adjust` (exposure, contrast, highlights, midtones, shadows by region, whites, blacks, vibrance, saturation, camera-space white balance), `curves` (parametric regions and a point curve, on luminance), `brightness`, `crop` (trim and straighten, with a preview), `upright` (perspective from vanishing points: level, vertical, full), `vignette`, `clarity` (edge-aware local contrast: clarity and texture), `lens_correct` (distortion k1/k2, lateral CA measured or manual, vignetting, one resample), `film_grain`, `dehaze` (dark channel prior), `resize` (area-average on minify, bilinear on magnify) |
 | **tonemap** | `tonemap` (global), `tonemap_local` (illumination/detail split) |
 | **features** | `detect_sift`, `detect_surf`, `detect_akaze`, `detect_orb`, `detect_brisk`, `detect_dad` and `describe_dedode` (learned; see below), `draw_features`, `draw_matches`, `match_guided` (a second pass along epipolar lines) |
 | **match** | `match_brute` (exact), `match_ann` (k-d forest / LSH) |
@@ -479,7 +487,7 @@ so these names are the ones that matter in a script.
 | **filter** | `sharpen` (unsharp mask in log luminance: hue kept, halo limit, edge masking), `gaussian_blur`, `box_blur`, `median_blur`, `bilateral`, `guided_filter`, `nonlocal_means`, `anisotropic_diffusion`, `kuwahara`, `kuwahara_generalized`, `symmetric_nearest`, `bloom` (glow and halation), `orton` |
 | **edge** | `sobel`, `canny`, `non_max_suppression`, `hysteresis` |
 | **threshold** | `threshold`, `threshold_otsu`, `threshold_isodata`, `threshold_triangle`, `threshold_adaptive_mean`, `threshold_adaptive_gaussian`, `threshold_niblack`, `threshold_sauvola`, `threshold_bernsen` |
-| **color** | `grayscale`, `apply_lut` (3D .cube LUTs) |
+| **color** | `defringe` (purple and green fringes along edges, in OkLab), `grayscale`, `apply_lut` (3D .cube LUTs) |
 | **sfm** | `solve_cameras` (the whole chain, focal found automatically), `relative_pose`, `build_tracks`, `rotation_average`, `global_position`, `triangulate`, `bundle_adjust_sfm`; dense: `plane_sweep` (depth maps), `fuse_depth`; splats: `init_splats`, `train_splats`, `carve_splats`, `render_splats`, `load_ply` |
 
 Most have a GPU kernel and fall back to the CPU if it fails — **always saying
@@ -1139,7 +1147,12 @@ other tools, which `scripts/view_ply.tgl` opens in the 3D viewer.
   pyramid, and rebuilds the clipped channels at that colour and the level the
   measured ones imply. Fully clipped cores go neutral, rising from the clip
   level at their rim, so they blend into the halo instead of stepping up from
-  it. Put it straight after the demosaic.
+  it. It runs on the GPU (35 passes, ~60 ms at 45 MP), and only **straight off
+  the demosaic** — the image carries the clamp level (`ImageDesc::rawClamp`),
+  and any later stage clears it, so after a merge or an exposure change it
+  passes through rather than mistaking headroom for clipping. `develop.tgl`,
+  `hdr.tgl` and `panorama.tgl` run it first; before a merge it is safe, since the
+  merge still ignores every rebuilt channel except where all frames clipped.
 - **`lens_correct`** undoes radial distortion (`k1`, `k2`), lateral chromatic
   aberration and vignetting in one resample, with every quantity relative to
   the frame so a proxy matches the result. `auto_ca` (on) measures red's and
@@ -1151,14 +1164,48 @@ other tools, which `scripts/view_ply.tgl` opens in the 3D viewer.
 - **`sharpen`** is an unsharp mask in log luminance: one gain per pixel, so hue
   is kept and colour noise is not amplified, and an edge is the same size in
   stops wherever it sits. `limit` caps how many stops any pixel may change;
-  `masking` sharpens only near edges, keyed on the gradient of the blurred
-  image, so grain and smooth skin are left alone.
+  `masking` (0.5 by default) sharpens only near edges, keyed on the gradient of
+  the blurred image, so grain and smooth skin are left alone.
 - **`clarity`** raises local contrast without halos: the detail is log
   luminance minus a guided filter of itself, which follows any edge stronger
   than its threshold, so the edge itself is not in the detail being raised.
   `clarity` works at a large radius (a percentage of the frame), `texture` at a
   tenth of it with large swings tamed. Beside a strong edge it leaves a tenth of
   the halo an unsharp mask of the same radius paints in.
+- **Highlights, midtones and shadows work by region** (`local_tones`, on).
+  `basic_adjust` decides which band a pixel falls in by the brightness around it
+  — an edge-aware base layer, a guided filter of log luminance — and applies
+  the change as a gain, so texture inside a region keeps its contrast: pulling
+  down a sky's highlights darkens the sky without flattening its clouds
+  (measured, 91% of the texture kept against 64% per pixel). `midtones` sits
+  between the two: a stop at middle grey, falling away toward both ends. The
+  base is only built when a tonal band is moved, and dragging any of the stage's
+  sliders skips rebuilding it.
+- **`curves`** is a parametric curve — shadows, darks, lights and highlights
+  with three movable splits, each a smooth bump, the result forced monotone with
+  fixed ends — plus an optional typed point curve, `points = "0,0 0.25,0.2
+  0.75,0.85 1,1"`, as a monotone cubic that passes through every point without
+  overshooting. It works on display values and on luminance, so contrast does
+  not shift hue; a colour pushed past white moves toward grey just enough to
+  fit rather than clipping. `per_channel` gives the per-channel curve.
+- **`defringe`** takes the colour out of purple and magenta fringes, and
+  optionally green ones — axial chromatic aberration and demosaic false colour,
+  which no geometric correction removes — but only within `radius` of a strong
+  edge and only in those OkLab hues, with lightness untouched. A purple object's
+  interior is not near an edge, so it is left alone. The green window starts
+  above yellow, or sodium-lit edges go grey.
+- **`upright`** corrects perspective from the photograph's own lines. Line
+  segments are grown from strong gradients and fitted by PCA; vanishing points
+  come from RANSAC over pairs of near-vertical (and near-horizontal) segments,
+  refined by least squares; the correction is a virtual camera rotation applied
+  as one homography and one bicubic resample. `mode`: level (roll only),
+  vertical (converging verticals made parallel), full (the dominant horizontals
+  too); `amount` scales it, and `crop` fills the frame with no empty corners.
+  The focal length is measured from an orthogonal pair of vanishing points only
+  when both are near enough to trust, else assumed — the verticals come out
+  parallel either way. It is **off by default** (`mode` off): a photograph with
+  no architecture has no verticals worth trusting. The detection is cached, so
+  dragging `amount` resamples only.
 - **White balance is done in camera space.** `basic_adjust`'s `kelvin` and
   `tint` compute the camera's own multipliers for that illuminant, through its
   colour matrix, and re-balance with one 3×3: the matrix undone, the camera's
@@ -1189,7 +1236,10 @@ other tools, which `scripts/view_ply.tgl` opens in the 3D viewer.
   trade its design implies. Deciding from gradients is exactly what noise and
   clipping corrupt.
 - **`bloom`** thresholds the highlights on **luminance**, blurs them with a
-  **separate radius per channel**, and adds the result back. Equal radii give an
+  **separate radius per channel**, and adds the result back. The blur is three
+  running-sum box passes each way: a Gaussian to within a few percent, at the
+  same cost for any spread. A direct Gaussian had to cap its window, and a wide
+  spread at full resolution came out square. Equal radii give an
   ordinary glow; a wider red gives halation, which is a spread that differs per
   channel rather than a red tint — real halation is light reflecting off a
   film base, and red penetrates deepest. `intensity` is compensated for spread,

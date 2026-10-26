@@ -304,9 +304,16 @@ being algorithms themselves. Currently:
   `RobustWeight` (Huber, Cauchy) and `LmDamping`, each solver's damping policy
   as one line instead of scattered literals.
 - `color.h` — the colour conventions: `Luma` (Rec. 709, everywhere — there
-  used to be two), the sRGB transfer curve, XYZ to linear sRGB. Every
-  pipeline kernel gets the same functions in HLSL (`kColorHlsl`, prepended by
-  the pipeline), so a shader calls `Luma()` exactly as C++ does.
+  used to be two), the sRGB transfer curve, XYZ to linear sRGB, and OkLab
+  (`LinearSrgbToOkLab` / `OkLabToLinearSrgb`, with `kOkLabHlsl` for kernels) —
+  the space to pick colours by hue angle in, since its hue stays put as
+  lightness and chroma change (`defringe`). Every pipeline kernel gets
+  `kColorHlsl` prepended by the pipeline, so a shader calls `Luma()` exactly as
+  C++ does; `kOkLabHlsl` a kernel prepends itself.
+- `resample.h` — `SampleCubicClamped`, Catmull-Rom held to the range of the
+  four nearest samples so a warp cannot ring along hard edges, and the same in
+  HLSL (`kSampleCubicHlsl`, placed after the kernel's `Src`, `Width` and
+  `Height`). `lens_correct` and `upright` share it.
 - `fast.h` — the FAST-9 corner test ORB and BRISK share.
 - `math_util.h` (in `src/core/`) — `Sigmoid`, `Logit`, and `FloatBits`, the
   float-to-root-constant cast every `GpuConstants()` needs.
@@ -858,6 +865,17 @@ Bindings are fixed by convention: `t0..t3` inputs, `u0..u3` outputs, and `b0`
 holding `Width`, `Height`, then whatever `GpuConstants()` returns (floats
 bit-cast through `uint`, read back with `asfloat`). Thread groups are 8×8.
 
+**`b0` is 32 root constants in all**, `Width` and `Height` included, and
+anything past that is silently dropped. A table does not belong there:
+`curves`' 256-entry curve went in as constants first and the shader read
+garbage (a mean difference of 119/255 against the CPU). Give it to the kernel
+as a small texture through `GpuExtraInputs()` instead — see below.
+
+**A mode is a dropdown.** An integer parameter with names
+(`.choices = kNames, .choiceCount = n`, as `upright`'s `mode` and
+`stitch_panorama`'s `projection`) is drawn as a menu and offered by name to a
+script's `pick()`; the value the algorithm reads is still the integer.
+
 **Iterative kernels.** Some schemes cannot be one dispatch: each step must see
 the *completed* previous step, and threads within a dispatch have no ordering
 relative to each other. Returning more than 1 from `GpuIterations()` makes the
@@ -988,10 +1006,40 @@ the input before any pass runs. It forces a readback, so:
   fit — share the function — or the two paths place their curves differently
   and the parity test is the first to notice.
 
+**Read only what you measure.** `MapCpuRead()` reads back the WHOLE image;
+`ReadImageRegions(img, rects, &outs)` reads back just the rectangles, in one
+round trip, from the CPU copy if there is one. `wavelet_denoise` measures nine
+640 px tiles and was moving all 45 MP across to do it.
+
+**Each frame of a group is its own input.** A stage mapped across a group runs
+every frame under one stage, and the pipeline keys measurements and skipped
+passes on `FrameIdentity` — the stage's input identity mixed with the frame
+index. Keyed on the stage alone, frame 2 was served frame 1's measurement and a
+multi-pass stage could skip passes against planes another frame had filled.
+
+**A measurement may be kept through a drag** when its staleness cannot be seen
+in a moving preview: return true from `MeasurementStaleOkWhileDragging()`, and
+mid-drag (a preview scale or a region) the last measurement at this size
+stands in, with an exact one made when the drag settles. `wavelet_denoise`
+does; anything whose measurement the drag is meant to move — a tone mapper's
+percentiles — must not.
+
 A GPU-path note for the info panel goes through `RunReport()`, from members the
 GPU path set; the CPU path reports per call through `ctx.SetReport()`. The
 filters suite fails any per-frame algorithm whose `RunReport()` holds state a
 CPU run left behind, because one instance runs every frame of a group.
+
+### Facts on the image that do not survive a stage
+
+Some descriptor fields describe the pixels only until something changes them.
+`ImageDesc::rawClamp` — the level the demosaic clamped white-balanced camera
+RGB at, so that a channel there is clipped rather than merely bright — is set
+by the pipeline on a demosaic's output and cleared on every other stage's, and
+by the stages that build their own descriptors (`merge_hdr`,
+`stitch_panorama`). `highlight_reconstruct` refuses an image without it:
+after a merge the camera metadata is still there, and without the flag the
+merge's headroom above ~1.0 read as clipped channels. A new fact of this kind
+should be cleared by default and kept only where it is still true.
 
 ### Declaring how a stage behaves on previews
 
