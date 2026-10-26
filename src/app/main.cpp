@@ -506,6 +506,10 @@ private:
     // What the last requested save wrote, shown in the status strip. Cleared
     // when the script changes, since it then describes a previous script.
     std::string m_saveReport;
+    // Whether m_saveReport is a failure, so the status strip shows it in red.
+    // Set alongside every report rather than found by searching the text: a
+    // failure that did not happen to contain the word "failed" was green.
+    bool        m_saveFailed = false;
     int         m_saveCount = 0;   // save() lines in the current script
     std::string m_loadError;    // script file could not be read (survives a re-run)
     bool        m_dirty = true; // re-run requested
@@ -1022,6 +1026,7 @@ void App::InstallLoadedImage(LoadResult&& r) {
         target->playBuilt = -1;
         target->version = NextContentVersion();
         m_saveReport = file + ": " + r.note;
+        m_saveFailed = false;
         m_dirty = true;
         return;
     }
@@ -1071,18 +1076,43 @@ void App::InstallLoadedImage(LoadResult&& r) {
 // Picks up finished loads. Called once per frame.
 // Saves what a viewer is showing, after asking where.
 //
-// The pixels come from m_viewerImages rather than from the panel: the panel
-// holds a texture, and for a GPU-resident result those pixels are on the
-// device. The worker already copies each visible viewer's result back for the
-// UI to draw, so the CPU copy is here for free.
+// The pixels come from m_viewerImages rather than from the panel. A CPU result
+// arrives with its pixels; a GPU-resident one arrives as a shared texture and a
+// descriptor only -- the readback is exactly what that path exists to avoid on
+// every frame -- so it is read back HERE, once, when someone actually asks to
+// save. It used to refuse ("no pixels on the CPU to write"), which after any
+// all-GPU edit was every time.
 void App::SaveViewer(const std::string& viewer) {
     ViewerImage* found = nullptr;
     for (ViewerImage& v : m_viewerImages)
         if (v.name == viewer) { found = &v; break; }
 
-    if (!found || !found->image.Valid()) {
-        m_saveReport = "save: '" + viewer + "' has no pixels on the CPU to write";
+    m_saveFailed = true;   // until a write succeeds
+    if (!found || !(found->gpu ? found->image.Desc().Valid() : found->image.Valid())) {
+        m_saveReport = "save failed: '" + viewer + "' has nothing to save yet";
         return;
+    }
+
+    // The pixels: the viewer's own, or read back from its texture.
+    Image fromGpu;
+    Image* pixels = &found->image;
+    if (found->gpu) {
+        const ImageDesc& d = found->image.Desc();
+        std::vector<uint8_t> bytes;
+        if (!GpuTexture::ReadRegion(m_dev, *found->gpu, 0, 0, d.width, d.height, &bytes)) {
+            m_saveReport = "save failed: could not read '" + viewer + "' back from the GPU";
+            return;
+        }
+        fromGpu.Alloc(d);
+        ImageView v = fromGpu.MapCpuWrite();
+        const size_t row = size_t(d.width) * size_t(BytesPerPixel(d.format));
+        if (!v.Valid() || bytes.size() < row * size_t(d.height)) {
+            m_saveReport = "save failed: the readback of '" + viewer + "' came back short";
+            return;
+        }
+        for (int y = 0; y < d.height; ++y)
+            std::memcpy(v.data + size_t(y) * size_t(v.Pitch()), bytes.data() + size_t(y) * row, row);
+        pixels = &fromGpu;
     }
 
     // A sensible default name: the viewer's, which is what the script called
@@ -1115,10 +1145,12 @@ void App::SaveViewer(const std::string& viewer) {
     if (!GetSaveFileNameA(&ofn)) return;      // cancelled
 
     std::string err;
-    if (SaveImage(path, found->image, &err))
+    if (SaveImage(path, *pixels, &err)) {
         m_saveReport = std::string("saved ") + path;
-    else
+        m_saveFailed = false;
+    } else {
         m_saveReport = "save failed: " + err;
+    }
 }
 
 void App::PollLoader() {
@@ -1357,7 +1389,7 @@ void App::RunScript() {
 
             m_saveCount = int(built.Saves().size());
             // The old report describes a script that is no longer running.
-            if (m_saveCount == 0) m_saveReport.clear();
+            if (m_saveCount == 0) { m_saveReport.clear(); m_saveFailed = false; }
 
             // PROXY WHILE DRAGGING.
             //
@@ -1488,6 +1520,7 @@ void App::PollWorker() {
     // otherwise leave the user looking for a file that is not there.
     if (!out.saved.empty() || !out.saveError.empty()) {
         m_saveReport.clear();
+        m_saveFailed = !out.saveError.empty();
         if (!out.saved.empty()) {
             m_saveReport = "saved " + std::to_string(out.saved.size()) +
                            (out.saved.size() == 1 ? " file: " : " files: ") +
@@ -3741,8 +3774,7 @@ void App::Frame() {
         // the script names, and silently writing out_3.png would leave the user
         // looking for out.png.
         if (!m_saveReport.empty()) {
-            const bool failed = m_saveReport.find("failed") != std::string::npos;
-            ImGui::TextColored(failed ? ImVec4(1.0f, 0.45f, 0.45f, 1.0f)
+            ImGui::TextColored(m_saveFailed ? ImVec4(1.0f, 0.45f, 0.45f, 1.0f)
                                       : ImVec4(0.5f, 0.9f, 0.5f, 1.0f),
                                "%s", m_saveReport.c_str());
         }
