@@ -22,6 +22,8 @@
 
 #include "../src/algo_util/pixel_buffer.h"
 #include "../src/algo_util/white_balance.h"
+#include "../src/algo_util/color.h"
+#include "../src/algo_util/resample.h"
 #include "../src/core/algorithm.h"
 #include "../src/core/pipeline.h"
 #include "../src/script/interp.h"
@@ -744,7 +746,7 @@ static void TestSharpen() {
     // Faint noise (+-1%) on the flats: masking leaves it, while the edge is
     // still sharpened.
     Image noisy = edge(0.02f), plain, masked;
-    if (RunFilter("sharpen", edge(0.02f), {{"amount", 1.0}, {"radius", 2.0}}, &plain, &err) &&
+    if (RunFilter("sharpen", edge(0.02f), {{"amount", 1.0}, {"radius", 2.0}, {"masking", 0.0}}, &plain, &err) &&
         RunFilter("sharpen", edge(0.02f), {{"amount", 1.0}, {"radius", 2.0}, {"masking", 1.0}}, &masked, &err)) {
         auto flatDiff = [&](Image& im) {
             double s = 0;
@@ -971,6 +973,319 @@ static void TestFilmGrain() {
 //     screening, and expanding with the inverse is not a round trip, because
 //     the screen of two compressed values is not itself a compressed value.
 //     A 0.9 square came out at 2.79 and a 6.0 highlight at 51.75.
+// A BLOOM IS ROUND. One small light, spread wide: the glow must fall off the
+// same along an axis and along a diagonal at the same distance. Capped at a
+// 128 px window, a spread of 100 was a nearly flat kernel run across and then
+// down -- a square, much brighter on the diagonal.
+static void TestBloomRound() {
+    constexpr int W = 801, H = 801;
+    Image img;
+    ImageDesc d{W, H, Format::RGBA32F};
+    d.linear = true;
+    img.Alloc(d);
+    {
+        ImageView v = img.MapCpuWrite();
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                float* p = v.At<float>(x, y);
+                const bool light = std::abs(x - 400) <= 2 && std::abs(y - 400) <= 2;
+                p[0] = p[1] = p[2] = light ? 50.0f : 0.0f;
+                p[3] = 1.0f;
+            }
+    }
+    Image out;
+    std::string err;
+    if (!RunFilter("bloom", std::move(img), {{"threshold", 1.0}, {"intensity", 1.0},
+                   {"spread_r", 100.0}, {"spread_g", 100.0}, {"spread_b", 100.0}}, &out, &err)) {
+        Check(false, "bloom runs: " + err);
+        return;
+    }
+    ImageView v = out.MapCpuRead();
+    const int dist = 150;
+    const int dg = int(std::lround(dist / std::sqrt(2.0)));
+    const float axis = v.At<float>(400 + dist, 400)[1], diag = v.At<float>(400 + dg, 400 + dg)[1];
+    Check(axis > 0.0f && std::fabs(diag / axis - 1.0f) < 0.1f,
+          "a wide bloom is round, not square (diagonal / axis " + std::to_string(diag / axis) + ")");
+}
+
+// defringe: a fringe along an edge loses its colour and keeps its lightness;
+// the same purple away from any edge, and a green fringe while green is off,
+// are left alone.
+static void TestDefringe() {
+    constexpr int W = 200, H = 60;
+    auto make = [&] {
+        Image img;
+        ImageDesc d{W, H, Format::RGBA32F};
+        d.linear = true;
+        img.Alloc(d);
+        ImageView v = img.MapCpuWrite();
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                float* p = v.At<float>(x, y);
+                float r = 0.02f, g = 0.02f, b = 0.02f;
+                if (x >= 40 && x < 50) r = g = b = 0.9f;                          // a bright bar
+                else if (x >= 50 && x < 53) { r = 0.25f; g = 0.05f; b = 0.35f; }   // its purple fringe
+                else if (x >= 36 && x < 40) { r = 0.08f; g = 0.22f; b = 0.05f; }   // a green one
+                else if (x >= 120 && x < 190) { r = 0.25f; g = 0.05f; b = 0.35f; } // a purple object
+                p[0] = r; p[1] = g; p[2] = b; p[3] = 1.0f;
+            }
+        return img;
+    };
+    auto lab = [](Image& im, int x, float* o) {
+        ImageView v = im.MapCpuRead();
+        const float* p = v.At<float>(x, 30);
+        const float rgb[3] = {p[0], p[1], p[2]};
+        LinearSrgbToOkLab(rgb, o);
+    };
+    std::string err;
+    Image src = make(), off, both;
+    if (!RunFilter("defringe", make(), {{"purple", 1.0}, {"green", 0.0}}, &off, &err) ||
+        !RunFilter("defringe", make(), {{"purple", 1.0}, {"green", 1.0}}, &both, &err)) {
+        Check(false, "defringe runs: " + err);
+        return;
+    }
+    float a[3], b[3];
+    lab(src, 51, a); lab(off, 51, b);
+    const float c0 = std::hypot(a[1], a[2]), c1 = std::hypot(b[1], b[2]);
+    Check(c1 < 0.2f * c0 && std::fabs(a[0] - b[0]) < 1e-3f,
+          "defringe takes the colour out of a purple fringe and keeps its lightness (chroma " +
+              std::to_string(c0) + " -> " + std::to_string(c1) + ")");
+    lab(src, 155, a); lab(off, 155, b);
+    Check(std::fabs(a[1] - b[1]) < 1e-5f && std::fabs(a[2] - b[2]) < 1e-5f,
+          "defringe leaves the same purple alone away from an edge");
+    lab(src, 37, a); lab(off, 37, b);
+    Check(std::fabs(a[1] - b[1]) < 1e-5f, "...and a green fringe while green is off");
+    lab(both, 37, b);
+    Check(std::hypot(b[1], b[2]) < 0.2f * std::hypot(a[1], a[2]), "...which green = 1 cleans");
+}
+
+// LOCAL TONES: highlights pull a bright, textured region down as a whole, so
+// its texture keeps its contrast -- per pixel, the bright half of every cloud
+// is compressed and the texture flattens. And midtones moves middle grey
+// while leaving both ends nearly where they were.
+static void TestLocalTones() {
+    constexpr int W = 400, H = 300;
+    auto make = [&] {
+        Image img;
+        ImageDesc d{W, H, Format::RGBA32F};
+        d.linear = true;
+        img.Alloc(d);
+        ImageView v = img.MapCpuWrite();
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                float* p = v.At<float>(x, y);
+                // A bright textured "sky" over a dark "land".
+                const float tex = 1.0f + 0.25f * std::sin(float(x) * 0.31f) * std::cos(float(y) * 0.27f);
+                const float val = y < H / 2 ? 1.3f * tex : 0.05f;
+                p[0] = p[1] = p[2] = val; p[3] = 1.0f;
+            }
+        return img;
+    };
+    auto stats = [&](Image& im, double* mean, double* rel) {
+        ImageView v = im.MapCpuRead();
+        double s = 0, s2 = 0; int n = 0;
+        for (int y = 20; y < H / 2 - 60; ++y)
+            for (int x = 60; x < W - 60; ++x) {
+                const double l = std::log2(std::max(1e-6f, v.At<float>(x, y)[1]));
+                s += l; s2 += l * l; ++n;
+            }
+        *mean = s / n;
+        *rel = std::sqrt(std::max(0.0, s2 / n - (s / n) * (s / n)));   // texture, in stops
+    };
+    std::string err;
+    Image src = make(), loc, pix;
+    if (!RunFilter("basic_adjust", make(), {{"highlights", -1.0}}, &loc, &err) ||
+        !RunFilter("basic_adjust", make(), {{"highlights", -1.0}, {"local_tones", 0.0}}, &pix, &err)) {
+        Check(false, "basic_adjust local tones run: " + err);
+        return;
+    }
+    double m0, t0, m1, t1, m2, t2;
+    stats(src, &m0, &t0); stats(loc, &m1, &t1); stats(pix, &m2, &t2);
+    Check(m1 < m0 - 0.3, "local highlights -1 pulls the bright region down (" + std::to_string(m0) +
+                             " -> " + std::to_string(m1) + " stops)");
+    Check(t1 > 0.9 * t0, "...keeping its texture (" + std::to_string(t0) + " -> " + std::to_string(t1) +
+                             " stops; per pixel " + std::to_string(t2) + ")");
+    Check(t2 < t1, "...which per-pixel highlights flatten more");
+
+    // Midtones.
+    auto flat = [&](float v) {
+        Image img;
+        ImageDesc d{64, 64, Format::RGBA32F};
+        d.linear = true;
+        img.Alloc(d);
+        ImageView iv = img.MapCpuWrite();
+        for (int y = 0; y < 64; ++y)
+            for (int x = 0; x < 64; ++x) { float* p = iv.At<float>(x, y); p[0] = p[1] = p[2] = v; p[3] = 1.0f; }
+        return img;
+    };
+    auto out1 = [&](float v) {
+        Image o;
+        std::string e;
+        if (!RunFilter("basic_adjust", flat(v), {{"midtones", 1.0}}, &o, &e)) return -1.0f;
+        return o.MapCpuRead().At<float>(32, 32)[1] / v;
+    };
+    const float gMid = out1(0.18f), gDark = out1(0.005f), gBright = out1(3.0f);
+    Check(std::fabs(gMid - 2.0f) < 0.05f && gDark < 1.1f && gBright < 1.1f,
+          "midtones +1 is a stop at middle grey and little at either end (x" + std::to_string(gMid) +
+              ", x" + std::to_string(gDark) + ", x" + std::to_string(gBright) + ")");
+}
+
+// curves: monotone with fixed ends whatever the sliders, each region moves its
+// own tones, a point curve passes through its points, and luminance mode keeps
+// hue where per-channel mode does not.
+static void TestCurves() {
+    constexpr int W = 256, H = 4;
+    // Display-referred (not linear): row 0 a grey ramp, row 1 an orange.
+    auto make = [&] {
+        Image img;
+        img.Alloc({W, H, Format::RGBA32F});
+        ImageView v = img.MapCpuWrite();
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                float* p = v.At<float>(x, y);
+                const float t = float(x) / float(W - 1);
+                if (y == 1) { p[0] = 0.75f; p[1] = 0.45f; p[2] = 0.15f; }   // stays under white
+                else        { p[0] = p[1] = p[2] = t; }
+                p[3] = 1.0f;
+            }
+        return img;
+    };
+    auto at = [](Image& im, int x, int y, int c = 1) { return im.MapCpuRead().At<float>(x, y)[c]; };
+    std::string err;
+    Image hl, sh, pts, lum, per;
+    if (!RunFilter("curves", make(), {{"highlights", 1.0}, {"darks", -1.0}}, &hl, &err) ||
+        !RunFilter("curves", make(), {{"shadows", -1.0}}, &sh, &err) ||
+        !RunFilter("curves", make(), {{"darks", 1.0}, {"lights", 1.0}}, &lum, &err) ||
+        !RunFilter("curves", make(), {{"darks", 1.0}, {"lights", 1.0}, {"per_channel", 1.0}}, &per, &err)) {
+        Check(false, "curves runs: " + err);
+        return;
+    }
+    Image src = make();
+    bool mono = true;
+    for (int x = 1; x < W; ++x) if (at(hl, x, 0) < at(hl, x - 1, 0) - 1e-5f) mono = false;
+    Check(mono && at(hl, 0, 0) < 1e-4f && std::fabs(at(hl, W - 1, 0) - 1.0f) < 1e-3f,
+          "curves stay monotone with their ends fixed, whatever the sliders");
+    Check(at(hl, 222, 0) > at(src, 222, 0) + 0.03f, "highlights +1 lifts the upper tones (" +
+              std::to_string(at(src, 222, 0)) + " -> " + std::to_string(at(hl, 222, 0)) + ")");
+    Check(at(sh, 30, 0) < at(src, 30, 0) - 0.01f && std::fabs(at(sh, 200, 0) - at(src, 200, 0)) < 1e-4f,
+          "shadows -1 lowers the lower tones and leaves the upper ones");
+    {
+        Image p;
+        std::vector<std::pair<std::string, Value>> prm{{"points", Value(std::string("0,0 0.5,0.7 1,1"))}};
+        if (RunFilterV("curves", make(), prm, &p, &err))
+            Check(std::fabs(at(p, 128, 0) - 0.7f) < 0.02f,
+                  "a point curve passes through its points (0.5 -> " + std::to_string(at(p, 128, 0)) + ")");
+        else
+            Check(false, "curves with points runs: " + err);
+    }
+    // Red against green, in LINEAR light: luminance mode scales the linear
+    // channels together; per channel, the darks region lifts the orange's green
+    // and nothing else.
+    auto ratio = [&](Image& im) {
+        return SrgbToLinear(at(im, 10, 1, 0)) / SrgbToLinear(at(im, 10, 1, 1));
+    };
+    const float r0 = ratio(src), rl = ratio(lum), rp = ratio(per);
+    Check(std::fabs(rl / r0 - 1.0f) < 1e-3f && std::fabs(rp / r0 - 1.0f) > 0.02f,
+          "on luminance the curve keeps a colour's channel ratios; per channel it does not (" +
+              std::to_string(r0) + ", " + std::to_string(rl) + ", " + std::to_string(rp) + ")");
+}
+
+// upright: a facade photographed by a camera tilted up and rolled has
+// converging, leaning verticals; vertical mode makes them parallel and upright
+// (each line at the same x top and bottom), and level mode fixes only the lean.
+static void TestUpright() {
+    constexpr int W = 900, H = 700;
+    // The facade, frontal: dark lines every 50 px each way on a light ground.
+    std::vector<float> facade(size_t(W) * size_t(H) * 4);
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+            const bool line = (x % 50) < 3 || (y % 50) < 3;
+            float* p = &facade[(size_t(y) * size_t(W) + size_t(x)) * 4];
+            p[0] = p[1] = p[2] = line ? 0.08f : 0.8f; p[3] = 1.0f;
+        }
+    // The same facade from a camera tilted up 10 degrees and rolled 3: a pure
+    // rotation, so a homography K R K^-1 (f = one long edge).
+    auto rot = [](double ax, double az, double* R) {
+        const double cx = std::cos(ax), sx = std::sin(ax), cz = std::cos(az), sz = std::sin(az);
+        const double Rx[9] = {1, 0, 0, 0, cx, -sx, 0, sx, cx}, Rz[9] = {cz, -sz, 0, sz, cz, 0, 0, 0, 1};
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 3; ++c) {
+                double s = 0;
+                for (int k = 0; k < 3; ++k) s += Rz[r * 3 + k] * Rx[k * 3 + c];
+                R[r * 3 + c] = s;
+            }
+    };
+    double R0[9];
+    rot(10.0 * 3.14159265 / 180.0, 3.0 * 3.14159265 / 180.0, R0);
+    auto tilted = [&] {
+        Image img;
+        ImageDesc d{W, H, Format::RGBA32F};
+        img.Alloc(d);
+        ImageView v = img.MapCpuWrite();
+        const double L = double(std::max(W, H)), cx = 0.5 * W, cy = 0.5 * H;
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                // This pixel's ray, turned into the facade's frame.
+                const double u = (x + 0.5 - cx) / L, w = (y + 0.5 - cy) / L;
+                const double r[3] = {u, w, 1.0};
+                double q[3];
+                for (int k = 0; k < 3; ++k) q[k] = R0[k * 3] * r[0] + R0[k * 3 + 1] * r[1] + R0[k * 3 + 2] * r[2];
+                const double sx = q[0] / q[2] * L + cx, sy = q[1] / q[2] * L + cy;
+                float* p = v.At<float>(x, y);
+                for (int c = 0; c < 4; ++c)
+                    p[c] = SampleCubicClamped(facade.data(), W, H, 4, c, sx - 0.5, sy - 0.5);
+            }
+        return img;
+    };
+    // The x of each dark vertical line crossing row y, between x0 and x1.
+    auto linesAt = [&](Image& im, int y, int x0, int x1) {
+        ImageView v = im.MapCpuRead();
+        std::vector<double> xs;
+        int run = -1;
+        for (int x = x0; x <= x1; ++x) {
+            const bool dark = x < x1 && v.At<float>(x, y)[1] < 0.35f &&
+                              v.At<float>(x, y - 6)[1] < 0.45f && v.At<float>(x, y + 6)[1] < 0.45f;
+            if (dark && run < 0) run = x;
+            if (!dark && run >= 0) { xs.push_back(0.5 * (run + x - 1)); run = -1; }
+        }
+        return xs;
+    };
+    // How far the verticals move between a row near the top and one near the
+    // bottom: the worst over lines matched by order.
+    auto spread = [&](Image& im) {
+        const auto a = linesAt(im, H / 4, W / 6, 5 * W / 6), b = linesAt(im, 3 * H / 4, W / 6, 5 * W / 6);
+        if (a.size() < 4 || a.size() != b.size()) return 1e9;
+        double worst = 0;
+        for (size_t i = 0; i < a.size(); ++i) worst = std::max(worst, std::fabs(a[i] - b[i]));
+        return worst;
+    };
+    Image src = tilted(), vert, level;
+    std::string err;
+    if (!RunFilter("upright", tilted(), {{"mode", 2.0}}, &vert, &err) ||
+        !RunFilter("upright", tilted(), {{"mode", 1.0}}, &level, &err)) {
+        Check(false, "upright runs: " + err);
+        return;
+    }
+    const double s0 = spread(src), s1 = spread(vert);
+    Check(s0 > 8.0 && s1 < 1.5, "upright vertical makes converging verticals parallel and upright (worst " +
+                                     std::to_string(s0) + " -> " + std::to_string(s1) + " px)");
+    // Level: roll only. The verticals still converge, but symmetrically, so the
+    // middle line no longer leans.
+    auto middle = [&](Image& im) {
+        const auto a = linesAt(im, H / 4, W / 6, 5 * W / 6), b = linesAt(im, 3 * H / 4, W / 6, 5 * W / 6);
+        if (a.empty() || b.empty()) return 1e9;
+        auto nearest = [](const std::vector<double>& v, double x) {
+            double best = v[0];
+            for (double c : v) if (std::fabs(c - x) < std::fabs(best - x)) best = c;
+            return best;
+        };
+        const double xa = nearest(a, 0.5 * W);
+        return std::fabs(xa - nearest(b, xa));
+    };
+    Check(middle(src) > 4.0 && middle(level) < 1.5, "upright level removes the lean of the middle vertical (" +
+              std::to_string(middle(src)) + " -> " + std::to_string(middle(level)) + " px)");
+}
+
 static void TestOrton() {
     const int N = 128;
     auto spot = [&](float bg, float fg) {
@@ -2124,6 +2439,11 @@ int main() {
     TestSharpen();
     TestClarity();
     TestFilmGrain();
+    TestBloomRound();
+    TestDefringe();
+    TestLocalTones();
+    TestCurves();
+    TestUpright();
     TestOrton();
     TestLut();
     TestDehaze();

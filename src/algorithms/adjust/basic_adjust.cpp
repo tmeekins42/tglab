@@ -41,6 +41,7 @@
 #include "../../algo_util/white_balance.h"
 #include "../../algo_util/color.h"
 #include "../../core/algorithm.h"
+#include "../../core/parallel.h"
 
 namespace tglab {
 namespace {
@@ -144,6 +145,139 @@ inline float SmoothBand(float x, float lo, float hi) {
     return t * t * (3.0f - 2.0f * t);
 }
 
+// The midtones band: centred on middle grey (0.18 linear), falling away over
+// about a stop and a quarter either side in log -- so it moves the middle of
+// the picture and leaves both ends where they are. Applied as a gain in
+// stops: +1 brightens middle grey by a stop.
+inline float MidtoneWeight(float lum) {
+    const float d = std::log2(std::max(lum, 1e-6f) / 0.18f) / 1.25f;
+    return std::exp(-d * d);
+}
+
+// THE LOCAL BASE, which is what makes highlights, shadows and midtones edge-
+// aware: a guided filter (He, Sun & Tang) of log luminance at kBaseRadius
+// full-resolution pixels, threshold kBaseEps stops. The tonal bands are chosen
+// by the base -- the brightness of the REGION a pixel is in -- and applied as
+// a gain, so the texture inside a region keeps its contrast: pulling down a
+// sky's highlights darkens the sky without flattening its clouds, where a
+// per-pixel band compresses the bright half of every cloud and leaves them grey.
+constexpr int   kBaseRadius = 48;
+constexpr float kBaseEps    = 0.4f;
+
+void BoxMeanBA(const std::vector<float>& in, std::vector<float>& out, int w, int h, int r) {
+    std::vector<float> tmp(in.size());
+    const float norm = 1.0f / float(2 * r + 1);
+    ParallelFor(size_t(h), [&](size_t y) {
+        const size_t row = y * size_t(w);
+        float sum = 0.0f;
+        for (int i = -r; i <= r; ++i) sum += in[row + size_t(std::clamp(i, 0, w - 1))];
+        for (int x = 0; x < w; ++x) {
+            tmp[row + size_t(x)] = sum * norm;
+            sum += in[row + size_t(std::clamp(x + r + 1, 0, w - 1))] -
+                   in[row + size_t(std::clamp(x - r, 0, w - 1))];
+        }
+    });
+    ParallelFor(size_t(w), [&](size_t x) {
+        float sum = 0.0f;
+        for (int i = -r; i <= r; ++i) sum += tmp[size_t(std::clamp(i, 0, h - 1)) * size_t(w) + x];
+        for (int y = 0; y < h; ++y) {
+            out[size_t(y) * size_t(w) + x] = sum * norm;
+            sum += tmp[size_t(std::clamp(y + r + 1, 0, h - 1)) * size_t(w) + x] -
+                   tmp[size_t(std::clamp(y - r, 0, h - 1)) * size_t(w) + x];
+        }
+    });
+}
+
+// The guided filter's a and b, smoothed: base = a * l + b.
+void GuidedAB(const std::vector<float>& l, int w, int h, int r, float eps,
+              std::vector<float>* a, std::vector<float>* b) {
+    const size_t n = l.size();
+    std::vector<float> mean(n), meanSq(n), sq(n);
+    for (size_t i = 0; i < n; ++i) sq[i] = l[i] * l[i];
+    BoxMeanBA(l, mean, w, h, r);
+    BoxMeanBA(sq, meanSq, w, h, r);
+    std::vector<float> ra(n), rb(n);
+    for (size_t i = 0; i < n; ++i) {
+        const float var = std::max(0.0f, meanSq[i] - mean[i] * mean[i]);
+        ra[i] = var / (var + eps * eps);
+        rb[i] = (1.0f - ra[i]) * mean[i];
+    }
+    a->resize(n); b->resize(n);
+    BoxMeanBA(ra, *a, w, h, r);
+    BoxMeanBA(rb, *b, w, h, r);
+}
+
+// The base passes on the GPU: log luminance (and its square), running-sum boxes
+// a run of kBaseRun pixels per thread, the a/b coefficients, boxes again.
+const char* const kBaseCommon = R"(
+Texture2D<float4>   T0 : register(t0);
+RWTexture2D<float4> U0 : register(u0);
+cbuffer Params : register(b0) {
+    uint Width;
+    uint Height;
+    uint Radius;
+    uint EpsBits;
+    uint Linear;
+};
+int2 ClampXY(int x, int y) { return int2(clamp(x, 0, int(Width) - 1), clamp(y, 0, int(Height) - 1)); }
+)";
+const char* const kBaseLog = R"(
+[numthreads(8, 8, 1)]
+void main(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= Width || tid.y >= Height) return;
+    float3 c = T0[tid.xy].rgb;
+    c = (Linear != 0) ? c : SrgbToLinear(c);
+    float l = log2(max(Luma(c), 1e-6));
+    U0[tid.xy] = float4(l, l * l, 0, 1);
+}
+)";
+const char* const kBaseBoxH = R"(
+static const int kRun = 64;
+[numthreads(8, 8, 1)]
+void main(uint3 tid : SV_DispatchThreadID) {
+    int x0 = int(tid.x) * kRun, y = int(tid.y);
+    if (x0 >= int(Width) || y >= int(Height)) return;
+    int r = int(Radius);
+    float inv = 1.0 / float(2 * r + 1);
+    float2 sum = 0.0;
+    for (int i = -r; i <= r; ++i) sum += T0[ClampXY(x0 + i, y)].xy;
+    int x1 = min(x0 + kRun, int(Width));
+    for (int x = x0; x < x1; ++x) {
+        if (x > x0) sum += T0[ClampXY(x + r, y)].xy - T0[ClampXY(x - r - 1, y)].xy;
+        U0[int2(x, y)] = float4(sum * inv, 0, 1);
+    }
+}
+)";
+const char* const kBaseBoxV = R"(
+static const int kRun = 64;
+[numthreads(8, 8, 1)]
+void main(uint3 tid : SV_DispatchThreadID) {
+    int x = int(tid.x), y0 = int(tid.y) * kRun;
+    if (x >= int(Width) || y0 >= int(Height)) return;
+    int r = int(Radius);
+    float inv = 1.0 / float(2 * r + 1);
+    float2 sum = 0.0;
+    for (int i = -r; i <= r; ++i) sum += T0[ClampXY(x, y0 + i)].xy;
+    int y1 = min(y0 + kRun, int(Height));
+    for (int y = y0; y < y1; ++y) {
+        if (y > y0) sum += T0[ClampXY(x, y + r)].xy - T0[ClampXY(x, y - r - 1)].xy;
+        U0[int2(x, y)] = float4(sum * inv, 0, 1);
+    }
+}
+)";
+const char* const kBaseAb = R"(
+[numthreads(8, 8, 1)]
+void main(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= Width || tid.y >= Height) return;
+    float2 ms = T0[int2(tid.xy)].xy;
+    float var = max(0.0, ms.y - ms.x * ms.x);
+    float eps = asfloat(EpsBits);
+    float a = var / (var + eps * eps);
+    U0[tid.xy] = float4(a, (1.0 - a) * ms.x, 0, 1);
+}
+)";
+constexpr uint32_t kBaseRun = 64;   // must match the HLSL above
+
 
 } // namespace
 
@@ -196,6 +330,24 @@ public:
         WhiteBalanceMatrix(wb);
         const float expGain = std::pow(2.0f, float(m_exposure));
 
+        // The local base, when a tonal band needs it.
+        const bool useBase = NeedBase();
+        std::vector<float> logL, baseA, baseB;
+        if (useBase) {
+            logL.resize(size_t(w) * size_t(h));
+            ParallelFor(size_t(h), [&](size_t y) {
+                for (int x = 0; x < w; ++x) {
+                    const float* p = m_in.At(x, int(y));
+                    float r, g, b;
+                    if (ch == 1) r = g = b = DecodeIn(p[0] / scale, linear);
+                    else { r = DecodeIn(p[0] / scale, linear); g = DecodeIn(p[1] / scale, linear);
+                           b = DecodeIn(p[2] / scale, linear); }
+                    logL[y * size_t(w) + size_t(x)] = std::log2(std::max(Luma(r, g, b), 1e-6f));
+                }
+            });
+            GuidedAB(logL, w, h, std::max(1, int(std::lround(ctx.ScaledPx(float(kBaseRadius))))), kBaseEps, &baseA, &baseB);
+        }
+
         for (int y = 0; y < h; ++y) {
             if (ctx.Cancelled()) return;
             for (int x = 0; x < w; ++x) {
@@ -216,7 +368,17 @@ public:
                 r = wb[0] * r0 + wb[1] * g0 + wb[2] * b0;
                 g = wb[3] * r0 + wb[4] * g0 + wb[5] * b0;
                 b = wb[6] * r0 + wb[7] * g0 + wb[8] * b0;
-                Apply(&r, &g, &b, 1.0f, 1.0f, 1.0f, expGain, white, shadowTop);
+                // The base, as a linear luminance the input had in this
+                // region, carried through the same white balance and exposure
+                // the pixel was: scaled by the pixel's own change.
+                float base = -1.0f;
+                if (useBase) {
+                    const size_t i = size_t(y) * size_t(w) + size_t(x);
+                    const float lumIn = std::max(Luma(r0, g0, b0), 1e-6f);
+                    const float lumAdj = Luma(r, g, b) * expGain;
+                    base = std::exp2(baseA[i] * logL[i] + baseB[i]) * lumAdj / lumIn;
+                }
+                Apply(&r, &g, &b, 1.0f, 1.0f, 1.0f, expGain, white, shadowTop, base);
 
                 if (ch == 1) {
                     m_out.Set(x, y, 0, EncodeOut(Luma(r, g, b), linear) * scale);
@@ -237,9 +399,51 @@ public:
     // between. See the file header for the measurements.
     bool HasGPU() const override { return true; }
 
-    const char* GpuSource() const override {
-        return R"(
+    // Per pixel, unless the local base is in use: then the two box stages of
+    // its guided filter reach twice its radius.
+    int ReachPixels() const override { return NeedBase() ? 2 * kBaseRadius : 0; }
+
+    const char* GpuSource() const override { return kMainHlsl; }
+
+    // With a local base: six passes build it -- they depend only on the input,
+    // so dragging any of this stage's sliders skips them -- then the main pass.
+    // Without one (no tonal band set, or `local` off) the single kernel above.
+    bool NeedBase() const {
+        return bool(m_local) && (std::abs(float(m_highlights)) > 1e-4f ||
+                                 std::abs(float(m_shadows)) > 1e-4f ||
+                                 std::abs(float(m_midtones)) > 1e-4f);
+    }
+    int        GpuScratchCount()  const override { return NeedBase() ? 4 : 0; }
+    FormatSpec GpuScratchPlanes() const override { return FormatSpec::RG32F; }
+    std::vector<GpuPass> GpuPasses() const override {
+        if (!NeedBase()) return {};
+        static const std::string logp = std::string(kBaseCommon) + kBaseLog;
+        static const std::string boxh = std::string(kBaseCommon) + kBaseBoxH;
+        static const std::string boxv = std::string(kBaseCommon) + kBaseBoxV;
+        static const std::string ab   = std::string(kBaseCommon) + kBaseAb;
+        static const std::string mainp = std::string("#define USE_BASE 1\n") + kMainHlsl;
+        return {{logp.c_str(), "baseLog",  {-1}, {0}},
+                {boxh.c_str(), "baseBoxH", {0}, {1}, kBaseRun, 1},
+                {boxv.c_str(), "baseBoxV", {1}, {2}, 1, kBaseRun},
+                {ab.c_str(),   "baseAb",   {2}, {1}},
+                {boxh.c_str(), "baseAbH",  {1}, {2}, kBaseRun, 1},
+                {boxv.c_str(), "baseAbV",  {2}, {3}, 1, kBaseRun},
+                {mainp.c_str(), "adjust",  {-1, 3}, {-1}}};
+    }
+    std::vector<uint32_t> GpuPassConstants(int pass) const override {
+        if (NeedBase() && pass < 6)
+            return {uint32_t(std::max(1, int(std::lround(GpuScaledPx(float(kBaseRadius)))))), FloatBits(kBaseEps),
+                    m_linear ? 1u : 0u};
+        return GpuConstants(0);
+    }
+
+    // The adjustment kernel. With USE_BASE it reads the local base's a/b plane
+    // at t1 and drives the tonal bands from it; see Apply.
+    static constexpr const char* kMainHlsl = R"(
 Texture2D<float4>   Src : register(t0);
+#ifdef USE_BASE
+Texture2D<float4>   BaseAB : register(t1);
+#endif
 RWTexture2D<float4> Dst : register(u0);
 
 cbuffer Params : register(b0) {
@@ -254,7 +458,12 @@ cbuffer Params : register(b0) {
     uint  Linear;               // 1 = scene-linear input: no transfer, no clamp
     uint  HighlightTop;         // top of the highlight band (1.0 unless linear)
     uint  ShadowTop;            // top of the shadow band (0.5 unless linear)
+    uint  Midtones;
 };
+float MidtoneWeight(float lum) {
+    float d = log2(max(lum, 1e-6) / 0.18) / 1.25;
+    return exp(-d * d);
+}
 
 // kLumaW, Luma, SrgbToLinear and LinearToSrgb: color.h's kColorHlsl,
 // prepended at compile time.
@@ -271,6 +480,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
 
     // Scene-linear input is already linear -- decoding it again would be wrong.
     float3 c = (Linear != 0) ? texel.rgb : SrgbToLinear(texel.rgb);
+    float lumIn = max(Luma(c), 1e-6);
 
     // --- white balance: a 3x3, since on a raw it is done in camera space ---
     c = float3(dot(float3(asfloat(Wb0), asfloat(Wb1), asfloat(Wb2)), c),
@@ -284,8 +494,31 @@ void main(uint3 tid : SV_DispatchThreadID) {
     // Each targets a tonal band via a smooth window, so the correction fades
     // out rather than leaving a visible edge where it stops applying.
     float lum = Luma(c);
-
+    float drive = lum;
     float hi = asfloat(Highlights);
+#ifdef USE_BASE
+    // The region's brightness, carried through this pixel's white balance and
+    // exposure; and highlights as a gain on it -- see Apply on the CPU.
+    float2 ab = BaseAB[int2(tid.xy)].xy;
+    drive = exp2(ab.x * log2(lumIn) + ab.y) * lum / lumIn;
+    if (abs(hi) > 1e-4) {
+        float wp = asfloat(HighlightTop);
+        float w = SmoothBand(drive, 0.35, wp);
+        float amount = -hi * w;
+        if (amount > 0.0) {
+            float shed = 0.5 * amount;
+            float b1 = drive - max(drive - wp, 0.0) * shed;
+            b1 *= (1.0 - 0.35 * amount);
+            c *= b1 / max(drive, 1e-6);
+            float l0 = Luma(c);
+            float3 c2 = c - max(c - wp, 0.0) * shed;
+            float l2 = Luma(c2);
+            c = l2 > 1e-6 ? c2 * (l0 / l2) : c;
+        } else if (amount < 0.0) {
+            c *= (1.0 - amount);
+        }
+    }
+#else
     if (abs(hi) > 1e-4) {
         float wp = asfloat(HighlightTop);
         float w = SmoothBand(lum, 0.35, wp);
@@ -310,11 +543,14 @@ void main(uint3 tid : SV_DispatchThreadID) {
             c *= (1.0 - amount);
         }
     }
+#endif
     float sh = asfloat(Shadows);
     if (abs(sh) > 1e-4) {
-        float w = 1.0 - SmoothBand(lum, 0.0, asfloat(ShadowTop));
+        float w = 1.0 - SmoothBand(drive, 0.0, asfloat(ShadowTop));
         c *= (1.0 + sh * w);
     }
+    float md = asfloat(Midtones);
+    if (abs(md) > 1e-4) c *= exp2(md * MidtoneWeight(drive));
 
     // --- whites / blacks: the endpoints, not bands ---
     float wh = asfloat(Whites);
@@ -348,7 +584,6 @@ void main(uint3 tid : SV_DispatchThreadID) {
     Dst[tid.xy] = float4((Linear != 0) ? c : LinearToSrgb(c), texel.a);
 }
 )";
-    }
 
     std::vector<uint32_t> GpuConstants(int) const override {
         float wb[9];
@@ -362,7 +597,8 @@ void main(uint3 tid : SV_DispatchThreadID) {
                 FloatBits(float(m_highlights)), FloatBits(float(m_shadows)),
                 FloatBits(float(m_whites)),     FloatBits(float(m_blacks)),
                 FloatBits(float(m_vibrance)),   FloatBits(float(m_saturation)),
-                uint32_t(m_linear ? 1 : 0), FloatBits(m_white), FloatBits(m_shadowTop)};
+                uint32_t(m_linear ? 1 : 0), FloatBits(m_white), FloatBits(m_shadowTop),
+                FloatBits(float(m_midtones))};
     }
 
     // HasGPU() is consulted before PrepareGpu(), so this is where the input
@@ -473,17 +709,48 @@ private:
     // `white` is where the highlight band tops out; see kLinearShoulder and
     // the caller for why it is not 1.0 on scene-linear input.
 
+    // `base`: the local base's luminance (see kBaseRadius), or negative for the
+    // per-pixel bands.
     void Apply(float* rr, float* gg, float* bb,
                float wbR, float wbG, float wbB, float expGain, float white,
-               float shadowTop) const {
+               float shadowTop, float base = -1.0f) const {
         float r = *rr * wbR * expGain;
         float g = *gg * wbG * expGain;
         float b = *bb * wbB * expGain;
 
         float lum = Luma(r, g, b);
+        // What chooses the tonal bands: the region's brightness when local.
+        const bool local = base >= 0.0f;
+        const float drive = local ? base : lum;
 
         const float hi = float(m_highlights);
-        if (std::abs(hi) > 1e-4f) {
+        if (local && std::abs(hi) > 1e-4f) {
+            // LOCAL: the base decides how much, and the change is a GAIN, so
+            // the region's texture keeps its contrast. The same compression of
+            // the excess above the band top as below, done to the base.
+            const float w = SmoothBand(drive, 0.35f, white);
+            const float amount = -hi * w;
+            if (amount > 0.0f) {
+                const float shed = 0.5f * amount;
+                float b1 = drive - std::max(drive - white, 0.0f) * shed;
+                b1 *= 1.0f - 0.35f * amount;
+                const float gain = b1 / std::max(drive, 1e-6f);
+                r *= gain; g *= gain; b *= gain;
+                // And still per channel for COLOUR: a blown highlight is blown
+                // because one channel clipped, so recovery pulls that channel
+                // toward the others -- with the lightness the gain set kept.
+                const float l0 = Luma(r, g, b);
+                float r2 = r - std::max(r - white, 0.0f) * shed;
+                float g2 = g - std::max(g - white, 0.0f) * shed;
+                float b2 = b - std::max(b - white, 0.0f) * shed;
+                const float l2 = Luma(r2, g2, b2);
+                const float k = l2 > 1e-6f ? l0 / l2 : 1.0f;
+                r = r2 * k; g = g2 * k; b = b2 * k;
+            } else if (amount < 0.0f) {
+                const float k = 1.0f - amount;
+                r *= k; g *= k; b *= k;
+            }
+        } else if (std::abs(hi) > 1e-4f) {
             const float w = SmoothBand(lum, 0.35f, white);
 
             // Recovery pulls each channel toward the band's top, rather than
@@ -546,8 +813,13 @@ private:
         }
         const float sh = float(m_shadows);
         if (std::abs(sh) > 1e-4f) {
-            const float w = 1.0f - SmoothBand(lum, 0.0f, shadowTop);
+            const float w = 1.0f - SmoothBand(drive, 0.0f, shadowTop);
             const float k = 1.0f + sh * w;
+            r *= k; g *= k; b *= k;
+        }
+        const float mid = float(m_midtones);
+        if (std::abs(mid) > 1e-4f) {
+            const float k = std::exp2(mid * MidtoneWeight(drive));
             r *= k; g *= k; b *= k;
         }
 
@@ -638,11 +910,25 @@ private:
                  "highlights, which is the usual direction; positive pushes "
                  "them further.",
          .step = 0.01, .softMin = -1.0, .softMax = 0.5}};
+    Param<float> m_midtones{
+        this, "midtones", 0.0f, -1.0f, 1.0f,
+        {.help = "Brightness of the middle tones only, in stops at middle grey, "
+                 "falling away toward both ends -- so the picture opens up or "
+                 "deepens without the highlights or shadows moving.",
+         .step = 0.01, .softMin = -0.5, .softMax = 0.5}};
+
     Param<float> m_shadows{
         this, "shadows", 0.0f, -1.0f, 1.0f,
         {.help = "Brightness of the lower tones only. POSITIVE opens up shadow "
                  "detail; negative deepens it.",
          .step = 0.01, .softMin = -0.5, .softMax = 1.0}};
+
+    Param<bool> m_local{this, "local_tones", true,
+        "Highlights, midtones and shadows by REGION rather than by pixel: the "
+        "band each pixel falls in is decided by the brightness around it "
+        "(edge-aware, so a sky and the land below it are separate regions), and "
+        "texture inside a region keeps its contrast -- clouds stay crisp while "
+        "the sky is pulled down. Off: each pixel by its own brightness."};
     Param<float> m_whites{
         this, "whites", 0.0f, -1.0f, 1.0f,
         {.help = "The white point -- where the brightest tones land. Sets how "

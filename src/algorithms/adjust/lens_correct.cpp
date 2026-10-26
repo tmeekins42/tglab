@@ -47,6 +47,7 @@
 
 #include "../../algo_util/color.h"
 #include "../../algo_util/pixel_buffer.h"
+#include "../../algo_util/resample.h"
 #include "../../core/algorithm.h"
 #include "../../core/parallel.h"
 
@@ -102,36 +103,6 @@ double FitScale(LensMap m, double w, double h) {
     return lo;
 }
 
-// Catmull-Rom, with the result held to the range of the four nearest samples:
-// the cubic's overshoot is a dark or bright ring along every hard edge, worst
-// on a blown light against a night sky, and a resample that only moves the
-// image must not add one.
-float SampleCubic(const float* d, int w, int h, int ch, int c, double fx, double fy) {
-    const int x0 = int(std::floor(fx)), y0 = int(std::floor(fy));
-    const float tx = float(fx - x0), ty = float(fy - y0);
-    auto wts = [](float t, float* o) {
-        const float t2 = t * t, t3 = t2 * t;
-        o[0] = 0.5f * (-t3 + 2 * t2 - t);
-        o[1] = 0.5f * (3 * t3 - 5 * t2 + 2);
-        o[2] = 0.5f * (-3 * t3 + 4 * t2 + t);
-        o[3] = 0.5f * (t3 - t2);
-    };
-    float wx[4], wy[4];
-    wts(tx, wx); wts(ty, wy);
-    float sum = 0, lo = 3.4e38f, hi = -3.4e38f;
-    for (int j = 0; j < 4; ++j) {
-        const int yy = std::clamp(y0 - 1 + j, 0, h - 1);
-        float row = 0;
-        for (int i = 0; i < 4; ++i) {
-            const int xx = std::clamp(x0 - 1 + i, 0, w - 1);
-            const float v = d[(size_t(yy) * size_t(w) + size_t(xx)) * size_t(ch) + size_t(c)];
-            row += wx[i] * v;
-            if ((i == 1 || i == 2) && (j == 1 || j == 2)) { lo = std::min(lo, v); hi = std::max(hi, v); }
-        }
-        sum += wy[j] * row;
-    }
-    return std::clamp(sum, lo, hi);
-}
 
 // --- automatic lateral CA ---------------------------------------------------
 
@@ -331,7 +302,7 @@ public:
                     double sx, sy;
                     m.Source(fx, fy, mc, &sx, &sy);
                     if (mc == 1) { gx = sx; gy = sy; }
-                    q[c] = SampleCubic(px, w, h, ch, c, sx - d.originX - 0.5, sy - d.originY - 0.5);
+                    q[c] = SampleCubicClamped(px, w, h, ch, c, sx - d.originX - 0.5, sy - d.originY - 0.5);
                 }
                 if (stops != 0.0f) {
                     const double r = std::hypot(gx - m.cx, gy - m.cy) / m.hd;
@@ -397,7 +368,12 @@ public:
     }
 
     const char* GpuSource() const override {
-        return R"(
+        // The shared sampler (algo_util/resample.h) between the declarations
+        // it uses and the kernel that calls it.
+        static const std::string src = std::string(kLensHead) + kSampleCubicHlsl + kLensMain;
+        return src.c_str();
+    }
+    static constexpr const char* kLensHead = R"(
 Texture2D<float4>   Src : register(t0);
 RWTexture2D<float4> Dst : register(u0);
 
@@ -423,33 +399,8 @@ float3 LinearToSrgb3(float3 c) {
     return select(c <= 0.0031308, c * 12.92, 1.055 * pow(c, 1.0 / 2.4) - 0.055);
 }
 
-float4 CubicW(float t) {
-    float t2 = t * t, t3 = t2 * t;
-    return 0.5 * float4(-t3 + 2 * t2 - t, 3 * t3 - 5 * t2 + 2, -3 * t3 + 4 * t2 + t, t3 - t2);
-}
-
-// Catmull-Rom of one channel, held to the range of the four nearest samples
-// (see SampleCubic on the CPU side).
-float SampleCubic(float2 f, uint c) {
-    int2 p0 = int2(floor(f));
-    float2 t = f - float2(p0);
-    float4 wx = CubicW(t.x), wy = CubicW(t.y);
-    float sum = 0, lo = 3.4e38, hi = -3.4e38;
-    [unroll] for (int j = 0; j < 4; ++j) {
-        int yy = clamp(p0.y - 1 + j, 0, int(Height) - 1);
-        float row = 0;
-        [unroll] for (int i = 0; i < 4; ++i) {
-            int xx = clamp(p0.x - 1 + i, 0, int(Width) - 1);
-            float v = Src.Load(int3(xx, yy, 0))[c];
-            row += wx[i] * v;
-            if ((i == 1 || i == 2) && (j == 1 || j == 2)) { lo = min(lo, v); hi = max(hi, v); }
-        }
-        sum += wy[j] * row;
-    }
-    return clamp(sum, lo, hi);
-}
-
-[numthreads(8, 8, 1)]
+)";
+    static constexpr const char* kLensMain = R"([numthreads(8, 8, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
     if (tid.x >= Width || tid.y >= Height) return;
     float cx = asfloat(CxBits), cy = asfloat(CyBits), hd = asfloat(HdBits);
@@ -478,7 +429,6 @@ void main(uint3 tid : SV_DispatchThreadID) {
     Dst[tid.xy] = o;
 }
 )";
-    }
 
     std::vector<uint32_t> GpuConstants(int) const override {
         const LensMap m = Map(m_desc, bool(m_autoCa) ? m_est : CaEstimate{});

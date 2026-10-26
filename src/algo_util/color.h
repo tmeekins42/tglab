@@ -50,6 +50,53 @@ inline void XyzToLinearSrgb(float X, float Y, float Z, float* r, float* g, float
     *b =  0.0556434f * X - 0.2040259f * Y + 1.0572252f * Z;
 }
 
+// OkLab (Ottosson 2020), from and to LINEAR sRGB. A perceptual space whose
+// hue angle stays put as lightness and chroma change -- which is what lets a
+// stage pick out "purple" or "green" by angle and change chroma alone. The
+// cube root is sign-preserving: a linear pipeline carries out-of-gamut
+// negatives, and std::cbrt of one is defined, pow is not.
+inline void LinearSrgbToOkLab(const float* rgb, float* lab) {
+    const float l = 0.4122214708f * rgb[0] + 0.5363325363f * rgb[1] + 0.0514459929f * rgb[2];
+    const float m = 0.2119034982f * rgb[0] + 0.6806995451f * rgb[1] + 0.1073969566f * rgb[2];
+    const float s = 0.0883024619f * rgb[0] + 0.2817188376f * rgb[1] + 0.6299787005f * rgb[2];
+    const float l_ = std::cbrt(l), m_ = std::cbrt(m), s_ = std::cbrt(s);
+    lab[0] = 0.2104542553f * l_ + 0.7936177850f * m_ - 0.0040720468f * s_;
+    lab[1] = 1.9779984951f * l_ - 2.4285922050f * m_ + 0.4505937099f * s_;
+    lab[2] = 0.0259040371f * l_ + 0.7827717662f * m_ - 0.8086757660f * s_;
+}
+inline void OkLabToLinearSrgb(const float* lab, float* rgb) {
+    const float l_ = lab[0] + 0.3963377774f * lab[1] + 0.2158037573f * lab[2];
+    const float m_ = lab[0] - 0.1055613458f * lab[1] - 0.0638541728f * lab[2];
+    const float s_ = lab[0] - 0.0894841775f * lab[1] - 1.2914855480f * lab[2];
+    const float l = l_ * l_ * l_, m = m_ * m_ * m_, s = s_ * s_ * s_;
+    rgb[0] =  4.0767416621f * l - 3.3077115913f * m + 0.2309699292f * s;
+    rgb[1] = -1.2684380046f * l + 2.6097574011f * m - 0.3413193965f * s;
+    rgb[2] = -0.0041960863f * l - 0.7034186147f * m + 1.7076147010f * s;
+}
+
+// The same in HLSL, kept beside the C++ so the two cannot drift.
+inline constexpr const char* kOkLabHlsl = R"(
+float CbrtS(float x) { return sign(x) * pow(abs(x), 1.0 / 3.0); }
+float3 LinearSrgbToOkLab(float3 c) {
+    float l = 0.4122214708 * c.r + 0.5363325363 * c.g + 0.0514459929 * c.b;
+    float m = 0.2119034982 * c.r + 0.6806995451 * c.g + 0.1073969566 * c.b;
+    float s = 0.0883024619 * c.r + 0.2817188376 * c.g + 0.6299787005 * c.b;
+    float l_ = CbrtS(l), m_ = CbrtS(m), s_ = CbrtS(s);
+    return float3(0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,
+                  1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,
+                  0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_);
+}
+float3 OkLabToLinearSrgb(float3 lab) {
+    float l_ = lab.x + 0.3963377774 * lab.y + 0.2158037573 * lab.z;
+    float m_ = lab.x - 0.1055613458 * lab.y - 0.0638541728 * lab.z;
+    float s_ = lab.x - 0.0894841775 * lab.y - 1.2914855480 * lab.z;
+    float l = l_ * l_ * l_, m = m_ * m_ * m_, s = s_ * s_ * s_;
+    return float3( 4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+                  -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+                  -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s);
+}
+)";
+
 // The same for kernels: prepend to an HLSL source.
 inline constexpr const char* kColorHlsl = R"(
 static const float3 kLumaW = float3(0.2126, 0.7152, 0.0722);   // Rec. 709

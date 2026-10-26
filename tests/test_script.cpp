@@ -7837,8 +7837,11 @@ int main() {
             // Checked per stage by NAME rather than by counting, because the
             // interesting claim is which ones ran, not how many. A count would
             // pass just as happily with orton live and tonemap bypassed.
+            // ...plus curves, which is a correction but NEUTRAL at its
+            // defaults -- the identity curve -- and so skipped until a slider
+            // moves, exactly as an effect is.
             const std::set<std::string> mustBypass = {
-                "orton", "bloom", "vignette", "film_grain", "dehaze",
+                "orton", "bloom", "vignette", "film_grain", "dehaze", "curves",
             };
             for (const Stage& st : p.Stages()) {
                 const bool live = st.bypassOf.stage == -2;

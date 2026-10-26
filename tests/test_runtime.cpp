@@ -1414,6 +1414,31 @@ static void TestGpuAgreement(ID3D12Device* dev) {
          "o = lens_correct(src, k1 = 0.05)\n"
          "display(o)\n", 2.0, 0.5},
 
+        // basic_adjust with the local base: six passes build it, and every
+        // tonal band -- highlights, midtones, shadows -- is driven by it.
+        {"basic_adjust",
+         "src = image(\"test\")\n"
+         "o = basic_adjust(src, highlights = -0.6, midtones = 0.4, shadows = 0.5, contrast = 0.2)\n"
+         "display(o)\n", 4.0, 1.0},
+
+        // curves: a 256-entry table in the constant buffer, on luminance.
+        {"curves",
+         "src = image(\"test\")\n"
+         "o = curves(src, highlights = 0.6, darks = -0.4, points = \"0,0 0.4,0.35 1,1\")\n"
+         "display(o)\n", 2.0, 0.75},
+
+        // upright: lines found on the CPU from a readback, the warp on the GPU.
+        {"upright",
+         "src = image(\"test\")\n"
+         "o = upright(src, mode = 3)\n"
+         "display(o)\n", 2.0, 0.75},
+
+        // defringe: OkLab lightness, a min/max window, chroma scaled by hue.
+        {"defringe",
+         "src = image(\"test\")\n"
+         "o = defringe(src, purple = 1, green = 0.5, radius = 3)\n"
+         "display(o)\n", 2.0, 0.75},
+
         // sharpen: log luminance, a separable blur, one gain per pixel.
         {"sharpen",
          "src = image(\"test\")\n"
@@ -2166,6 +2191,12 @@ static void TestProxyFidelity() {
         // glow vanished for the length of a drag and came back on release.
         {"bloom",         "o = bloom(src, threshold = 0.1, intensity = 2, "
                           "spread_r = 24, spread_g = 24, spread_b = 24)\n"},
+        // And WIDE: the direct Gaussian capped its window at 128 px, so a
+        // spread of 100 at full resolution was cut to a near-flat kernel and
+        // the glow came out square, while the preview -- a fraction of the
+        // spread, inside the cap -- was round.
+        {"bloom",         "o = bloom(src, threshold = 0.1, intensity = 2, "
+                          "spread_r = 100, spread_g = 100, spread_b = 100)\n"},
     };
 
     for (const Case& c : cases) {
@@ -2886,6 +2917,59 @@ static void TestMeasureCachePerFrame(ID3D12Device* dev) {
     gpu.Shutdown();
 }
 
+// A DRAG KEEPS wavelet_denoise's NOISE MEASUREMENT; THE SETTLED RUN REMAKES IT.
+//
+// Any change upstream re-measured the noise -- a readback and a CPU pass, most
+// of every tick of every slider above the denoise. Mid-drag (a preview scale
+// or a region) a stage that allows it now keeps its last measurement; the run
+// after release, at full scale, measures exactly. Read through the noise the
+// stage reports: unchanged across a drag that doubled the input, changed once
+// it settles.
+static void TestMeasureStaleWhileDragging(ID3D12Device* dev) {
+    std::printf("\n--- measurement kept while dragging ---\n");
+    ComputeContext gpu;
+    if (!gpu.Init(dev)) { Check(false, "compute context starts"); return; }
+    const int dim = 512;
+    Image img;
+    img.Alloc({dim, dim, Format::RGBA32F});
+    {
+        ImageView v = img.MapCpuWrite();
+        uint32_t s = 7;
+        for (int y = 0; y < dim; ++y)
+            for (int x = 0; x < dim; ++x) {
+                s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+                float* p = v.At<float>(x, y);
+                p[0] = p[1] = p[2] = 0.3f + 0.05f * (float(s & 0xFFFF) / 65535.0f - 0.5f);
+                p[3] = 1.0f;
+            }
+    }
+    auto run = [&](Pipeline* p, Pipeline* prev, double gain, float proxy, std::string* note) {
+        UiState ui; Program prog; std::string err;
+        const std::string script = "src = image(\"test\")\na = basic_adjust(src, exposure = " +
+                                   std::to_string(gain) + ")\nd = wavelet_denoise(a)\ndisplay(d)\n";
+        std::vector<SourceImage> names{{"test", 0}};
+        if (!Parse(script, &prog, &err) || !Interpret(prog, names, &ui, p).ok) return false;
+        p->SetProxyScale(proxy);
+        std::vector<Data> src;
+        src.push_back(Data{img.Clone()});
+        const std::vector<uint64_t> versions{1};
+        if (!p->Execute(&src, prev, &err, &gpu, ExecMode::ForceGPU, &versions)) return false;
+        for (const auto& st : p->Stages())
+            if (st.algoName == "wavelet_denoise") *note = st.algo->RunReport();
+        return true;
+    };
+    Pipeline a, b, c;
+    std::string na, nb, nc;
+    if (!run(&a, nullptr, 0.0, 0.5f, &na) || !run(&b, &a, 1.0, 0.5f, &nb) || !run(&c, &b, 1.0, 1.0f, &nc)) {
+        Check(false, "the drag runs");
+        gpu.Shutdown();
+        return;
+    }
+    Check(!na.empty() && na == nb, "mid-drag, a change upstream keeps the noise measurement (" + nb + ")");
+    Check(!nc.empty() && nc != nb, "...and the settled run measures again (" + nc + ")");
+    gpu.Shutdown();
+}
+
 static void TestMeasureCache(ID3D12Device* dev) {
     std::printf("\n--- gpu measurement cache ---\n");
 
@@ -3333,6 +3417,7 @@ int main() {
         TestGpuAgreement(dev);
         TestMeasureCache(dev);
         TestMeasureCachePerFrame(dev);
+        TestMeasureStaleWhileDragging(dev);
         dev->Release();
     } else {
         std::printf("\n(no D3D12 device — GPU tests skipped)\n");
