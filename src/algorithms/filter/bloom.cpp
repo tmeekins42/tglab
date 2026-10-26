@@ -1,6 +1,14 @@
 // bloom — threshold the highlights, spread them, add them back.
 //
 // Three steps, and that is the whole algorithm: threshold, Gaussian blur, add.
+//
+// THE BLUR IS THREE BOX FILTERS PER DIRECTION, each a running sum, which is a
+// Gaussian to within a few percent and costs the same at every radius. A direct
+// Gaussian had to cap its window (128 px), and a spread of 94 at full
+// resolution needs 235: cut off at 1.4 sigma and renormalised, the kernel was
+// nearly flat, and a flat kernel run across and then down is a SQUARE. The
+// preview, at a quarter of the spread, sat inside the cap and looked right --
+// the glow turned into a box the moment the slider was let go.
 // The one addition is that the blur radius is SEPARATE PER CHANNEL, which is
 // what turns the same three steps into halation and dispersion without any
 // extra machinery.
@@ -52,6 +60,7 @@ cbuffer Constants : register(b0) {
     uint Width;
     uint Height;
     uint C0; uint C1; uint C2; uint C3; uint C4; uint C5; uint C6;
+    uint RadR; uint RadG; uint RadB;   // box radii, per channel
 };
 float T()         { return asfloat(C0); }
 float Knee()      { return asfloat(C1); }
@@ -108,44 +117,83 @@ void main(uint3 tid : SV_DispatchThreadID) {
 }
 )";
 
-// Passes 2 and 3: a separable Gaussian with a PER-CHANNEL sigma.
-//
-// One kernel weight per channel per tap, so all three colours spread by their
-// own amount in a single pass rather than needing three separate blurs. The
-// loop bound is the largest of the three radii; narrower channels contribute
-// nothing past their own, which costs a few wasted taps and saves two passes.
-//
-// Each channel is normalised by ITS OWN weight sum. That is what makes this
-// redistribute light rather than add or lose it: a channel cut off by the loop
-// bound still integrates to 1.
+// Passes 2-7: three box passes across, then three down, each a running sum
+// with a PER-CHANNEL radius -- so all three colours spread by their own amount
+// in the same passes. A thread walks kBoxRun pixels, gathering each channel's
+// window once at the start of its run and sliding it (add the sample entering,
+// drop the one leaving); re-gathering every run keeps float error in the sums
+// from building. Samples past the edge clamp to it, as before.
 const char* kBlurHlsl = R"(
 Texture2D<float4>   Src : register(t0);
 RWTexture2D<float4> Dst : register(u0);
+static const int kBoxRun = 64;
+
+float4 At(int i, int fixedC, bool across) {
+    int2 q = across ? int2(clamp(i, 0, int(Width) - 1), fixedC)
+                    : int2(fixedC, clamp(i, 0, int(Height) - 1));
+    return Src[q];
+}
 
 [numthreads(8, 8, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
-    if (tid.x >= Width || tid.y >= Height) return;
-    int2 p = int2(tid.xy);
-
-    float3 sig = max(float3(SpreadR(), SpreadG(), SpreadB()), 0.05);
-    float rmax = max(sig.r, max(sig.g, sig.b));
-    int R = min(128, int(ceil(rmax * 2.5)));
-
-    float3 sum = 0.0, wsum = 0.0;
-    for (int i = -R; i <= R; ++i) {
-        int2 q = (Dir() < 0.5) ? int2(p.x + i, p.y) : int2(p.x, p.y + i);
-        q = clamp(q, int2(0, 0), int2(int(Width) - 1, int(Height) - 1));
-        float3 c = Src[q].rgb;
-        float fi = float(i);
-        // Per channel: contributes nothing beyond that channel's own reach.
-        float3 inside = step(abs(fi), sig * 2.5);
-        float3 w = exp(-(fi * fi) / (2.0 * sig * sig)) * inside;
-        sum  += c * w;
-        wsum += w;
+    bool across = Dir() < 0.5;
+    int len   = across ? int(Width) : int(Height);
+    int other = across ? int(Height) : int(Width);
+    int i0 = int(across ? tid.x : tid.y) * kBoxRun;
+    int fc = int(across ? tid.y : tid.x);
+    if (i0 >= len || fc >= other) return;
+    int3 r = int3(RadR, RadG, RadB);
+    float3 sum = 0.0;
+    [unroll] for (int c = 0; c < 3; ++c)
+        for (int k = -r[c]; k <= r[c]; ++k) sum[c] += At(i0 + k, fc, across)[c];
+    float3 inv = 1.0 / float3(2 * r + 1);
+    int i1 = min(i0 + kBoxRun, len);
+    for (int i = i0; i < i1; ++i) {
+        if (i > i0) {
+            [unroll] for (int c = 0; c < 3; ++c)
+                sum[c] += At(i + r[c], fc, across)[c] - At(i - r[c] - 1, fc, across)[c];
+        }
+        int2 o = across ? int2(i, fc) : int2(fc, i);
+        Dst[o] = float4(sum * inv, 1.0);
     }
-    Dst[tid.xy] = float4(sum / max(wsum, 1e-6), 1.0);
 }
 )";
+constexpr uint32_t kBoxRun = 64;   // must match the HLSL above
+
+// The box radius whose three passes give a Gaussian of `sigma`: three boxes of
+// width n have variance 3 (n^2 - 1) / 12.
+inline int BoxRadius(float sigma) {
+    const float n = std::sqrt(4.0f * sigma * sigma + 1.0f);
+    return std::max(0, int(std::lround((n - 1.0f) * 0.5f)));
+}
+
+// One box pass over three-channel float data, exactly as the shader: per
+// channel radius, edge clamped, a running sum restarted every kBoxRun pixels.
+void BoxPass(const std::vector<float>& src, std::vector<float>& dst, int w, int h,
+             const int* r, bool across) {
+    const int len = across ? w : h, other = across ? h : w;
+    auto at = [&](int i, int f, int c) {
+        const int x = across ? std::clamp(i, 0, w - 1) : f;
+        const int y = across ? f : std::clamp(i, 0, h - 1);
+        return src[(size_t(y) * size_t(w) + size_t(x)) * 3 + size_t(c)];
+    };
+    for (int f = 0; f < other; ++f)
+        for (int i0 = 0; i0 < len; i0 += int(kBoxRun)) {
+            float sum[3] = {0, 0, 0};
+            for (int c = 0; c < 3; ++c)
+                for (int k = -r[c]; k <= r[c]; ++k) sum[c] += at(i0 + k, f, c);
+            const int i1 = std::min(i0 + int(kBoxRun), len);
+            for (int i = i0; i < i1; ++i) {
+                if (i > i0)
+                    for (int c = 0; c < 3; ++c)
+                        sum[c] += at(i + r[c], f, c) - at(i - r[c] - 1, f, c);
+                const int x = across ? i : f, y = across ? f : i;
+                for (int c = 0; c < 3; ++c)
+                    dst[(size_t(y) * size_t(w) + size_t(x)) * 3 + size_t(c)] =
+                        sum[c] * (1.0f / float(2 * r[c] + 1));
+            }
+        }
+}
 
 // Pass 4: add the glow back.
 //
@@ -209,19 +257,22 @@ public:
         static const std::string cmb = std::string(kCommon) + kCombineHlsl;
 
         std::vector<GpuPass> p;
-        // Plane 0 holds the highlights, 1 takes the horizontal pass, and 0 is
-        // reused for the vertical result -- safe because the highlights have
-        // been consumed by then.
+        // Plane 0 holds the highlights; the six box passes ping-pong between
+        // the two planes and leave the glow in 0.
         p.push_back({thr.c_str(), "threshold", {-1},    {0}});
-        p.push_back({blr.c_str(), "blurH",     {0},     {1}});
-        p.push_back({blr.c_str(), "blurV",     {1},     {0}});
+        p.push_back({blr.c_str(), "boxH1",     {0},     {1}, kBoxRun, 1});
+        p.push_back({blr.c_str(), "boxH2",     {1},     {0}, kBoxRun, 1});
+        p.push_back({blr.c_str(), "boxH3",     {0},     {1}, kBoxRun, 1});
+        p.push_back({blr.c_str(), "boxV1",     {1},     {0}, 1, kBoxRun});
+        p.push_back({blr.c_str(), "boxV2",     {0},     {1}, 1, kBoxRun});
+        p.push_back({blr.c_str(), "boxV3",     {1},     {0}, 1, kBoxRun});
         p.push_back({cmb.c_str(), "combine",   {-1, 0}, {-1}});
         return p;
     }
 
     std::vector<uint32_t> GpuPassConstants(int pass) const override {
-        // Pass 1 blurs horizontally and pass 2 vertically; the rest ignore it.
-        const float dir = (pass == 2) ? 1.0f : 0.0f;
+        // Passes 1-3 blur across, 4-6 down; the rest ignore it.
+        const float dir = (pass >= 4 && pass <= 6) ? 1.0f : 0.0f;
         // THE SPREAD SCALES; THE GAIN MUST NOT.
         //
         // Gain() in the shader is Intensity * s^2 / 64, compensating for a
@@ -253,17 +304,20 @@ public:
                 FloatBits(std::max(0.05f, GpuScaledPx(float(m_spreadG)))),
                 FloatBits(std::max(0.05f, GpuScaledPx(float(m_spreadB)))),
                 FloatBits(float(m_intensity) * gainFix),
-                FloatBits(dir)};
+                FloatBits(dir),
+                uint32_t(BoxRadius(std::max(0.05f, GpuScaledPx(float(m_spreadR))))),
+                uint32_t(BoxRadius(std::max(0.05f, GpuScaledPx(float(m_spreadG))))),
+                uint32_t(BoxRadius(std::max(0.05f, GpuScaledPx(float(m_spreadB)))))};
     }
 
-    // The widest channel, at the 2.5-sigma cutoff the blur pass uses. Bloom
-    // spreads FAR -- a 24 px spread reaches 60 -- so this is the stage most
+    // The widest channel: three box passes reach three box radii. Bloom
+    // spreads FAR -- a 24 px spread reaches ~72 -- so this is the stage most
     // likely to make a region unprofitable, which is honest rather than a
-    // reason to understate it.
+    // reason to understate it. No cap: the blur has none now either.
     int ReachPixels() const override {
         const float s = std::max(float(m_spreadR),
                                  std::max(float(m_spreadG), float(m_spreadB)));
-        return std::min(128, std::max(1, int(std::ceil(s * 2.5f))));
+        return std::max(1, 3 * BoxRadius(s));
     }
 
 private:
@@ -358,35 +412,15 @@ void Bloom::RunCPU(RunCtx& ctx) {
             hi[i + 2] = b * c;
         }
 
-    const int R = std::min(128, int(std::ceil(
-        std::max(sig[0], std::max(sig[1], sig[2])) * 2.5f)));
-
-    std::vector<float> tmp(hi.size(), 0.0f), glow(hi.size(), 0.0f);
-    for (int axis = 0; axis < 2; ++axis) {
-        const std::vector<float>& s = (axis == 0) ? hi : tmp;
-        std::vector<float>&       d = (axis == 0) ? tmp : glow;
-        for (int y = 0; y < h; ++y) {
-            if (ctx.Cancelled()) return;
-            for (int x = 0; x < w; ++x) {
-                float sum[3] = {0, 0, 0}, wsum[3] = {0, 0, 0};
-                for (int i = -R; i <= R; ++i) {
-                    const int sx = std::clamp(axis == 0 ? x + i : x, 0, w - 1);
-                    const int sy = std::clamp(axis == 0 ? y : y + i, 0, h - 1);
-                    const size_t si = (size_t(sy) * size_t(w) + size_t(sx)) * 3;
-                    for (int c = 0; c < 3; ++c) {
-                        if (std::fabs(float(i)) > sig[c] * 2.5f) continue;
-                        const float wgt =
-                            std::exp(-float(i * i) / (2.0f * sig[c] * sig[c]));
-                        sum[c]  += s[si + size_t(c)] * wgt;
-                        wsum[c] += wgt;
-                    }
-                }
-                const size_t di = (size_t(y) * size_t(w) + size_t(x)) * 3;
-                for (int c = 0; c < 3; ++c)
-                    d[di + size_t(c)] = sum[c] / std::max(wsum[c], 1e-6f);
-            }
-        }
+    // Three box passes across, three down: see kBlurHlsl.
+    const int r[3] = {BoxRadius(sig[0]), BoxRadius(sig[1]), BoxRadius(sig[2])};
+    std::vector<float> glow(hi.size(), 0.0f);
+    for (int pass = 0; pass < 6; ++pass) {
+        if (ctx.Cancelled()) return;
+        BoxPass(hi, glow, w, h, r, pass < 3);
+        hi.swap(glow);
     }
+    glow.swap(hi);
 
     // Add back. Additive, so a blown highlight stays blown.
     for (int y = 0; y < h; ++y)
