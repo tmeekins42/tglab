@@ -74,5 +74,7 @@ developed = developed
          => params( dehaze )()
          => params( wavelet_denoise )()
          => params( sharpen )()
+         => params( bloom )()
          => params( orton )()
          => params( vignette )()
+         => params( film_grain )()         

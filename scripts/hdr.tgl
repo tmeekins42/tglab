@@ -55,9 +55,18 @@
 
 tonemap_op = choose("tonemapper", [tonemap, tonemap_local])
 
-# lens_correct FIRST, on every frame: align and the merge both do better on
-# undistorted frames, and the vignetting gain belongs to linear light.
+# On every frame, before the merge:
+#
+#   highlight_reconstruct  straight off the demosaic, the only place it can tell
+#               a clipped channel from a bright one. The merge still ignores
+#               every rebuilt channel -- they sit at or above the clamp, where
+#               its weight is zero -- and takes them only where EVERY frame
+#               clipped, which is exactly where the darkest frame's colour used
+#               to be lost to the clamp.
+#   lens_correct  align and the merge both do better on undistorted frames, and
+#               the vignetting gain belongs to linear light.
 developed = image("group")
+         => params( highlight_reconstruct )()
          => params( lens_correct )()
          => params( align )()
          => params( merge_hdr )()

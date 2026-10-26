@@ -88,7 +88,11 @@
 # barrel-bent frame never quite fits its neighbour, and the error grows toward
 # the edges -- exactly where frames overlap. Lateral CA and vignetting show as
 # colour fringes and brightness steps along the seams.
-frames = image("group") => params( lens_correct )()
+#
+# highlight_reconstruct before it, straight off the demosaic -- the only place
+# it can tell a clipped channel from a bright one: a blown sun or sky edge keeps
+# its colour instead of the clamp's pale flat value in every frame.
+frames = image("group") => params( highlight_reconstruct )() => params( lens_correct )()
 
 det = choose("detector", [detect_orb, detect_brisk, detect_sift,
                           detect_surf, detect_akaze])

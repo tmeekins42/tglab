@@ -9,8 +9,12 @@
 #
 # Drop a raw file (.CR3, .ARW, .NEF, ...) onto the "test" row to develop it.
 
+# highlight_reconstruct straight off the demosaic -- the only place it can
+# tell a clipped channel from a bright one -- then lens_correct, on the linear
+# frame (see _develop.tgl).
 developed = image("test")
-         => params( lens_correct )()   # first, on the linear frame: see _develop.tgl
+         => params( highlight_reconstruct )()
+         => params( lens_correct )()
 
 include "_develop.tgl"
 
