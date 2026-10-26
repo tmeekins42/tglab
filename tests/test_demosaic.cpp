@@ -134,9 +134,10 @@ double MeanError(Image& img, int channel) {
 // plain (non-raw) image must pass through untouched.
 static void TestHighlightReconstruct() {
     constexpr int W = 96, H = 96;
-    auto make = [&](bool disc) {
+    auto make = [&](bool disc, bool offDemosaic = true) {
         ImageDesc d{W, H, Format::RGBA32F};
         d.linear = true;
+        d.rawClamp = offDemosaic ? 1.0f : 0.0f;   // what the pipeline marks a demosaic's output with
         d.camMul[0] = 1.0f; d.camMul[1] = 2.0f; d.camMul[2] = 2.0f;   // ceiling 1, max 2
         for (int i = 0; i < 9; ++i) d.rgbCam[i] = (i % 4 == 0) ? 1.0f : 0.0f;
         Image img;
@@ -176,6 +177,47 @@ static void TestHighlightReconstruct() {
     } else {
         Check(false, "highlight_reconstruct (nothing clipped) runs: " + err);
     }
+    // Not straight off a demosaic -- a merge's radiance, say, which carries
+    // the frames' camera metadata but runs past their clamp by design. Taking
+    // its bright values for clipped channels would flatten the merge's
+    // headroom, so it must pass through untouched.
+    if (RunDemosaic("highlight_reconstruct", make(true, false), {}, &out, &err)) {
+        ImageView o = out.MapCpuRead();
+        const float* c = o.At<float>(W / 2, H / 2);
+        Check(c[0] == 1.0f && std::abs(c[1] - 0.8f) < 1e-6f,
+              "highlight_reconstruct leaves an image the demosaic did not just clamp alone");
+    } else {
+        Check(false, "highlight_reconstruct (no clamp) runs: " + err);
+    }
+}
+
+// A demosaiced raw with a blown light in it, as the demosaic would hand it on:
+// a warm surround brightening toward a light whose halo clips some channels
+// and whose core clips all three, white-balanced, clamped at the smallest
+// gain, then through a real (mixing) camera matrix, in RGBA16F.
+static Image MakeClippedRaw(int W, int H) {
+    const float M[9] = {1.5f, -0.4f, -0.1f, -0.15f, 1.3f, -0.15f, 0.05f, -0.35f, 1.3f};
+    ImageDesc d{W, H, Format::RGBA16F};
+    d.linear = true;
+    d.camMul[0] = 2.0f; d.camMul[1] = 1.0f; d.camMul[2] = 1.6f;   // clamp 1, max 2
+    d.rawClamp = 1.0f;
+    for (int i = 0; i < 9; ++i) d.rgbCam[i] = M[i];
+    Image img;
+    img.Alloc(d);
+    ImageView v = img.MapCpuWrite();
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+            const float dx = float(x) - 0.6f * float(W), dy = float(y) - 0.45f * float(H);
+            const float k = 0.35f + 2.2f * std::exp(-(dx * dx + dy * dy) / (2.0f * 22.0f * 22.0f)) +
+                            0.1f * std::sin(float(x) * 0.21f) * std::cos(float(y) * 0.17f);
+            float q[3] = {k * 1.0f, k * 0.7f, k * 0.45f};
+            for (float& c : q) c = std::min(c, 1.0f);
+            uint16_t* p = v.At<uint16_t>(x, y);
+            for (int r = 0; r < 3; ++r)
+                p[r] = FloatToHalf(M[r * 3] * q[0] + M[r * 3 + 1] * q[1] + M[r * 3 + 2] * q[2]);
+            p[3] = FloatToHalf(1.0f);
+        }
+    return img;
 }
 
 int main() {
@@ -1295,6 +1337,40 @@ int main() {
                         }
                     } else {
                         Check(false, std::string("crop ") + what + " ran both ways");
+                    }
+                }
+
+                // highlight_reconstruct: 35 passes, a pyramid sixteen levels
+                // deep and a rebuild through the in-gamut solve. The CPU path
+                // is written as the passes are, so the two should agree to
+                // the half-float output's rounding.
+                {
+                    constexpr int W = 300, H = 200;
+                    Image cpuOut, gpuOut;
+                    std::string e1, e2;
+                    const bool okCpu = RunDemosaicMode("highlight_reconstruct", MakeClippedRaw(W, H),
+                                                       &cpuOut, &e1, nullptr, ExecMode::ForceCPU);
+                    const bool okGpu = RunDemosaicMode("highlight_reconstruct", MakeClippedRaw(W, H),
+                                                       &gpuOut, &e2, &gpu, ExecMode::ForceGPU);
+                    if (okCpu && okGpu) {
+                        Image in = MakeClippedRaw(W, H);
+                        ImageView a = cpuOut.MapCpuRead(), b = gpuOut.MapCpuRead(), s = in.MapCpuRead();
+                        double worst = 0.0;
+                        int changed = 0;
+                        for (int y = 0; y < H; ++y)
+                            for (int x = 0; x < W; ++x)
+                                for (int c = 0; c < 3; ++c) {
+                                    const double va = HalfToFloat(a.At<uint16_t>(x, y)[c]);
+                                    const double vb = HalfToFloat(b.At<uint16_t>(x, y)[c]);
+                                    worst = std::max(worst, std::abs(va - vb) / std::max(1.0, std::abs(va)));
+                                    if (vb != double(HalfToFloat(s.At<uint16_t>(x, y)[c]))) ++changed;
+                                }
+                        Check(changed > 100, "highlight_reconstruct's GPU path rebuilds the clipped light (" +
+                                                 std::to_string(changed) + " values changed)");
+                        Check(worst < 0.005, "highlight_reconstruct GPU matches CPU (worst " +
+                                                 std::to_string(worst) + ", relative)");
+                    } else {
+                        Check(false, "highlight_reconstruct ran both ways: " + (okCpu ? e2 : e1));
                     }
                 }
 

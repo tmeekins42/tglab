@@ -789,6 +789,15 @@ bool Pipeline::RunStageOnce(Stage& s, const std::vector<const Data*>& in,
             // pushed a channel past saturation. Tonal algorithms downstream need
             // to know not to gamma-decode it and not to clamp it.
             d.linear = true;
+
+            // ...and clamped at the brightest neutral the sensor describes,
+            // which is what lets highlight_reconstruct tell a clipped channel
+            // from a bright one. See ImageDesc::rawClamp.
+            const float c = std::min(base.camMul[0], std::min(base.camMul[1], base.camMul[2]));
+            d.rawClamp = c > 0.0f ? c : 0.0f;
+        } else {
+            // Any other stage may have changed what "at the clamp" means.
+            d.rawClamp = 0.0f;
         }
         // The algorithm's chance to change the raster -- a crop, or a resize.
         // Applied AFTER the format is resolved, so an algorithm that changes

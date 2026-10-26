@@ -155,6 +155,20 @@ struct ImageDesc {
     // inference silently.
     bool linear = false;
 
+    // The level the DEMOSAIC clamped this image's white-balanced camera RGB at
+    // (the smallest white-balance gain; see clip_repair.h), so that a channel
+    // reading there is CLIPPED rather than merely bright. 0 when that is no
+    // longer what the pixels mean.
+    //
+    // Set by the pipeline on a demosaic's output and cleared on every other
+    // stage's: any stage that changes values -- an exposure, a tone curve -- or
+    // builds new ones -- a merge, whose radiance runs past the clamp by design,
+    // a stitch's gain-compensated frames -- breaks the link between "at the
+    // clamp" and "clipped". highlight_reconstruct reads it, and refuses an image
+    // without it: after a merge it would otherwise take every value above ~1.0
+    // for a clipped channel and flatten the merge's headroom.
+    float rawClamp = 0.0f;
+
     // Pixels here per pixel of the full-resolution original. 1.0 is full
     // resolution; 0.25 is a quarter-scale proxy.
     //

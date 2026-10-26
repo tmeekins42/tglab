@@ -606,6 +606,7 @@ public:
         ImageDesc od = m_desc;
         od.format = Format::RGBA32F;
         od.linear = true;     // scene-linear radiance, not display encoded
+        od.rawClamp = 0.0f;   // radiance runs past the frames' clamp by design
         out->Alloc(od);
         ImageView ov = out->MapCpuWrite();
         if (!ov.data) { *err = "merge_hdr: could not allocate the result"; return false; }

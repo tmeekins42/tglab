@@ -1153,6 +1153,7 @@ bool StitchPanorama::Finish(Image* out, std::string* err) {
     }
 
     ImageDesc od = m_desc;
+    od.rawClamp = 0.0f;   // gain-compensated frames: the clamp no longer marks clipping
     od.width  = m_outW;
     od.height = m_outH;
     out->Alloc(od);
