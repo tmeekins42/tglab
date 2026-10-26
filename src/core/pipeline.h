@@ -385,10 +385,12 @@ private:
     // algorithm holding accumulator state across frames. Hence `out` alone
     // does not make a stage parallel -- it removes the first of three
     // obstacles.
+    // `frame`: which frame of a group this run is, for a stage mapped across
+    // one; -1 for a single image. See FrameIdentity.
     bool RunStageOnce(Stage& s, const std::vector<const Data*>& in,
                       std::vector<Data>* out, std::string* report,
                       ComputeContext* gpu, ExecMode mode,
-                      const CancelToken* cancel, std::string* err);
+                      const CancelToken* cancel, std::string* err, int frame = -1);
     bool BroadcastStage(Stage& s, const std::vector<const Data*>& in,
                         ComputeContext* gpu, ExecMode mode,
                         const CancelToken* cancel, Progress* progress,
@@ -401,7 +403,7 @@ private:
     // rewritten here.
     bool RunStageGpu(Stage& s, const std::vector<const Data*>& in,
                      std::vector<Data>* out,
-                     ComputeContext* gpu, std::string* err);
+                     ComputeContext* gpu, std::string* err, int frame = -1);
 
     std::vector<Stage>      m_stages;
     std::vector<ViewerDecl> m_viewers;
@@ -478,6 +480,7 @@ private:
     // algorithm accepts by opting in.
     struct MeasureCacheEntry {
         int      stage = -1;        // which stage owns this measurement
+        int      frame = -1;        // ...for which frame of a group (-1: a single image)
         uint64_t key   = 0;         // identity of the input it was measured from
         int      srcW = 0, srcH = 0;
         std::vector<uint32_t> blob;
@@ -490,6 +493,16 @@ private:
     // Shared by the proxy cache and the measurement cache so the two cannot
     // drift apart on what "the same input" means.
     uint64_t InputIdentity(const Stage& s, size_t port) const;
+
+    // InputIdentity for one FRAME of a stage mapped across a group. The stage's
+    // input identity is the whole set's, the same for every frame -- so keyed
+    // on it alone, frame 2 restored frame 1's cached measurement, and a
+    // multi-pass stage could skip passes on frame 1 against planes the last
+    // frame had just filled.
+    uint64_t FrameIdentity(const Stage& s, size_t port, int frame) const {
+        const uint64_t id = InputIdentity(s, port);
+        return frame < 0 ? id : (id ^ (uint64_t(frame) + 0x9E3779B97F4A7C15ull)) * 1099511628211ull;
+    }
 
     // When the current Execute() began, so the live tallies published to
     // Progress can report elapsed time. A member rather than a local because

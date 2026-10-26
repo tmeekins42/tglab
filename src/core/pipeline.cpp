@@ -567,7 +567,7 @@ bool Pipeline::RunFusedReduction(int reduceStage, const std::vector<int>& chain,
             // A local rather than cs.outputs: the result is moved straight into
             // `carried` on the next line, so the stage never needed to hold it.
             std::vector<Data> chainOut;
-            if (!RunStageOnce(cs, csIn, &chainOut, nullptr, gpu, mode, cancel, err))
+            if (!RunStageOnce(cs, csIn, &chainOut, nullptr, gpu, mode, cancel, err, int(f)))
                 return false;
             if (chainOut.size() != 1) { *err = Where() + "chain stage produced no result"; return false; }
             carried = std::move(chainOut[0]);
@@ -738,7 +738,7 @@ bool Pipeline::RunReduction(Stage& s, const std::vector<const Data*>& in,
 bool Pipeline::RunStageOnce(Stage& s, const std::vector<const Data*>& in,
                             std::vector<Data>* out, std::string* report,
                             ComputeContext* gpu, ExecMode mode,
-                            const CancelToken* cancel, std::string* err) {
+                            const CancelToken* cancel, std::string* err, int frame) {
     // Sized here rather than by the caller: how many ports a stage has is the
     // algorithm's business, and every caller would otherwise have to ask.
     out->resize(s.algo->Outputs().size());
@@ -831,7 +831,7 @@ bool Pipeline::RunStageOnce(Stage& s, const std::vector<const Data*>& in,
     if (wantGpu) {
         std::string gpuErr;
         const auto gpuT0 = std::chrono::steady_clock::now();
-        const bool okG = RunStageGpu(s, in, out, gpu, &gpuErr);
+        const bool okG = RunStageGpu(s, in, out, gpu, &gpuErr, frame);
         if (StageTiming())
             std::fprintf(stderr, "[stage] %s gpu run %.1f ms (%d passes skipped)\n",
                          s.algoName.c_str(), MsSince(gpuT0), s.passesSkipped);
@@ -1035,7 +1035,7 @@ bool Pipeline::BroadcastStage(Stage& s, const std::vector<const Data*>& in,
 
         std::string fErr;
         if (!RunStageOnce(s, frameIn, &frameOuts[f], &s.frameReports[f], gpu,
-                          mode, cancel, &fErr)) {
+                          mode, cancel, &fErr, int(f))) {
             std::lock_guard<std::mutex> lock(errMtx);
             if (!failed.exchange(true)) firstErr = std::move(fErr);
             return;
@@ -2191,7 +2191,7 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
 
 bool Pipeline::RunStageGpu(Stage& s, const std::vector<const Data*>& in,
                            std::vector<Data>* out,
-                           ComputeContext* gpu, std::string* err) {
+                           ComputeContext* gpu, std::string* err, int frame) {
     // M3 supports the common shape: image inputs and image outputs, one
     // dispatch. Anything else stays on the CPU.
     for (const Data* d : in)
@@ -2245,11 +2245,11 @@ bool Pipeline::RunStageGpu(Stage& s, const std::vector<const Data*>& in,
                 if (&m_stages[i] == &s) { si = int(i); break; }
 
             const ImageDesc& id = inImages[0]->Desc();
-            const uint64_t key = InputIdentity(s, 0);
+            const uint64_t key = FrameIdentity(s, 0, frame);
 
             if (si >= 0) {
                 for (MeasureCacheEntry& e : m_measureCache) {
-                    if (e.valid && e.stage == si && e.key == key &&
+                    if (e.valid && e.stage == si && e.frame == frame && e.key == key &&
                         e.srcW == id.width && e.srcH == id.height) {
                         // A restore that FAILS is not a hit: fall through and
                         // measure, rather than dispatching passes against
@@ -2265,12 +2265,13 @@ bool Pipeline::RunStageGpu(Stage& s, const std::vector<const Data*>& in,
                     if (!blob.empty()) {
                         MeasureCacheEntry* slot = nullptr;
                         for (MeasureCacheEntry& e : m_measureCache)
-                            if (e.stage == si) { slot = &e; break; }
+                            if (e.stage == si && e.frame == frame) { slot = &e; break; }
                         if (!slot) {
                             m_measureCache.push_back(MeasureCacheEntry{});
                             slot = &m_measureCache.back();
                         }
                         slot->stage = si;
+                        slot->frame = frame;
                         slot->key   = key;
                         slot->srcW  = id.width;
                         slot->srcH  = id.height;
@@ -2493,7 +2494,7 @@ bool Pipeline::RunStageGpu(Stage& s, const std::vector<const Data*>& in,
             h = mix(h, passes[p].divY);
             for (int idx : passes[p].reads) {
                 h = mix(h, uint64_t(int64_t(idx)));
-                if (idx < 0) h = mix(h, InputIdentity(s, size_t(-idx - 1)));
+                if (idx < 0) h = mix(h, FrameIdentity(s, size_t(-idx - 1), frame));
             }
             for (int idx : passes[p].writes) h = mix(h, uint64_t(int64_t(idx)));
             h = mix(h, uint64_t(kd.width));

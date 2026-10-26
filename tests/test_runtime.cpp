@@ -2790,6 +2790,102 @@ static void TestRegionOriginStable() {
 // Driven through the pipeline rather than by calling the algorithm directly,
 // because the cache is the PIPELINE's -- the algorithm object does not survive
 // between runs, which is the whole reason the facility exists.
+// EVERY FRAME OF A GROUP IS ITS OWN INPUT.
+//
+// A stage mapped across a group ran every frame under the stage's input
+// identity, which is the whole set's -- the same for all of them. So the
+// measurement cache served frame 1's measurement to every later frame (and,
+// one slot per stage, re-measured all of them every tick), and pass skipping
+// could run a multi-pass stage's early passes on frame 1 against planes the
+// last frame had just filled. Here dehaze -- a measured airlight and twelve
+// passes -- runs across a hazy frame and a clear one, then again with a
+// different strength (so passes may be skipped); each frame must come out as
+// it does on its own.
+static void TestMeasureCachePerFrame(ID3D12Device* dev) {
+    std::printf("\n--- gpu measurement cache, per frame ---\n");
+    ComputeContext gpu;
+    if (!gpu.Init(dev)) { Check(false, "compute context starts"); return; }
+    const int dim = 256;
+    auto make = [&](bool hazy) {
+        Image img;
+        img.Alloc({dim, dim, Format::RGBA32F});
+        ImageView v = img.MapCpuWrite();
+        for (int y = 0; y < dim; ++y)
+            for (int x = 0; x < dim; ++x) {
+                float* p = v.At<float>(x, y);
+                const float base = ((x / 32) + (y / 32)) % 2 ? 0.6f : 0.15f;
+                if (hazy) { p[0] = 0.55f + base * 0.25f; p[1] = 0.58f + base * 0.25f; p[2] = 0.70f + base * 0.25f; }
+                else      { p[0] = p[1] = p[2] = base; }
+                p[3] = 1.0f;
+            }
+        return img;
+    };
+    auto runOne = [&](const Image& srcImg, double strength, Image* out) {
+        UiState ui; Pipeline pipe; std::vector<Data> src;
+        src.push_back(Data{const_cast<Image&>(srcImg).Clone()});
+        std::vector<SourceImage> names{{"test", 0}};
+        Program prog; std::string err;
+        const std::string script = "src = image(\"test\")\nd = dehaze(src, strength = " +
+                                   std::to_string(strength) + ")\ndisplay(d)\n";
+        if (!Parse(script, &prog, &err) || !Interpret(prog, names, &ui, &pipe).ok) return false;
+        const std::vector<uint64_t> versions{1};
+        if (!pipe.Execute(&src, nullptr, &err, &gpu, ExecMode::ForceGPU, &versions)) return false;
+        const Data* d = pipe.Resolve(pipe.Viewers()[0].source, &src);
+        if (!d || !std::holds_alternative<Image>(*d)) return false;
+        *out = const_cast<Image&>(std::get<Image>(*d)).Clone();
+        return true;
+    };
+    Image hazy = make(true), clear = make(false);
+    auto runGroup = [&](Pipeline* pipe, Pipeline* prev, double strength, std::vector<Image>* outs) {
+        ImageSet set;
+        set.images.push_back(hazy.Clone());
+        set.images.push_back(clear.Clone());
+        set.shape = Shape::Of("frame", 2);
+        std::vector<SourceImage> names{{"test", 0}};
+        SourceImage gs; gs.name = "g"; gs.index = 1; gs.shape = Shape::Of("frame", 2);
+        names.push_back(gs);
+        UiState ui; Program prog; std::string err;
+        const std::string script = "g = image(\"g\")\nd = dehaze(g, strength = " +
+                                   std::to_string(strength) + ")\ndisplay(d)\n";
+        if (!Parse(script, &prog, &err) || !Interpret(prog, names, &ui, pipe).ok) return false;
+        std::vector<Data> src;
+        src.push_back(Data{});
+        src.push_back(Data{std::move(set)});
+        const std::vector<uint64_t> versions{1, 1};
+        if (!pipe->Execute(&src, prev, &err, &gpu, ExecMode::ForceGPU, &versions)) return false;
+        const Data* d = pipe->Resolve(pipe->Viewers()[0].source, &src);
+        const auto* os = d ? std::get_if<ImageSet>(d) : nullptr;
+        if (!os || os->images.size() != 2) return false;
+        outs->clear();
+        for (const Image& im : os->images) outs->push_back(const_cast<Image&>(im).Clone());
+        return true;
+    };
+    auto worst = [](Image& a, Image& b) {
+        ImageView va = a.MapCpuRead(), vb = b.MapCpuRead();
+        float w = 0.0f;
+        for (int y = 0; y < va.desc.height; ++y)
+            for (int x = 0; x < va.desc.width; ++x)
+                for (int c = 0; c < 3; ++c)
+                    w = std::max(w, std::fabs(va.At<float>(x, y)[c] - vb.At<float>(x, y)[c]));
+        return w;
+    };
+    Pipeline p1, p2;
+    std::vector<Image> g1, g2;
+    Image h1, c1, h2, c2;
+    if (!runGroup(&p1, nullptr, 0.8, &g1) || !runGroup(&p2, &p1, 0.5, &g2) ||
+        !runOne(hazy, 0.8, &h1) || !runOne(clear, 0.8, &c1) ||
+        !runOne(hazy, 0.5, &h2) || !runOne(clear, 0.5, &c2)) {
+        Check(false, "dehaze runs across a group and alone");
+        gpu.Shutdown();
+        return;
+    }
+    const float w1 = std::max(worst(g1[0], h1), worst(g1[1], c1));
+    const float w2 = std::max(worst(g2[0], h2), worst(g2[1], c2));
+    Check(w1 < 1e-5f, "each frame of a group measures its own airlight (worst " + std::to_string(w1) + ")");
+    Check(w2 < 1e-5f, "...and a drag re-runs each frame from its own planes (worst " + std::to_string(w2) + ")");
+    gpu.Shutdown();
+}
+
 static void TestMeasureCache(ID3D12Device* dev) {
     std::printf("\n--- gpu measurement cache ---\n");
 
@@ -3236,6 +3332,7 @@ int main() {
         TestGpuHistogram(dev);
         TestGpuAgreement(dev);
         TestMeasureCache(dev);
+        TestMeasureCachePerFrame(dev);
         dev->Release();
     } else {
         std::printf("\n(no D3D12 device — GPU tests skipped)\n");
