@@ -30,6 +30,15 @@
 #                  one GPU pass rather than chained -- at 36 MP each separate
 #                  stage would read and write a 144 MB intermediate.
 #
+#   defringe       takes the colour out of purple (and, if asked, green)
+#                  fringes along edges -- lens CA and demosaic false colour --
+#                  once exposure is set, so its edge test sees the picture's
+#                  own contrast.
+#
+#   curves         a tone curve -- parametric regions and an optional point
+#                  curve -- on luminance, after the photographic controls it
+#                  refines. A no-op until a slider moves.
+#
 #   dehaze         before the local contrast and grain, because it inverts a
 #                  physical mixing of light and wants the picture still clean.
 #
@@ -71,6 +80,8 @@
 
 developed = developed
          => params( basic_adjust, auto_exposure = 1 )()
+         => params( defringe )()
+         => params( curves )()
          => params( dehaze )()
          => params( wavelet_denoise )()
          => params( sharpen )()

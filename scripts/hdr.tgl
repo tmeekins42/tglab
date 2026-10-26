@@ -70,7 +70,8 @@ developed = image("group")
          => params( lens_correct )()
          => params( align )()
          => params( merge_hdr )()
-         => params( tonemap_op )()         
+         => params( tonemap_op )()
+         => params( upright )()        # perspective, on the merge; off until a mode is chosen         
 
 include "_develop.tgl"
 

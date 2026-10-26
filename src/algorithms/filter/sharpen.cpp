@@ -274,7 +274,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
                  "need no sharpening and halo when they get it; this caps them "
                  "and leaves fine texture alone.",
          .step = 0.01}};
-    Param<float> m_masking{this, "masking", 0.0f, 0.0f, 1.0f,
+    Param<float> m_masking{this, "masking", 0.5f, 0.0f, 1.0f,
         {.help = "Sharpen only near edges, leaving noise, smooth skin and "
                  "clear sky alone. 0 sharpens everything.",
          .step = 0.01}};

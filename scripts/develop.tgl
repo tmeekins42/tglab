@@ -15,6 +15,7 @@
 developed = image("test")
          => params( highlight_reconstruct )()
          => params( lens_correct )()
+         => params( upright )()        # perspective; off until a mode is chosen
 
 include "_develop.tgl"
 
