@@ -643,6 +643,19 @@ public:
     // does not look like a bug, it looks like a slightly wrong picture.
     virtual bool MeasurementDependsOnlyOnInput() const { return false; }
 
+    // Whether, WHILE A SLIDER IS MOVING, the last measurement may stand in for
+    // one of an input that has since changed -- with the exact one made when
+    // the drag settles.
+    //
+    // For a measurement whose staleness cannot be seen in a moving preview.
+    // wavelet_denoise's noise level is the case: it is re-measured whenever
+    // anything upstream changes, which made every adjustment above it pay
+    // ~170 ms a tick at 45 MP for thresholds that move by a few percent.
+    // NOT for anything whose measurement the drag is meant to change --
+    // tonemap's percentiles follow exposure, and a stale one would show an
+    // exposure change that vanished on release.
+    virtual bool MeasurementStaleOkWhileDragging() const { return false; }
+
     // Serialise the last measurement, and restore one. Opaque to the pipeline,
     // which only stores and returns the bytes.
     //

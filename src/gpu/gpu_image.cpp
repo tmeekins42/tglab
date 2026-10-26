@@ -3,6 +3,7 @@
 #include "gpu_budget.h"
 
 #include <cstdio>
+#include <cstring>
 
 namespace tglab {
 
@@ -102,6 +103,37 @@ void DiscardGpuResidency(GpuResidency* g) {
     if (!g) return;
     g->owner = nullptr;   // so its destructor releases rather than recycles
     delete g;
+}
+
+bool ReadImageRegion(const Image& img, int x, int y, int w, int h, std::vector<uint8_t>* out) {
+    const ImageDesc& d = img.Desc();
+    if (w <= 0 || h <= 0 || x < 0 || y < 0 || x + w > d.width || y + h > d.height) return false;
+    const size_t bpp = size_t(BytesPerPixel(d.format)), row = size_t(w) * bpp;
+    out->resize(row * size_t(h));
+    if (img.HasCpu()) {
+        ImageView v = const_cast<Image&>(img).MapCpuRead();   // no sync: already here
+        if (!v.Valid()) return false;
+        for (int r = 0; r < h; ++r)
+            std::memcpy(out->data() + size_t(r) * row,
+                        v.data + size_t(y + r) * size_t(v.Pitch()) + size_t(x) * bpp, row);
+        return true;
+    }
+    const GpuResidency* g = img.RawGpu();
+    if (!g || !g->image.Valid() || !g->owner) return false;
+    return g->owner->ReadbackRegion(g->image, x, y, w, h, out->data(), row);
+}
+
+bool ReadImageRegions(const Image& img, const std::vector<std::array<int, 4>>& rects,
+                      std::vector<std::vector<uint8_t>>* outs) {
+    if (img.HasCpu() || !img.RawGpu() || !img.RawGpu()->owner) {
+        outs->assign(rects.size(), {});
+        for (size_t i = 0; i < rects.size(); ++i)
+            if (!ReadImageRegion(img, rects[i][0], rects[i][1], rects[i][2], rects[i][3], &(*outs)[i]))
+                return false;
+        return true;
+    }
+    const GpuResidency* g = img.RawGpu();
+    return g->image.Valid() && g->owner->ReadbackRegions(g->image, rects, outs);
 }
 
 std::shared_ptr<SharedGpuTexture> ShareGpuTexture(const Image& img) {

@@ -598,6 +598,131 @@ bool ComputeContext::Readback(const GpuImage& src, ImageView* dst) {
     return true;
 }
 
+bool ComputeContext::ReadbackRegions(const GpuImage& src, const std::vector<std::array<int, 4>>& rects,
+                                     std::vector<std::vector<uint8_t>>* outs) {
+    if (!src.Valid() || rects.empty()) return false;
+    const UINT bpp = UINT(BytesPerPixel(src.desc.format));
+    std::vector<UINT64> offset(rects.size());
+    std::vector<UINT> pitch(rects.size());
+    UINT64 total = 0;
+    for (size_t i = 0; i < rects.size(); ++i) {
+        const auto& r = rects[i];
+        if (r[2] <= 0 || r[3] <= 0 || r[0] < 0 || r[1] < 0 ||
+            r[0] + r[2] > src.desc.width || r[1] + r[3] > src.desc.height)
+            return false;
+        pitch[i] = (UINT(r[2]) * bpp + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) &
+                   ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+        total = (total + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1) &
+                ~UINT64(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1);
+        offset[i] = total;
+        total += UINT64(pitch[i]) * UINT64(r[3]);
+    }
+    ID3D12Resource* staging = TakeStaging(D3D12_HEAP_TYPE_READBACK, total);
+    if (!staging) return false;
+    if (!BeginRecording()) return false;
+    {
+        GpuImage& m = const_cast<GpuImage&>(src);
+        if (m.state != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+            D3D12_RESOURCE_BARRIER b = {};
+            b.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b.Transition.pResource   = m.res;
+            b.Transition.StateBefore = m.state;
+            b.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            m_list->ResourceBarrier(1, &b);
+            m.state = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        }
+    }
+    for (size_t i = 0; i < rects.size(); ++i) {
+        const auto& r = rects[i];
+        D3D12_TEXTURE_COPY_LOCATION d = {};
+        d.pResource                          = staging;
+        d.Type                               = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        d.PlacedFootprint.Offset             = offset[i];
+        d.PlacedFootprint.Footprint.Format   = ToDxgi(src.desc.format);
+        d.PlacedFootprint.Footprint.Width    = UINT(r[2]);
+        d.PlacedFootprint.Footprint.Height   = UINT(r[3]);
+        d.PlacedFootprint.Footprint.Depth    = 1;
+        d.PlacedFootprint.Footprint.RowPitch = pitch[i];
+        D3D12_TEXTURE_COPY_LOCATION s = {};
+        s.pResource = src.res;
+        s.Type      = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        const D3D12_BOX box = {UINT(r[0]), UINT(r[1]), 0, UINT(r[0] + r[2]), UINT(r[1] + r[3]), 1};
+        m_list->CopyTextureRegion(&d, 0, 0, 0, &s, &box);
+    }
+    m_pendingWork = true;
+    std::string err;
+    if (!Flush(&err)) { staging->Release(); return false; }
+    void* mapped = nullptr;
+    D3D12_RANGE range = {0, SIZE_T(total)};
+    if (FAILED(staging->Map(0, &range, &mapped))) { staging->Release(); return false; }
+    outs->assign(rects.size(), {});
+    for (size_t i = 0; i < rects.size(); ++i) {
+        const size_t row = size_t(rects[i][2]) * bpp;
+        (*outs)[i].resize(row * size_t(rects[i][3]));
+        for (int y = 0; y < rects[i][3]; ++y)
+            std::memcpy((*outs)[i].data() + size_t(y) * row,
+                        static_cast<const uint8_t*>(mapped) + offset[i] + size_t(y) * pitch[i], row);
+    }
+    staging->Unmap(0, nullptr);
+    RecycleStaging(staging);
+    return true;
+}
+
+bool ComputeContext::ReadbackRegion(const GpuImage& src, int x, int y, int w, int h,
+                                    uint8_t* dst, size_t dstPitch) {
+    if (!src.Valid() || !dst || w <= 0 || h <= 0 || x < 0 || y < 0 ||
+        x + w > src.desc.width || y + h > src.desc.height)
+        return false;
+    const UINT rowBytes = UINT(w) * UINT(BytesPerPixel(src.desc.format));
+    const UINT aligned  = (rowBytes + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) &
+                          ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+    const UINT64 total  = UINT64(aligned) * UINT64(h);
+    ID3D12Resource* staging = TakeStaging(D3D12_HEAP_TYPE_READBACK, total);
+    if (!staging) return false;
+    if (!BeginRecording()) return false;
+
+    D3D12_TEXTURE_COPY_LOCATION d = {};
+    d.pResource                          = staging;
+    d.Type                               = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    d.PlacedFootprint.Footprint.Format   = ToDxgi(src.desc.format);
+    d.PlacedFootprint.Footprint.Width    = UINT(w);
+    d.PlacedFootprint.Footprint.Height   = UINT(h);
+    d.PlacedFootprint.Footprint.Depth    = 1;
+    d.PlacedFootprint.Footprint.RowPitch = aligned;
+    D3D12_TEXTURE_COPY_LOCATION s = {};
+    s.pResource = src.res;
+    s.Type      = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    {
+        // As Readback: the source in COPY_SOURCE, its tracked state kept true.
+        GpuImage& m = const_cast<GpuImage&>(src);
+        if (m.state != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+            D3D12_RESOURCE_BARRIER b = {};
+            b.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b.Transition.pResource   = m.res;
+            b.Transition.StateBefore = m.state;
+            b.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            m_list->ResourceBarrier(1, &b);
+            m.state = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        }
+    }
+    const D3D12_BOX box = {UINT(x), UINT(y), 0, UINT(x + w), UINT(y + h), 1};
+    m_list->CopyTextureRegion(&d, 0, 0, 0, &s, &box);
+    m_pendingWork = true;
+    std::string err;
+    if (!Flush(&err)) { staging->Release(); return false; }
+    void* mapped = nullptr;
+    D3D12_RANGE range = {0, SIZE_T(total)};
+    if (FAILED(staging->Map(0, &range, &mapped))) { staging->Release(); return false; }
+    for (int r = 0; r < h; ++r)
+        std::memcpy(dst + size_t(r) * dstPitch, static_cast<const uint8_t*>(mapped) + size_t(r) * aligned,
+                    rowBytes);
+    staging->Unmap(0, nullptr);
+    RecycleStaging(staging);
+    return true;
+}
+
 bool ComputeContext::Dispatch(const ComputeKernel& k,
                               const std::vector<const GpuImage*>& inputs,
                               const std::vector<GpuImage*>& outputs,

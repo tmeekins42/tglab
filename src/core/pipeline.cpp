@@ -2258,6 +2258,20 @@ bool Pipeline::RunStageGpu(Stage& s, const std::vector<const Data*>& in,
                         break;
                     }
                 }
+                // Mid-drag -- a preview at reduced scale, or a zoomed region,
+                // which the settled run never is -- a stage that allows it
+                // keeps the last measurement made at this size. The entry is
+                // not re-keyed, so the settled run measures afresh.
+                const bool dragging = m_proxyScale < 1.0f || m_requestRegion.Valid();
+                if (!measured && dragging && s.algo->MeasurementStaleOkWhileDragging()) {
+                    for (MeasureCacheEntry& e : m_measureCache) {
+                        if (e.valid && e.stage == si && e.frame == frame &&
+                            e.srcW == id.width && e.srcH == id.height) {
+                            measured = s.algo->RestoreMeasurement(e.blob);
+                            break;
+                        }
+                    }
+                }
 
                 if (!measured) {
                     s.algo->MeasureForGpu(inImages);

@@ -12,6 +12,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <array>
 #include <vector>
 
 #include "../core/image.h"
@@ -199,6 +200,16 @@ public:
     static void RecycleTo(ComputeContext* owner, GpuImage&& img);
     bool Upload(const ImageView& src, GpuImage* dst);
     bool Readback(const GpuImage& src, ImageView* dst);
+    // One rectangle of `src`, into `dst` (rows `dstPitch` bytes apart), in the
+    // texture's own format. For a measurement that samples a few tiles: the
+    // whole-frame readback it replaces moved 360 MB at 45 MP to look at 30.
+    bool ReadbackRegion(const GpuImage& src, int x, int y, int w, int h,
+                        uint8_t* dst, size_t dstPitch);
+    // Several rectangles in ONE submission and one wait -- each its own
+    // round trip cost more than the copies (nine tiles: ~10 ms a wait). Each
+    // comes back tightly packed in `outs[i]`. A rect is {x, y, w, h}.
+    bool ReadbackRegions(const GpuImage& src, const std::vector<std::array<int, 4>>& rects,
+                         std::vector<std::vector<uint8_t>>* outs);
 
     // Records and submits one dispatch, then waits. `constants` are the b0
     // root constants beyond the automatic width/height pair.

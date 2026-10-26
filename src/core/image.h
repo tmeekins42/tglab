@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <array>
 #include <vector>
 
 #include "sidecar.h"
@@ -425,6 +426,15 @@ private:
 // null when it is not. Defined in gpu/gpu_image.cpp; core/ calls it through
 // this declaration, which keeps the dependency pointing one way.
 std::shared_ptr<SharedGpuTexture> ShareGpuTexture(const Image& img);
+
+// One rectangle of `img`, tightly packed in its own format: from the CPU copy
+// when there is one, else read back from the GPU -- only that rectangle, not
+// the frame MapCpuRead() would. For measurements that look at a few tiles.
+// Defined in gpu/gpu_image.cpp, like ShareGpuTexture.
+bool ReadImageRegion(const Image& img, int x, int y, int w, int h, std::vector<uint8_t>* out);
+// Several at once, in one GPU round trip. A rect is {x, y, w, h}.
+bool ReadImageRegions(const Image& img, const std::vector<std::array<int, 4>>& rects,
+                      std::vector<std::vector<uint8_t>>* outs);
 
 // Frees a GpuResidency's texture OUTRIGHT, never into its context's reuse
 // pool -- for the VRAM collector, whose whole point is to give memory back.

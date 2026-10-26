@@ -208,6 +208,17 @@ struct NoiseModel {
 // vignetting, so a band is never allowed more noise than the one below it.
 //
 // `sample(x, y, rgb)` returns the pixel in normalised units.
+// WHERE THE NOISE IS MEASURED: a 3x3 grid of tiles, 640 px square (or the
+// image, if smaller), spread over the frame. Shared with MeasureForGpu, which
+// reads back only these tiles.
+constexpr int kNoiseGrid = 3;
+inline int NoiseTileSize(int w, int h) { return std::min({640, w, h}); }
+inline void NoiseTileOrigin(int w, int h, int ti, int* x0, int* y0) {
+    const int tile = NoiseTileSize(w, h);
+    *x0 = (w - tile) * (ti % kNoiseGrid) / std::max(1, kNoiseGrid - 1);
+    *y0 = (h - tile) * (ti / kNoiseGrid) / std::max(1, kNoiseGrid - 1);
+}
+
 template <typename Sample>
 NoiseModel MeasureNoise(int w, int h, bool colour, Sample&& sample) {
     NoiseModel nm;
@@ -215,18 +226,17 @@ NoiseModel MeasureNoise(int w, int h, bool colour, Sample&& sample) {
     // A margin of the coarsest kernel's reach keeps the tile edge's clamping
     // out of the measured blocks; a small image gets less, and its coarse
     // bands are then capped by the finer ones anyway.
-    const int tile = std::min({640, w, h});
+    const int tile = NoiseTileSize(w, h);
     const int margin = std::min(4 * (1 << (kMaxLevels - 1)), tile / 4);
     const int inner = tile - 2 * margin;
     if (inner < kB) return nm;                                // too small to tell
-    const int grid = 3;
+    const int grid = kNoiseGrid;
     struct Stat { std::vector<float> s[4][kMaxLevels]; };     // luma, chroma, lumaN, chromaN
     std::vector<Stat> per(size_t(grid * grid));
 
     ParallelFor(per.size(), [&](size_t ti) {
-        const int tx = int(ti) % grid, ty = int(ti) / grid;
-        const int x0 = (w - tile) * tx / std::max(1, grid - 1);
-        const int y0 = (h - tile) * ty / std::max(1, grid - 1);
+        int x0, y0;
+        NoiseTileOrigin(w, h, int(ti), &x0, &y0);
         const int ch = 3;
         std::vector<float> c(size_t(tile) * size_t(tile) * ch), next, tmp;
         for (int y = 0; y < tile; ++y)
@@ -489,33 +499,47 @@ public:
         m_noise = NoiseModel{};
         m_gpuValid = false;
         if (inputs.empty() || !inputs[0]) return;
-        ImageView v = const_cast<Image*>(inputs[0])->MapCpuRead();
-        if (!v.data) return;
-        const ImageDesc& vd = v.desc;
+        const Image& img = *inputs[0];
+        const ImageDesc& vd = img.Desc();
         const bool colour = vd.format != Format::R32F;
-        // The sampled pixels read directly, not through PixelBuffer, whose
-        // Unpack converts the whole image -- see dehaze's MeasureForGpu.
+        // ONLY THE TILES the measurement looks at, read back from the GPU --
+        // not the frame. MapCpuRead() here moved the whole 45 MP image across
+        // for 3.7 MP of tiles, and was ~390 ms of a ~430 ms slider tick: every
+        // change upstream re-measures, so it was the cost of every adjustment
+        // above this stage.
+        const int tile = NoiseTileSize(vd.width, vd.height);
+        const size_t bpp = size_t(BytesPerPixel(vd.format));
+        std::vector<std::vector<uint8_t>> tiles;
+        std::vector<std::array<int, 4>> rects;
+        int ox[kNoiseGrid * kNoiseGrid], oy[kNoiseGrid * kNoiseGrid];
+        for (int ti = 0; ti < kNoiseGrid * kNoiseGrid; ++ti) {
+            NoiseTileOrigin(vd.width, vd.height, ti, &ox[ti], &oy[ti]);
+            rects.push_back({ox[ti], oy[ti], tile, tile});
+        }
+        if (!ReadImageRegions(img, rects, &tiles)) return;
         m_noise = MeasureNoise(vd.width, vd.height, colour, [&](int x, int y, float* p) {
+            int ti = 0;
+            while (ti < kNoiseGrid * kNoiseGrid - 1 &&
+                   !(x >= ox[ti] && x < ox[ti] + tile && y >= oy[ti] && y < oy[ti] + tile)) ++ti;
+            const uint8_t* q8 = tiles[size_t(ti)].data() +
+                                (size_t(y - oy[ti]) * size_t(tile) + size_t(x - ox[ti])) * bpp;
             switch (vd.format) {
-                case Format::RGBA8: {
-                    const uint8_t* q = v.At<uint8_t>(x, y);
-                    for (int c = 0; c < 3; ++c) p[c] = float(q[c]) / 255.0f;
+                case Format::RGBA8:
+                    for (int c = 0; c < 3; ++c) p[c] = float(q8[c]) / 255.0f;
                     break;
-                }
                 case Format::RGBA32F: {
-                    const float* q = v.At<float>(x, y);
+                    const float* q = reinterpret_cast<const float*>(q8);
                     for (int c = 0; c < 3; ++c) p[c] = q[c];
                     break;
                 }
                 case Format::RGBA16F: {
-                    const uint16_t* q = v.At<uint16_t>(x, y);
+                    const uint16_t* q = reinterpret_cast<const uint16_t*>(q8);
                     for (int c = 0; c < 3; ++c) p[c] = HalfToFloat(q[c]);
                     break;
                 }
-                case Format::R32F: {
-                    p[0] = p[1] = p[2] = *v.At<float>(x, y);
+                case Format::R32F:
+                    p[0] = p[1] = p[2] = *reinterpret_cast<const float*>(q8);
                     break;
-                }
                 default: p[0] = p[1] = p[2] = 0.0f;
             }
         });
@@ -525,6 +549,11 @@ public:
     // MeasureForGpu; the CPU path reports per call (see RunCPU), because one
     // instance serves every frame of a group.
     std::string RunReport() const override { return m_gpuValid ? Report(m_noise) : std::string(); }
+
+    // The noise level moves by a few percent across a drag of anything above
+    // this stage, and a moving preview cannot show that; the settled run
+    // measures it exactly. See AlgorithmBase.
+    bool MeasurementStaleOkWhileDragging() const override { return true; }
 
     void PrepareGpu(const std::vector<ImageDesc>& inputs) override {
         m_gpuColour = inputs.empty() || inputs[0].format != Format::R32F;
