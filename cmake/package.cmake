@@ -14,6 +14,8 @@
 #                         that never mentions the missing DLL.
 #   scripts/              the app opens scripts/hello.tgl at startup
 #   assets/               and loads assets/test.png when given no image
+#   lensfun/              the lensfun lens database (CC BY-SA 3.0), which
+#                         lens_correct's profiles are read from at run time
 #   LICENSE               tglab's own MIT terms
 #   licenses/             third-party texts. LibRaw is LGPL-2.1/CDDL-1.0 and is
 #                         linked statically, so shipping its notice and licence
@@ -79,6 +81,11 @@ add_custom_target(package_release
             "${CMAKE_SOURCE_DIR}/models/loma_b128.tgw"
             "${TGLAB_DIST_DIR}/models/"
 
+    # The lensfun lens database, for lens_correct's profiles. Data under CC
+    # BY-SA 3.0, its licence beside the others below.
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_SOURCE_DIR}/third_party/lensfun/db" "${TGLAB_DIST_DIR}/lensfun"
+
     COMMAND ${CMAKE_COMMAND} -E copy
             "${CMAKE_SOURCE_DIR}/LICENSE"   "${TGLAB_DIST_DIR}/"
     COMMAND ${CMAKE_COMMAND} -E copy
@@ -105,6 +112,12 @@ add_custom_target(package_release
             "${CMAKE_SOURCE_DIR}/third_party/models/LoMa-LICENSE.txt"
             "${CMAKE_SOURCE_DIR}/third_party/models/LightGlue-LICENSE.txt"
             "${TGLAB_DIST_DIR}/licenses/"
+    COMMAND ${CMAKE_COMMAND} -E copy
+            "${CMAKE_SOURCE_DIR}/third_party/lensfun/COPYING.CC_BY-SA_3.0"
+            "${TGLAB_DIST_DIR}/licenses/lensfun-database-CC_BY-SA_3.0.txt"
+    COMMAND ${CMAKE_COMMAND} -E copy
+            "${CMAKE_SOURCE_DIR}/third_party/lensfun/README.md"
+            "${TGLAB_DIST_DIR}/licenses/lensfun-database-README.md"
 
     # Generated rather than checked in, so it cannot disagree with the archive
     # it describes.

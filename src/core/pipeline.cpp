@@ -1230,6 +1230,11 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
                 if (sd.originX != 0 || sd.originY != 0 ||
                     sd.fullW   != 0 || sd.fullH   != 0)
                     return false;
+            } else if (const ImageSet* st = std::get_if<ImageSet>(&d)) {
+                // A set's frames the same way: a preview run now shrinks a
+                // group, and a set of proxies must not be the settled run's.
+                for (const Image& im2 : st->images)
+                    if (std::fabs(im2.Desc().proxyScale - 1.0f) > 1e-6f) return false;
             }
         return true;
     };
@@ -1439,6 +1444,12 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
         // fusing actually saves.
         static const bool noFuse = GetEnvironmentVariableA("TGLAB_NOFUSE", nullptr, 0) > 0;
         if (noFuse) break;
+        // NOT IN A PREVIEW. Fusing streams the group's full-size frames one at
+        // a time, which is what keeps a settled merge's memory down -- and it
+        // reads them straight from the source, past the preview's shrinking.
+        // Shrunk, the frames are a sixteenth the size and the saving is not
+        // needed; unfused, the group is shrunk once and cached for the drag.
+        if (runScale < 1.0f) break;
         if (!m_stages[i].algo->IsReduction()) continue;
         PortRef srcPort{};
         std::vector<int> chain = FusableChain(int(i), &srcPort);
@@ -1702,19 +1713,59 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
 
         if (runScale < 1.0f && i == firstDirty) {
             for (size_t k = 0; k < in.size(); ++k) {
-                // A SET IS NOT PROXIED, and that is a real limitation rather
-                // than an oversight.
-                //
-                // Downsampling every frame of a group is correct in principle
-                // -- merge_hdr reducing N proxies gives a proxy of the merge --
-                // but it is N downsamples of full-size raws, which is most of
-                // what the proxy was meant to avoid. So dragging an `align` or
-                // `merge_hdr` parameter runs at full resolution; dragging
-                // anything AFTER the merge proxies normally, because by then
-                // the group has become a single image.
-                //
-                // That covers the common case: the develop controls people
-                // actually drag all sit after the merge.
+                // A SET IS PROXIED TOO: every frame shrunk, and the shrunk set
+                // cached like a single image, so the N downsamples are paid
+                // once per drag rather than once per tick. merge_hdr reducing
+                // N proxies gives a proxy of the merge, and align solves in
+                // the proxies' own pixels, consistent with the merge that
+                // consumes them; the settled run re-aligns and re-merges at
+                // full resolution. Sets used not to be: dragging a per-frame
+                // stage ahead of a merge -- lens_correct's k1 in hdr.tgl --
+                // re-ran eight 45 MP frames through align and the merge on
+                // every tick, ~18 s each.
+                if (const ImageSet* set = std::get_if<ImageSet>(in[k])) {
+                    if (set->images.empty()) continue;
+                    const ImageDesc& d0 = set->images.front().Desc();
+                    if (!d0.Valid() || d0.IsMosaic()) continue;
+                    const PortRef& sr = s.inputs[k];
+                    const uint64_t key = InputIdentity(s, k);
+                    if (m_proxyCache.valid && m_proxyCache.stage == sr.stage &&
+                        m_proxyCache.port == sr.port && m_proxyCache.key == key &&
+                        m_proxyCache.srcW == d0.width && m_proxyCache.srcH == d0.height &&
+                        std::fabs(m_proxyCache.scale - runScale) < 1e-6f &&
+                        std::holds_alternative<ImageSet>(m_proxyCacheData)) {
+                        in[k] = &m_proxyCacheData;
+                        continue;
+                    }
+                    // Read back serially first: a GPU-resident frame's
+                    // readback goes through the compute context, which is not
+                    // for several threads at once (as BroadcastStage does).
+                    for (const Image& fr : set->images) const_cast<Image&>(fr).MapCpuRead();
+                    ImageSet shrunk;
+                    shrunk.shape = set->shape;
+                    shrunk.images.resize(set->images.size());
+                    std::vector<char> ok(set->images.size(), 0);
+                    ParallelFor(set->images.size(), [&](size_t f) {
+                        const ImageDesc& fd = set->images[f].Desc();
+                        const int nw = std::max(1, int(std::lround(double(fd.width) * double(runScale))));
+                        const int nh = std::max(1, int(std::lround(double(fd.height) * double(runScale))));
+                        ok[f] = (nw < fd.width && nh < fd.height &&
+                                 DownsampleImage(set->images[f], nw, nh, &shrunk.images[f])) ? 1 : 0;
+                    });
+                    bool all = true;
+                    for (char c : ok) all = all && c;
+                    if (!all) continue;   // any frame that will not shrink: run the set whole
+                    m_proxyCache.stage = sr.stage;
+                    m_proxyCache.port  = sr.port;
+                    m_proxyCache.key   = key;
+                    m_proxyCache.srcW  = d0.width;
+                    m_proxyCache.srcH  = d0.height;
+                    m_proxyCache.scale = runScale;
+                    m_proxyCache.valid = true;
+                    m_proxyCacheData = Data{std::move(shrunk)};
+                    in[k] = &m_proxyCacheData;
+                    continue;
+                }
                 const Image* src = std::get_if<Image>(in[k]);
                 if (!src) continue;
                 const ImageDesc& sd = src->Desc();
@@ -1745,7 +1796,8 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
                     m_proxyCache.key   == key &&
                     m_proxyCache.srcW  == sd.width &&
                     m_proxyCache.srcH  == sd.height &&
-                    std::fabs(m_proxyCache.scale - runScale) < 1e-6f) {
+                    std::fabs(m_proxyCache.scale - runScale) < 1e-6f &&
+                    std::holds_alternative<Image>(m_proxyCacheData)) {
                     // THE CACHED IMAGE ITSELF, not a copy of it.
                     //
                     // Cloning drops GPU residency, so every frame allocated a
@@ -1785,9 +1837,12 @@ bool Pipeline::Execute(std::vector<Data>* sources, Pipeline* prev, std::string* 
         // Now that the inputs are final, record the scale on the algorithm.
         {
             float sc = 1.0f;
-            if (!in.empty())
+            if (!in.empty()) {
                 if (const Image* im = std::get_if<Image>(in[0]))
                     sc = im->Desc().proxyScale;
+                else if (const ImageSet* st = std::get_if<ImageSet>(in[0]))
+                    if (!st->images.empty()) sc = st->images.front().Desc().proxyScale;
+            }
             if (s.algo) s.algo->SetProxyScale(sc);
         }
 

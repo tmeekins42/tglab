@@ -41,7 +41,8 @@ shaders at runtime; without them every algorithm silently falls back to the
 CPU and large images become very slow.
 
 Keep the scripts and assets folders next to tglab.exe too, or the app starts
-with nothing loaded.
+with nothing loaded. The lensfun folder holds the lens profiles lens_correct
+applies automatically; without it lenses are simply not corrected.
 
 
 LICENCE
@@ -56,6 +57,11 @@ linked statically into tglab.exe. Its complete source is in the tglab
 repository under third_party/libraw/, and building tglab from that repository
 rebuilds LibRaw from that source -- so a modified LibRaw can be substituted by
 editing it there and rebuilding.
+
+The lens database in the lensfun folder is the lensfun project's
+(https://lensfun.github.io, (c) the lensfun contributors), unmodified, under
+the Creative Commons Attribution-ShareAlike 3.0 licence -- see
+licenses/lensfun-database-CC_BY-SA_3.0.txt.
 
 LibRaw is distributed in the hope that it will be useful, but WITHOUT ANY
 WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A

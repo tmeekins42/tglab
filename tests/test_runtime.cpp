@@ -20,6 +20,7 @@
 #include "../src/algo_util/histogram.h"
 #include "../src/algo_util/pixel_buffer.h"
 #include "../src/core/compare.h"
+#include "../src/core/lensfun.h"
 #include "../src/core/pipeline.h"
 #include "../src/core/worker.h"
 #include "../src/gpu/compute.h"
@@ -1414,6 +1415,23 @@ static void TestGpuAgreement(ID3D12Device* dev) {
          "o = lens_correct(src, k1 = 0.05)\n"
          "display(o)\n", 2.0, 0.5},
 
+        // color_mixer and color_grade: one OkLab round trip per pixel each,
+        // the band and range settings carried as root constants -- the
+        // mixer's 24 as a packed array, which HLSL pads per element unless
+        // it is declared uint4.
+        {"color_mixer",
+         "src = image(\"test\")\n"
+         "o = color_mixer(src, red_hue = 0.5, orange_saturation = -0.6, yellow_luminance = 0.4, "
+         "green_hue = -0.3, aqua_saturation = 0.5, blue_luminance = -0.5, purple_hue = 0.8, "
+         "magenta_saturation = -1)\n"
+         "display(o)\n", 2.0, 0.75},
+        {"color_grade",
+         "src = image(\"test\")\n"
+         "o = color_grade(src, shadows_hue = 230, shadows_strength = 0.6, shadows_lightness = 0.2, "
+         "midtones_strength = 0.3, highlights_hue = 70, highlights_strength = 0.5, "
+         "highlights_lightness = -0.3, global_strength = 0.1, balance = 0.3, blending = 0.8)\n"
+         "display(o)\n", 2.0, 0.75},
+
         // basic_adjust with the local base: six passes build it, and every
         // tonal band -- highlights, midtones, shadows -- is driven by it.
         {"basic_adjust",
@@ -2679,6 +2697,72 @@ static void TestPrevReleasedEarly() {
                          std::to_string(held) + " still held)");
 }
 
+// A GROUP IS PREVIEWED SHRUNK, AND THE SETTLED RUN IS NOT.
+//
+// Dragging a per-frame stage ahead of a merge used to run every frame at full
+// resolution on every tick (~18 s a tick on an eight-frame bracket), because
+// only a single image was ever shrunk for a preview. Now a group crossing into
+// the re-run range is shrunk frame by frame and cached for the drag. What must
+// not change is the settled run: it has to come back at full size and equal a
+// run that never saw a preview -- a set of proxies left in the cache and
+// reused would be a quietly soft final picture.
+static void TestGroupProxy() {
+    std::printf("\n--- group proxy ---\n");
+    const int dim = 256;
+    auto frame = [&](float base) {
+        Image img;
+        img.Alloc({dim, dim, Format::RGBA32F});
+        ImageView v = img.MapCpuWrite();
+        for (int y = 0; y < dim; ++y)
+            for (int x = 0; x < dim; ++x) {
+                float* p = v.At<float>(x, y);
+                p[0] = p[1] = p[2] = base + (((x / 16) + (y / 16)) % 2 ? 0.3f : 0.0f);
+                p[3] = 1.0f;
+            }
+        return img;
+    };
+    auto run = [&](Pipeline* p, Pipeline* prev, double b, float proxy, Image* out) {
+        ImageSet set;
+        for (float base : {0.1f, 0.2f, 0.3f}) set.images.push_back(frame(base));
+        set.shape = Shape::Of("frame", 3);
+        std::vector<SourceImage> names{{"test", 0}};
+        SourceImage gs; gs.name = "g"; gs.index = 1; gs.shape = Shape::Of("frame", 3);
+        names.push_back(gs);
+        UiState ui; Program prog; std::string err;
+        const std::string script = "g = image(\"g\")\na = brightness(g, brightness = " + std::to_string(b) +
+                                   ")\nm = merge_mean(a)\ndisplay(m)\n";
+        if (!Parse(script, &prog, &err) || !Interpret(prog, names, &ui, p).ok) return false;
+        p->SetProxyScale(proxy);
+        std::vector<Data> src;
+        src.push_back(Data{});
+        src.push_back(Data{std::move(set)});
+        const std::vector<uint64_t> versions{1, 1};
+        if (!p->Execute(&src, prev, &err, nullptr, ExecMode::Auto, &versions)) return false;
+        const Data* d = p->Resolve(p->Viewers()[0].source, &src);
+        if (!d || !std::holds_alternative<Image>(*d)) return false;
+        *out = const_cast<Image&>(std::get<Image>(*d)).Clone();
+        return true;
+    };
+    Pipeline a, b, c, cold;
+    Image oa, ob, oc, ocold;
+    if (!run(&a, nullptr, 0.1, 0.5f, &oa) || !run(&b, &a, 0.2, 0.5f, &ob) ||
+        !run(&c, &b, 0.2, 1.0f, &oc) || !run(&cold, nullptr, 0.2, 1.0f, &ocold)) {
+        Check(false, "the group drag runs");
+        return;
+    }
+    Check(ob.Desc().width == dim / 2, "a drag over a group runs on shrunk frames (" +
+                                          std::to_string(ob.Desc().width) + " px)");
+    Check(oc.Desc().width == dim, "...and the settled run is full size (" + std::to_string(oc.Desc().width) + " px)");
+    bool same = oc.Desc().width == ocold.Desc().width;
+    if (same) {
+        ImageView v1 = oc.MapCpuRead(), v2 = ocold.MapCpuRead();
+        for (int y = 0; y < dim && same; ++y)
+            for (int x = 0; x < dim; ++x)
+                if (std::fabs(v1.At<float>(x, y)[1] - v2.At<float>(x, y)[1]) > 1e-6f) { same = false; break; }
+    }
+    Check(same, "...and equals a run that never saw a preview");
+}
+
 static void TestRegionThenFull() {
     std::printf("\n--- region then full ---\n");
 
@@ -2915,6 +2999,173 @@ static void TestMeasureCachePerFrame(ID3D12Device* dev) {
     Check(w1 < 1e-5f, "each frame of a group measures its own airlight (worst " + std::to_string(w1) + ")");
     Check(w2 < 1e-5f, "...and a drag re-runs each frame from its own planes (worst " + std::to_string(w2) + ")");
     gpu.Shutdown();
+}
+
+// LENS PROFILES: a lensfun database read, matched and converted, and applied.
+//
+// The database here is a small synthetic one written for the test (the real
+// one is not in the repository), with known coefficients, so every number the
+// conversion produces can be worked out by hand: lensfun's poly3 term k1, in
+// Hugin units, becomes k1 s^2 / (1 - k1)^3 on r^2 in lens_correct's, with s
+// the image's half diagonal over half the calibration sensor's short side.
+// Then the plumbing: a profile with only that term must give exactly the
+// image a manual k1 of the converted value gives, and with distortion, TCA
+// and vignetting all on, the GPU must agree with the CPU.
+static void TestLensProfile(ID3D12Device* dev) {
+    std::printf("\n--- lens profiles ---\n");
+    char tmp[MAX_PATH] = {};
+    GetTempPathA(MAX_PATH, tmp);
+    const std::string dir = std::string(tmp) + "tglab_lensfun_test";
+    CreateDirectoryA(dir.c_str(), nullptr);
+    auto conv = [](double k1, double s) { return k1 * s * s / std::pow(1 - k1, 3); };
+    const double sFull = std::hypot(1.5, 1.0);   // full-frame calibration, full-frame image
+    const double kPrime = -0.089;
+    {
+        FILE* f = nullptr;
+        if (fopen_s(&f, (dir + "\\test.xml").c_str(), "wb") != 0 || !f) { Check(false, "write test db"); return; }
+        std::fputs(
+            "<?xml version=\"1.0\"?>\n<lensdatabase version=\"2\">\n"
+            "<camera><maker>Testco</maker><model>Testco Body 1</model><model lang=\"en\">Body One</model>"
+            "<mount>Test</mount><cropfactor>1.5</cropfactor></camera>\n"
+            "<!-- a zoom calibrated on full frame -->\n"
+            "<lens><maker>Testco</maker><model>Testco 20-40mm f/2.8 Zoom</model><mount>Test</mount>"
+            "<cropfactor>1</cropfactor><calibration>"
+            "<distortion model=\"poly3\" focal=\"20\" k1=\"-0.02\"/>"
+            "<distortion model=\"poly3\" focal=\"40\" k1=\"0.01\"/>"
+            "<tca model=\"poly3\" focal=\"20\" vr=\"1.0006\" br=\"0.0002\" vb=\"0.9995\" cb=\"0.0001\"/>"
+            "<vignetting model=\"pa\" focal=\"20\" aperture=\"2.8\" distance=\"1\" k1=\"-0.9\" k2=\"0\" k3=\"0\"/>"
+            "<vignetting model=\"pa\" focal=\"20\" aperture=\"2.8\" distance=\"1000\" k1=\"-0.4\" k2=\"0.1\" k3=\"0\"/>"
+            "<vignetting model=\"pa\" focal=\"40\" aperture=\"2.8\" distance=\"1000\" k1=\"-0.2\" k2=\"0\" k3=\"0\"/>"
+            "</calibration></lens>\n"
+            "<!-- the same zoom again, calibrated on APS-C -->\n"
+            "<lens><maker>Testco</maker><model>Testco 20-40mm f/2.8 Zoom</model><mount>Test</mount>"
+            "<cropfactor>1.5</cropfactor><calibration>"
+            "<distortion model=\"poly3\" focal=\"20\" k1=\"-0.04\"/>"
+            "</calibration></lens>\n"
+            "<lens><maker>Testco</maker><model>Testco 20-50mm f/2.8 Zoom</model><mount>Test</mount>"
+            "<cropfactor>1</cropfactor><calibration>"
+            "<distortion model=\"poly3\" focal=\"20\" k1=\"0.3\"/></calibration></lens>\n", f);
+        // The prime's k1 is chosen to convert to exactly kPrime, which a
+        // script can type: a typed k1 is held to the slider's 0.001.
+        double k = -0.03;
+        for (int i = 0; i < 50; ++i) {
+            const double g = conv(k, sFull) - kPrime, h = 1e-7;
+            k -= g / ((conv(k + h, sFull) - conv(k - h, sFull)) / (2 * h));
+        }
+        std::fprintf(f,
+            "<lens><maker>Testco</maker><model>Testco 35mm f/2 Prime</model><mount>Test</mount>"
+            "<cropfactor>1</cropfactor><calibration>"
+            "<distortion model=\"poly3\" focal=\"35\" k1=\"%.17g\"/></calibration></lens>\n"
+            "</lensdatabase>\n", k);
+        std::fclose(f);
+    }
+    SetLensfunDirectory(dir);
+    Check(LensfunLensCount() == 4 && LensfunCameraCount() == 1,
+          "the database reads (" + std::to_string(LensfunLensCount()) + " lenses, " +
+              std::to_string(LensfunCameraCount()) + " cameras)");
+
+    // EXIF spellings: no maker, no space before mm, "F2.8".
+    const LensProfile ff = FindLensProfile("Other", "Cam", "20-40mm F2.8 Zoom", 30.0f, 2.8f, 0.0f);
+    const double want = 0.5 * (conv(-0.02, sFull) + conv(0.01, sFull));
+    Check(ff.valid && ff.lens == "Testco 20-40mm f/2.8 Zoom" && std::fabs(ff.calibCrop - 1.0f) < 1e-6f &&
+              std::fabs(ff.dist[2] - want) < 1e-6,
+          "a zoom's distortion is matched by fuzzy name, converted and interpolated in focal (r^2 " +
+              std::to_string(ff.dist[2]) + ", want " + std::to_string(want) + ")");
+    Check(ff.hasTca && std::fabs(ff.tca[0][0] - 1.0006) < 1e-9 &&
+              std::fabs(ff.tca[0][2] - 0.0002 * sFull * sFull) < 1e-9 &&
+              std::fabs(ff.tca[1][1] - 0.0001 * sFull) < 1e-9,
+          "...its TCA rescaled to the image's half diagonal");
+    // Vignetting: the far entry at 20 mm, not the near one, averaged with 40.
+    Check(ff.hasVignetting && std::fabs(ff.vig[0] - (-0.3)) < 1e-6 && std::fabs(ff.vig[1] - 0.05) < 1e-6,
+          "...and its vignetting focused far (k1 " + std::to_string(ff.vig[0]) + ")");
+
+    // The APS-C body: its crop from the camera entry, and the calibration made
+    // on APS-C chosen over the full-frame one. The image's half diagonal is
+    // then the calibration's, so s is the aspect term alone.
+    const LensProfile aps = FindLensProfile("TESTCO CORPORATION", "Body 1", "Testco 20-40mm f/2.8 Zoom",
+                                            30.0f, 2.8f, 0.0f);
+    Check(aps.valid && aps.camera == "Testco Body 1" && std::fabs(aps.cropFactor - 1.5f) < 1e-6f &&
+              std::fabs(aps.calibCrop - 1.5f) < 1e-6f && std::fabs(aps.dist[2] - conv(-0.04, sFull)) < 1e-6,
+          "a body's crop picks the calibration made on its sensor size (r^2 " + std::to_string(aps.dist[2]) + ")");
+    Check(!FindLensProfile("Other", "Cam", "24-40mm F2.8 Zoom", 30.0f, 2.8f, 0.0f).valid,
+          "...and a lens whose numbers differ is never matched");
+
+    // The plumbing, through the pipeline: an image that says what took it.
+    const int W = 256, H = 192;
+    auto make = [&](const char* lens, float focal) {
+        Image img;
+        ImageDesc d{W, H, Format::RGBA32F};
+        d.linear = true;
+        d.focalMm = focal;
+        d.aperture = 2.8f;
+        d.lensTag = InternLensTag("Other", "Cam", lens);
+        img.Alloc(d);
+        ImageView v = img.MapCpuWrite();
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                float* p = v.At<float>(x, y);
+                const bool on = ((x / 12) + (y / 12)) % 2;
+                p[0] = on ? 0.7f : 0.1f; p[1] = on ? 0.6f : 0.15f; p[2] = on ? 0.5f : 0.2f; p[3] = 1.0f;
+            }
+        return img;
+    };
+    ComputeContext gpu;
+    const bool haveGpu = dev && gpu.Init(dev);
+    auto run = [&](const Image& srcImg, const std::string& args, ExecMode mode, Image* out) {
+        UiState ui; Pipeline pipe; std::vector<Data> src;
+        src.push_back(Data{const_cast<Image&>(srcImg).Clone()});
+        std::vector<SourceImage> names{{"test", 0}};
+        Program prog; std::string err;
+        const std::string script = "src = image(\"test\")\no = lens_correct(src, auto_ca = 0" + args +
+                                   ")\ndisplay(o)\n";
+        if (!Parse(script, &prog, &err) || !Interpret(prog, names, &ui, &pipe).ok) return false;
+        const std::vector<uint64_t> versions{1};
+        if (!pipe.Execute(&src, nullptr, &err, mode == ExecMode::ForceGPU ? &gpu : nullptr, mode, &versions))
+            return false;
+        const Data* d = pipe.Resolve(pipe.Viewers()[0].source, &src);
+        if (!d || !std::holds_alternative<Image>(*d)) return false;
+        *out = const_cast<Image&>(std::get<Image>(*d)).Clone();
+        return true;
+    };
+    auto worst = [](Image& a, Image& b) {
+        ImageView va = a.MapCpuRead(), vb = b.MapCpuRead();
+        if (va.desc.width != vb.desc.width || va.desc.height != vb.desc.height) return 1e9f;
+        float w = 0.0f;
+        for (int y = 0; y < va.desc.height; ++y)
+            for (int x = 0; x < va.desc.width; ++x)
+                for (int c = 0; c < 3; ++c)
+                    w = std::max(w, std::fabs(va.At<float>(x, y)[c] - vb.At<float>(x, y)[c]));
+        return w;
+    };
+
+    const Image prime = make("Testco 35mm f/2 Prime", 35.0f);
+    Image byProfile, byHand, off;
+    char k1[64];
+    std::snprintf(k1, sizeof k1, ", profile = 0, k1 = %.3f", kPrime);
+    if (run(prime, "", ExecMode::ForceCPU, &byProfile) && run(prime, k1, ExecMode::ForceCPU, &byHand) &&
+        run(prime, ", profile = 0", ExecMode::ForceCPU, &off)) {
+        const float same = worst(byProfile, byHand), moved = worst(byProfile, off);
+        Check(same < 1e-4f && moved > 0.05f,
+              "a profile corrects exactly as the slider set to its value (worst " + std::to_string(same) +
+                  ", against none " + std::to_string(moved) + ")");
+    } else {
+        Check(false, "lens_correct runs with a profile");
+    }
+
+    if (haveGpu) {
+        const Image zoom = make("20-40mm F2.8 Zoom", 30.0f);
+        Image cpu, gpuOut;
+        if (run(zoom, ", k2 = 0.01, ca_red = 0.5", ExecMode::ForceCPU, &cpu) &&
+            run(zoom, ", k2 = 0.01, ca_red = 0.5", ExecMode::ForceGPU, &gpuOut)) {
+            const float w = worst(cpu, gpuOut);
+            Check(w < 2e-3f, "the GPU applies distortion, TCA and vignetting from a profile as the CPU does (worst " +
+                                 std::to_string(w) + ")");
+        } else {
+            Check(false, "lens_correct runs a profile on both paths");
+        }
+        gpu.Shutdown();
+    }
+    SetLensfunDirectory("");
 }
 
 // A DRAG KEEPS wavelet_denoise's NOISE MEASUREMENT; THE SETTLED RUN REMAKES IT.
@@ -3402,6 +3653,7 @@ int main() {
     TestRegionThenFull();
     TestRegionKeepsCache();
     TestPrevReleasedEarly();
+    TestGroupProxy();
     TestGpuBudget();
 
     ID3D12Device* dev = nullptr;
@@ -3418,6 +3670,7 @@ int main() {
         TestMeasureCache(dev);
         TestMeasureCachePerFrame(dev);
         TestMeasureStaleWhileDragging(dev);
+        TestLensProfile(dev);
         dev->Release();
     } else {
         std::printf("\n(no D3D12 device — GPU tests skipped)\n");

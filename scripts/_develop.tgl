@@ -39,6 +39,11 @@
 #                  curve -- on luminance, after the photographic controls it
 #                  refines. A no-op until a slider moves.
 #
+#   color_mixer    hue, saturation and luminance by colour band, in OkLab,
+#                  then color_grade, the shadow/midtone/highlight wheels.
+#                  Colour after tone, so the bands and ranges are judged on
+#                  the picture as it will look; both no-ops until moved.
+#
 #   dehaze         before the local contrast and grain, because it inverts a
 #                  physical mixing of light and wants the picture still clean.
 #
@@ -82,6 +87,8 @@ developed = developed
          => params( basic_adjust, auto_exposure = 1 )()
          => params( defringe )()
          => params( curves )()
+         => params( color_mixer )()
+         => params( color_grade )()
          => params( dehaze )()
          => params( wavelet_denoise )()
          => params( sharpen )()

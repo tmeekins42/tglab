@@ -2,6 +2,8 @@
 
 #include <cassert>
 #include <cstring>
+#include <deque>
+#include <mutex>
 
 namespace tglab {
 
@@ -12,6 +14,32 @@ bool (*g_readbackFromGpu)(Image&) = nullptr;
 
 static bool ReadbackFromGpu(Image& img) {
     return g_readbackFromGpu ? g_readbackFromGpu(img) : false;
+}
+
+// --- lens tags ---------------------------------------------------------------
+//
+// A deque so a returned reference stays valid as the table grows. Never
+// shrinks: a process sees a handful of lenses.
+namespace {
+std::mutex             g_lensTagMutex;
+std::deque<LensTag>    g_lensTags;   // id = index + 1
+}
+
+uint32_t InternLensTag(const std::string& make, const std::string& model, const std::string& lens) {
+    if (make.empty() && model.empty() && lens.empty()) return 0;
+    std::lock_guard<std::mutex> lock(g_lensTagMutex);
+    for (size_t i = 0; i < g_lensTags.size(); ++i) {
+        const LensTag& t = g_lensTags[i];
+        if (t.make == make && t.model == model && t.lens == lens) return uint32_t(i + 1);
+    }
+    g_lensTags.push_back(LensTag{make, model, lens});
+    return uint32_t(g_lensTags.size());
+}
+
+const LensTag& LensTagOf(uint32_t id) {
+    static const LensTag kNone;
+    std::lock_guard<std::mutex> lock(g_lensTagMutex);
+    return (id == 0 || id > g_lensTags.size()) ? kNone : g_lensTags[id - 1];
 }
 
 int BytesPerPixel(Format f) {

@@ -871,6 +871,13 @@ anything past that is silently dropped. A table does not belong there:
 garbage (a mean difference of 119/255 against the CPU). Give it to the kernel
 as a small texture through `GpuExtraInputs()` instead — see below.
 
+**An array in `b0` is padded.** HLSL gives every element of a cbuffer array
+its own 16-byte register, while root constants arrive packed, so `uint S[24]`
+reads one value in four. Declare it `uint4 S[6]`, start it on a 16-byte
+boundary (pad the scalars before it to a multiple of four, and push a zero for
+the pad), and index `S[k >> 2][k & 3]` — as `color_mixer` does for its 24 band
+settings.
+
 **A mode is a dropdown.** An integer parameter with names
 (`.choices = kNames, .choiceCount = n`, as `upright`'s `mode` and
 `stitch_panorama`'s `projection`) is drawn as a menu and offered by name to a
@@ -1040,6 +1047,18 @@ by the stages that build their own descriptors (`merge_hdr`,
 after a merge the camera metadata is still there, and without the flag the
 merge's headroom above ~1.0 read as clipped channels. A new fact of this kind
 should be cleared by default and kept only where it is still true.
+
+The lens that took the frame is the opposite case: kept through every stage
+that keeps the frame's geometry, cleared (`ClearLens()`) by `crop` and
+`stitch_panorama`, after which a `lens_correct` finds no profile rather than
+the wrong one.
+
+**Keep `ImageDesc` small.** It is copied by value everywhere, and
+`tests/test_script.cpp`'s `main()` holds enough of them that 176 bytes of lens
+and camera names overflowed its 1 MB stack (`0xC00000FD`, and the suite simply
+stops). Names go in an interned table — `InternLensTag` / `LensTagOf` — and the
+descriptor carries a 4-byte id; equal names always get the same id, so
+`operator==` still means what the stage cache needs.
 
 ### Declaring how a stage behaves on previews
 

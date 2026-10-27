@@ -61,6 +61,7 @@ public:
         Rect(in.width, in.height, &x0, &y0, &w, &h);
         d.width  = w;
         d.height = h;
+        d.ClearLens();
         return d;
     }
 

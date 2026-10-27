@@ -6,6 +6,8 @@
 #pragma once
 
 #include <cstdint>
+#include <cstring>
+#include <string>
 #include <memory>
 #include <array>
 #include <vector>
@@ -100,6 +102,29 @@ struct ImageDesc {
     float shutter  = 0.0f;   // seconds
     float aperture = 0.0f;   // f-number
     float iso      = 0.0f;   // ISO speed
+
+    // What took it, for finding a lens profile (core/lensfun.h): the lens as
+    // EXIF names it, the camera, the focal length, and the 35 mm equivalent
+    // over the real focal (the crop factor, 0 when the file does not say).
+    // Empty and 0 for a JPEG or a scan.
+    //
+    // The names are an id into an interned table (LensTagOf), not strings:
+    // a descriptor is copied by value everywhere, and 176 bytes of names in
+    // it overflowed the 1 MB stack of the script tests' long main(). Equal
+    // names always intern to the same id, so operator== still means what it
+    // should.
+    float    focalMm = 0.0f;
+    float    crop35  = 0.0f;
+    uint32_t lensTag = 0;   // 0: nothing known
+
+    // For a stage whose output is no longer the frame the lens drew -- a crop
+    // moves the centre, a panorama is many frames -- so a lens_correct after
+    // it finds no profile rather than the wrong one.
+    void ClearLens() {
+        focalMm = 0.0f;
+        crop35  = 0.0f;
+        lensTag = 0;
+    }
 
     // Relative exposure of this frame: how much light reached the sensor
     // compared with a reference, up to a constant that cancels in a merge.
@@ -260,6 +285,15 @@ struct ImageDesc {
     // True when this image still carries an undemosaiced sensor pattern.
     bool IsMosaic() const { return cfa != CfaPattern::None; }
 };
+
+// The names behind ImageDesc::lensTag. Interned for the life of the process:
+// the same three names always give the same id, and an id's names never
+// change or move. Thread-safe.
+struct LensTag {
+    std::string make, model, lens;
+};
+uint32_t InternLensTag(const std::string& make, const std::string& model, const std::string& lens);
+const LensTag& LensTagOf(uint32_t id);   // empty names for 0 or an unknown id
 
 // Non-owning view of CPU pixels. Algorithms operate through this.
 // A rectangle of pixels, for asking that only part of an image be computed.

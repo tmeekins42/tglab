@@ -64,6 +64,11 @@ const Attribution kLibraries[] = {
      "MIT License",
      "Copyright (c) 2026 Johan Edstedt"},
 
+    // DATA rather than code: tglab reads the XML with its own reader.
+    {"lensfun lens database", "2026-10-25", "https://lensfun.github.io",
+     "CC BY-SA 3.0 (the data files only)",
+     "Copyright (c) the lensfun contributors; shipped unmodified in lensfun/"},
+
     // LoMa's matcher is LightGlue's architecture and carries its licence.
     {"LoMa-B128 matcher (weights)", "B128", "https://github.com/davnords/LoMa",
      "Apache License 2.0 (from LightGlue)",

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(tglab VERSION 0.20.0 LANGUAGES CXX)
+project(tglab VERSION 0.21.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -64,6 +64,7 @@ add_library(tglab_core STATIC
     src/core/exif.cpp
     src/core/image_stats.cpp
     src/core/raw_io.cpp
+    src/core/lensfun.cpp
     src/script/lexer.cpp
     src/script/parser.cpp
     src/script/interp.cpp
@@ -524,3 +525,11 @@ if(MSVC)
     target_compile_definitions(bench_sparse PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
 tglab_copy_dxc(bench_sparse)
+
+# lens_info: which lensfun profile each raw gets (src/core/lensfun.h).
+#   build/Release/lens_info.exe <raw>...
+add_executable(lens_info tools/lens_info.cpp $<TARGET_OBJECTS:tglab_algorithms>)
+target_link_libraries(lens_info PRIVATE tglab_core)
+if(MSVC)
+    target_compile_definitions(lens_info PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()

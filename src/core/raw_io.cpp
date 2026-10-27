@@ -365,6 +365,15 @@ bool LoadRawMosaic(const std::string& path, Image* out, std::string* err) {
         d.shutter  = (o.shutter   > 0.0f) ? o.shutter   : 0.0f;
         d.aperture = (o.aperture  > 0.0f) ? o.aperture  : 0.0f;
         d.iso      = (o.iso_speed > 0.0f) ? o.iso_speed : 0.0f;
+
+        // The lens and body, for lens_correct's profile lookup.
+        d.focalMm = (o.focal_len > 0.0f) ? o.focal_len : 0.0f;
+        const auto& ln = raw.imgdata.lens;
+        if (d.focalMm > 0.0f && ln.FocalLengthIn35mmFormat > 0)
+            d.crop35 = float(ln.FocalLengthIn35mmFormat) / d.focalMm;
+        std::string lensName = Trim(ln.Lens);
+        if (lensName.empty()) lensName = Trim(ln.makernotes.Lens);
+        d.lensTag = InternLensTag(Trim(raw.imgdata.idata.make), Trim(raw.imgdata.idata.model), lensName);
     }
 
     // The camera's DAYLIGHT reference: the gains that make a D65 white neutral

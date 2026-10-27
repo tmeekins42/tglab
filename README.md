@@ -472,12 +472,12 @@ defaults.
 
 ## Algorithms
 
-86 registered. `choose("x", "category")` offers every algorithm in a category,
+88 registered. `choose("x", "category")` offers every algorithm in a category,
 so these names are the ones that matter in a script.
 
 | Category | Algorithms |
 |---|---|
-| **adjust** | `basic_adjust` (exposure, contrast, highlights, midtones, shadows by region, whites, blacks, vibrance, saturation, camera-space white balance), `curves` (parametric regions and a point curve, on luminance), `brightness`, `crop` (trim and straighten, with a preview), `upright` (perspective from vanishing points: level, vertical, full), `vignette`, `clarity` (edge-aware local contrast: clarity and texture), `lens_correct` (distortion k1/k2, lateral CA measured or manual, vignetting, one resample), `film_grain`, `dehaze` (dark channel prior), `resize` (area-average on minify, bilinear on magnify) |
+| **adjust** | `basic_adjust` (exposure, contrast, highlights, midtones, shadows by region, whites, blacks, vibrance, saturation, camera-space white balance), `curves` (parametric regions and a point curve, on luminance), `brightness`, `crop` (trim and straighten, with a preview), `upright` (perspective from vanishing points: level, vertical, full), `vignette`, `clarity` (edge-aware local contrast: clarity and texture), `lens_correct` (lensfun profiles from the raw's lens and focal length, or distortion k1/k2, lateral CA measured or manual, vignetting; one resample), `film_grain`, `dehaze` (dark channel prior), `resize` (area-average on minify, bilinear on magnify) |
 | **tonemap** | `tonemap` (global), `tonemap_local` (illumination/detail split) |
 | **features** | `detect_sift`, `detect_surf`, `detect_akaze`, `detect_orb`, `detect_brisk`, `detect_dad` and `describe_dedode` (learned; see below), `draw_features`, `draw_matches`, `match_guided` (a second pass along epipolar lines) |
 | **match** | `match_brute` (exact), `match_ann` (k-d forest / LSH) |
@@ -487,7 +487,7 @@ so these names are the ones that matter in a script.
 | **filter** | `sharpen` (unsharp mask in log luminance: hue kept, halo limit, edge masking), `gaussian_blur`, `box_blur`, `median_blur`, `bilateral`, `guided_filter`, `nonlocal_means`, `anisotropic_diffusion`, `kuwahara`, `kuwahara_generalized`, `symmetric_nearest`, `bloom` (glow and halation), `orton` |
 | **edge** | `sobel`, `canny`, `non_max_suppression`, `hysteresis` |
 | **threshold** | `threshold`, `threshold_otsu`, `threshold_isodata`, `threshold_triangle`, `threshold_adaptive_mean`, `threshold_adaptive_gaussian`, `threshold_niblack`, `threshold_sauvola`, `threshold_bernsen` |
-| **color** | `defringe` (purple and green fringes along edges, in OkLab), `grayscale`, `apply_lut` (3D .cube LUTs) |
+| **color** | `color_mixer` (hue, saturation and luminance in eight OkLab colour bands), `color_grade` (shadow, midtone, highlight and global colour wheels), `defringe` (purple and green fringes along edges, in OkLab), `grayscale`, `apply_lut` (3D .cube LUTs) |
 | **sfm** | `solve_cameras` (the whole chain, focal found automatically), `relative_pose`, `build_tracks`, `rotation_average`, `global_position`, `triangulate`, `bundle_adjust_sfm`; dense: `plane_sweep` (depth maps), `fuse_depth`; splats: `init_splats`, `train_splats`, `carve_splats`, `render_splats`, `load_ply` |
 
 Most have a GPU kernel and fall back to the CPU if it fails — **always saying
@@ -1161,6 +1161,35 @@ other tools, which `scripts/view_ply.tgl` opens in the 3D viewer.
   **Put it first**, on each frame, before `align`, a merge or a stitch — they
   all work better on undistorted frames, and the vignetting gain belongs to
   linear light. `hdr.tgl`, `panorama.tgl`, `develop.tgl` and `sfm.tgl` do.
+- **Lens profiles** (`lens_correct`'s `profile`, on). When the
+  [lensfun](https://lensfun.github.io) database is present, the lens the raw
+  names is looked up — by fuzzy name, so EXIF's "RF24-105mm F4 L IS USM"
+  finds lensfun's "Canon RF 24-105mm F4L IS USM", with every number required
+  to match — and its measured distortion, TCA and vignetting are applied at
+  the shot's focal length and aperture with no slider touched. A compact that
+  names no lens is matched through its body. The coefficients are converted
+  from lensfun's three coordinate systems into lens_correct's (r = 1 at the
+  image's half diagonal), interpolated between calibrated focal lengths, and
+  the calibration made on the right sensor size is chosen. `k1`, `k2`,
+  `ca_red` and `ca_blue` add to the profile; `auto_ca` stands aside when the
+  profile has its own TCA. The info panel names the lens it found.
+  The database ships with tglab — `lensfun/` beside the exe in a release,
+  `third_party/lensfun/db` in the repository — and `TGLAB_LENSFUN_DIR` points
+  at another copy. `lens_info <raw>...`
+  prints what each raw would get.
+- **`color_mixer`** moves hue, saturation and luminance in eight colour bands
+  — red, orange, yellow, green, aqua, blue, purple, magenta — placed on the
+  OkLab hue circle where those sRGB colours fall, blended by a raised cosine so
+  every hue belongs to two neighbouring bands in proportions that sum to one.
+  OkLab's hue holds still as lightness changes, so "the blues" are the same
+  pixels in shadow and highlight, and turning yellow toward green does not
+  darken it. Weighted by chroma, so greys never move.
+- **`color_grade`** is three-way grading: a colour wheel (hue and strength)
+  and a lightness for the shadows, the midtones and the highlights, and a
+  global one. The wheel's colour is added to OkLab a/b, the ranges judged by
+  OkLab lightness around a pivot at middle grey; `balance` moves the pivot and
+  `blending` sets how far each range reaches into the next. Black stays
+  neutral.
 - **`sharpen`** is an unsharp mask in log luminance: one gain per pixel, so hue
   is kept and colour noise is not amplified, and an edge is the same size in
   stops wherever it sits. `limit` caps how many stops any pixel may change;
@@ -1442,5 +1471,11 @@ source is vendored under [third_party/libraw/](third_party/libraw/) with both
 licence texts, and building tglab rebuilds it from that source — which
 satisfies both. Anyone distributing a compiled tglab needs to carry the same
 source and notice.
+
+The lensfun lens database (https://lensfun.github.io, © the lensfun
+contributors) is **CC BY-SA 3.0**. It is vendored unmodified under
+[third_party/lensfun/](third_party/lensfun/) with its licence text and ships in
+the release as `lensfun/`; tglab reads it as data at run time with its own
+reader, so the licence covers those files and not tglab's code.
 
 `Help → About tglab` shows the version and every dependency with its licence.

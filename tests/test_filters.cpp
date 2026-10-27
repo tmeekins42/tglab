@@ -1011,6 +1011,126 @@ static void TestBloomRound() {
 // defringe: a fringe along an edge loses its colour and keeps its lightness;
 // the same purple away from any edge, and a green fringe while green is off,
 // are left alone.
+// color_mixer: each band's slider moves its colours and only its colours, by
+// what it says; color_grade: each range's wheel tints its range and not the
+// others. Read back in OkLab, the space both work in.
+static void OkLabAt(Image& im, int x, int y, float lab[3]) {
+    ImageView v = im.MapCpuRead();
+    const float* p = v.At<float>(x, y);
+    const float rgb[3] = {p[0], p[1], p[2]};
+    LinearSrgbToOkLab(rgb, lab);
+}
+
+static void TestColorMixer() {
+    constexpr int W = 90, H = 10;
+    // Three patches, linear: red, blue, grey.
+    auto make = [&] {
+        Image img;
+        ImageDesc d{W, H, Format::RGBA32F};
+        d.linear = true;
+        img.Alloc(d);
+        ImageView v = img.MapCpuWrite();
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                float* p = v.At<float>(x, y);
+                if (x < 30)      { p[0] = 0.6f;  p[1] = 0.05f; p[2] = 0.05f; }
+                else if (x < 60) { p[0] = 0.05f; p[1] = 0.1f;  p[2] = 0.6f;  }
+                else             { p[0] = p[1] = p[2] = 0.3f; }
+                p[3] = 1.0f;
+            }
+        return img;
+    };
+    Image src = make();
+    float red0[3], blue0[3], grey0[3];
+    OkLabAt(src, 15, 5, red0); OkLabAt(src, 45, 5, blue0); OkLabAt(src, 75, 5, grey0);
+    auto chroma = [](const float l[3]) { return std::hypot(l[1], l[2]); };
+    auto hue = [](const float l[3]) { return std::atan2(l[2], l[1]) * 180.0 / 3.14159265; };
+    auto same = [](const float a[3], const float b[3]) {
+        return std::fabs(a[0] - b[0]) < 1e-4f && std::fabs(a[1] - b[1]) < 1e-4f && std::fabs(a[2] - b[2]) < 1e-4f;
+    };
+    std::string err;
+    Image out;
+    if (RunFilter("color_mixer", make(), {{"red_saturation", -1.0}}, &out, &err)) {
+        float r[3], b[3], g[3];
+        OkLabAt(out, 15, 5, r); OkLabAt(out, 45, 5, b); OkLabAt(out, 75, 5, g);
+        Check(chroma(r) < 0.005f && std::fabs(r[0] - red0[0]) < 1e-3f,
+              "color_mixer red_saturation = -1 greys the reds and keeps their lightness (chroma " +
+                  std::to_string(chroma(red0)) + " -> " + std::to_string(chroma(r)) + ")");
+        Check(same(b, blue0) && same(g, grey0), "...and leaves blue and grey exactly alone");
+    } else {
+        Check(false, "color_mixer runs: " + err);
+    }
+    if (RunFilter("color_mixer", make(), {{"blue_luminance", -1.0}}, &out, &err)) {
+        float b[3], r[3];
+        OkLabAt(out, 45, 5, b); OkLabAt(out, 15, 5, r);
+        // Up to 40%: this blue sits a little short of the band's centre, so
+        // it takes most of the blue setting and a little of aqua's (zero).
+        const float ratio = b[0] / blue0[0];
+        Check(ratio > 0.59f && ratio < 0.67f && std::fabs(chroma(b) - chroma(blue0)) < 1e-3f && same(r, red0),
+              "blue_luminance = -1 takes most of 40% off blue's lightness, and only blue's (L " +
+                  std::to_string(blue0[0]) +
+                  " -> " + std::to_string(b[0]) + ")");
+    } else {
+        Check(false, "color_mixer luminance runs: " + err);
+    }
+    if (RunFilter("color_mixer", make(), {{"red_hue", 1.0}}, &out, &err)) {
+        float r[3];
+        OkLabAt(out, 15, 5, r);
+        const double turn = hue(r) - hue(red0);
+        Check(turn > 20.0 && turn < 31.0, "red_hue = +1 turns red toward orange (" + std::to_string(turn) + " degrees)");
+    } else {
+        Check(false, "color_mixer hue runs: " + err);
+    }
+}
+
+static void TestColorGrade() {
+    constexpr int W = 100, H = 4;
+    // A grey ramp, linear 0.005 .. 1: shadows on the left, highlights on the right.
+    auto make = [&] {
+        Image img;
+        ImageDesc d{W, H, Format::RGBA32F};
+        d.linear = true;
+        img.Alloc(d);
+        ImageView v = img.MapCpuWrite();
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                float* p = v.At<float>(x, y);
+                p[0] = p[1] = p[2] = 0.005f + 0.995f * std::pow(float(x) / (W - 1), 2.2f);
+                p[3] = 1.0f;
+            }
+        return img;
+    };
+    std::string err;
+    Image cool;
+    if (RunFilter("color_grade", make(), {{"shadows_hue", 264.0}, {"shadows_strength", 1.0}}, &cool, &err)) {
+        float dark[3], bright[3];
+        OkLabAt(cool, 18, 1, dark); OkLabAt(cool, W - 1, 1, bright);
+        const double h = std::atan2(dark[2], dark[1]) * 180.0 / 3.14159265;
+        Check(std::hypot(dark[1], dark[2]) > 0.04f && std::fabs(h - (-96.0)) < 5.0,
+              "color_grade's shadow wheel tints the shadows its hue (" + std::to_string(h + 360.0) + " degrees)");
+        Check(std::hypot(bright[1], bright[2]) < 0.002f, "...and leaves white alone");
+    } else {
+        Check(false, "color_grade runs: " + err);
+    }
+    Image warm;
+    if (RunFilter("color_grade", make(), {{"highlights_hue", 70.0}, {"highlights_strength", 1.0}}, &warm, &err)) {
+        float dark[3], bright[3];
+        OkLabAt(warm, 10, 1, dark); OkLabAt(warm, 92, 1, bright);
+        Check(std::hypot(bright[1], bright[2]) > 0.05f && std::hypot(dark[1], dark[2]) < 0.002f,
+              "the highlight wheel tints highlights and not shadows");
+    } else {
+        Check(false, "color_grade highlights run: " + err);
+    }
+    Image none;
+    if (RunFilter("color_grade", make(), {{"balance", 0.5}}, &none, &err)) {
+        Image src = make();
+        ImageView a = none.MapCpuRead(), b = src.MapCpuRead();
+        bool exact = true;
+        for (int x = 0; x < W && exact; ++x) exact = a.At<float>(x, 1)[1] == b.At<float>(x, 1)[1];
+        Check(exact, "color_grade with no wheel turned changes nothing");
+    }
+}
+
 static void TestDefringe() {
     constexpr int W = 200, H = 60;
     auto make = [&] {
@@ -2441,6 +2561,8 @@ int main() {
     TestFilmGrain();
     TestBloomRound();
     TestDefringe();
+    TestColorMixer();
+    TestColorGrade();
     TestLocalTones();
     TestCurves();
     TestUpright();
